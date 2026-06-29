@@ -82,10 +82,34 @@ NEXT_STEP_PROMPT = """
 
 浏览器交互操作：
 - 导航：使用 browser_use，action="go_to_url", url="..."
-- 点击：使用 browser_use，action="click_element", index=N
-- 输入：使用 browser_use，action="input_text", index=N, text="..."
 - 提取：使用 browser_use，action="extract_content", goal="..."
 - 滚动：使用 browser_use，action="scroll_down" 或 "scroll_up"
+
+# 两种并列的交互方式（由你自主选择）
+对于点击、输入这类元素交互，你有两种**并列、平等**的方式，请根据当前页面情况主动选择最合适的一种，二者没有主次之分：
+
+【方式 A：基于 DOM 索引】
+- 点击：action="click_element", index=N
+- 输入：action="input_text", index=N, text="..."
+- 适用：目标控件已出现在「交互元素」列表中、有明确的数字索引 [N]、是标准 HTML 控件（按钮、链接、普通输入框、下拉框）
+- 优势：定位精确、稳定、不依赖视觉
+
+【方式 B：基于视觉坐标（GUI）】
+- 操作：action="gui_action", task="单一原子子目标"，例如 task="点击页面右上角的登录按钮"
+- 它会对页面截图并用视觉模型按像素坐标直接驱动鼠标/键盘，不依赖 DOM 索引
+- 仅适用：DOM 确实没有抓手的场景——canvas、地图、图片热区、富文本等无法用选择器/索引命中的控件
+- [关键] task 必须是单一原子动作，禁止复合步骤（如"点输入框再开日历再选日期"会让模型卡死）
+
+特殊控件——日期选择器：
+- 选日期请直接用 action="select_date", index=日期输入框索引, text="2026-07-01"（也支持 "7月1日"）
+- 它会自动开日历、按日期属性/文本点中真实日期格，比 gui_action 视觉点日历稳得多
+- 不要用 gui_action 去点日历格
+
+选择原则：
+- 目标在交互元素列表中有清晰索引时，优先方式 A（更精确稳定）
+- 选日期优先 select_date
+- 只有当目标确实没有任何 DOM 抓手时，才用方式 B（gui_action）
+- 若 gui_action 连续重复同一动作仍无效，立即改走 DOM 方式，不要继续视觉重试
 
 同时考虑可见内容和当前视口之外可能的内容。
 要有条理 - 记住你的进度和到目前为止学到的内容。

@@ -8,6 +8,12 @@ data/
 # Workspace
 workspace/
 
+# GUI 视觉操作调试截图（gui_action 运行时落盘，体积大，无需入库）
+screenshots/
+
+# 经验库运行时数据（jsonl 含 embedding，运行时生成）
+experience/
+
 ### Python ###
 # Byte-compiled / optimized / DLL files
 __pycache__/

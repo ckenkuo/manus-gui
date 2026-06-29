@@ -28,7 +28,9 @@ class Manus(ToolCallAgent):
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 10000
-    max_steps: int = 20
+    # 复杂任务（多页表单、反爬重试、跨页操作）20 步常不够；默认放宽到 40，
+    # 仍可用 main.py 的 --max-steps 覆盖。base.py 在达到上限时会安全终止。
+    max_steps: int = 40
 
     # MCP 客户端，用于远程工具访问
     mcp_clients: MCPClients = Field(default_factory=MCPClients)

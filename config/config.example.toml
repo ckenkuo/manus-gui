@@ -55,6 +55,21 @@ temperature = 0.0                          # Controls randomness for vision mode
 # max_tokens = 4096
 # temperature = 0.0
 
+# Optional GUI vision model — used as a fallback when browser_use DOM element
+# recognition fails (no interactive elements, custom date/map/canvas widgets).
+# The browser tool's action="gui_action" screenshots the page and asks this
+# model for a pixel-coordinate atomic action. Falls back to [llm.vision], then to
+# env DASHSCOPE_API_KEY with model "gui-plus", if this section is omitted.
+# The model is expected to return absolute pixel coordinates relative to the
+# screenshot image; the browser tool scales them to viewport CSS pixels.
+# [llm.gui]
+# api_type = 'openai'
+# model = "qwen3.7-plus"                                          # DashScope vision model
+# base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+# api_key = "YOUR_DASHSCOPE_API_KEY"
+# max_tokens = 2048
+# temperature = 0.0
+
 # Optional configuration for specific browser configuration
 # [browser]
 # Whether to run browser in headless mode (default: false)
