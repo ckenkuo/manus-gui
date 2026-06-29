@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import Field, model_validator
 
@@ -55,6 +55,10 @@ class Manus(ToolCallAgent):
         default_factory=dict
     )  # server_id -> url/command
     _initialized: bool = False
+
+    # RAG 经验库：terminate 的状态由覆写的 _handle_special_tool 捕获，
+    # main.py 据此决定是否在跑完后弹出经验保存确认（仅 success 时）。
+    _last_terminate_status: Optional[str] = None
 
     @model_validator(mode="after")
     def initialize_helper(self) -> "Manus":
@@ -142,6 +146,51 @@ class Manus(ToolCallAgent):
         if self._initialized:
             await self.disconnect_mcp_server()
             self._initialized = False
+
+    async def run(self, request: Optional[str] = None) -> str:
+        """运行前注入历史成功经验（few-shot），再交给基类执行。
+
+        注入是非交互的 agent 自带行为：开跑前一次性把检索到的经验追加到
+        system_prompt（think() 每步都会把它作为 system 消息下发，天然持续生效）。
+        录制/确认不在此处——那是交互式的，留在 main.py（CLI 层）。
+        全程 best-effort，经验检索任何异常都不得影响主流程。
+        """
+        # 注入是本次运行的临时增益；先记录原始 prompt，跑完恢复，
+        # 避免同一实例多次 run 时经验块累积。
+        original_system_prompt = self.system_prompt
+
+        if request:
+            try:
+                from app.experience import (
+                    format_injection,
+                    is_enabled,
+                    retrieve_recipes,
+                )
+
+                if is_enabled():
+                    recipes = await retrieve_recipes(request)
+                    if recipes:
+                        self.system_prompt += format_injection(recipes)
+                        logger.info(f"🧠 已注入 {len(recipes)} 条历史成功经验作为参考")
+            except Exception as e:
+                logger.warning(f"经验注入失败（忽略）：{e}")
+
+        try:
+            return await super().run(request)
+        finally:
+            self.system_prompt = original_system_prompt
+
+    async def _handle_special_tool(self, name: str, result: Any, **kwargs):
+        """捕获 terminate 的完成状态，供 main.py 判断是否录制经验。
+
+        Terminate.execute 返回形如 "...status: success"，从中解析状态即可
+        （_handle_special_tool 不直接接收工具入参）。
+        """
+        if name.lower() == Terminate().name:
+            self._last_terminate_status = (
+                "success" if "status: success" in str(result).lower() else "failure"
+            )
+        await super()._handle_special_tool(name=name, result=result, **kwargs)
 
     async def think(self) -> bool:
         """处理当前状态，并在适当的上下文中决定下一步行动。"""
