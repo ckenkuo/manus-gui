@@ -92,6 +92,20 @@ class BrowserSettings(BaseModel):
     )
 
 
+class ExperienceSettings(BaseModel):
+    """RAG 经验库配置（成功流程检索 + few-shot 注入）。"""
+
+    enabled: bool = Field(False, description="是否启用经验库特性")
+    embedding_model: str = Field(
+        "text-embedding-v4", description="向量模型（建库与查询须一致）"
+    )
+    top_k: int = Field(2, description="注入的最相似经验条数")
+    min_score: float = Field(
+        0.35, description="相关性下限闸：低于此余弦且不同时命中两路则判无可用经验"
+    )
+    rrf_k: int = Field(60, description="RRF 倒数排名融合常数")
+
+
 class SandboxSettings(BaseModel):
     """执行沙箱的配置"""
 
@@ -189,6 +203,9 @@ class AppConfig(BaseModel):
     )
     daytona_config: Optional[DaytonaSettings] = Field(
         None, description="Daytona configuration"
+    )
+    experience_config: Optional[ExperienceSettings] = Field(
+        None, description="Experience library (RAG) configuration"
     )
 
     class Config:
@@ -314,6 +331,12 @@ class Config:
         else:
             run_flow_settings = RunflowSettings()
 
+        experience_config = raw_config.get("experience")
+        if experience_config:
+            experience_settings = ExperienceSettings(**experience_config)
+        else:
+            experience_settings = ExperienceSettings()
+
         # 处理 LLM 覆盖配置，也支持从环境变量读取 api_key
         llm_configs = {}
         for name, override_config in llm_overrides.items():
@@ -335,6 +358,7 @@ class Config:
             "mcp_config": mcp_settings,
             "run_flow_config": run_flow_settings,
             "daytona_config": daytona_settings,
+            "experience_config": experience_settings,
         }
 
         self._config = AppConfig(**config_dict)
@@ -368,6 +392,11 @@ class Config:
     def run_flow_config(self) -> RunflowSettings:
         """获取运行流程配置"""
         return self._config.run_flow_config
+
+    @property
+    def experience(self) -> ExperienceSettings:
+        """获取经验库（RAG）配置"""
+        return self._config.experience_config
 
     @property
     def workspace_root(self) -> Path:

@@ -42,3 +42,8 @@ huggingface-hub~=0.29.2
 setuptools~=75.8.0
 structlog
 daytona-sdk
+
+# RAG 经验库（成功流程检索 + few-shot 注入）
+faiss-cpu~=1.8.0
+rank-bm25~=0.2.2
+jieba~=0.42.1
