@@ -126,3 +126,16 @@ server_reference = "app.mcp.server" # default server module reference
 # Your can add additional agents into run-flow workflow to solve different-type tasks.
 [runflow]
 use_data_analysis_agent = false     # The Data Analysi Agent to solve various data analysis tasks
+
+# Optional RAG experience library — distill successful task flows and retrieve the
+# most similar ones (hybrid dense + BM25 + RRF) to inject as few-shot on new runs,
+# so the agent takes fewer detours. Write entry: interactive [y/N] confirm after a
+# successful run; non-interactive runs (e.g. --prompt scripts) skip saving.
+# To edit/delete an entry, hand-edit experience/recipes.jsonl (human-readable).
+# Requires: pip install faiss-cpu rank-bm25 jieba
+# [experience]
+# enabled = true
+# embedding_model = "text-embedding-v4"  # embedding model; build & query must match
+# top_k = 2                              # how many similar recipes to inject
+# min_score = 0.35                       # relevance floor gate
+# rrf_k = 60                             # reciprocal rank fusion constant

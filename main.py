@@ -1,8 +1,59 @@
 import argparse
 import asyncio
+import sys
 
 from app.agent.manus import Manus
 from app.logger import logger
+
+
+def _format_candidate(recipe) -> str:
+    """把提炼出的候选经验渲染成终端可读的预览。"""
+    lines = ["\n" + "=" * 60, "📝 本次任务已成功，提炼出以下经验（确认后存入经验库）：", f"任务：{recipe.task}"]
+    if recipe.steps:
+        lines.append("步骤：")
+        lines.extend(f"  {s}" for s in recipe.steps)
+    if recipe.result_summary:
+        lines.append(f"结果：{recipe.result_summary}")
+    if recipe.tips:
+        lines.append("关键提示：")
+        lines.extend(f"  - {t}" for t in recipe.tips)
+    lines.append("=" * 60)
+    return "\n".join(lines)
+
+
+async def _maybe_save_experience(agent: Manus) -> None:
+    """跑完交互确认入口（Entry A）。
+
+    仅在经验库启用、且 terminate(status=success) 时触发；此刻 agent.memory/llm
+    仍可用（cleanup 只关浏览器/MCP，不动 memory）。非交互运行（stdin 非 TTY，
+    如 --prompt 脚本）跳过保存。想修改经验：事后手编 experience/recipes.jsonl。
+    全程 best-effort，绝不影响主流程。
+    """
+    try:
+        from app.experience import distill_recipe, is_enabled, store
+
+        if not is_enabled():
+            return
+        if getattr(agent, "_last_terminate_status", None) != "success":
+            return
+
+        candidate = await distill_recipe(agent)
+        if candidate is None:
+            return
+
+        if not sys.stdin.isatty():
+            logger.info("非交互模式，跳过经验保存（如需保存请在交互式终端运行）。")
+            return
+
+        print(_format_candidate(candidate))
+        answer = input("保存这条经验吗？[y/N]: ").strip().lower()
+        if answer == "y":
+            await store.add(candidate)
+            logger.info("✅ 经验已保存。想修改/删除可手编 experience/recipes.jsonl")
+        else:
+            logger.info("已丢弃该经验。")
+    except Exception as e:
+        logger.warning(f"经验保存流程出错（忽略）：{e}")
 
 
 async def main():
@@ -37,6 +88,9 @@ async def main():
         logger.warning("正在处理你的请求...")
         await agent.run(prompt)
         logger.info("请求处理完成。")
+
+        # 任务成功后，交互确认是否把本次流程沉淀进经验库（RAG few-shot）。
+        await _maybe_save_experience(agent)
     except KeyboardInterrupt:
         logger.warning("操作被中断。")
     finally:
