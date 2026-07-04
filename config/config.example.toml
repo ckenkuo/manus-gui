@@ -70,10 +70,27 @@ temperature = 0.0                          # Controls randomness for vision mode
 # max_tokens = 2048
 # temperature = 0.0
 
+# 白底主体提取（批量采集：图搜查询图预处理）——app/collect/image_extract.py
+# Temu 主图常是营销拼图，直接以图搜 recall 差。启用后先用生图模型（packyapi 的
+# gpt-image-2 /images/edits）把主图重绘成「纯白背景 + 单一商品」的干净图当【搜索
+# 查询图】，配合商品标题约束保留哪一件；判同款仍用原图（生成误差只影响 recall 不影响
+# 精度）。全部走环境变量，不在此 toml 配（避免 config.py 把空 key 回退成 DASHSCOPE）：
+#   PACKY_API_KEY        必填，packyapi 的 Bearer token；未设则跳过白底提取、退回原图搜
+#   PACKY_BASE_URL       选填，默认 https://www.packyapi.com/v1
+#   PACKY_IMAGE_MODEL    选填，默认 gpt-image-2
+#   PACKY_IMAGE_SIZE     选填，默认 1024x1024
+#   PACKY_IMAGE_QUALITY  选填，默认 medium（搜索查询图够用；成本杠杆，别默认 high）
+
 # Optional configuration for specific browser configuration
 # [browser]
 # Whether to run browser in headless mode (default: false)
 #headless = false
+# Viewport size in CSS pixels. Leave unset to use browser_use default 1280x1100.
+# Set these to match your real screen's usable area (e.g. 1920x953) so the DOM's
+# in-viewport visibility check stays consistent with the screenshot the GUI vision
+# model sees — a mismatch makes the model click on elements that are off-screen.
+#window_width = 1920
+#window_height = 953
 # Disable browser security features (default: true)
 #disable_security = true
 # Extra arguments to pass to the browser

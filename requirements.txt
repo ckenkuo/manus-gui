@@ -47,3 +47,8 @@ daytona-sdk
 faiss-cpu~=1.8.0
 rank-bm25~=0.2.2
 jieba~=0.42.1
+
+# 系统桌面级 computer_use 工具（整屏截图 + 鼠标/键盘控制 + 窗口置前）
+# 连带装 pygetwindow（focus_window 用）；中文输入走剪贴板时需 pyperclip
+pyautogui~=0.9.54
+pyperclip~=1.8.2
