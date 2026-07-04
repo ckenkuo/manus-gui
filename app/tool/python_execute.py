@@ -1,6 +1,6 @@
-import multiprocessing
+import asyncio
+import os
 import sys
-from io import StringIO
 from typing import Dict
 
 from app.tool.base import BaseTool
@@ -22,54 +22,61 @@ class PythonExecute(BaseTool):
         "required": ["code"],
     }
 
-    def _run_code(self, code: str, result_dict: dict, safe_globals: dict) -> None:
-        original_stdout = sys.stdout
-        try:
-            output_buffer = StringIO()
-            sys.stdout = output_buffer
-            exec(code, safe_globals, safe_globals)
-            result_dict["observation"] = output_buffer.getvalue()
-            result_dict["success"] = True
-        except Exception as e:
-            result_dict["observation"] = str(e)
-            result_dict["success"] = False
-        finally:
-            sys.stdout = original_stdout
-
     async def execute(
         self,
         code: str,
-        timeout: int = 5,
+        timeout: int = 30,
     ) -> Dict:
         """
-        使用超时执行提供的 Python 代码。
+        在一个干净的子进程中执行提供的 Python 代码。
+
+        使用 `python -c` 启动一个独立解释器，而不是 multiprocessing.Process。
+        后者在 Windows（spawn 启动方式）上会重新 import 整个 app 包
+        （连带 browser_use、浏览器初始化等重型依赖），仅启动就远超超时时间，
+        导致代码尚未运行就被判定为超时。
 
         Args:
             code (str): 要执行的 Python 代码。
             timeout (int): 执行超时时间（秒）。
 
         Returns:
-            Dict: 包含执行输出或错误消息的 'output' 和 'success' 状态。
+            Dict: 包含执行输出的 'observation' 和 'success' 状态。
         """
+        # 强制子进程的 stdout/stderr 使用 UTF-8，避免中文 Windows 上的编码错误。
+        # 用 -X utf8（UTF-8 模式）而非依赖 PYTHONIOENCODING，更可靠。
+        env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
-        with multiprocessing.Manager() as manager:
-            result = manager.dict({"observation": "", "success": False})
-            if isinstance(__builtins__, dict):
-                safe_globals = {"__builtins__": __builtins__}
-            else:
-                safe_globals = {"__builtins__": __builtins__.__dict__.copy()}
-            proc = multiprocessing.Process(
-                target=self._run_code, args=(code, result, safe_globals)
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-X",
+                "utf8",
+                "-c",
+                code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
             )
-            proc.start()
-            proc.join(timeout)
+        except Exception as e:
+            return {"observation": f"Failed to start interpreter: {e}", "success": False}
 
-            # 超时进程
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(1)
-                return {
-                    "observation": f"Execution timeout after {timeout} seconds",
-                    "success": False,
-                }
-            return dict(result)
+        try:
+            stdout, _ = await asyncio.wait_for(
+                process.communicate(), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.wait()
+            return {
+                "observation": f"Execution timeout after {timeout} seconds",
+                "success": False,
+            }
+
+        output = stdout.decode(errors="replace")
+        return {
+            "observation": output,
+            "success": process.returncode == 0,
+        }

@@ -13,6 +13,7 @@
 
 import json
 import os
+import re
 from typing import Any, Dict, Optional
 
 from openai import AsyncOpenAI
@@ -117,6 +118,21 @@ def _resolve_gui_llm_settings() -> Dict[str, str]:
     }
 
 
+def _repair_coord_json(text: str) -> str:
+    """修复视觉模型把坐标写成「一个 key 后跟两个裸值」的畸形 JSON。
+
+    Qwen-VL 系模型偶发输出 `"x": 814, 421,`，本意是坐标 (814, 421)，但语法上
+    是 key `x` 后跟一个孤立数字，`json.loads` 必然失败。这里把
+    `"<key>": <num1>, <num2>` 改写成 `"<key>": <num1>, "y": <num2>`，让下游
+    的 `_normalize_click_coords` 能拿到标量 x/y。仅此一种畸形，命不中则原样返回。
+    """
+    return re.sub(
+        r'("(?:x|point|coordinate|coordinates)"\s*:\s*-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)',
+        r'\1, "y": \2',
+        text,
+    )
+
+
 def _parse_action(content: str) -> Dict[str, Any]:
     """解析视觉模型返回的 JSON 原子操作。
 
@@ -132,8 +148,12 @@ def _parse_action(content: str) -> Dict[str, Any]:
 
     try:
         parsed = json.loads(text)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"视觉模型返回的不是合法 JSON：{content!r}") from e
+    except json.JSONDecodeError:
+        repaired = _repair_coord_json(text)
+        try:
+            parsed = json.loads(repaired)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"视觉模型返回的不是合法 JSON：{content!r}") from e
 
     action = parsed.get("action")
     if not isinstance(action, str) or not action:
@@ -219,6 +239,7 @@ async def query_gui_action(
     image_mime: str = "image/png",
     history: Optional[list] = None,
     temperature: float = _GUI_TEMPERATURE,
+    system_prompt: Optional[str] = None,
 ) -> Dict[str, Any]:
     """调用视觉模型，根据截图与任务返回单一原子操作。
 
@@ -228,6 +249,9 @@ async def query_gui_action(
         image_mime: 截图 MIME 类型，默认为 image/png。
         history: 本次子任务内已执行的原子操作列表，用于让模型确认是否完成。
         temperature: 采样温度，默认小温度以避免确定性死循环。
+        system_prompt: 可选的系统提示词覆盖。默认用 GUI_SYSTEM_PROMPT（浏览器路径
+            沿用不变）；系统级 computer_use 可传入桌面增强版（补 DOUBLE_CLICK/
+            RIGHT_CLICK/DRAG 等桌面刚需动作），互不影响。
 
     Returns:
         dict: {"thought": str, "action": str, "parameters": dict}
@@ -239,7 +263,7 @@ async def query_gui_action(
     image_data_url = f"data:{image_mime};base64,{base64_image}"
 
     messages = [
-        {"role": "system", "content": GUI_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt or GUI_SYSTEM_PROMPT},
         {
             "role": "user",
             "content": [

@@ -17,6 +17,46 @@ PROJECT_ROOT = get_project_root()
 WORKSPACE_ROOT = PROJECT_ROOT / "workspace"
 
 
+# 桌面产物输出根目录：Excel 备份、商品图片、调试截图等所有生成物集中分类存放，
+# 避免直接堆在桌面把桌面撑爆。可用环境变量 MANUS_OUTPUT_DIR 覆盖根目录位置。
+def _default_output_root() -> Path:
+    return Path.home() / "Desktop" / "manus输出"
+
+
+OUTPUT_ROOT = Path(os.environ.get("MANUS_OUTPUT_DIR") or _default_output_root())
+
+# 分类子目录名（键给代码用，值是磁盘上的中文目录名，方便用户在桌面直接辨认）
+OUTPUT_SUBDIRS = {
+    "backup": "Excel备份",
+    "image": "商品图片",
+    "screenshot": "调试截图",
+    # 已提取白底主图但严格判"无同款"、拿不到采购价的漏采品：主图归档于此（命名带 SPU），
+    # 供人工后续手动找货源补价。见 pipeline.archive_unmatched_image。
+    "unmatched": "未找到同款主图",
+}
+
+
+def get_output_dir(kind: str = "") -> Path:
+    """返回（并按需创建）桌面输出目录下的分类子目录。
+
+    kind 取 OUTPUT_SUBDIRS 的键（backup/image/screenshot）；为空则返回根目录。
+    创建失败（如桌面不可写）时回退到项目内 workspace/输出 下的同名子目录，
+    全程 best-effort，绝不抛错中断主流程。
+    """
+    sub = OUTPUT_SUBDIRS.get(kind, "")
+    target = OUTPUT_ROOT / sub if sub else OUTPUT_ROOT
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    except Exception:
+        fallback = (WORKSPACE_ROOT / "输出" / sub) if sub else (WORKSPACE_ROOT / "输出")
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return fallback
+
+
 class LLMSettings(BaseModel):
     model: str = Field(..., description="模型名称")
     base_url: str = Field(..., description="API 基础 URL")
@@ -89,6 +129,16 @@ class BrowserSettings(BaseModel):
     )
     max_content_length: int = Field(
         2000, description="内容检索操作的最大长度"
+    )
+    window_width: Optional[int] = Field(
+        None,
+        description="浏览器视口宽度（CSS 像素）。留空则用 browser_use 默认 1280。"
+        "应对齐真实屏幕可用区，避免 DOM 可见性判定与截图不一致。",
+    )
+    window_height: Optional[int] = Field(
+        None,
+        description="浏览器视口高度（CSS 像素）。留空则用 browser_use 默认 1100。"
+        "建议设为实际可用高度（如 1920×953 屏设为 953）。",
     )
 
 
@@ -402,6 +452,10 @@ class Config:
     def workspace_root(self) -> Path:
         """获取工作区根目录"""
         return WORKSPACE_ROOT
+
+    def output_dir(self, kind: str = "") -> Path:
+        """桌面产物输出目录（分类子目录）。kind: backup/image/screenshot；空为根目录。"""
+        return get_output_dir(kind)
 
     @property
     def root_path(self) -> Path:

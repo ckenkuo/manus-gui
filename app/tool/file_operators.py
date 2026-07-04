@@ -80,8 +80,8 @@ class LocalFileOperator(FileOperator):
             )
             return (
                 process.returncode or 0,
-                stdout.decode(),
-                stderr.decode(),
+                stdout.decode(errors="replace"),
+                stderr.decode(errors="replace"),
             )
         except asyncio.TimeoutError as exc:
             try:

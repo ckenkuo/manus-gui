@@ -32,5 +32,5 @@ class NormalPythonExecute(PythonExecute):
         "required": ["code"],
     }
 
-    async def execute(self, code: str, code_type: str | None = None, timeout=5):
+    async def execute(self, code: str, code_type: str | None = None, timeout=60):
         return await super().execute(code, timeout)

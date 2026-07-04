@@ -46,6 +46,12 @@ MULTIMODAL_MODELS = [
     "qwen-vl-plus",  # DashScope 视觉模型
     "qwen-vl-max",  # DashScope 视觉模型
     "qwen/qwen2.5-vl-72b-instruct",  # DashScope 视觉模型
+    "qwen3-vl-plus",  # DashScope 视觉模型（同款图片匹配用；不加则 ask 丢图、ask_with_images 抛 ValueError）
+    # 主模型 qwen3.7-plus 也是多模态：2026-07-03 对 DashScope 端点实发商品图，能准确
+    # 描述图中主体（颜色/形状/品类）。此前误判为纯文本，导致 ask 静默丢图、每次文本调用
+    # 还误报"does NOT support images"。加入后：视觉档/GUI 档（均配 qwen3.7-plus）真正可用，
+    # agent 兜底也能看页面截图（注意截图占 token，靠 max_input_tokens=60000 兜底）。
+    "qwen3.7-plus",  # DashScope 思考+多模态主模型（实测可看图）
 ]
 
 
@@ -408,8 +414,11 @@ class LLM:
                 else:
                     logger.debug(f"📷 No image in current messages")
             else:
-                logger.warning(f"⚠️ Model {self.model} does NOT support images - visual understanding disabled")
+                # 只有在有图片但模型不支持时才告警（对齐 ask_tool 的逻辑）；纯文本调用
+                # （如 judge_price 读价走 qwen3.7-plus）无需喊，否则每次文本调用都刷一条
+                # 误导性的"does NOT support images"警告。
                 if has_images:
+                    logger.warning(f"⚠️ Model {self.model} does NOT support images - visual understanding disabled")
                     logger.warning(f"⚠️ Images detected but will be ignored (model doesn't support vision)")
 
             # 使用图像支持检查格式化系统和用户消息

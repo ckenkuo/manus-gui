@@ -217,19 +217,40 @@ class StrReplaceEditor(BaseTool):
 
     @staticmethod
     async def _view_directory(path: PathLike, operator: FileOperator) -> CLIResult:
-        """显示目录内容。"""
-        find_cmd = f"find {path} -maxdepth 2 -not -path '*/\\.*'"
+        """显示目录内容（跨平台，最多 2 层深，排除隐藏项）。"""
+        # 沙箱环境用 Unix find；本地环境用跨平台的 Python 遍历，
+        # 避免依赖 Windows 上不存在的 Unix `find` 命令。
+        if isinstance(operator, SandboxFileOperator):
+            find_cmd = f"find {path} -maxdepth 2 -not -path '*/\\.*'"
+            returncode, stdout, stderr = await operator.run_command(find_cmd)
+            if not stderr:
+                stdout = (
+                    f"Here's the files and directories up to 2 levels deep in {path}, "
+                    f"excluding hidden items:\n{stdout}\n"
+                )
+            return CLIResult(output=stdout, error=stderr)
 
-        # 使用操作器执行命令
-        returncode, stdout, stderr = await operator.run_command(find_cmd)
+        base = Path(path)
+        entries: List[str] = []
+        try:
+            for child in sorted(base.iterdir(), key=lambda p: p.name):
+                if child.name.startswith("."):
+                    continue
+                entries.append(str(child))
+                if child.is_dir():
+                    for grandchild in sorted(child.iterdir(), key=lambda p: p.name):
+                        if grandchild.name.startswith("."):
+                            continue
+                        entries.append(str(grandchild))
+        except OSError as exc:
+            return CLIResult(output="", error=str(exc))
 
-        if not stderr:
-            stdout = (
-                f"Here's the files and directories up to 2 levels deep in {path}, "
-                f"excluding hidden items:\n{stdout}\n"
-            )
-
-        return CLIResult(output=stdout, error=stderr)
+        listing = "\n".join(entries)
+        output = (
+            f"Here's the files and directories up to 2 levels deep in {path}, "
+            f"excluding hidden items:\n{listing}\n"
+        )
+        return CLIResult(output=output, error="")
 
     async def _view_file(
         self,

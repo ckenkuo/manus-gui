@@ -7,15 +7,23 @@ from app.agent.toolcall import ToolCallAgent
 from app.config import config
 from app.llm import LLM
 from app.logger import logger
-from app.prompt.manus import NEXT_STEP_PROMPT, SYSTEM_PROMPT
+from app.prompt.manus import (
+    COMPUTER_USE_RULES,
+    NEXT_STEP_PROMPT,
+    OUTPUT_DIRS_RULES,
+    SYSTEM_PROMPT,
+    WPS_EXCEL_RULES,
+)
 from app.schema import Message
 from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
 from app.tool.browser_use_tool import BrowserUseTool
+from app.tool.computer_use_tool import ComputerUseTool
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
 from app.tool.str_replace_editor import StrReplaceEditor
 from app.tool.web_search import WebSearch
+from app.tool.wps_excel_tool import WpsExcelTool
 
 
 class Manus(ToolCallAgent):
@@ -24,7 +32,16 @@ class Manus(ToolCallAgent):
     name: str = "Manus"
     description: str = "一个多功能的 agent，可以使用多种工具（包括基于 MCP 的工具）解决各种任务"
 
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
+    system_prompt: str = (
+        SYSTEM_PROMPT.format(directory=config.workspace_root)
+        + WPS_EXCEL_RULES
+        + OUTPUT_DIRS_RULES.format(
+            image_dir=config.output_dir("image"),
+            backup_dir=config.output_dir("backup"),
+            screenshot_dir=config.output_dir("screenshot"),
+        )
+        + COMPUTER_USE_RULES
+    )
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 10000
@@ -40,8 +57,10 @@ class Manus(ToolCallAgent):
         default_factory=lambda: ToolCollection(
             PythonExecute(),
             BrowserUseTool(),
+            ComputerUseTool(),
             WebSearch(),
             StrReplaceEditor(),
+            WpsExcelTool(),
             AskHuman(),
             Terminate(),
         )
