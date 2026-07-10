@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>批量采集 · Temu → 1688 → Excel</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+    <link href="/static/bootstrap.min.css" rel="stylesheet" />
+    <link
+      href="https://gcore.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css"
+      rel="stylesheet"
+    />
+    <style>
+      body {
+        background: var(--bs-body-bg);
+      }
+      .stat-card {
+        border: 1px solid var(--bs-border-color);
+        border-radius: 0.75rem;
+      }
+      .stat-num {
+        font-size: 1.75rem;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      /* 进度日志：等宽、可滚动，实时 append */
+      #eventLog {
+        height: 240px;
+        overflow-y: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        background: var(--bs-tertiary-bg);
+        border-radius: 0.5rem;
+        padding: 0.5rem 0.75rem;
+      }
+      #eventLog .line {
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .worklist-table {
+        font-size: 0.85rem;
+      }
+      .worklist-table td,
+      .worklist-table th {
+        vertical-align: middle;
+      }
+      .thumb {
+        width: 40px;
+        height: 40px;
+        object-fit: cover;
+        border-radius: 0.25rem;
+        background: var(--bs-tertiary-bg);
+      }
+      .table-scroll {
+        max-height: 520px;
+        overflow-y: auto;
+      }
+      .cell-ellipsis {
+        max-width: 260px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="navbar navbar-expand bg-body-tertiary border-bottom mb-3">
+      <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">
+          <i class="bi bi-box-seam me-1"></i> 批量采集
+          <small class="text-muted fs-6">Temu → 1688 → Excel</small>
+        </span>
+        <div class="ms-auto">
+          <a href="/" class="btn btn-sm btn-outline-secondary">
+            <i class="bi bi-chat-dots"></i> 返回对话
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="container-fluid px-4 pb-5">
+      <!-- Excel 占用告警 -->
+      <div id="lockAlert" class="alert alert-warning d-none" role="alert">
+        <i class="bi bi-exclamation-triangle-fill"></i>
+        Excel 正被 WPS/Excel 占用，采集将无法写入。请先关闭该文件。
+      </div>
+
+      <!-- 统计卡片 -->
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num" id="statTotal">–</div>
+            <div class="text-muted small">清单总量</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-success" id="statDone">–</div>
+            <div class="text-muted small">已入库</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-primary" id="statTodo">–</div>
+            <div class="text-muted small">待采</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num" id="statBatch">0</div>
+            <div class="text-muted small">本批处理</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 目标选择：工作簿 → Sheet → 店铺（级联） -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row g-2 align-items-end">
+            <div class="col-12 col-md-5">
+              <label class="form-label small text-muted mb-1">目标工作簿</label>
+              <select id="selExcel" class="form-select form-select-sm"></select>
+              <input
+                id="inputExcelPath"
+                type="text"
+                class="form-control form-control-sm mt-1 d-none"
+                placeholder="粘贴 .xlsx 完整路径后按回车"
+              />
+            </div>
+            <div class="col-6 col-md-3">
+              <label class="form-label small text-muted mb-1">目标 Sheet</label>
+              <select id="selSheet" class="form-select form-select-sm"></select>
+            </div>
+            <div class="col-6 col-md-4">
+              <label class="form-label small text-muted mb-1">店铺</label>
+              <select id="selStore" class="form-select form-select-sm"></select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 控制条 -->
+      <div class="card mb-3">
+        <div class="card-body d-flex flex-wrap gap-2 align-items-center">
+          <button id="btnRefresh" class="btn btn-outline-secondary btn-sm">
+            <i class="bi bi-arrow-repeat"></i> 重新枚举清单
+          </button>
+          <div class="vr d-none d-md-block"></div>
+          <div class="input-group input-group-sm" style="width: 160px">
+            <span class="input-group-text">数量</span>
+            <input
+              type="number"
+              id="inputLimit"
+              class="form-control"
+              value="20"
+              min="1"
+              max="500"
+            />
+          </div>
+          <div class="form-check form-switch ms-1">
+            <input class="form-check-input" type="checkbox" id="switchAuto1688" />
+            <label
+              class="form-check-label small"
+              for="switchAuto1688"
+              title="关：只采 Temu 基础信息，采购价/重量留空待人工填。开：跑 1688 图搜自动采价"
+              >1688 自动采价</label
+            >
+          </div>
+          <div class="form-check form-switch ms-1 d-none" id="pipelineWrap">
+            <input
+              class="form-check-input"
+              type="checkbox"
+              id="switchPipeline"
+              checked
+            />
+            <label class="form-check-label small" for="switchPipeline"
+              >确定性管道</label
+            >
+          </div>
+          <button id="btnStart" class="btn btn-primary btn-sm">
+            <span
+              id="startSpinner"
+              class="spinner-border spinner-border-sm d-none"
+              role="status"
+            ></span>
+            <i class="bi bi-play-fill"></i> 开始采集
+          </button>
+          <span id="statusText" class="text-muted small ms-2"></span>
+        </div>
+      </div>
+
+      <!-- 进度条 + 事件日志 -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="d-flex justify-content-between small text-muted mb-1">
+            <span>本批进度</span>
+            <span id="progressLabel">0 / 0</span>
+          </div>
+          <div class="progress mb-3" style="height: 8px">
+            <div
+              id="progressBar"
+              class="progress-bar"
+              role="progressbar"
+              style="width: 0%"
+            ></div>
+          </div>
+          <div id="eventLog"></div>
+        </div>
+      </div>
+
+      <!-- 清单表格 -->
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-list-ul"></i> 工作清单</span>
+          <div class="btn-group btn-group-sm" role="group">
+            <input type="radio" class="btn-check" name="flt" id="fltTodo" checked />
+            <label class="btn btn-outline-secondary" for="fltTodo">待采</label>
+            <input type="radio" class="btn-check" name="flt" id="fltDone" />
+            <label class="btn btn-outline-secondary" for="fltDone">已入库</label>
+            <input type="radio" class="btn-check" name="flt" id="fltAll" />
+            <label class="btn btn-outline-secondary" for="fltAll">全部</label>
+          </div>
+        </div>
+        <div class="table-scroll">
+          <table class="table table-sm table-hover worklist-table mb-0">
+            <thead class="sticky-top bg-body">
+              <tr>
+                <th style="width: 48px"></th>
+                <th style="width: 110px">SPU</th>
+                <th>商品名</th>
+                <th style="width: 110px">店铺</th>
+                <th style="width: 90px">售价</th>
+                <th style="width: 90px">状态</th>
+                <th style="width: 130px">采购价/运费</th>
+              </tr>
+            </thead>
+            <tbody id="worklistBody">
+              <tr>
+                <td colspan="7" class="text-center text-muted py-4">加载中…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="position-fixed top-0 end-0 p-3" style="z-index: 1100">
+      <div id="toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="toast-header">
+          <strong class="me-auto" id="toastTitle">提示</strong>
+          <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+        </div>
+        <div class="toast-body" id="toastBody"></div>
+      </div>
+    </div>
+
+    <script src="/static/bootstrap.bundle.min.js"></script>
+    <script>
+      // 采集页前端：全部走 /collect/* 接口，进度经 SSE 消费 service 抛出的结构化事件。
+      const $ = (id) => document.getElementById(id);
+      let items = []; // 当前清单（含每条 done 状态）
+      let priced = {}; // spu -> {status, purchase_price, shipping}（本批实时结果覆盖）
+      let evtSource = null;
+      // 三级选择当前值（后端回显「上次选择」作初值）
+      let sel = { excel: "", sheet: "", store: "" };
+      const MANUAL = "__manual__"; // 工作簿下拉里「手填路径」哨兵值
+
+      function showToast(title, body, kind = "primary") {
+        $("toastTitle").textContent = title;
+        $("toastBody").textContent = body;
+        const el = $("toast");
+        el.className = `toast text-bg-${kind}`;
+        new bootstrap.Toast(el, { delay: 4000 }).show();
+      }
+
+      function logLine(text, cls = "") {
+        const box = $("eventLog");
+        const div = document.createElement("div");
+        div.className = "line " + cls;
+        const t = new Date().toLocaleTimeString();
+        div.textContent = `[${t}] ${text}`;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function currentFilter() {
+        if ($("fltDone").checked) return "done";
+        if ($("fltAll").checked) return "all";
+        return "todo";
+      }
+
+      function statusBadge(it) {
+        const p = priced[it.spu];
+        if (p) {
+          if (p.status === "ok")
+            return '<span class="badge text-bg-success">本批✓</span>';
+          if (p.status === "base")
+            return '<span class="badge text-bg-info">待人工填</span>';
+          if (p.status === "empty")
+            return '<span class="badge text-bg-warning">无同款</span>';
+          return '<span class="badge text-bg-danger">失败</span>';
+        }
+        return it.done
+          ? '<span class="badge text-bg-secondary">已入库</span>'
+          : '<span class="badge text-bg-light text-dark">待采</span>';
+      }
+
+      function priceCell(it) {
+        const p = priced[it.spu];
+        if (p && p.purchase_price != null) {
+          const ship = p.shipping != null ? ` +￥${p.shipping}` : "";
+          return `￥${p.purchase_price}${ship}`;
+        }
+        return '<span class="text-muted">–</span>';
+      }
+
+      function renderTable() {
+        const flt = currentFilter();
+        const rows = items.filter((it) =>
+          flt === "all" ? true : flt === "done" ? it.done : !it.done
+        );
+        const body = $("worklistBody");
+        if (!rows.length) {
+          body.innerHTML =
+            '<tr><td colspan="7" class="text-center text-muted py-4">无数据</td></tr>';
+          return;
+        }
+        body.innerHTML = rows
+          .map((it) => {
+            const img = it.image
+              ? `<img class="thumb" src="${it.image}" loading="lazy" />`
+              : '<div class="thumb"></div>';
+            const store = it.store || it.mallid || "";
+            return `<tr data-spu="${it.spu}">
+              <td>${img}</td>
+              <td class="small text-muted">${it.spu}</td>
+              <td class="cell-ellipsis" title="${it.name || ""}">${it.name || ""}</td>
+              <td class="small cell-ellipsis" title="${store}">${store}</td>
+              <td class="small">${it.price || ""}</td>
+              <td>${statusBadge(it)}</td>
+              <td class="small">${priceCell(it)}</td>
+            </tr>`;
+          })
+          .join("");
+      }
+
+      function renderStats(s) {
+        $("statTotal").textContent = s.total;
+        $("statDone").textContent = s.done == null ? "–" : s.done;
+        $("statTodo").textContent = s.todo;
+        $("lockAlert").classList.toggle("d-none", !s.excel_locked);
+      }
+
+      // 短化工作簿路径为文件名（下拉更好读；title 保留完整路径）
+      function baseName(p) {
+        return (p || "").split(/[\\/]/).pop() || p;
+      }
+
+      function fillSelectors(s) {
+        // 工作簿下拉：扫描到的 .xlsx + 「手填路径」
+        const excelSel = $("selExcel");
+        const wbs = s.workbooks || [];
+        excelSel.innerHTML =
+          wbs
+            .map(
+              (p) =>
+                `<option value="${p}" title="${p}"${
+                  p === s.excel ? " selected" : ""
+                }>${baseName(p)}</option>`
+            )
+            .join("") + `<option value="${MANUAL}">✎ 手填路径…</option>`;
+        // 当前生效工作簿不在扫描列表里（手填过的）→ 也补一项选中
+        if (s.excel && !wbs.includes(s.excel)) {
+          const opt = document.createElement("option");
+          opt.value = s.excel;
+          opt.title = s.excel;
+          opt.textContent = baseName(s.excel);
+          opt.selected = true;
+          excelSel.insertBefore(opt, excelSel.lastElementChild);
+        }
+
+        // Sheet 下拉：选中工作簿的所有表；首项为「请选择」
+        const sheetSel = $("selSheet");
+        sheetSel.innerHTML =
+          `<option value="">— 请选择 —</option>` +
+          (s.sheets || [])
+            .map(
+              (n) =>
+                `<option value="${n}"${n === s.sheet ? " selected" : ""}>${n}</option>`
+            )
+            .join("");
+
+        // 店铺下拉：全部 + 各店（label + 商品数）
+        const storeSel = $("selStore");
+        storeSel.innerHTML =
+          `<option value="">全部店铺</option>` +
+          (s.stores || [])
+            .map(
+              (st) =>
+                `<option value="${st.key}"${
+                  st.key === s.store ? " selected" : ""
+                }>${st.label}（${st.count}）</option>`
+            )
+            .join("");
+      }
+
+      async function loadWorklist() {
+        try {
+          const qs = new URLSearchParams({
+            excel: sel.excel,
+            sheet: sel.sheet,
+            store: sel.store,
+          });
+          const r = await fetch("/collect/worklist?" + qs.toString());
+          const s = await r.json();
+          items = s.items || [];
+          // 用后端回显的生效值同步本地选择（首屏即「上次选择」）
+          sel.excel = s.excel || "";
+          sel.sheet = s.sheet || "";
+          sel.store = s.store || "";
+          fillSelectors(s);
+          renderStats(s);
+          renderTable();
+          updateStartEnabled();
+        } catch (e) {
+          showToast("加载失败", String(e), "danger");
+        }
+      }
+
+      // 未选 Sheet 时禁用「开始采集」（无处判重/写入）
+      function updateStartEnabled() {
+        const noSheet = !sel.sheet;
+        $("btnStart").disabled = noSheet;
+        $("btnStart").title = noSheet ? "请先选目标 Sheet" : "";
+      }
+
+      // ---- 事件处理：把 service 的结构化事件映射到 UI ----
+      function onEvent(type, data) {
+        if (type === "batch_start") {
+          $("statBatch").textContent = data.batch;
+          $("progressLabel").textContent = `0 / ${data.batch}`;
+          $("progressBar").style.width = "0%";
+          logLine(
+            `批次开始：清单 ${data.total}，已入库 ${data.done_existing}，待采 ${data.todo}，本批 ${data.batch}`,
+            "text-info"
+          );
+        } else if (type === "product_start") {
+          logLine(`[${data.index}/${data.total}] 采集 SPU=${data.spu} ${data.name || ""}`);
+        } else if (type === "product_done") {
+          priced[data.spu] = {
+            status: data.status,
+            purchase_price: data.purchase_price,
+            shipping: data.shipping,
+          };
+          const pct = Math.round((data.index / data.total) * 100);
+          $("progressBar").style.width = pct + "%";
+          $("progressLabel").textContent = `${data.index} / ${data.total}`;
+          if (data.status === "ok") {
+            logLine(
+              `✅ SPU=${data.spu} 采购价￥${data.purchase_price} 运费￥${data.shipping} 重量${data.weight_g}g [${data.via}]`,
+              "text-success"
+            );
+          } else if (data.status === "base") {
+            logLine(`⬜ SPU=${data.spu} 基础行已写入（采购价/重量待人工填）`, "text-info");
+          } else if (data.status === "empty") {
+            logLine(`⬜ SPU=${data.spu} 无同款 → 留空待人工补`, "text-warning");
+          } else {
+            logLine(`⚠️ SPU=${data.spu} 未入库（${data.note || "失败"}）`, "text-danger");
+          }
+          renderTable();
+        } else if (type === "batch_done") {
+          logLine(`批次完成：成功 ${data.ok}，失败/存疑 ${data.fail}`, "text-info");
+        } else if (type === "aborted") {
+          logLine(`❌ 中止：${data.reason}`, "text-danger");
+          showToast("采集中止", data.reason, "danger");
+        }
+      }
+
+      function finishRun() {
+        if (evtSource) {
+          evtSource.close();
+          evtSource = null;
+        }
+        $("startSpinner").classList.add("d-none");
+        $("statusText").textContent = "";
+        loadWorklist(); // 刷新入库统计（本批结果落库后重新读 Excel）+ 复位开始按钮禁用态
+      }
+
+      async function startBatch() {
+        if (!sel.sheet) {
+          showToast("无法开始", "请先选择目标 Sheet", "warning");
+          return;
+        }
+        const limit = parseInt($("inputLimit").value, 10) || 20;
+        const auto1688 = $("switchAuto1688").checked;
+        const usePipeline = $("switchPipeline").checked;
+        $("btnStart").disabled = true;
+        $("startSpinner").classList.remove("d-none");
+        $("statusText").textContent = "采集中…";
+        priced = {};
+        try {
+          const r = await fetch("/collect/batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              limit,
+              base_only: !auto1688,
+              use_pipeline: usePipeline,
+              excel: sel.excel,
+              sheet: sel.sheet,
+              store: sel.store,
+            }),
+          });
+          const { job_id } = await r.json();
+          evtSource = new EventSource(`/collect/batch/${job_id}/events`);
+          ["batch_start", "product_start", "product_done", "batch_done", "aborted"].forEach(
+            (ev) =>
+              evtSource.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)))
+          );
+          evtSource.addEventListener("done", () => finishRun());
+          evtSource.onerror = () => {
+            // 流结束或断开：done 事件后浏览器会触发一次 error，忽略即可
+            if (evtSource && evtSource.readyState === EventSource.CLOSED) finishRun();
+          };
+        } catch (e) {
+          showToast("启动失败", String(e), "danger");
+          finishRun();
+        }
+      }
+
+      async function refreshWorklist() {
+        $("btnRefresh").disabled = true;
+        $("statusText").textContent = "重新枚举中…";
+        try {
+          const r = await fetch("/collect/enumerate", { method: "POST" });
+          const { count } = await r.json();
+          showToast("枚举完成", `共 ${count} 个商品`, "success");
+          await loadWorklist();
+        } catch (e) {
+          showToast("枚举失败", String(e), "danger");
+        } finally {
+          $("btnRefresh").disabled = false;
+          $("statusText").textContent = "";
+        }
+      }
+
+      // 1688 自动采价开关：关（默认）= 基础采集，隐藏「确定性管道」子选项；开才显示
+      $("switchAuto1688").addEventListener("change", (e) => {
+        $("pipelineWrap").classList.toggle("d-none", !e.target.checked);
+      });
+
+      $("btnStart").addEventListener("click", startBatch);
+      $("btnRefresh").addEventListener("click", refreshWorklist);
+      ["fltTodo", "fltDone", "fltAll"].forEach((id) =>
+        $(id).addEventListener("change", renderTable)
+      );
+
+      // 工作簿切换：选「手填路径」→ 显示输入框；否则换 excel、清空 sheet（表可能不同）后重拉
+      $("selExcel").addEventListener("change", (e) => {
+        const v = e.target.value;
+        if (v === MANUAL) {
+          $("inputExcelPath").classList.remove("d-none");
+          $("inputExcelPath").focus();
+          return;
+        }
+        $("inputExcelPath").classList.add("d-none");
+        sel.excel = v;
+        sel.sheet = ""; // 换工作簿，旧 Sheet 未必存在
+        loadWorklist();
+      });
+      $("inputExcelPath").addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        const v = e.target.value.trim();
+        if (!v) return;
+        sel.excel = v;
+        sel.sheet = "";
+        $("inputExcelPath").classList.add("d-none");
+        loadWorklist();
+      });
+      $("selSheet").addEventListener("change", (e) => {
+        sel.sheet = e.target.value;
+        loadWorklist(); // 重算该 Sheet 下的 done/todo
+      });
+      $("selStore").addEventListener("change", (e) => {
+        sel.store = e.target.value;
+        loadWorklist(); // 过滤到该店
+      });
+
+      loadWorklist();
+    </script>
+  </body>
+</html>

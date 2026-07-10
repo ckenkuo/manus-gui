@@ -26,6 +26,7 @@ token、往返 7–20 次。本管道把单商品大模型往返压到 **2 次**
 判断质量护栏：解析/判断失败 → 抛异常，交由 batch_collect 的单商品重试兜底；
 两处判断均 best-effort，不阻断整批。
 """
+import asyncio
 import json
 import os
 import re
@@ -41,12 +42,23 @@ from app.schema import Message
 # ---- 已实测确认的选择器（勿凭记忆改；改前对真站重验）----------------------
 # 结果页单个商品卡片容器（s.1688.com 图搜/关键词结果页通用）。
 _CARD_SELECTOR = ".search-offer-wrapper"
-# 详情页价格：主价区间 + 各 SKU 价/库存。
+# 详情页价格：主价区间 + 各 SKU 价/库存 + 运费 + 重量。
+# 【2026-07 改·实测选择器】首屏 DOM 本就含批发阶梯价、各 SKU 价、运费、重量，故不必
+# 再让 agent 点数量「+」触发内联结算面板（去掉整个 agent probe，见
+# batch_collect._checkout_probe）。以下 module-od-* 类名对 3 个真实 offer
+# （811937050886/1050735486992/940655272431）实测跨店稳定命中：
+#   .module-od-main-price       主价阶梯，如「¥9.50 1件起批 / ¥8.50 300-499件 / ¥7.50 ≥500件」
+#   .module-od-sku-selection    各 SKU 名+价+库存，如「雪人款 ¥9.5 库存4472件」
+#   .module-od-shipping-services 物流区，含「运费 ¥7 起」← 之前漏抓致运费全填 0 的根因
+#   .module-od-submit-order      首屏就有的金额面板，「商品金额：¥9.50 另需运费(预估)：¥7」
+#                                 （即原想点「+」才出的那块，实测首屏已在 DOM）
+#   .module-od-product-pack-info 包装信息，含「重量(g) 60」← 之前没抓致重量全靠猜的根因
+# 运费/重量文本喂给 judge_price 判（优先按文本、缺失才估）。
 _DETAIL_PRICE_JS = r"""
 () => {
   const pick = (sel) => {
     const el = document.querySelector(sel);
-    return el ? (el.innerText || '').replace(/\n{2,}/g, '\n').trim() : '';
+    return el ? (el.innerText || '').replace(/\s+/g, ' ').trim() : '';
   };
   const skuBlocks = [...document.querySelectorAll('.item-price-stock')]
       .map(e => (e.innerText || '').replace(/\s+/g, ' ').trim())
@@ -55,6 +67,8 @@ _DETAIL_PRICE_JS = r"""
     mainPrice: pick('.module-od-main-price'),
     skuText: pick('.module-od-sku-selection'),
     skuPriceStock: skuBlocks,
+    shipping: pick('.module-od-shipping-services') || pick('.module-od-submit-order'),
+    weightText: pick('.module-od-product-pack-info'),
   };
 }
 """
@@ -121,11 +135,17 @@ _SAMEMATCH_SYSTEM = (
 )
 
 _PRICE_SYSTEM = (
-    "你是采购价核算助手。给你一个 1688 商品详情页的价格文本块（含主价区间与各规格 SKU 的价/库存）。"
+    "你是采购价核算助手。给你一个 1688 商品详情页的价格文本块（含主价区间、各规格 SKU 的价/库存，"
+    "可能还含【运费文本】）。"
     "请判断该商品的【常规批发价】——务必剔除首单价/新人价/限时价/优惠券等一次性优惠，取可持续拿到的常规价。"
-    "并据商品推测运费与单件估重（克）。返回严格 JSON："
+    "【运费】优先按给出的运费文本判断（如「运费¥5起」取 5、「另需运费(预估)：¥7」取 7、「包邮/免运费」取 0）；"
+    "文本缺失才据商品推测，仍不确定填 0。"
+    "【重量】优先按『包装/重量信息』文本读单件重量（如「重量(g) 60」取 60；若按 SKU 分列了多个重量、取其一即可）；"
+    "文本缺失才据商品品类/材质推测。"
+    "返回严格 JSON："
     "{\"purchase_price\": <数字, 常规批发单价元>, \"shipping\": <数字, 运费元, 不确定填0>, "
-    "\"weight_g\": <数字, 单件估重克>, \"note\": \"<存疑点, 无则空串>\"}。只输出 JSON，勿加围栏或解释。"
+    "\"weight_g\": <数字, 单件重量克>, \"note\": \"<存疑点/依据, 如 运费按文本¥7、重量按属性60g; 无则空串>\"}。"
+    "只输出 JSON，勿加围栏或解释。"
 )
 
 # 主体裁剪：Temu 主图常是营销拼图/模特实拍/带促销文案，直接拿去图搜/严格判同款会
@@ -336,18 +356,46 @@ async def search_match_over_regions(
 
     流程：先判默认主体(R0)；不中再逐个坐标点框 → 重载 → 读候选 → 判同款；命中即返回。
     """
-    page = await _get_page(browser_tool)
+    matches = await collect_matches_over_regions(
+        browser_tool, target_img, top_k=1, max_regions=max_regions
+    )
+    return matches[0] if matches else None
 
-    async def _read_and_judge() -> Optional[dict]:
+
+async def collect_matches_over_regions(
+    browser_tool, target_img: str, top_k: int = 3, max_regions: int = 4
+) -> list[dict]:
+    """在图搜结果页跨主体框【累计】最多 top_k 个去重同款候选（用于比价），无则空列表。
+
+    与 search_match_over_regions 同一套主体框 dance（默认主体 + 逐框重搜），区别在于
+    不「命中即停」，而是把每个框读到的同款累计去重（按 offerId），凑够 top_k 或试完
+    所有框才返回。top_k=1 即退化为原「命中即停」单选行为。
+    """
+    page = await _get_page(browser_tool)
+    collected: list[dict] = []
+    seen: set = set()
+
+    def _accumulate(cands_matched: list[dict]) -> bool:
+        """把一批同款候选并进结果（去重）；返回是否已凑够 top_k。"""
+        for c in cands_matched:
+            oid = c.get("offerId")
+            if oid and oid not in seen:
+                seen.add(oid)
+                collected.append(c)
+        return len(collected) >= top_k
+
+    async def _read_and_judge() -> list[dict]:
         cands = await read_search_results(browser_tool, 8)
         if not cands:
-            return None
-        return await judge_same_match(target_img, cands)
+            return []
+        if top_k == 1:
+            one = await judge_same_match(target_img, cands)
+            return [one] if one else []
+        return await judge_same_matches(target_img, cands, top_k=top_k)
 
     # 1) 默认主体（paste_image 落地即此，已加载好、卡片带链接）
-    chosen = await _read_and_judge()
-    if chosen:
-        return chosen
+    if _accumulate(await _read_and_judge()):
+        return collected[:top_k]
 
     tried = {_region_key(page.url)}
 
@@ -386,11 +434,10 @@ async def search_match_over_regions(
         except Exception as e:
             logger.warning(f"重载主体框 {key} 失败：{e}")
             continue
-        logger.info(f"search_match_over_regions：试主体框 {key}")
-        chosen = await _read_and_judge()
-        if chosen:
-            return chosen
-    return None
+        logger.info(f"collect_matches_over_regions：试主体框 {key}（已收集 {len(collected)}）")
+        if _accumulate(await _read_and_judge()):
+            return collected[:top_k]
+    return collected[:top_k]
 
 
 async def read_detail_price(browser_tool, detail_url: str) -> dict:
@@ -440,7 +487,81 @@ async def judge_same_match(
         return None
     chosen = dict(candidates[idx])
     chosen["_match_reason"] = data.get("reason", "")
+    logger.info(
+        f"判同款选中 offer={chosen.get('offerId')}：{chosen.get('title', '')[:30]}"
+        f" | {chosen.get('detailUrl', '')}"
+    )
     return chosen
+
+
+_MULTIMATCH_SYSTEM = (
+    "你是电商选品助手，帮我在 1688 找到与目标商品【精确同款】的多个货源用于比价。"
+    "第一张图是目标商品主图，其余是 1688 候选商品缩略图（每张配了编号和标题）。"
+    "注意：目标主图可能是营销拼图（带促销文案、多角度小图、模特实拍），"
+    "识别其【核心商品本体】后，再逐一比对候选。"
+    "【严格判定】只有当候选与目标是【同一件商品/同款】——同品类且主要特征、规格、款式一致"
+    "——才算同款。结合候选标题辅助判断，但以商品本体一致为准，宁缺毋滥。"
+    "从所有候选里选出【最多 {top_k} 个】精确同款、且最有比价价值的（不同店铺/价格有差异的优先），"
+    "按推荐优先级排序。返回严格 JSON："
+    "{{\"indexes\": [<候选编号,从0开始>, ...], \"reason\": \"<15字内理由>\"}}。"
+    "若没有任何候选是精确同款，返回 {{\"indexes\": [], \"reason\": \"无同款\"}}。"
+    "只输出 JSON，勿加围栏或解释。"
+)
+
+
+async def judge_same_matches(
+    target_img: str, candidates: list[dict], top_k: int = 3, config_name: str = "samematch"
+) -> list[dict]:
+    """判断点A（视觉·多选）：目标主图 + 候选缩略图 → 选出最多 top_k 个同款用于比价。
+
+    返回选中的候选 dict 列表（含 offerId/detailUrl，按推荐优先级），无同款返回空列表。
+    """
+    if not candidates:
+        return []
+    llm = LLM(config_name=config_name)
+    lines = ["目标商品主图见第一张图。候选商品（编号→标题）："]
+    images = [_to_image_ref(target_img)]
+    for i, c in enumerate(candidates):
+        lines.append(f"[{i}] {c.get('title', '')}（参考价 {c.get('priceText', '')}）")
+        if c.get("img"):
+            images.append(c["img"])
+    prompt = "\n".join(lines) + f"\n\n请选出最多 {top_k} 个与目标同款的候选编号（比价用）。"
+
+    raw = await llm.ask_with_images(
+        messages=[Message.user_message(prompt)],
+        images=images,
+        system_msgs=[Message.system_message(_MULTIMATCH_SYSTEM.format(top_k=top_k))],
+        stream=False,
+        temperature=0.0,
+    )
+    data = _parse_json(raw)
+    if not data:
+        logger.warning(f"judge_same_matches：解析失败，原始：{(raw or '')[:120]}")
+        return []
+    idxs = data.get("indexes", [])
+    if not isinstance(idxs, list):
+        return []
+    out = []
+    seen = set()
+    for idx in idxs:
+        if not isinstance(idx, int) or idx < 0 or idx >= len(candidates):
+            continue
+        oid = candidates[idx].get("offerId")
+        if oid in seen:
+            continue
+        seen.add(oid)
+        c = dict(candidates[idx])
+        c["_match_reason"] = data.get("reason", "")
+        out.append(c)
+        logger.info(
+            f"判同款选中 [{len(out)}] offer={oid}：{c.get('title', '')[:30]}"
+            f" | {c.get('detailUrl', '')}"
+        )
+        if len(out) >= top_k:
+            break
+    if not out:
+        logger.info(f"judge_same_matches：无同款（{data.get('reason', '')}）")
+    return out
 
 
 async def judge_price(price_block: dict, config_name: str = "default") -> Optional[dict]:
@@ -452,6 +573,10 @@ async def judge_price(price_block: dict, config_name: str = "default") -> Option
         parts.append("规格区：\n" + price_block["skuText"][:600])
     if price_block.get("skuPriceStock"):
         parts.append("各SKU价/库存：\n" + " | ".join(price_block["skuPriceStock"][:20]))
+    if price_block.get("shipping"):
+        parts.append("运费文本：\n" + price_block["shipping"])
+    if price_block.get("weightText"):
+        parts.append("包装/重量信息：\n" + price_block["weightText"][:300])
     if not parts:
         return None
 
@@ -501,10 +626,63 @@ def archive_unmatched_image(spu: str) -> Optional[str]:
         return None
 
 
-async def collect_one_product(browser_tool, item: dict) -> CollectResult:
+# Temu 主图 CDN（img.kwcdn.com）会对"裸" requests（无 UA/Referer）做 bot 拦截，
+# 表现为连接被重置（WinError 10054）或 403。带上浏览器化请求头 + 有限重试即可稳。
+# 实测：agent 路径的提示词早已说明"直连可 200、仅 403 才退回会话内 fetch"，管道这里
+# 补齐同样的请求头 + 重试，避免一次瞬时重置就把商品推到昂贵的 agent 兜底。
+_IMG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ),
+    "Referer": "https://www.temu.com/",
+    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+}
+
+
+def _download_main_image(url: str, dst_path: str, retries: int = 3) -> None:
+    """把主图 URL 下载到 dst_path，带浏览器化请求头 + 指数退避重试。
+
+    失败（重试耗尽/HTTP 错/内容为空）抛异常，交由 collect_one_product 记 fail_reason。
+    """
+    import time
+
+    import requests
+
+    os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(url, headers=_IMG_HEADERS, timeout=(10, 30))
+            r.raise_for_status()
+            if not r.content:
+                raise ValueError("响应体为空")
+            with open(dst_path, "wb") as f:
+                f.write(r.content)
+            return
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                wait = (0, 1, 3)[min(attempt, 2)]
+                logger.warning(
+                    f"主图下载失败（{attempt}/{retries}）：{e}；{wait}s 后重试"
+                )
+                time.sleep(wait)
+    raise RuntimeError(f"重试 {retries} 次仍失败：{last_err}")
+
+
+async def collect_one_product(
+    browser_tool, item: dict, checkout_probe=None, top_k: int = 3
+) -> CollectResult:
     """确定性采集单个商品（不写 Excel，由调用方决定落库）。
 
     任一确定性步骤失败即抛/记 fail_reason，交上层重试或退回 agent 兜底。
+
+    checkout_probe: 可选的异步回调 async (offer: dict) -> Optional[dict]，用于让 agent 进
+        每个同款候选的结算页读【真实货价/运费/重量】，返回
+        {goods_price, shipping, total, weight_g, weight_basis, sku_desc} 或 None。
+        提供时走「收集 top_k 个同款 → 各自 probe → 取总价最低」的比价路径；
+        为 None 时退回原「单个同款 + 详情页文本读价」路径。
     """
     spu = str(item.get("spu", ""))
     res = CollectResult(spu=spu, ok=False)
@@ -512,16 +690,12 @@ async def collect_one_product(browser_tool, item: dict) -> CollectResult:
     img_dir = config.output_dir("image")
     img_path = os.path.join(str(img_dir), f"{spu}.jpeg")
 
-    # 1. 主图（调用方通常已下好；缺则直连下载）
+    # 1. 主图（调用方通常已下好；缺则下载）。带浏览器化请求头 + 重试，避免 Temu CDN
+    #    对裸 requests 的 bot 拦截（连接重置/403）一次瞬时失败就把商品推到 agent 兜底。
+    #    下载放线程里跑，不阻塞浏览器所在事件循环。
     if not os.path.exists(img_path) and item.get("image"):
         try:
-            import requests
-
-            os.makedirs(str(img_dir), exist_ok=True)
-            r = requests.get(item["image"], timeout=30)
-            r.raise_for_status()
-            with open(img_path, "wb") as f:
-                f.write(r.content)
+            await asyncio.to_thread(_download_main_image, item["image"], img_path)
         except Exception as e:
             res.fail_reason = f"主图下载失败：{e}"
             return res
@@ -535,7 +709,11 @@ async def collect_one_product(browser_tool, item: dict) -> CollectResult:
     #    标题（item["name"]）喂给生图模型约束该保留哪一件。
     search_img = await extract_white_bg(img_path, item.get("name", "")) or img_path
     got_white = search_img != img_path
-    r = await browser_tool.execute(action="go_to_url", url="https://www.1688.com/")
+    # 【必须新开标签】用 open_tab 而非 go_to_url：go_to_url 是在【当前活动标签】原地导航，
+    # 而枚举复用并置前了 Temu 的 product-select 标签，采集开始时当前标签常就是它——原地
+    # 导航会把 Temu 页覆盖成 1688，随后 close_tabs(text="1688") 又把它关掉，导致用户的
+    # Temu 页签消失。开新标签则图搜全程在新标签里，采完关掉，Temu 标签原样保留。
+    r = await browser_tool.execute(action="open_tab", url="https://www.1688.com/")
     if r.error:
         res.fail_reason = f"打开 1688 失败：{r.error}"
         return res
@@ -546,34 +724,74 @@ async def collect_one_product(browser_tool, item: dict) -> CollectResult:
 
     # 3+4. 挑同款。【红线】判同款始终用原图：白底图是重绘、可能改动商品外观，只影响
     #      recall；精度必须锚在真实像素（item["image"]）上。
+    #      有 checkout_probe（比价模式）→ 收集最多 top_k 个同款；否则单选（原行为）。
+    #
+    #      【2026-07 修正】只在图搜【落地结果列表页】里直接对卡片判同款，不再点 1688 的
+    #      主体框（YOLO cropRegion）换区域重搜——实测「换框重搜=让 1688 用图里某块区域
+    #      找相似」，结果会发散到不相干品类（搜"水果毛绒玩偶"点框后搜出女装/童装套装）。
+    #      白底提取已能保证查询图干净、默认主体即准，主体框 dance 弊大于利，故弃用。
     target_img = item.get("image", "") or img_path
-    if got_white:
-        # 查询图已干净 → 1688 默认主体即准，不必再跟它的框较劲（框只对脏拼图有用）。
-        # 直接读默认结果判同款。
-        cands = await read_search_results(browser_tool, 8)
-        chosen = await judge_same_match(target_img, cands) if cands else None
-        had_candidates = bool(cands)
+    want_k = top_k if checkout_probe else 1
+    cands = await read_search_results(browser_tool, 20)  # 多读些卡片供筛（不再靠重搜补）
+    if not cands:
+        matches = []
+        had_candidates = False
+    elif want_k == 1:
+        one = await judge_same_match(target_img, cands)
+        matches = [one] if one else []
+        had_candidates = True
     else:
-        # 退回脏拼图搜 → 保留原有主体框 dance 兜底（默认主体常框到脸/手，漏真商品）。
-        chosen = await search_match_over_regions(browser_tool, target_img)
-        had_candidates = True  # dance 内部已尽力枚举各框，保持原「无同款」语义
-    if not chosen:
+        matches = await judge_same_matches(target_img, cands, top_k=want_k)
+        had_candidates = True
+    if not matches:
         # 有候选但无同款 → no_same_match=True：clean query 下 agent 也不会更好，记漏采、
         #   跳过 agent 兜底（省批次时间）。
         # 0 候选（白底图可能生崩/过裁）→ no_same_match=False：放行 agent 用原图兜底。
         res.fail_reason = "未匹配到同款" if had_candidates else "白底图搜无候选"
         res.no_same_match = had_candidates
+        res.candidates = matches
         return res
+    res.candidates = matches
+
+    # 5+6. 比价读价。
+    if checkout_probe:
+        # 比价模式：每个同款候选进结算页读【真实货价+运费+重量】，取总价最低。
+        priced = []
+        for m in matches:
+            try:
+                info = await checkout_probe(m)
+            except Exception as e:
+                logger.warning(f"结算探测异常 offer={m.get('offerId')}：{e}")
+                info = None
+            if info and info.get("total") is not None:
+                info["_offer"] = m
+                priced.append(info)
+        if priced:
+            best = min(priced, key=lambda x: float(x.get("total", 1e9)))
+            res.offer_id = best["_offer"].get("offerId")
+            res.detail_url = best["_offer"].get("detailUrl")
+            res.purchase_price = _to_number(best.get("goods_price"))
+            res.shipping = _to_number(best.get("shipping")) or 0
+            res.weight_g = _to_number(best.get("weight_g"))
+            basis = best.get("weight_basis", "")
+            res.note = (f"比价{len(priced)}家取最低; " if len(priced) > 1 else "") + (
+                f"重量依据:{basis}" if basis else ""
+            )
+            res.ok = res.purchase_price is not None
+            if not res.ok:
+                res.fail_reason = "结算读价未得出货价"
+            return res
+        # 全部 probe 失败 → 退回旧读价路径（用第一个同款）
+        logger.warning(f"SPU={spu} 所有候选结算探测失败，退回详情页文本读价")
+
+    # 单选模式 / 比价全失败兜底：用第一个同款 + 详情页文本读价（含 judge_price 估重）
+    chosen = matches[0]
     res.offer_id = chosen.get("offerId")
     res.detail_url = chosen.get("detailUrl")
-
-    # 5. 详情页读价
     price_block = await read_detail_price(browser_tool, res.detail_url)
     if not price_block or not price_block.get("mainPrice"):
         res.fail_reason = "详情页未读到价格"
         return res
-
-    # 6. 判断点B：文本读价
     price = await judge_price(price_block)
     if not price:
         res.fail_reason = "价格判断失败"
@@ -589,11 +807,13 @@ async def collect_one_product(browser_tool, item: dict) -> CollectResult:
     return res
 
 
-# 列映射照本表表头（实测行1）：站点A/类目B/【产品图片E】/SPU D/销售价I/日常价G/
-# 采购价J/重量K(公斤)/ros O=7；公式列 H/L/N/P/Q/R 照 inspect 最后一行同列公式（须把
-# 字面行号换成 {r} 才会随行自适应）。注意：图片列是 E（产品图片），F 是货号，勿写图。
-_FORMULA_COLS = ["H", "L", "N", "P", "Q", "R"]
-_IMAGE_COLUMN = "E"  # 产品图片列（表头行1实测；F=货号，历史459张图全在E）
+# 【勿再硬编码列】不同 Sheet（pawly美国/全球、wintak、VibeMakers…）的列序完全不同：
+# SPU 在 C 还是 D、图片在 D 还是 E、采购价在 I 还是 J、ros 在 O/P/Q…全不一样。写入列现在
+# 一律由 inspect 的「字段列映射」按【本 Sheet 真实表头】解析（见 WpsExcelTool._FIELD_RULES），
+# 公式列/常量输入列同样从 inspect 学出，天然适配任意 Sheet。
+# ros 兜底：多数 Sheet 的 ros 是稳定常量（会出现在 inspect 的「常量输入列」），少数逐商品变
+# （学不出常量）时用此默认值，保证 N=销售价/ros 之类公式不除空。
+_DEFAULT_ROS = 7
 
 
 def _to_number(v) -> Optional[float]:
@@ -610,6 +830,81 @@ def _to_number(v) -> Optional[float]:
     return float(m.group(0)) if m else None
 
 
+@dataclass
+class SheetSchema:
+    """一个目标 Sheet 的写入结构（表头解析结果）——每批只解析一次，全批复用。
+
+    为什么单拎出来：同一工作簿里各 Sheet 列序完全不同（SPU 在 C 还是 D、采购价在 I 还是 J
+    …），必须【按真实表头】决定往哪列写。而这些事实在一批采集里是恒定的，逐商品重新 inspect
+    一个 225MB 工作簿既慢又浪费——故在批次开始时 resolve_sheet_schema 一次，随后每个商品的
+    write_product_row 直接复用。真正逐次变化的只有"插入到第几行/复制哪行样式"，那由
+    WpsExcelTool._append 自己读，不在此缓存。
+
+    字段：
+    - sheet：表名。
+    - fields：逻辑字段 → 列字母（spu/image/site/category/daily/sale/purchase/weight/ros/note）。
+    - formula_columns：公式列 → 模板（行号已换成 {r} 占位，随行自适应）。
+    - constant_columns：公式依赖的固定数值列（操作费/尾程等）→ 历史学出的常量。
+    - ok / error：结构是否可写（解析不出 SPU 列即不可写，error 带原因）。
+    """
+
+    sheet: str
+    fields: dict = field(default_factory=dict)
+    formula_columns: dict = field(default_factory=dict)
+    constant_columns: dict = field(default_factory=dict)
+    ok: bool = False
+    error: str = ""
+
+
+async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> SheetSchema:
+    """inspect 一次目标 Sheet，解析出稳定的写入结构（SSheetSchema）。每批调用一次。
+
+    - 缺 SPU 列 → ok=False（表头认不出，拒绝写入，避免列错位乱写）。
+    - 公式列过滤掉图片列与任何含 DISPIMG 的公式：坏历史行可能把嵌入图误写到别的列（实测
+      pawly美国 曾把 DISPIMG 落到"货号"列），若当普通公式复制会把新行也污染成图片公式。
+    """
+    inspect = await excel_tool.execute(
+        action="inspect", file_path=excel_path, sheet_name=sheet
+    )
+    if inspect.error:
+        return SheetSchema(sheet=sheet, error=f"inspect 失败：{inspect.error}")
+    try:
+        info = json.loads(inspect.output)
+    except Exception as e:
+        return SheetSchema(sheet=sheet, error=f"inspect 输出解析失败：{e}")
+
+    fields = info.get("字段列映射", {}) or {}
+    if not fields.get("spu"):
+        return SheetSchema(
+            sheet=sheet,
+            error=f"无法在 Sheet「{sheet}」表头解析出 SPU 列（避免列错位，拒绝写入）",
+        )
+    image_col = fields.get("image")
+
+    # 公式列：sample 里 = 开头、非图片列、且不含 DISPIMG。把公式里【所有相对单元格引用】的
+    # 行号换成 {r} 占位符，_append 的 .format(r=新行号) 才能让公式随行自适应；否则新行公式
+    # 冻在旧行号。
+    # 【关键教训】不能假设引用行号=最后数据行去替换：采样行本身可能是历史坏行、公式冻在更早
+    # 行号 → 按【实际出现的引用行号】通配替换，谁在换谁。
+    # (?<![A-Za-z$]) 避开函数名尾随数字与绝对引用（$G$1）；常数（如 *80，无字母前缀）不误伤。
+    sample = info.get("sample_最后行公式与值", {})
+    formula_columns = {}
+    for c, f in sample.items():
+        if c == image_col or not isinstance(f, str) or not f.startswith("="):
+            continue
+        if "DISPIMG" in f:  # 坏行把嵌入图落到了普通列 → 别当公式复制
+            continue
+        formula_columns[c] = re.sub(r"(?<![A-Za-z$])([A-Z]{1,3})\d+", r"\1{r}", f)
+
+    return SheetSchema(
+        sheet=sheet,
+        fields=fields,
+        formula_columns=formula_columns,
+        constant_columns=info.get("常量输入列", {}) or {},
+        ok=True,
+    )
+
+
 async def write_product_row(
     excel_tool,
     excel_path: str,
@@ -617,44 +912,31 @@ async def write_product_row(
     item: dict,
     res: CollectResult,
     image_path: str,
+    schema: Optional[SheetSchema] = None,
 ) -> tuple[bool, str]:
-    """把采集结果写入 Excel（inspect 取公式模板 → append_product_row）。
+    """把采集结果按【本 Sheet 真实表头】写入 Excel。
 
-    返回 (是否成功, 消息)。存疑（res.note 非空）时写入备注列 T，不阻断。
+    schema：批次开始时 resolve_sheet_schema 解析好的结构，全批复用（省去逐商品重 inspect
+    大工作簿）。未传时就地解析一次（CLI/单元测试等场景的兜底）。
+    返回 (是否成功, 消息)。存疑（res.note 非空）时写入备注列，不阻断。
     """
-    inspect = await excel_tool.execute(
-        action="inspect", file_path=excel_path, sheet_name=sheet
-    )
-    if inspect.error:
-        return False, f"inspect 失败：{inspect.error}"
-    try:
-        info = json.loads(inspect.output)
-    except Exception as e:
-        return False, f"inspect 输出解析失败：{e}"
-    sample = info.get("sample_最后行公式与值", {})
-    # inspect 采到的是最后数据行的字面公式（如 "=I575/G575"）。必须把公式里【所有相对
-    # 单元格引用】的行号换成 {r} 占位符，_append 的 .format(r=新行号) 才能让公式随行自适应；
-    # 否则新行公式冻在旧行号。
-    # 【关键教训】不能假设引用行号 = 最后数据行去替换：采样的那行本身可能是历史坏行、
-    # 公式冻在更早行号（实测从 575 行采到的却是 I543/G543）→ 按 575 替换什么都换不到。
-    # 故按【实际出现的引用行号】通配替换，谁在换谁。
-    # (?<![A-Za-z$]) 避开函数名尾随数字与绝对引用（$G$1）；常数（如 *80，无字母前缀）不误伤。
-    formula_columns = {}
-    for c in _FORMULA_COLS:
-        f = sample.get(c)
-        if not f or not str(f).startswith("="):
-            continue
-        formula_columns[c] = re.sub(r"(?<![A-Za-z$])([A-Z]{1,3})\d+", r"\1{r}", str(f))
+    if schema is None:
+        schema = await resolve_sheet_schema(excel_tool, excel_path, sheet)
+    if not schema.ok:
+        return False, schema.error
+    fields = schema.fields
+    image_col = fields.get("image")
+    formula_columns = schema.formula_columns
 
     # 采购价/重量：有值就写，无值（如所有主体框均未匹配的快速失败）留空待人工补。
     if res.purchase_price is not None:
         purchase_cell = round(float(res.purchase_price) + float(res.shipping or 0), 2)
     else:
         purchase_cell = ""
-    # 价格剥¥转数字（否则 H=I/G 折扣公式崩）；解析不出则留空、不写脏字符串。
+    # 价格剥¥转数字（否则 折扣=销售价/日常价 公式崩）；解析不出则留空、不写脏字符串。
     sale_price = _to_number(item.get("price"))
     sale_cell = sale_price if sale_price is not None else ""
-    # 重量：judge_price 返回【克】，本表 K 列是【公斤】（历史 0.3kg→L=K*80+1=25 吻合），克÷1000。
+    # 重量：judge_price 返回【克】，本表重量列是【公斤】（历史 0.3kg→空运头程=K*80+1=25 吻合），克÷1000。
     if res.weight_g is not None:
         try:
             weight_cell = round(float(res.weight_g) / 1000.0, 3)
@@ -662,19 +944,36 @@ async def write_product_row(
             weight_cell = ""
     else:
         weight_cell = ""
-    column_values = {
-        "A": item.get("site", ""),
-        "B": item.get("category", ""),
-        "D": res.spu,
-        "I": sale_cell,
-        "G": sale_cell,  # 日常价：无独立来源时暂用销售价，同旧 prompt 行为
-        "J": purchase_cell,
-        "K": weight_cell,
-        "O": 7,  # ros
+
+    # 按解析出的真实列填逐商品字段（字段没解析到就跳过该列，不误写）。
+    column_values = {}
+    _field_val = {
+        "site": item.get("site", ""),
+        "category": item.get("category", ""),
+        "spu": res.spu,
+        "sale": sale_cell,
+        "daily": sale_cell,  # 日常价：无独立来源时暂用销售价，同旧行为
+        "purchase": purchase_cell,
+        "weight": weight_cell,
     }
+    for fname, val in _field_val.items():
+        col = fields.get(fname)
+        if col:
+            column_values[col] = val
+
+    # 常量输入列（公式依赖的固定数值：操作费/尾程/ros 等），从历史行学出并回填，
+    # 否则新行这些格留空会让成本/利润公式算错。逐商品输入列不会出现在这里（已被 inspect 排除）。
+    for col, cval in schema.constant_columns.items():
+        column_values.setdefault(col, cval)
+    # ros 列若既非学出的常量、也还没被填（逐商品变的 Sheet）→ 用默认值兜底，避免除空。
+    ros_col = fields.get("ros")
+    if ros_col and ros_col not in column_values:
+        column_values[ros_col] = _DEFAULT_ROS
+
     note = res.note or ""
-    if note:
-        column_values["T"] = note  # 存疑标记，不阻断
+    note_col = fields.get("note")
+    if note and note_col:
+        column_values[note_col] = note  # 存疑标记，不阻断
 
     kwargs = dict(
         action="append_product_row",
@@ -683,9 +982,9 @@ async def write_product_row(
         column_values=column_values,
         formula_columns=formula_columns,
     )
-    if os.path.exists(image_path):
+    if image_col and os.path.exists(image_path):
         kwargs["image_path"] = image_path
-        kwargs["image_column"] = _IMAGE_COLUMN  # E=产品图片（勿写 F 货号列）
+        kwargs["image_column"] = image_col  # 本 Sheet 的产品图片列（勿写货号列）
 
     r = await excel_tool.execute(**kwargs)
     if r.error:

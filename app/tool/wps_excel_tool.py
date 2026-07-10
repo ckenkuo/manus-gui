@@ -27,6 +27,31 @@ from app.tool.base import BaseTool, ToolResult
 
 NS_ETC = "http://www.wps.cn/officeDocument/2017/etCustomData"
 
+# 单元格引用（列字母+行号），带可选 $ 绝对标记；(?<![A-Za-z0-9_$]) 避开函数名尾随数字。
+# 模块级常量：WpsExcelTool 是 Pydantic 模型，类体内 `_x = ...` 会被当私有属性吞掉，
+# 故编译好的正则放模块级，避免变成 ModelPrivateAttr。
+_CELL_REF_RE = re.compile(r"(?<![A-Za-z0-9_$])(\$?)([A-Z]{1,3})(\$?)(\d+)")
+
+# 逻辑字段 → 表头标题判定。采集管道要往【任意布局】的 Sheet 写，绝不能再假设固定列序：
+# 实测同一工作簿里 pawly美国/pawly全球/wintak/VibeMakers 各 Sheet 的列序都不同（SPU 在
+# C 还是 D、图片在 D 还是 E、采购价在 I 还是 J…全不一样），旧代码把字段硬编码成 pawly全球
+# 的列 → 换 Sheet 就整体错位（SPU 写进"产品图片"列、采购价写进"重量"列）。改为按【表头标题】
+# 把每个逻辑字段解析到该 Sheet 的真实列。
+# 规则顺序即认领优先级；一列至多归一个字段（先到先得）。pick='last' 用于"备注"——有的
+# Sheet 有多列备注（前置那列常被挪作它用），取末列最稳。判定前对标题 strip()。
+_FIELD_RULES = [
+    ("spu", lambda t: "spu" in t.lower(), "first"),
+    ("image", lambda t: ("产品图片" in t) or t == "图片", "first"),
+    ("site", lambda t: t == "站点", "first"),
+    ("category", lambda t: t in ("类目", "类别", "品类", "分类"), "first"),
+    ("daily", lambda t: t == "日常价", "first"),
+    ("sale", lambda t: t in ("销售价格", "销售价", "售价"), "first"),
+    ("purchase", lambda t: t in ("采购价格", "采购价", "购入价格"), "first"),
+    ("weight", lambda t: t == "重量", "first"),
+    ("ros", lambda t: t.lower() == "ros", "first"),
+    ("note", lambda t: t == "备注", "last"),
+]
+
 
 def _col_to_idx(col: str) -> int:
     """列字母 → 1-based 索引。A=1, Z=26, AA=27。"""
@@ -165,6 +190,65 @@ class WpsExcelTool(BaseTool):
             return v.group(1)
         return ""
 
+    # ---- 共享公式解析 ----------------------------------------------------
+    # 本表（WPS 导出）把整列同型公式存成【共享公式】：仅一个「主单元格」带公式文本
+    #   <f t="shared" ref="H8:H23" si="4">I8/G8</f>
+    # 其余单元格只引用 si、自身不含文本、且是【自闭合】标签
+    #   <f t="shared" si="4"/>
+    # 旧 _inspect 用 `<f[^>]*>(.*?)</f>` 抓不到自闭合 <f/>，会退化去读 <v> 缓存【数值】，
+    # 于是 H/L/N/P/Q/R 被当成硬编码值丢弃（write_product_row 只留 = 开头的），
+    # 新行整列公式全丢 → 折扣/空运/成本/利润/毛利全空，且坏行变"最后行"后自我传染。
+    # 下面按 OOXML 语义解析：建 si→主公式表，按相对偏移把主公式平移到目标行/列。
+
+    @classmethod
+    def _shared_formula_masters(cls, sheet_xml: str) -> Dict[str, tuple]:
+        """扫全表主单元格，建 si → (主行号, 主列索引, 公式文本)。仅主单元格带文本。"""
+        masters: Dict[str, tuple] = {}
+        for m in re.finditer(
+            r'<c r="([A-Z]+)(\d+)"[^>]*?><f\b([^>]*?)>([^<]*)</f>', sheet_xml
+        ):
+            col, row, attrs, text = m.group(1), int(m.group(2)), m.group(3), m.group(4)
+            si_m = re.search(r'si="(\d+)"', attrs)
+            if si_m and "shared" in attrs and text.strip():
+                masters.setdefault(
+                    si_m.group(1),
+                    (row, _col_to_idx(col), text.replace("&quot;", '"')),
+                )
+        return masters
+
+    @classmethod
+    def _shift_formula(cls, formula: str, drow: int, dcol: int) -> str:
+        """把公式里所有【相对】单元格引用按 (drow, dcol) 平移；绝对引用($)与常数不动。"""
+        def repl(mo: "re.Match") -> str:
+            col_abs, col, row_abs, row = mo.group(1), mo.group(2), mo.group(3), mo.group(4)
+            new_col = col if col_abs else _idx_to_col(_col_to_idx(col) + dcol)
+            new_row = row if row_abs else str(int(row) + drow)
+            return f"{col_abs}{new_col}{row_abs}{new_row}"
+
+        return _CELL_REF_RE.sub(repl, formula)
+
+    @classmethod
+    def _resolve_cell_formula(
+        cls, cell_xml: str, row: int, col_idx: int, masters: Dict[str, tuple]
+    ) -> Optional[str]:
+        """取单元格公式文本（不含=）：主单元格取原文；共享依赖单元格从主公式平移解析；
+        非公式单元格返回 None。"""
+        m = re.search(r"<f\b([^>]*?)(?:/>|>(.*?)</f>)", cell_xml, re.S)
+        if not m:
+            return None
+        attrs = m.group(1)
+        text = (m.group(2) or "").strip()
+        si_m = re.search(r'si="(\d+)"', attrs)
+        if "shared" in attrs and not text and si_m:
+            master = masters.get(si_m.group(1))
+            if not master:
+                return None
+            m_row, m_col, m_formula = master
+            return cls._shift_formula(m_formula, row - m_row, col_idx - m_col)
+        if text:
+            return text.replace("&quot;", '"')
+        return None
+
     @classmethod
     def _find_last_data_row(cls, rows: List[tuple], key_cols: List[str]) -> int:
         """最后一个真实数据行：key_cols 中任一列有 <v> 值的最大行号。"""
@@ -205,6 +289,170 @@ class WpsExcelTool(BaseTool):
         except Exception:
             return set()
 
+    @classmethod
+    def read_header(cls, file_path: str, sheet_name: str) -> Dict[str, str]:
+        """读某 Sheet 第一行表头：{列字母: 标题}。文件/表缺失或损坏返回 {}，绝不抛错。"""
+        try:
+            with zipfile.ZipFile(file_path) as zf:
+                part = cls._resolve_sheet_part(zf, sheet_name)
+                if not part:
+                    return {}
+                sheet_xml = zf.read(part).decode("utf-8")
+                shared = cls._shared_strings(zf)
+                row_map = dict(cls._parse_rows(sheet_xml))
+                header: Dict[str, str] = {}
+                if "1" in row_map:
+                    for cm in re.finditer(
+                        r'<c r="([A-Z]+)1"[^>]*>.*?</c>', row_map["1"], re.S
+                    ):
+                        txt = cls._cell_text(cm.group(0), shared)
+                        if txt:
+                            header[cm.group(1)] = txt
+                return header
+        except Exception:
+            return {}
+
+    @classmethod
+    def _resolve_fields_from_header(cls, header: Dict[str, str]) -> Dict[str, str]:
+        """把逻辑字段解析到该 Sheet 的真实列：{字段名: 列字母}。见 _FIELD_RULES。
+
+        一列至多归一个字段（先到先得，避免"备注"抢占别的列）；未命中的字段不在结果里。
+        """
+        roles: Dict[str, str] = {}
+        used: set = set()
+        for role, pred, pick in _FIELD_RULES:
+            hits = sorted(
+                [c for c, title in header.items() if c not in used and pred(title.strip())],
+                key=_col_to_idx,
+            )
+            if not hits:
+                continue
+            col = hits[-1] if pick == "last" else hits[0]
+            roles[role] = col
+            used.add(col)
+        return roles
+
+    @classmethod
+    def resolve_field_columns(cls, file_path: str, sheet_name: str) -> Dict[str, str]:
+        """公开入口：读某 Sheet 表头并解析出 {逻辑字段: 列字母}。
+
+        供采集管道按【真实列序】写入/判重，取代旧的硬编码列假设。文件/表不可读返回 {}。
+        字段名见 _FIELD_RULES：spu/image/site/category/daily/sale/purchase/weight/ros/note。
+        """
+        return cls._resolve_fields_from_header(cls.read_header(file_path, sheet_name))
+
+    @classmethod
+    def spu_column(cls, file_path: str, sheet_name: str, default: str = "D") -> str:
+        """该 Sheet 里 SPU 所在列字母；表头解析不出（表损坏/无 SPU 列）时退回 default。"""
+        return cls.resolve_field_columns(file_path, sheet_name).get("spu", default)
+
+    @classmethod
+    def column_numeric_constants(
+        cls,
+        file_path: str,
+        sheet_name: str,
+        exclude_cols: Optional[set] = None,
+        min_samples: int = 3,
+        dominance: float = 0.6,
+    ) -> Dict[str, float]:
+        """扫描数据行(row>1)，找出各列里【每行都填同一个数字】的常量列，返回 {列: 数字}。
+
+        为什么需要：不同 Sheet 的成本模型不同——除采购价/重量这类逐商品输入外，还有 ros、
+        操作费、尾程这类【每行固定的数值常量输入】，下游公式(成本=采购价+操作费+尾程+…)依赖
+        它们。旧代码只硬编码 ros=7，换到 pawly美国(ros=6、另有操作费=5/尾程=8)就让这些格留空、
+        公式算错。此法从历史行学出这些常量并复制到新行，天然适配任意 Sheet。
+
+        只认【纯数字】常量：文本型批次标注(编号筛选/总出货数)不返回，避免误抄。
+        判定：某列非空且为纯数字的单元格里，出现最多的那个数字占比≥dominance 且样本≥min_samples，
+        则该数字为列常量。公式单元格(_cell_text 返回 '=' 开头)天然被排除；共享公式的缓存数值
+        逐行不同→占比达不到阈值，也不会被误判为常量。exclude_cols 里的列直接跳过。
+        文件/表不可读返回 {}。
+        """
+        try:
+            with zipfile.ZipFile(file_path) as zf:
+                part = cls._resolve_sheet_part(zf, sheet_name)
+                if not part:
+                    return {}
+                sheet_xml = zf.read(part).decode("utf-8")
+                shared = cls._shared_strings(zf)
+                rows = cls._parse_rows(sheet_xml)
+                return cls._scan_numeric_constants(
+                    rows, shared, exclude_cols, min_samples, dominance
+                )
+        except Exception:
+            return {}
+
+    @classmethod
+    def _scan_numeric_constants(
+        cls,
+        rows: List[tuple],
+        shared: List[str],
+        exclude_cols: Optional[set] = None,
+        min_samples: int = 3,
+        dominance: float = 0.6,
+    ) -> Dict[str, float]:
+        """column_numeric_constants 的内核（已拿到 rows/shared）：返回 {列: 常量数字}。
+
+        供 _inspect 在同一次 sheet 扫描里顺带算出常量列，避免对 200MB 工作簿再开一遍 zip。
+        """
+        from collections import Counter
+
+        exclude = set(exclude_cols or set())
+        col_nums: Dict[str, Counter] = {}
+        for rid, body in rows:
+            if rid == "1":
+                continue
+            for cm in re.finditer(
+                r'<c r="([A-Z]+)\d+"[^>]*?(?:/>|>.*?</c>)', body, re.S
+            ):
+                col = cm.group(1)
+                if col in exclude:
+                    continue
+                txt = cls._cell_text(cm.group(0), shared).strip()
+                if not txt or txt.startswith("="):
+                    continue
+                try:
+                    col_nums.setdefault(col, Counter())[float(txt)] += 1
+                except ValueError:
+                    # 该列出现过非数字（文本标注）→ 标记为脏，永不当常量列
+                    col_nums.setdefault(col, Counter())[float("nan")] += 1
+        out: Dict[str, float] = {}
+        for col, counter in col_nums.items():
+            if any(v != v for v in counter):  # 含 NaN（曾有非数字）→ 跳过
+                continue
+            total = sum(counter.values())
+            if total < min_samples:
+                continue
+            val, cnt = counter.most_common(1)[0]
+            if cnt / total >= dominance:
+                out[col] = val
+        return out
+
+    @classmethod
+    def list_sheets(cls, file_path: str) -> List[str]:
+        """返回工作簿里所有工作表名（按 workbook.xml 声明顺序）。
+
+        供 UI 的 Sheet 下拉列举目标表。纯读 xl/workbook.xml，文件缺失/损坏/非 zip
+        时返回空列表，绝不抛错（与 existing_key_values 同风格）。
+        """
+        try:
+            with zipfile.ZipFile(file_path) as zf:
+                wb = zf.read("xl/workbook.xml").decode("utf-8")
+            names = re.findall(r'<sheet[^>]*\bname="([^"]+)"', wb)
+            # 表名里的 & < > " 在 XML 属性里是转义的，还原成显示名
+            unescape = {
+                "&amp;": "&", "&lt;": "<", "&gt;": ">",
+                "&quot;": '"', "&apos;": "'",
+            }
+            out = []
+            for n in names:
+                for k, v in unescape.items():
+                    n = n.replace(k, v)
+                out.append(n)
+            return out
+        except Exception:
+            return []
+
     # ---- inspect --------------------------------------------------------
 
     def _inspect(self, file_path: str, sheet_name: str) -> ToolResult:
@@ -232,35 +480,104 @@ class WpsExcelTool(BaseTool):
                 key_cols = ["A", "D"]
             last_data = self._find_last_data_row(rows, key_cols)
 
-            # 样例：最后数据行的每列公式/值
+            # 样例：最后数据行的每列公式/值。公式列用共享公式解析器（见
+            # _resolve_cell_formula）——旧逻辑抓不到自闭合 <f t="shared" si=.../>，
+            # 会把公式列当数值丢，导致 append 出的新行整列公式缺失。
+            masters = self._shared_formula_masters(sheet_xml)
             sample = {}
-            if str(last_data) in row_map:
-                for cm in re.finditer(r'<c r="([A-Z]+)%d"[^>]*>.*?</c>' % last_data, row_map[str(last_data)], re.S):
-                    col = cm.group(1)
-                    fm = re.search(r"<f[^>]*>(.*?)</f>", cm.group(0), re.S)
-                    if fm:
-                        sample[col] = "=" + fm.group(1).replace("&quot;", '"')
-                    else:
-                        vm = re.search(r"<v>(.*?)</v>", cm.group(0), re.S)
-                        if vm:
-                            sample[col] = self._cell_text(cm.group(0), shared)
 
-        # SPU 列（用于批量采集判重）：表头里含 SPU/ID 的列，找不到退化到 D
-        spu_col = next(
+            def _row_cells(rid: int) -> List[tuple]:
+                body = row_map.get(str(rid), "")
+                return re.findall(r'<c r="([A-Z]+)%d"[^>]*?(?:/>|>.*?</c>)' % rid, body, re.S)
+
+            def _cell_xml(rid: int, col: str) -> str:
+                body = row_map.get(str(rid), "")
+                mm = re.search(r'<c r="%s%d"[^>]*?(?:/>|>.*?</c>)' % (col, rid), body, re.S)
+                return mm.group(0) if mm else ""
+
+            if str(last_data) in row_map:
+                for col, full in re.findall(
+                    r'<c r="([A-Z]+)%d"[^>]*?(?:/>|>(.*?)</c>)' % last_data,
+                    row_map[str(last_data)],
+                    re.S,
+                ):
+                    cx = _cell_xml(last_data, col)
+                    f = self._resolve_cell_formula(cx, last_data, _col_to_idx(col), masters)
+                    if f is not None:
+                        sample[col] = "=" + f
+                    else:
+                        vm = re.search(r"<v>(.*?)</v>", cx, re.S)
+                        if vm:
+                            sample[col] = self._cell_text(cx, shared)
+
+            # 回填：最后数据行若是坏行（管道曾漏写整列公式），其公式列会缺失。
+            # 向上找最近的健康行，把该有公式却在 sample 里缺席/非公式的列补齐，
+            # 并平移到 last_data 行——这样 append 拿到的模板永远带全套公式，
+            # 不会被坏的尾行传染。formula_cols_expected = 主公式表覆盖到的列全集。
+            formula_cols_expected = {
+                _idx_to_col(mc) for (_, mc, _) in masters.values()
+            }
+            missing = {
+                c for c in formula_cols_expected
+                if not str(sample.get(c, "")).startswith("=")
+            }
+            rid = last_data - 1
+            while missing and rid > 1:
+                for col in list(missing):
+                    cx = _cell_xml(rid, col)
+                    if not cx:
+                        continue
+                    f = self._resolve_cell_formula(cx, rid, _col_to_idx(col), masters)
+                    if f is not None:
+                        sample[col] = "=" + self._shift_formula(f, last_data - rid, 0)
+                        missing.discard(col)
+                rid -= 1
+
+        # 逻辑字段 → 真实列（按表头解析，见 _FIELD_RULES）。采集管道据此按【本 Sheet 的
+        # 真实列序】写入，不再假设固定列。SPU 列优先取解析结果，退化到含 SPU/ID 的列再到 D。
+        field_cols = self._resolve_fields_from_header(header)
+        spu_col = field_cols.get("spu") or next(
             (c for c, h in header.items() if "SPU" in h or "ID" in h.upper()), "D"
         )
         existing_spus = self.existing_key_values(file_path, sheet_name, spu_col)
+
+        # 公式列 = sample 里 = 开头的列（排除图片列的 DISPIMG）。
+        image_col = field_cols.get("image")
+        formula_cols = {
+            c for c, v in sample.items()
+            if isinstance(v, str) and v.startswith("=") and c != image_col
+        }
+        # 逐商品输入列（采集逐条填的，不是常量）：这些列不当常量、也不该被常量覆盖。
+        item_cols = {
+            field_cols[k] for k in
+            ("spu", "image", "site", "category", "daily", "sale", "purchase", "weight", "note")
+            if k in field_cols
+        }
+        # 公式实际引用到、却既非公式列也非逐商品输入列的列 → 是【固定数值输入】(操作费/尾程/
+        # ros 等)。这些列若新行留空，成本/利润公式会算错。从历史行学出它们的常量值并回填。
+        # ros 是特例：它常逐商品变(6/7/8 混填)，学不出稳定常量，故若未学出则由管道兜底默认。
+        referenced: set = set()
+        for c in formula_cols:
+            for m in re.finditer(r"(?<![A-Za-z$])([A-Z]{1,3})\d+", sample[c]):
+                referenced.add(m.group(1))
+        need_const_cols = referenced - formula_cols - item_cols
+        all_consts = self._scan_numeric_constants(rows, shared, item_cols | formula_cols)
+        constant_columns = {c: all_consts[c] for c in need_const_cols if c in all_consts}
 
         out = {
             "sheet": sheet_name,
             "part": part,
             "header_列标题": header,
+            "字段列映射": field_cols,
+            "常量输入列": constant_columns,
             "last_data_row_最后数据行": last_data,
             "next_row_建议插入行": last_data + 1,
             "sample_最后行公式与值": sample,
             "SPU列": spu_col,
             "已入库SPU数": len(existing_spus),
             "提示": "公式列含 = 开头；硬编码列为纯值。append 时按此结构传 column_values 与 formula_columns。"
+            "字段列映射给出各逻辑字段（spu/image/purchase/weight/ros…）在本表的真实列，按它写勿硬编码。"
+            "常量输入列给出公式依赖的固定数值列（操作费/尾程等）及其历史常量，追加新行时应一并写入。"
             "批量采集前可用 SPU列/已入库SPU 判重跳过。",
         }
         return self.success_response(json.dumps(out, ensure_ascii=False, indent=2))
@@ -293,6 +610,14 @@ class WpsExcelTool(BaseTool):
             sheet_xml = zf.read(part).decode("utf-8")
             rows = self._parse_rows(sheet_xml)
             row_map = dict(rows)
+
+            # 样式表：写文本列时基于该列既有样式派生「自动换行」变体（见 _wrap_style_for）。
+            # styles.xml 缺失/解析失败 → wrap_ctx.ok=False，文本列退回原样式、不换行、不报错。
+            try:
+                styles_xml = zf.read("xl/styles.xml").decode("utf-8")
+            except KeyError:
+                styles_xml = ""
+            wrap_ctx = self._init_wrap_ctx(styles_xml)
 
             key_cols = ["A", "D"]
             for c in column_values:
@@ -378,14 +703,26 @@ class WpsExcelTool(BaseTool):
                 elif col in formula_columns:
                     f = formula_columns[col].format(r=new_rid).lstrip("=")
                     f = _xml_escape(f)
-                    cells.append(f'<c r="{ref}"{s_attr(col)}><f>{f}</f></c>')
+                    # 模板行缺该列样式（坏行）时，从最近的带公式行回填，保住数字格式
+                    # （R=毛利百分比、L/P 两位小数等）。
+                    fstyle = cell_styles.get(col) or self._formula_cell_style(rows, col)
+                    fsa = f' s="{fstyle}"' if fstyle else ""
+                    cells.append(f'<c r="{ref}"{fsa}><f>{f}</f></c>')
                 elif col in column_values:
                     val = column_values[col]
                     if isinstance(val, (int, float)):
                         cells.append(f'<c r="{ref}"{s_attr(col)}><v>{val}</v></c>')
                     else:
+                        # 文本列（类目/备注/站点…）用【带自动换行】样式，长文本才会换行而非溢出。
+                        # 空串不必派生新样式（无内容可换行），沿用原样式即可。
+                        sval = str(val)
+                        if sval:
+                            wcol = self._wrap_style_for(wrap_ctx, col, cell_styles, rows)
+                            sa = f' s="{wcol}"' if wcol else ""
+                        else:
+                            sa = s_attr(col)
                         cells.append(
-                            f'<c r="{ref}"{s_attr(col)} t="str"><v>{_xml_escape(val)}</v></c>'
+                            f'<c r="{ref}"{sa} t="str"><v>{_xml_escape(val)}</v></c>'
                         )
 
             # 行开标签复制模板行（保留行高/样式）
@@ -423,6 +760,11 @@ class WpsExcelTool(BaseTool):
             )
             changed[part] = sheet_new.encode("utf-8")
 
+            # 若为文本列派生了 wrap 变体样式，把新 xf 追加进 styles.xml 一并重写。
+            new_styles = self._rebuild_styles(wrap_ctx, styles_xml)
+            if new_styles is not None:
+                changed["xl/styles.xml"] = new_styles.encode("utf-8")
+
             # 写出新文件（临时名 → 替换）
             tmp = src.with_name(src.stem + f"_tmp{ts}" + src.suffix)
             with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
@@ -459,6 +801,137 @@ class WpsExcelTool(BaseTool):
             if m:
                 return m.group(1)
         return None
+
+    @staticmethod
+    def _formula_cell_style(rows: List[tuple], col: str) -> Optional[str]:
+        """从最近的一个【带公式】单元格取该列样式索引，供模板行缺该列时回填。
+
+        模板行若是坏行（管道曾漏写整列公式），该列无 s= → 新公式会丢失数字格式
+        （尤其 R=毛利 的百分比、L/P 的两位小数）。向下扫所有行找该列首个带公式且带
+        s= 的单元格，取其样式，让追加的公式列显示格式与历史行一致。
+        """
+        for _, body in rows:
+            m = re.search(r'<c r="%s\d+"\s+s="(\d+)"[^>]*?><f\b' % col, body)
+            if m:
+                return m.group(1)
+        return None
+
+    @staticmethod
+    def _text_cell_style(rows: List[tuple], col: str) -> Optional[str]:
+        """取该列首个【非公式】数据单元格的样式索引，供文本列缺模板样式时回填。
+
+        为什么需要：写文本列（类目/备注/站点等）要基于该列既有样式派生「自动换行」变体。
+        但模板行（最后数据行）常是坏行、该列无 s=（如本表 T 备注/B 类目在尾行为空样式），
+        直接用默认样式会丢掉该列历史的字体/边框/数字格式。向前扫【数据行】取该列首个带 s= 且
+        不含公式的单元格样式（类目列历史恒为 342、备注列为 28），据此派生 wrap 变体最贴合。
+
+        【跳过表头行(row 1)】表头单元格本就开了 wrapText 但带加粗/居中的标题样式，若拿它当
+        基样式会把标题样式套到数据格上（类目/备注变粗）。只从 row>1 的数据行取。
+        """
+        for rid, body in rows:
+            if rid == "1":
+                continue
+            for m in re.finditer(
+                r'<c r="%s\d+"\s+s="(\d+)"[^>]*?(?:/>|>(.*?)</c>)' % col, body, re.S
+            ):
+                if "<f" not in (m.group(2) or ""):
+                    return m.group(1)
+        return None
+
+    # ---- 自动换行（wrapText）样式派生 -----------------------------------
+    # 写入的文本列（类目/备注/站点…）此前不自动换行：新行逐列复制模板行的样式索引 s=，
+    # 而本表数据行的这些样式本就没开 wrapText（只有表头行开了），加上尾部坏行常无 s=，
+    # 于是长文本（如「玩具 / 毛绒玩具 / 毛绒公仔」、比价备注）溢出不换行。
+    # 解决：写字符串单元格时，基于该列既有样式【克隆一个只多加 wrapText 的新 <xf>】，
+    # 追加到 styles.xml 的 cellXfs 末尾（不动既有索引，故不影响其它单元格），用新索引。
+    # 只影响本次新写的字符串格；数值/公式/嵌入图格不变。
+
+    @staticmethod
+    def _add_wrap_to_xf(xf: str) -> str:
+        """克隆一个 cellXfs 里的 <xf>，仅追加 wrapText（自动换行），其余全保留。
+
+        字体/颜色/边框/数字格式/水平垂直对齐原样不动；已含 wrapText 的原样返回。
+        """
+        if 'wrapText="1"' in xf:
+            return xf
+        if "<alignment" in xf:  # 已有对齐子元素 → 在其上补 wrapText
+            return re.sub(r'(<alignment\b[^>]*?)\s*/>', r'\1 wrapText="1"/>', xf, count=1)
+        # 无对齐子元素 → 补 applyAlignment + <alignment>（沿用本表 vertical=center 习惯）
+        align = '<alignment vertical="center" wrapText="1"/>'
+        sm = re.match(r"<xf\b([^>]*?)/>\s*$", xf)
+        if sm:  # 自闭合 <xf .../>
+            attrs = sm.group(1)
+            if "applyAlignment" not in attrs:
+                attrs += ' applyAlignment="1"'
+            return f"<xf{attrs}>{align}</xf>"
+        om = re.match(r"<xf\b([^>]*?)>(.*)</xf>\s*$", xf, re.S)
+        if om:  # <xf ...>...</xf> 但无 alignment 子元素
+            attrs, inner = om.group(1), om.group(2)
+            if "applyAlignment" not in attrs:
+                attrs += ' applyAlignment="1"'
+            return f"<xf{attrs}>{align}{inner}</xf>"
+        return xf  # 无法解析 → 保底不改
+
+    def _init_wrap_ctx(self, styles_xml: str) -> dict:
+        """解析 styles.xml 的 cellXfs，建派生 wrap 样式所需的上下文（不修改）。
+
+        cellXfs 解析失败（缺 styles.xml / 结构异常）→ ok=False，后续退回原样式、不换行。
+        """
+        m = re.search(r"(<cellXfs[^>]*>)(.*?)(</cellXfs>)", styles_xml, re.S)
+        if not m:
+            return {"ok": False}
+        xfs = re.findall(r"<xf\b[^>]*?/>|<xf\b[^>]*?>.*?</xf>", m.group(2), re.S)
+        return {
+            "ok": True,
+            "full": m.group(0),
+            "open_tag": m.group(1),
+            "body": m.group(2),
+            "close_tag": m.group(3),
+            "xfs": xfs,
+            "count": len(xfs),
+            "new_xfs": [],
+            "cache": {},  # 基样式索引 → wrap 变体索引（同基样式多列共用一个新 xf）
+        }
+
+    def _wrap_style_for(
+        self, ctx: dict, col: str, cell_styles: Dict[str, str], rows: List[tuple]
+    ) -> Optional[str]:
+        """返回该文本列应使用的【带自动换行】样式索引；必要时新建 xf 记入 ctx。
+
+        基样式优先取模板行该列样式，缺失退回扫历史行的文本单元格样式（_text_cell_style），
+        再缺则用一个居中默认。基样式已开 wrapText 则直接复用，不新建。
+        """
+        if not ctx.get("ok"):
+            return cell_styles.get(col)  # 无法改样式 → 退回原逻辑
+        base_idx = cell_styles.get(col) or self._text_cell_style(rows, col)
+        key = base_idx if base_idx is not None else "__none__"
+        if key in ctx["cache"]:
+            return ctx["cache"][key]
+        xfs = ctx["xfs"]
+        if base_idx is not None and base_idx.isdigit() and int(base_idx) < len(xfs):
+            base_xf = xfs[int(base_idx)]
+        else:
+            base_xf = (
+                '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" '
+                'applyAlignment="1"><alignment vertical="center"/></xf>'
+            )
+        if 'wrapText="1"' in base_xf:  # 基样式已换行 → 直接复用
+            ctx["cache"][key] = base_idx
+            return base_idx
+        new_idx = str(ctx["count"] + len(ctx["new_xfs"]))
+        ctx["new_xfs"].append(self._add_wrap_to_xf(base_xf))
+        ctx["cache"][key] = new_idx
+        return new_idx
+
+    @staticmethod
+    def _rebuild_styles(ctx: dict, styles_xml: str) -> Optional[str]:
+        """把 ctx 里新派生的 wrap 变体 xf 追加进 cellXfs，返回新 styles.xml；无新增返回 None。"""
+        if not ctx.get("ok") or not ctx["new_xfs"]:
+            return None
+        new_count = ctx["count"] + len(ctx["new_xfs"])
+        new_open = re.sub(r'count="\d+"', 'count="%d"' % new_count, ctx["open_tag"])
+        new_full = new_open + ctx["body"] + "".join(ctx["new_xfs"]) + ctx["close_tag"]
+        return styles_xml.replace(ctx["full"], new_full, 1)
 
     async def execute(
         self,

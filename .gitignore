@@ -211,3 +211,6 @@ cython_debug/
 
 # node
 node_modules
+
+# Windows 误重定向产生的伪文件（NUL 设备被当成文件写入）
+/NUL
