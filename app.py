@@ -98,6 +98,12 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 
+@app.get("/collect", response_class=HTMLResponse)
+async def collect_page(request: Request):
+    """批量采集页：清单展示 + 一键开跑 + SSE 实时进度（独立于通用对话页）。"""
+    return templates.TemplateResponse("collect.html", {"request": request})
+
+
 @app.get("/download")
 async def download_file(file_path: str):
     if not os.path.exists(file_path):
@@ -307,6 +313,127 @@ async def save_config(config_data: dict = Body(...)):
         return {"status": "success"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+# ==== 批量采集（Temu→1688→Excel）：确定性管道，独立于通用 agent 任务 ==========
+# UI 复用 app/collect/service.py 的 run_batch，进度经 on_progress 结构化事件走 SSE。
+# 与 /tasks 的区别：/tasks 是通用 agent 自由循环；采集是确定性批处理作业，事件语义
+# 专属（SPU/比价/无同款留空），故单开一组接口，不挤进通用 step。
+
+from app.collect import service as collect_service
+
+
+class CollectJob:
+    """一次批量采集作业：持有进度队列，供 SSE 消费。"""
+
+    def __init__(
+        self, job_id: str, limit: int, use_pipeline: bool,
+        excel: str = "", sheet: str = "", store: str = "", base_only: bool = True,
+    ):
+        self.id = job_id
+        self.limit = limit
+        self.use_pipeline = use_pipeline
+        self.base_only = base_only
+        self.excel = excel
+        self.sheet = sheet
+        self.store = store
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.done = False
+        self.summary: dict = {}
+
+    async def push(self, event: dict):
+        await self.queue.put(event)
+
+
+collect_jobs: dict = {}
+
+
+@app.get("/collect/worklist")
+async def collect_worklist(
+    excel: str = "", sheet: str = "", store: str = "",
+):
+    """UI 首屏：清单总量/已入库/待采 + 每条状态（不触发采集）。
+
+    可选 excel/sheet/store 过滤：缺省回填上次选择。响应含 workbooks/sheets/stores 供下拉。
+    """
+    return JSONResponse(content=collect_service.get_worklist_status(
+        excel=excel or None, sheet=sheet or None, store=store or None,
+    ))
+
+
+@app.post("/collect/enumerate")
+async def collect_enumerate():
+    """重新枚举所有已打开店铺标签的「已发布到站点」清单，写 worklist.json，返回条数。"""
+    count = await collect_service.enumerate_worklist()
+    return {"count": count, "status": collect_service.get_worklist_status()}
+
+
+@app.post("/collect/batch")
+async def collect_batch(
+    limit: int = Body(20, embed=True),
+    use_pipeline: bool = Body(True, embed=True),
+    base_only: bool = Body(True, embed=True),
+    excel: str = Body("", embed=True),
+    sheet: str = Body("", embed=True),
+    store: str = Body("", embed=True),
+):
+    """启动一批采集作业，返回 job_id；进度经 /collect/batch/{job_id}/events (SSE) 消费。
+
+    base_only=True（默认）只采 Temu 基础信息、采购价/重量留空待人工填；False 走 1688 自动采价。
+    excel/sheet/store 指定目标工作簿/Sheet/店铺（缺省回填上次选择）。
+    """
+    job_id = str(uuid.uuid4())
+    job = CollectJob(job_id, limit, use_pipeline, excel, sheet, store, base_only)
+    collect_jobs[job_id] = job
+
+    async def _on_progress(event: dict):
+        await job.push(event)
+
+    async def _run():
+        try:
+            job.summary = await collect_service.run_batch(
+                limit=limit, use_pipeline=use_pipeline, base_only=base_only,
+                on_progress=_on_progress,
+                excel=excel or None, sheet=sheet or None, store=store or None,
+            )
+        except Exception as e:
+            await job.push({"type": "aborted", "reason": f"采集异常：{e}"})
+        finally:
+            job.done = True
+            await job.push({"type": "_end"})  # 哨兵：通知 SSE 收尾
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/collect/batch/{job_id}/events")
+async def collect_batch_events(job_id: str):
+    """SSE 推送某次采集作业的结构化进度事件（原样转发 service 的 on_progress 事件）。"""
+
+    async def event_generator():
+        job = collect_jobs.get(job_id)
+        if job is None:
+            yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
+            return
+        while True:
+            try:
+                event = await job.queue.get()
+            except asyncio.CancelledError:
+                break
+            if event.get("type") == "_end":
+                yield f"event: done\ndata: {dumps(job.summary)}\n\n"
+                break
+            yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.exception_handler(Exception)
