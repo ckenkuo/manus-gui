@@ -362,9 +362,19 @@ async def collect_worklist(
 
 
 @app.post("/collect/enumerate")
-async def collect_enumerate():
-    """重新枚举所有已打开店铺标签的「已发布到站点」清单，写 worklist.json，返回条数。"""
-    count = await collect_service.enumerate_worklist()
+async def collect_enumerate(status: str = Body("", embed=True)):
+    """重新枚举所有已打开店铺标签的清单，写 worklist.json，返回条数。
+
+    status：采集范围。空串（默认）= 跟随各店 Temu 页面当前的页签 + 所有筛选（类目/站点/
+    商品名等），点页面「查询」原样采集；非空 = 先替你切到该页签再查询。本次选择记入偏好回显。
+    """
+    tab = status or ""
+    # 记住本次采集范围，保留已存的 excel/sheet/store 不被覆盖
+    prefs = collect_service.load_prefs()
+    collect_service.save_prefs(
+        prefs.get("excel", ""), prefs.get("sheet", ""), prefs.get("store", ""), tab
+    )
+    count = await collect_service.enumerate_worklist(status_tab=tab)
     return {"count": count, "status": collect_service.get_worklist_status()}
 
 

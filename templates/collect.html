@@ -142,6 +142,14 @@
       <!-- 控制条 -->
       <div class="card mb-3">
         <div class="card-body d-flex flex-wrap gap-2 align-items-center">
+          <div class="input-group input-group-sm" style="width: 260px">
+            <span class="input-group-text">采集范围</span>
+            <select
+              id="selStatus"
+              class="form-select"
+              title="默认「跟随页面当前」：页签+类目/站点/商品名等筛选都在 Temu 页面设好，枚举时点页面「查询」原样采集。选具体页签则先替你切该页签（可能重置详细筛选）"
+            ></select>
+          </div>
           <button id="btnRefresh" class="btn btn-outline-secondary btn-sm">
             <i class="bi bi-arrow-repeat"></i> 重新枚举清单
           </button>
@@ -263,7 +271,7 @@
       let priced = {}; // spu -> {status, purchase_price, shipping}（本批实时结果覆盖）
       let evtSource = null;
       // 三级选择当前值（后端回显「上次选择」作初值）
-      let sel = { excel: "", sheet: "", store: "" };
+      let sel = { excel: "", sheet: "", store: "", status: "" };
       const MANUAL = "__manual__"; // 工作簿下拉里「手填路径」哨兵值
 
       function showToast(title, body, kind = "primary") {
@@ -403,6 +411,18 @@
                 }>${st.label}（${st.count}）</option>`
             )
             .join("");
+
+        // 采集范围下拉：首项「跟随页面当前」(value="") 为默认，其后是可选覆盖页签
+        const statusSel = $("selStatus");
+        const cur = s.status || "";
+        statusSel.innerHTML =
+          `<option value=""${cur === "" ? " selected" : ""}>跟随页面当前（含类目/站点/商品名等）</option>` +
+          (s.status_tabs || [])
+            .map(
+              (t) =>
+                `<option value="${t}"${t === cur ? " selected" : ""}>切到「${t}」</option>`
+            )
+            .join("");
       }
 
       async function loadWorklist() {
@@ -419,6 +439,7 @@
           sel.excel = s.excel || "";
           sel.sheet = s.sheet || "";
           sel.store = s.store || "";
+          sel.status = s.status || "";
           fillSelectors(s);
           renderStats(s);
           renderTable();
@@ -533,9 +554,14 @@
         $("btnRefresh").disabled = true;
         $("statusText").textContent = "重新枚举中…";
         try {
-          const r = await fetch("/collect/enumerate", { method: "POST" });
+          const r = await fetch("/collect/enumerate", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ status: sel.status }),
+          });
           const { count } = await r.json();
-          showToast("枚举完成", `共 ${count} 个商品`, "success");
+          const scope = sel.status ? `切到「${sel.status}」` : "跟随页面当前";
+          showToast("枚举完成", `${scope}，共 ${count} 个商品`, "success");
           await loadWorklist();
         } catch (e) {
           showToast("枚举失败", String(e), "danger");
@@ -585,6 +611,10 @@
       $("selStore").addEventListener("change", (e) => {
         sel.store = e.target.value;
         loadWorklist(); // 过滤到该店
+      });
+      // 采集页签只在「重新枚举」时生效，改选不重拉清单，仅记住选择
+      $("selStatus").addEventListener("change", (e) => {
+        sel.status = e.target.value;
       });
 
       loadWorklist();
