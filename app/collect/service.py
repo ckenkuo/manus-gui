@@ -46,7 +46,12 @@ DEFAULT_EXCEL = r"C:\Users\Administrator\Desktop\商品成本核算_原始备份
 DEFAULT_SHEET = "pawly全球"
 TEMU_URL = "https://agentseller.temu.com/newon/product-select"
 LIST_API = "searchForSemiSupplier"
-PUBLISHED_STATUS = 12  # secondarySelectStatusList=[12] → 已发布到站点
+# 采集范围「跟随当前页签」：不再写死 secondarySelectStatusList=[12]（已发布到站点），
+# 而是让代码去点选中的页签、抓页面此刻真正发出的列表请求 body 原样复用（见 _enumerate_one_store）。
+# 各页签的 status 码除 12 外均未实测确认，硬编码会踩「码必须实测」的规矩，故走抓包复用。
+# 采集范围下拉的「可选覆盖」页签名字（对应 Temu 界面底部 tab 文字）。默认是空串=跟随页面
+# 当前（不切页签、只点「查询」），这里仅列出想让代码替你切页签时的可选项。
+STATUS_TABS = ["全部", "价格申报中", "未发布到站点", "已发布到站点", "已下架/终止"]
 WORKLIST = config.workspace_root / "worklist.json"
 # 上次选择的工作簿/Sheet/店铺，供 UI/CLI 缺省回填（best-effort，坏了不影响采集）
 COLLECT_PREFS = config.workspace_root / "collect_prefs.json"
@@ -77,7 +82,7 @@ async def _emit(on_progress: ProgressCB, event: dict) -> None:
 
 # ---- 偏好持久化（记住上次选的工作簿/Sheet/店铺）-----------------------------
 def load_prefs() -> dict:
-    """读上次选择 {excel, sheet, store}；缺失/损坏返回 {}（best-effort，不抛错）。"""
+    """读上次选择 {excel, sheet, store, status}；缺失/损坏返回 {}（best-effort，不抛错）。"""
     if not COLLECT_PREFS.exists():
         return {}
     try:
@@ -87,13 +92,15 @@ def load_prefs() -> dict:
         return {}
 
 
-def save_prefs(excel: str = "", sheet: str = "", store: str = "") -> None:
-    """记住本次选择，供下次 UI/CLI 缺省回填。写失败只告警、不阻断采集。"""
+def save_prefs(
+    excel: str = "", sheet: str = "", store: str = "", status: str = ""
+) -> None:
+    """记住本次选择（含采集页签 status），供下次 UI/CLI 缺省回填。写失败只告警、不阻断采集。"""
     try:
         COLLECT_PREFS.parent.mkdir(parents=True, exist_ok=True)
         COLLECT_PREFS.write_text(
             json.dumps(
-                {"excel": excel, "sheet": sheet, "store": store},
+                {"excel": excel, "sheet": sheet, "store": store, "status": status},
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -164,17 +171,25 @@ def list_workbooks() -> list:
     return [p for p, _ in sorted(found.items(), key=lambda kv: kv[1], reverse=True)]
 
 
-# 页内翻页取全部商品并抽字段（命中列表接口，带 mallid + cookie）。
+# 页内翻页取全部商品并抽字段。关键：url + body 都用【页面此刻真正发出的那条列表请求】原样复用
+# （由 _enumerate_one_store 抓包传入），只把 pageNum/pageSize 覆盖掉逐页翻。这样筛选条件
+# （secondarySelectStatusList 等，即你选的页签）完全跟随当前页面，不再写死「已发布到站点」。
+# url/body 任一没抓到就返回空（best-effort，交上层「0 条不覆盖」护栏兜底），绝不猜接口/造 body。
 _FETCH_ALL_JS = r"""
-async (mallid) => {
+async ({mallid, url, body}) => {
   const out = [];
+  if (!url || !body) return out;  // 没抓到真实请求 → 不臆造，直接空
   const hdr = {'content-type': 'application/json'};
   if (mallid) hdr['mallid'] = mallid;
+  let tpl = {};
+  try { tpl = JSON.parse(body); } catch (e) { return out; }
+  const size = tpl.pageSize || 50;
   for (let pageNum = 1; pageNum <= 40; pageNum++) {
-    const resp = await fetch('/api/kiana/mms/robin/searchForSemiSupplier', {
+    // 以捕获 body 为模板，仅覆盖翻页字段，保留其余筛选条件原样
+    const payload = Object.assign({}, tpl, {pageNum, pageSize: size});
+    const resp = await fetch(url, {
       method: 'POST', headers: hdr, credentials: 'include',
-      body: JSON.stringify({pageSize: 50, pageNum,
-        secondarySelectStatusList: [__STATUS__], supplierTodoTypeList: []})
+      body: JSON.stringify(payload)
     });
     const j = await resp.json();
     const dl = (j.result && j.result.dataList) || [];
@@ -188,11 +203,11 @@ async (mallid) => {
         image: (it.carouselImageUrlList && it.carouselImageUrlList[0]) || ''
       });
     }
-    if (dl.length < 50) break;  // 最后一页
+    if (dl.length < size) break;  // 最后一页
   }
   return out;
 }
-""".replace("__STATUS__", str(PUBLISHED_STATUS))
+"""
 
 
 # best-effort 读店铺名。Temu 卖家中心（agentseller.temu.com）类名全哈希化，语义类名
@@ -228,46 +243,122 @@ _READ_STORE_NAME_JS = r"""
 """
 
 
-async def _enumerate_one_store(ctx, page, allow_cookie_fallback: bool = False) -> tuple:
-    """在单个 product-select 店铺标签内嗅 mallid + 抓该店全部商品 + 读店名。
+# 点页面自带的「查询」按钮触发一次列表请求：用当前表单里所有筛选（类目/站点/商品名/时间…）
+# + 当前选中页签原样重发，故采集范围完全跟随你在 Temu 页面的设置。精确匹配「查询」两字、
+# 显式排除「重置」，绝不误点清空筛选。找到并点中返回 true。
+_CLICK_QUERY_BTN_JS = r"""
+() => {
+  const nodes = [...document.querySelectorAll('button, [role="button"], a, span, div')];
+  const hit = nodes.find(e => {
+    const t = (e.textContent || '').replace(/\s+/g, '').trim();
+    if (t !== '查询') return false;                       // 精确「查询」，排除「重置」
+    const r = e.getBoundingClientRect();
+    return r.width > 0 && r.width < 160 && r.height > 0;   // 是个真按钮、非大容器
+  });
+  if (hit) { hit.click(); return true; }
+  return false;
+}
+"""
+
+# 按页签文字点击（可选覆盖用）：叶子/浅层节点 + 窄宽度，避免误点到含同样文字的大容器。
+# 注意切页签可能重置详细筛选，故仅在用户显式指定了具体页签时才调用（默认「跟随页面」不切）。
+_CLICK_TAB_JS = r"""
+(tab) => {
+  const t = [...document.querySelectorAll('*')].find(e =>
+    (e.textContent || '').includes(tab)
+    && e.children.length <= 2
+    && e.getBoundingClientRect().width > 0
+    && e.getBoundingClientRect().width < 200);
+  if (t) { t.click(); return true; }
+  return false;
+}
+"""
+
+
+async def _enumerate_one_store(
+    ctx, page, status_tab: str = "", allow_cookie_fallback: bool = False
+) -> tuple:
+    """在单个 product-select 店铺标签内嗅 mallid + 抓该店当前筛选下的全部商品 + 读店名。
 
     返回 (mallid, store_label, items)。items 每条打上该店 mallid/store 标签。
     单店内任一步失败只告警、返回已拿到的部分（best-effort），不阻断其它店。
+
+    触发方式：点页面自带的「查询」按钮，用表单里当前所有筛选（页签 + 类目/站点/商品名/时间…）
+    原样重发一次列表请求，抓其 url + body 翻页复用（只改 pageNum/pageSize，见 _FETCH_ALL_JS）。
+    故采集范围完全跟随你在 Temu 页面的筛选，无需在采集端重建表单、也不硬编码任何接口字段。
+
+    status_tab：可选覆盖。空串（默认）= 跟随页面当前页签，只点「查询」不切页签，保住已设的
+    详细筛选；非空 = 先替你点该页签再查询（注意：切页签可能被 Temu 重置掉详细筛选）。
 
     allow_cookie_fallback：仅【单标签】场景为 True——网络嗅探失败时退回读 mallid cookie
     （等价旧单店行为）。多标签禁用：mallid cookie 是 context 级、跨标签共享，会把当前
     激活店的 mallid 错安到别的店上（串店）。
     """
-    mallid = {"v": None}
+    # 抓包结果：mallid（请求头）+ list_url/list_body（该页签真实列表请求，供翻页复用）。
+    # req_id：CDP 对较大 POST body 会省略事件内联的 postData、只给 hasPostData 标记，此时
+    # 记下 requestId，事后用 Network.getRequestPostData 补拉真实 body（见下方等待循环后）。
+    cap = {"mallid": None, "url": None, "body": None, "req_id": None}
     client = await ctx.new_cdp_session(page)
     await client.send("Network.enable")
 
     def on_req(params):
         req = params.get("request", {})
-        if LIST_API in req.get("url", "") and not mallid["v"]:
-            mallid["v"] = req.get("headers", {}).get("mallid")
+        if LIST_API not in req.get("url", ""):
+            return
+        if not cap["mallid"]:
+            cap["mallid"] = req.get("headers", {}).get("mallid")
+        if cap["body"] or cap["req_id"]:
+            return  # 已锁定该店的列表请求，忽略后续同接口请求，避免被覆盖
+        # 列表查询是 POST：优先用事件内联的 postData；CDP 对较大 body 只给 hasPostData，
+        # 此时锁定 requestId 事后补拉，绝不臆造 body。
+        pd = req.get("postData")
+        if pd:
+            cap["url"] = req.get("url")
+            cap["body"] = pd
+        elif req.get("hasPostData"):
+            cap["url"] = req.get("url")
+            cap["req_id"] = params.get("requestId")
 
     client.on("Network.requestWillBeSent", on_req)
 
-    # 触发一次真实列表请求以抓 mallid：把该标签置前 + 点「已发布到站点」tab
+    # 触发一次真实列表请求以抓 mallid + body：把该标签置前
     try:
         await page.bring_to_front()
     except Exception:
         pass
     await asyncio.sleep(3)
-    for _ in range(20):  # 最多等 ~20s
-        if mallid["v"]:
+
+    # 若显式指定了页签，先替用户切一次（仅一次，避免反复切放大重置副作用）
+    if status_tab:
+        try:
+            switched = await page.evaluate(_CLICK_TAB_JS, status_tab)
+            if not switched:
+                logger.warning(f"未找到「{status_tab}」页签，改为跟随页面当前筛选")
+            await asyncio.sleep(1)
+        except Exception:
+            pass
+
+    for _ in range(20):  # 最多等 ~20s，直到抓到列表请求 body（或至少锁定 requestId 待补拉）
+        if cap["body"] or cap["req_id"]:
             break
         try:
-            await page.evaluate(
-                "() => { const t=[...document.querySelectorAll('*')].find("
-                "e=>/已发布到站点/.test(e.textContent||'')&&e.children.length<=2"
-                "&&e.getBoundingClientRect().width>0&&e.getBoundingClientRect().width<200);"
-                "if(t)t.click(); }"
-            )
+            # 点页面自带「查询」按钮，用当前表单所有筛选原样重发（跟随页面设置）
+            await page.evaluate(_CLICK_QUERY_BTN_JS)
         except Exception:
             pass
         await asyncio.sleep(1)
+
+    # body 未内联在事件里（CDP 对较大 POST 常如此）→ 用 requestId 补拉真实 body。
+    # 补拉失败只告警、body 仍为 None，交上层「0 条不覆盖」护栏兜底，绝不臆造。
+    if not cap["body"] and cap["req_id"]:
+        try:
+            r = await client.send(
+                "Network.getRequestPostData", {"requestId": cap["req_id"]}
+            )
+            cap["body"] = r.get("postData")
+        except Exception as e:
+            logger.warning(f"补拉列表请求 body 失败：{e}")
+    mallid = {"v": cap["mallid"]}
 
     if not mallid["v"] and allow_cookie_fallback:
         try:
@@ -280,6 +371,11 @@ async def _enumerate_one_store(ctx, page, allow_cookie_fallback: bool = False) -
             logger.warning(f"cookie 读 mallid 失败：{e}")
     if not mallid["v"]:
         logger.warning("未抓到该店 mallid（网络监听失败），尝试直接重放（可能失败/串店）")
+    if not cap["body"]:
+        logger.warning(
+            "未抓到列表请求（可能没找到「查询」按钮或页面未加载），该店返回 0 条。"
+            "请确认该店列表页已打开、可见「查询」按钮后重试。"
+        )
 
     # 店铺标签：best-effort 读店名，读不到退回 mallid
     store_label = ""
@@ -291,7 +387,11 @@ async def _enumerate_one_store(ctx, page, allow_cookie_fallback: bool = False) -
         store_label = mallid["v"] or ""
 
     try:
-        items = await page.evaluate(_FETCH_ALL_JS, mallid["v"])
+        # 用抓到的真实 url + body 翻页复用（跟随该页签筛选）；未抓到则内部返回空
+        items = await page.evaluate(
+            _FETCH_ALL_JS,
+            {"mallid": mallid["v"], "url": cap["url"], "body": cap["body"]},
+        )
     except Exception as e:
         logger.warning(f"抓取该店商品失败：{e}")
         items = []
@@ -307,9 +407,13 @@ async def _enumerate_one_store(ctx, page, allow_cookie_fallback: bool = False) -
     return mallid["v"], store_label, items
 
 
-async def enumerate_worklist() -> int:
-    """确定性枚举：遍历调试 Chrome 里所有已打开的 product-select 店铺标签，逐店命中
-    列表接口取全部「已发布到站点」商品，合并写 worklist.json，返回条数。
+async def enumerate_worklist(status_tab: str = "") -> int:
+    """确定性枚举：遍历调试 Chrome 里所有已打开的 product-select 店铺标签，逐店点「查询」
+    抓其当前筛选下的真实列表请求、翻页取全部商品，合并写 worklist.json，返回条数。
+
+    status_tab：可选覆盖。空串（默认）= 跟随各店页面当前的页签 + 所有筛选（类目/站点/商品名
+    等你在 Temu 表单里设好的条件）；非空 = 先替你点该页签再查询（切页签可能重置详细筛选）。
+    逐店透传给 _enumerate_one_store，采集端不重建表单、不硬编码任何接口字段。
 
     多店关键：mallid cookie 是 context 级、跨标签共享、只反映当前激活店，故【不能】靠
     cookie 区分店铺——必须逐标签从各自的网络请求头嗅 mallid（见 _enumerate_one_store）。
@@ -336,7 +440,7 @@ async def enumerate_worklist() -> int:
         single_tab = len(store_pages) == 1
         for idx, page in enumerate(store_pages, 1):
             mid, label, items = await _enumerate_one_store(
-                ctx, page, allow_cookie_fallback=single_tab
+                ctx, page, status_tab=status_tab, allow_cookie_fallback=single_tab
             )
             store_count += 1
             logger.info(
@@ -372,7 +476,10 @@ async def enumerate_worklist() -> int:
             pass
     WORKLIST.parent.mkdir(parents=True, exist_ok=True)
     WORKLIST.write_text(json.dumps(uniq, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info(f"枚举完成：{len(uniq)} 个商品，来自 {store_count} 个店铺标签 → {WORKLIST}")
+    logger.info(
+        f"枚举完成（页签「{status_tab}」）：{len(uniq)} 个商品，"
+        f"来自 {store_count} 个店铺标签 → {WORKLIST}"
+    )
     return len(uniq)
 
 
@@ -474,6 +581,9 @@ def get_worklist_status(
         "workbooks": workbooks,
         "sheets": sheets,
         "stores": stores,
+        # 采集范围：可选覆盖页签清单 + 上次选择（空串=跟随页面当前，供前端下拉渲染与回显）
+        "status_tabs": STATUS_TABS,
+        "status": prefs.get("status") or "",
         "excel_locked": excel_write_locked(excel),
         "items": items,
     }
@@ -897,8 +1007,9 @@ async def run_batch(
         logger.error("❌ " + msg)
         return {"ok": 0, "fail": 0, "batch": 0}
 
-    # 记住本次选择（工作簿/Sheet/店铺），供下次 UI/CLI 缺省回填
-    save_prefs(excel, sheet, store)
+    # 记住本次选择（工作簿/Sheet/店铺），供下次 UI/CLI 缺省回填；
+    # status 是枚举页签、非本批参数，沿用已存值，避免被空串覆盖丢掉。
+    save_prefs(excel, sheet, store, prefs.get("status") or "")
 
     done = WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
     todo = [
