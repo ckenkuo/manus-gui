@@ -313,6 +313,49 @@ class WpsExcelTool(BaseTool):
             return {}
 
     @classmethod
+    def read_row_by_key(
+        cls, file_path: str, sheet_name: str, key: str,
+        cols: Dict[str, str], key_col: str = "D",
+    ) -> Dict[str, str]:
+        """按 key（默认 SPU，在 key_col 列）定位数据行(row>1)，读取该行 cols 指定的各列值。
+
+        供活动管理管线在报活动前，按 SPU 回读已入库行的成本/日常价/售价等做红线校验与定价，
+        避免二次解析整表。cols: {逻辑名: 列字母}，如 {"purchase":"J","daily":"G","sale":"I"}。
+        返回 {逻辑名: 单元格文本}（只含成功读到且非空的项）；找不到 key 所在行返回 {}。
+        公式单元格返回其缓存值文本（沿用 _cell_text 行为，与 existing_key_values 判重口径一致）。
+        文件/表缺失或异常返回 {}，绝不抛错。
+        """
+        try:
+            with zipfile.ZipFile(file_path) as zf:
+                part = cls._resolve_sheet_part(zf, sheet_name)
+                if not part:
+                    return {}
+                sheet_xml = zf.read(part).decode("utf-8")
+                shared = cls._shared_strings(zf)
+                target = str(key).strip()
+                for rid, body in cls._parse_rows(sheet_xml):
+                    if rid == "1":  # 跳过表头
+                        continue
+                    km = re.search(r'<c r="%s%s"[^>]*>.*?</c>' % (key_col, rid), body, re.S)
+                    if not km:  # key_col 空/自闭合单元格，非目标行
+                        continue
+                    if cls._cell_text(km.group(0), shared).strip() != target:
+                        continue
+                    # 命中行：逐个逻辑列读文本，非空才收（自闭合空单元格匹配不到，自然跳过）
+                    out: Dict[str, str] = {}
+                    for name, col in cols.items():
+                        cm = re.search(r'<c r="%s%s"[^>]*>.*?</c>' % (col, rid), body, re.S)
+                        if not cm:
+                            continue
+                        txt = cls._cell_text(cm.group(0), shared).strip()
+                        if txt:
+                            out[name] = txt
+                    return out
+                return {}
+        except Exception:
+            return {}
+
+    @classmethod
     def _resolve_fields_from_header(cls, header: Dict[str, str]) -> Dict[str, str]:
         """把逻辑字段解析到该 Sheet 的真实列：{字段名: 列字母}。见 _FIELD_RULES。
 

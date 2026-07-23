@@ -9,6 +9,7 @@ from datetime import datetime
 from functools import partial
 from json import dumps
 from pathlib import Path
+from typing import Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,6 +103,16 @@ async def index(request: Request):
 async def collect_page(request: Request):
     """批量采集页：清单展示 + 一键开跑 + SSE 实时进度（独立于通用对话页）。"""
     return templates.TemplateResponse("collect.html", {"request": request})
+
+
+@app.get("/activity", response_class=HTMLResponse)
+async def activity_page(request: Request):
+    """活动管理页：SPU 清单 + dry-run/正式执行开关 + SSE 实时进度（独立页）。
+
+    最高优先级安全：涉及真实商家账号的不可逆操作，前端「正式执行」默认关闭，
+    默认只跑 dry-run（只读+算计划+出报名清单，不点任何变更按钮），对标采集页 base_only。
+    """
+    return templates.TemplateResponse("activity.html", {"request": request})
 
 
 @app.get("/download")
@@ -422,6 +433,125 @@ async def collect_batch_events(job_id: str):
 
     async def event_generator():
         job = collect_jobs.get(job_id)
+        if job is None:
+            yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
+            return
+        while True:
+            try:
+                event = await job.queue.get()
+            except asyncio.CancelledError:
+                break
+            if event.get("type") == "_end":
+                yield f"event: done\ndata: {dumps(job.summary)}\n\n"
+                break
+            yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ==== 活动管理（关加速器→报活动→重开加速器）：确定性批处理，独立于通用 agent ========
+# 对标上面的采集接口：ActivityJob 照抄 CollectJob（内部队列 + on_progress 塞事件 + SSE 逐条
+# yield）。与采集不同的是【安全语义】：涉及真实商家账号的不可逆操作，dry_run 默认 True，
+# 只有前端显式开「正式执行」才 False。工作簿/Sheet 枚举复用采集 service，不重复造。
+
+from app.activity import service as activity_service
+
+
+class ActivityJob:
+    """一次活动管理作业：持有进度队列，供 SSE 消费（对标 CollectJob）。"""
+
+    def __init__(
+        self, job_id: str, excel: str = "", sheet: str = "", dry_run: bool = True,
+    ):
+        self.id = job_id
+        self.excel = excel
+        self.sheet = sheet
+        self.dry_run = dry_run
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.done = False
+        self.summary: dict = {}
+
+    async def push(self, event: dict):
+        await self.queue.put(event)
+
+
+activity_jobs: dict = {}
+
+
+@app.get("/activity/worklist")
+async def activity_worklist(excel: str = "", sheet: str = ""):
+    """活动页首屏：可选工作簿/Sheet 列表 + 上次选择回显 + 全局毛利率红线默认。
+
+    工作簿/Sheet 枚举直接复用采集 service 的 get_worklist_status（同一数据源，不重复造），
+    只额外附上活动模块的全局默认毛利率（config [activity].min_margin，缺失兜底 0.15）。
+    纯读、不触发任何变更。
+    """
+    status = collect_service.get_worklist_status(
+        excel=excel or None, sheet=sheet or None,
+    )
+    return JSONResponse(content={
+        "excel": status.get("excel", ""),
+        "sheet": status.get("sheet", ""),
+        "workbooks": status.get("workbooks", []),
+        "sheets": status.get("sheets", []),
+        "excel_locked": status.get("excel_locked", False),
+        # 活动模块的全局默认毛利率红线（前端批量毛利率输入框初值）
+        "min_margin": activity_service.global_min_margin(),
+    })
+
+
+@app.post("/activity/batch")
+async def activity_batch(
+    excel: str = Body("", embed=True),
+    sheet: str = Body("", embed=True),
+    spus: str = Body("", embed=True),
+    min_margin: Optional[float] = Body(None, embed=True),
+    dry_run: bool = Body(True, embed=True),
+):
+    """启动一批活动管理作业，返回 job_id；进度经 /activity/batch/{job_id}/events (SSE) 消费。
+
+    安全：dry_run 默认 True（只读+算计划+出报名清单，不点任何变更按钮）；只有前端显式
+    开「正式执行」才传 False。spus 为原始清单文本（支持逐品 "spu:margin" 语法），min_margin
+    为本批统一毛利率红线（缺省走 config 全局默认）。excel/sheet 为目标成本核算表与 Sheet。
+    """
+    job_id = str(uuid.uuid4())
+    job = ActivityJob(job_id, excel, sheet, dry_run)
+    activity_jobs[job_id] = job
+
+    async def _on_progress(event: dict):
+        await job.push(event)
+
+    async def _run():
+        try:
+            job.summary = await activity_service.run_activity_batch(
+                spus, excel, sheet,
+                min_margin=min_margin, dry_run=dry_run, live=not dry_run,
+                on_progress=_on_progress,
+            )
+        except Exception as e:
+            await job.push({"type": "aborted", "reason": f"活动管理异常：{e}"})
+        finally:
+            job.done = True
+            await job.push({"type": "_end"})  # 哨兵：通知 SSE 收尾
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/activity/batch/{job_id}/events")
+async def activity_batch_events(job_id: str):
+    """SSE 推送某次活动管理作业的结构化进度事件（原样转发 service 的 on_progress 事件）。"""
+
+    async def event_generator():
+        job = activity_jobs.get(job_id)
         if job is None:
             yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
             return

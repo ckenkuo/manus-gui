@@ -156,3 +156,11 @@ use_data_analysis_agent = false     # The Data Analysi Agent to solve various da
 # top_k = 2                              # how many similar recipes to inject
 # min_score = 0.35                       # relevance floor gate
 # rrf_k = 60                             # reciprocal rank fusion constant
+
+# 活动管理管线（Temu 关流量加速器 → 报活动 → 开加速器）默认参数。
+# 毛利率红线三级回退：此处全局默认 → 本批运行值(web/CLI) → SPU清单逐品覆盖(spu:margin)。
+[activity]
+# 最低毛利率红线：申报价须保证 (申报价-成本)/申报价 >= 此值，否则跳过不报（skip_redline）。
+min_margin = 0.15
+# 申报价策略：'discount_ceiling'=贴活动折扣上限取最高价（守利润同时少让利）。
+price_strategy = "discount_ceiling"
