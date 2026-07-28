@@ -689,3 +689,78 @@ async def run_activity_batch(spus, excel, sheet, min_margin, dry_run=True, on_pr
   中，默认不可见。开启动作现在对 `skipped/failed/warning` 状态在 badge 下方直接显示原因文本，例如
   **无成功报名活动，不新增开启流量**；悬浮 title 仍保留完整原因。
 - 新增 `accel-flow-note` UI 回归断言。service 需重启、网页刷新后生效。
+
+### 15.30 报名成功判据放宽：列表出现且非「已退出」即成功（2026-07-24）
+- 2026-07-23 23:32~23:41 live 批次（SPU 2801689369，初始流量 off）报了 17 个活动：
+  4 个 `enrollStatus=4` 核验成功、9 个详情不符、4 个被判「报名记录存在但未成功」
+  （`enrollStatus=1`×2：夏季8折/破冰85折；`3`×2：半托管85折/新品8折）。初始 off 商品的开流量
+  闸门要求全部计划活动被「成功/详情不符」解析，4 个悬置 → 阶段三根本没发起开流量（不是开了
+  失败），最终 fail=1，note「流量最终状态未完成（初始=off）」。
+- 用户后台核对：那 4 条都是正常报名记录（夏季8折接口=1、页面显示「进行中」，场次
+  2026-07-05~07-31 已开始）。**平台规则：报名记录只要在列表出现、且不是「已退出」即代表
+  成功报名**。成功值标定：`4`=报名成功待开始（07-22 标定）、`1`/`3`=进行中（07-24 用户核对）；
+  已开始的场次报成功后不会是 4，旧 `==4` 判据把「进行中」误伤成未成功。
+- `_parse_activity_log_item` 成功判据由「==4 且无场次失败原因」放宽为「非已退出即成功」；
+  场次失败原因不再否决，改为成功 note 附注。**已退出=enrollStatus 6**（2026-07-24 用户后台
+  核对确认），数值命中即判退出，记录文本含「已退出」作兜底；未标定的状态值按成功计并打
+  校准日志供回填 `_EXITED_ENROLL_STATUSES`。service 未成功原因文案改为「报名记录存在但已退出」。
+  完整标定：1/3=进行中、4=报名成功待开始、6=已退出。
+- 该 SPU 流量仍保持 off（管线全程未动它），重跑批次即可验证闭环：4 个活动对账转正 →
+  `all_resolved=true` → 阶段三自动补开流量。
+- 附带观察：规则弹窗内容「加载中...」时做活动名绑定必然 mismatch，17 个活动里 15 个首次
+  打开因此失败、等约 8s 重试才成功（每个活动白等 ~10s），可改为绑定前先等弹窗正文加载完。
+
+### 15.31 修复规则弹窗「加载中」竞态：不再整轮重试（2026-07-24）
+- 根因：`_CLICK_ACTIVITY_RULE_JS` 在弹窗正文异步加载完成前就做活动名绑定。正文「加载中...」
+  时标题区还是占位符（活动名未渲染），`text.includes(target)` 必然为假 → 旧代码归为 mismatch →
+  `open_enroll_page` 整轮重试（重新标记报名按钮、重新点、再等），每个活动白等约 8s。15/17 个
+  活动首次打开都栽在这里。
+- 修复：JS 在命中「活动详情」大层时探测正文是否含「加载中」，含则返回新状态 `loading`（而非
+  mismatch）。`open_enroll_page` 的等弹窗轮询把 `loading` 当「还没加载完，继续轮询」——不 break、
+  不重试；只有正文加载完仍不含目标活动名才判 mismatch 整轮重试。轮询上限从 16 提到 20（10s），
+  持续 loading 超时打专门日志区分于真 mismatch。绑定安全性不变（仍要求弹层同时含「活动详情」
+  和完整活动名）。
+- 验证：新增 `test_open_enroll_page_waits_out_rule_popup_loading`（连续 2 次 loading 后 clicked，
+  断言只标记报名按钮 1 次=没整轮重试）；`test_activity_rule_button_supports_non_dialog_fullscreen_layer`
+  补断言 JS 含 loading 分支。service 需重启后生效。
+
+### 15.32 开流量判成败改用接口状态兜底：toast 不权威（2026-07-24）
+- 承 §15.30 判据放宽后首次真跑到阶段三：SPU 2801689369 报名 9 提交+8 详情不符=17 全 resolved，
+  闸门放行、开流量动作真的执行了（点「立即加速」1 次、填价 41），但日志「未捕获成功提示
+  （等待流量加速结果提示超时）」→ 判 opened=False → 上层报「流量加速失败」、fail。
+- 根因：`_open_accel_once` 完整路径判成功【只信瞬时 toast】（`_wait_accel_submit_feedback` 抓
+  「成功」提示，8s 没抓到返回 unknown）。但点「立即加速」后页面刷新/toast 一闪而过时抓不到，
+  抓不到≠没开成。对比旧路径（无 accel_price）点完是用 `verify_state` 回读行状态校验的，完整
+  路径却没有任何状态兜底——设计遗漏。而权威依据一直在手边：`_search_flux_product` 已解析平台
+  列表接口，`read_accel_state(search=True)` 走 /list 接口 + 行「流量加速中」文本即持久权威状态。
+- 修复（单次内两级判定）：`_open_accel_once` 里 feedback.status==unknown 时不直接判失败，回读
+  一次 `read_accel_state(search=True)`，状态=on 即判 opened=True（note 注明「未捕获成功提示，但
+  回查流量页确认状态=加速中」）；回读仍非 on 才如实失败。busy（火爆重试）与明确 success 的既有
+  判定完全不动。与本项目「submitted 不可信、必须回查对账」铁律同构：toast 不权威、接口状态才权威。
+- 外层整轮重试（用户要求 2026-07-24）：`open_accel` 再包一层「开启→回查确认」重试，最多 3 次。
+  一轮结束仍未确认开启成功（opened=False）则等状态回显后从 precheck 重走整套开启流程，直到成功
+  或用尽 3 次。安全前提：每轮 `_open_accel_once` 开头都按 SPU 回查状态，读到 on 即 no-op 成功——
+  「上一轮其实已开成、只是没抓到 toast」时下一轮 precheck 读到 on 直接成功返回，绝不重复点「立即
+  开启」（开流量不可逆锁 24h），故重试对已开成的品幂等。半程 allow=False 不真开、opened 恒 False，
+  整轮重试无意义，只跑一次。两级重试互不干扰：busy 是按钮级重点（`_click_open_with_busy_retries`），
+  本外层是整轮重走。
+- 验证：新增 `test_open_accel_verifies_by_state_when_toast_unknown`（unknown+回读 on→opened）、
+  `test_open_accel_stays_failed_when_toast_unknown_and_state_off`（unknown+回读 off→失败）、
+  外层重试 4 个测试（三轮后成功/已 on 幂等 no-op/用尽 3 次报失败/半程只跑一次），60 passed。
+  service 需重启后生效；重启后重跑该 SPU 应从 fail 转 done。
+
+### 15.33 超参考价失败反推「建议核对日常价」（2026-07-24）
+- 现象：SPU 6322830186 报多个活动，日志「申报价 7.0 高于提报页参考价 6.65（疑 Excel 日常价与
+  前端实际售价不一致）——已跳过未报名」。根因不是代码 bug：Excel 日常价 8.24 系统性偏高约 5.4%，
+  平台参考价按前端实际售价 × 折扣率给出（6.65 = 7.82 × 0.85），Excel 记的 8.24 偏高 → 按 Excel
+  算的申报价 7.0 超过参考价，平台必拒。
+- 用户要求：采集的 Excel 数据本身可能过期/错误，遇到超参考价要给出【建议人工核对的日常价】。
+- 实现：新增纯函数 `build_over_ref_note(submit_price, ref_price, daily_price, discount_rate)`。
+  正算 `submit_price = 日常价 × 折扣率`，平台参考价同样是「前端实际售价 × 折扣率」，故
+  `参考价 / 折扣率 = 平台认可的前端售价基准 ≈ 应填日常价`。反推 `suggested = round(ref/dr, 2)`
+  （dr 缺省/≤0 时不反推、退回原「请核对 Excel 日常价」文案，绝不抛错或给错误建议）。note 同时
+  给出「平台认可日常价约 X，当前 Excel 日常价 Y」并排，供操作者核对。
+- `enroll_activity` 签名加 `daily_price=None, discount_rate=None`（仅超参考价时反推用，不参与任何
+  主流程判定，申报价仍是既算好的 submit_price）；service 在 enrolled/by_activity 两处透传 daily/dr。
+- 验证：`test_build_over_ref_note_backsolves_suggested_daily_price`（6.65/0.85→7.82）、
+  `test_build_over_ref_note_without_discount_falls_back`（dr 缺省/0→不反推），全套 62 passed。

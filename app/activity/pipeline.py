@@ -563,17 +563,41 @@ _MARK_ACTIVITY_LOG_SPU_JS = r"""
 """
 
 
+# 报名成功判据（用户实机规则 2026-07-24）：报名记录只要出现在 /log 列表、且不是「已退出」，
+# 即为成功报名。已实测标定的成功 enrollStatus：4=报名成功待开始（2026-07-22 标定）、
+# 1=进行中、3=进行中（2026-07-24 用户后台核对：夏季8折/破冰85折=1、半托管85折/新品8折=3，
+# 均为正常报名记录；已开始的场次报成功后不会是 4）。此前按 ==4 严判，把「进行中」的 1/3
+# 误伤成未成功，连带初始 off 商品被挡在开流量闸门外（报名未全部解析不新增开启）。
+# 「已退出」对应 enrollStatus=6（2026-07-24 用户后台核对确认）。数值命中即判退出，文本探测
+# 仅作兜底（接口偶尔带状态文案字段时多一层保险）。旧判据里的「有场次失败原因不算成功」随
+# 用户规则一并废弃——记录出现在列表即算成功，场次原因仅保留在记录里供人工查阅。
+_EXITED_ENROLL_STATUSES = frozenset({6})
+_EXITED_STATUS_WORDS = ("已退出",)
+# 已实测标定过的状态值：1/3=进行中、4=待开始、6=已退出；未见过的值按用户规则计为成功，
+# 但打校准日志供回填标定。
+_KNOWN_ENROLL_STATUSES = frozenset({1, 3, 4, 6})
+
+
 def _parse_activity_log_item(item: dict) -> dict:
     session_failures = [
         session.get("sessionFailReason") for session in (item.get("assignSessionList") or [])
         if session.get("sessionFailReason")
     ]
     enroll_status = item.get("enrollStatus")
+    status_text = " ".join(str(value) for value in item.values() if isinstance(value, str))
+    exited = enroll_status in _EXITED_ENROLL_STATUSES or any(
+        word in status_text for word in _EXITED_STATUS_WORDS
+    )
+    if enroll_status not in _KNOWN_ENROLL_STATUSES and not exited:
+        logger.info(
+            f"[活动记录] 未标定的 enrollStatus={enroll_status}（按用户规则计为成功），"
+            f"enrollId={item.get('enrollId')}，请后台核对是否为「已退出」并回填标定"
+        )
     return {
         "spu": str(item.get("productId") or ""),
         "activity": item.get("activityThematicName") or item.get("activityTypeName") or "",
         "enroll_status": enroll_status,
-        "success": enroll_status == 4 and not session_failures,
+        "success": not exited,
         "enroll_time": item.get("enrollTime"),
         "enroll_id": item.get("enrollId"),
         "session_failures": session_failures,
@@ -859,6 +883,35 @@ async def judge_activity(
         logger.warning(f"judge_activity：LLM 返回了不在候选里的活动「{chosen}」，视为无匹配")
         return {"activity": None, "reason": f"返回了未知活动：{chosen}"}
     return {"activity": chosen, "reason": reason}
+
+
+def build_over_ref_note(submit_price, ref_price, daily_price, discount_rate) -> dict:
+    """申报价超参考价时生成失败提示：反推平台认可的日常价基准，供操作者核对 Excel。
+
+    正算是 submit_price = 日常价 × 折扣率（见 compute_submit_price）；平台参考价同样是
+    「前端实际售价 × 折扣率」，故 参考价 / 折扣率 = 平台认可的前端售价基准（≈应填的日常价）。
+    折扣率无效（缺省/≤0）时不反推，退回原文案。返回 {note, suggested_daily_price, current_daily_price}。
+    """
+    dr_num = _to_number(discount_rate)
+    dp_num = _to_number(daily_price)
+    suggest = round(ref_price / dr_num, 2) if (dr_num is not None and dr_num > 0) else None
+    if suggest is not None and dp_num is not None:
+        hint = (
+            f"（按活动折扣 {dr_num} 反推：平台认可日常价约 {suggest}，"
+            f"当前 Excel 日常价 {dp_num}，请把该商品日常价核对为约 {suggest} 后重报）"
+        )
+    elif suggest is not None:
+        hint = (
+            f"（按活动折扣 {dr_num} 反推：平台认可日常价约 {suggest}，"
+            f"请核对该商品 Excel 日常价后重报）"
+        )
+    else:
+        hint = "（疑 Excel 日常价与商品前端实际售价不一致）——请核对该商品 Excel 日常价"
+    return {
+        "note": f"申报价 {submit_price} 高于提报页参考价 {ref_price}{hint}——已跳过未报名",
+        "suggested_daily_price": suggest,
+        "current_daily_price": dp_num,
+    }
 
 
 def compute_submit_price(daily_price, discount_rate, sale) -> dict:
@@ -1341,6 +1394,7 @@ _CLICK_ACTIVITY_RULE_JS = r"""
   const buttons = [...document.querySelectorAll('button,a,[role="button"]')]
     .filter(button => visible(button) && norm(button.textContent).includes('同意活动规则'));
   let fallbackText = '';
+  let fallbackLoading = false;
   for (const button of buttons) {
     let node = button;
     for (let depth = 0; depth < 16 && node && node !== document.body; depth += 1) {
@@ -1349,6 +1403,10 @@ _CLICK_ACTIVITY_RULE_JS = r"""
       const isLargeLayer = rect.width >= 400 && rect.height >= 250;
       if (isLargeLayer && text.includes('活动详情')) {
         fallbackText = (node.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        // 弹窗正文异步加载：「加载中」期间活动名还没渲染（实测 2026-07-23，标题区是
+        // 占位符「-」）。此刻绑定必然 mismatch，必须让调用方继续轮询等正文加载完，
+        // 而不是当失败整轮重试。外层文本含内层全部内容，最外层大层命中即可。
+        fallbackLoading = text.includes('加载中');
       }
       if (isLargeLayer && text.includes('活动详情') && text.includes(target)) {
         if (button.disabled || String(button.className || '').includes('disabled')) {
@@ -1361,6 +1419,9 @@ _CLICK_ACTIVITY_RULE_JS = r"""
     }
   }
   if (buttons.length) {
+    if (fallbackLoading) {
+      return {status: 'loading', actual: fallbackText};
+    }
     return {status: 'mismatch', actual: fallbackText || '规则按钮所在弹层未包含目标活动名'};
   }
   return {status: 'none', actual: ''};
@@ -1375,7 +1436,7 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
     ① 保留启动前已存在的 detail-new tab（可能是操作者手动截图/测试页）；
     ② 用 _MARK_ENROLL_JS 按活动名精确标记报名 a；
     ③ JS click 报名（绕过虚拟列表/遮挡的可见性超时）→ 等活动详情弹窗；
-    ④ 只在【包含目标活动名】的规则弹窗内点「同意活动规则」；
+    ④ 只在【包含目标活动名】的规则弹窗内点「同意活动规则」（正文「加载中」时等其加载完再绑定）；
     ⑤ 用点击前/后 Page 对象集合 diff 认本次新 tab。失败只关闭本次新建页，绝不碰既有页。
     """
     await dismiss_all_page_popups(activity_page)
@@ -1404,9 +1465,13 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
 
         # ④ 同时等直接打开的新页或目标活动规则弹窗。不能全页找「同意活动规则」直接点：
         #    上一活动残留弹窗会导致目标「官方大促」实际再次打开「限时秒杀」。
+        #    实测教训（2026-07-23，15/17 个活动首次打开失败）：弹窗正文「加载中...」期间
+        #    活动名尚未渲染，此刻绑定必然 mismatch——loading 只是没加载完，继续轮询即可；
+        #    只有加载完仍不含目标活动名才判 mismatch 整轮重试。此前每个活动白等 ~8s。
         agreed = False
         modal_mismatch = None
-        for _ in range(16):
+        modal_loading = False
+        for _ in range(20):
             await asyncio.sleep(0.5)
             direct_pages = [
                 page for page in ctx.pages
@@ -1415,16 +1480,23 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
             if direct_pages:
                 break
             rule = await activity_page.evaluate(_CLICK_ACTIVITY_RULE_JS, activity_name)
-            if rule.get("status") == "clicked":
+            rule_status = rule.get("status")
+            if rule_status == "clicked":
                 agreed = True
                 break
-            if rule.get("status") in {"mismatch", "blocked"}:
+            if rule_status in {"mismatch", "blocked"}:
                 modal_mismatch = rule
                 break
+            if rule_status == "loading":
+                modal_loading = True
         if modal_mismatch:
             logger.error(
                 f"[活动] 规则弹窗未绑定目标「{activity_name}」："
                 f"{modal_mismatch.get('actual') or modal_mismatch.get('status')}；未点击并重试"
+            )
+        elif not agreed and modal_loading:
+            logger.error(
+                f"[活动] 规则弹窗正文持续「加载中」超 10s 未渲染完：{activity_name}；未点击并重试"
             )
         elif not agreed:
             logger.info(f"[活动] 未见「同意活动规则」按钮（可能无需同意或弹窗未出）：{activity_name}")
@@ -1577,8 +1649,13 @@ async def _set_sessions_all(page) -> dict:
 
 async def enroll_activity(
     page, spu, activity, submit_price, allow_submit=False, on_step=None,
+    daily_price=None, discount_rate=None,
 ) -> dict:
     """在提报页(detail-new)给某 SPU 搜索→勾选→设置场次(全选)→填申报价；allow_submit=False 停在提交前。
+
+    daily_price/discount_rate 仅在申报价超参考价时用于反推「建议核对的日常价」写进失败 note
+    （submit_price = daily_price × discount_rate 的逆运算：平台参考价 / discount_rate 即平台认可
+    的前端售价基准）。二者可缺省，缺省时失败 note 退回原文案、不影响任何主流程判定。
 
     page 须为该活动已打开的 detail-new 提报页。实测操作序列（2026-07-17 半程试点验证）：
     实测操作序列（2026-07-17 用户逐步纠正后定稿）：
@@ -1699,10 +1776,11 @@ async def enroll_activity(
     if ref_price is not None and float(submit_price) > ref_price:
         result["over_ref"] = True
         result["failed_step"] = "fill_price"
-        result["note"] = (
-            f"申报价 {submit_price} 高于提报页参考价 {ref_price}"
-            f"（疑 Excel 日常价与商品前端实际售价不一致）——已跳过未报名，请核对该商品 Excel 日常价"
-        )
+        # 超参考价：反推平台认可的日常价基准写进 note，供操作者核对 Excel（见 build_over_ref_note）。
+        over = build_over_ref_note(submit_price, ref_price, daily_price, discount_rate)
+        result["note"] = over["note"]
+        result["suggested_daily_price"] = over["suggested_daily_price"]
+        result["current_daily_price"] = over["current_daily_price"]
         await report("fill_price", False, result["note"])
         return result
 
@@ -2144,19 +2222,76 @@ async def _open_accel_once(page, spu, allow=False, accel_price=None) -> dict:
         result["note"] = "未点到最终「立即加速」按钮"
         return result
     result["opened"] = feedback["status"] == "success"
-    # 成功 toast 是平台提交结果的权威判据；商品行可能仍保留旧状态，字段只作非权威快照。
-    result["row_state_snapshot"] = await read_accel_state(page, spu) if result["opened"] else "off"
-    result["note"] = (f"已开启加速、加速价设为 {accel_price}（{price['rows_filled']} 个 SKC，"
-                      f"最终按钮点击 {feedback['clicks']} 次，成功提示：{feedback['message']}）"
-                      if result["opened"] else
-                      f"最终按钮点击 {feedback['clicks']} 次、填价 {accel_price}；"
-                      f"未捕获成功提示（{feedback['message'] or feedback['status']}）")
+    # 成功 toast 抓到即权威判成功。但 toast 是瞬时的：点「立即加速」后页面刷新/toast 一闪而过
+    # 时 _wait_accel_submit_feedback 会返回 unknown（实测 2026-07-24：动作已执行、填价 41，却因
+    # 没抓到成功提示被判失败）。此时不能像旧代码那样直接判未开——回读一次流量页按 SPU 查询，
+    # 用平台列表接口的持久状态（read_accel_state 内部走 /list 接口 + 行「流量加速中」文本）兜底。
+    # 这与本项目「submitted 不可信、必须回查对账」的铁律同构：toast 不权威，接口状态才权威。
+    # 只对 unknown 兜底；busy（火爆）与明确 success 的既有判定不变。
+    verified_by_state = False
+    if not result["opened"] and feedback.get("status") == "unknown":
+        recheck_state = await read_accel_state(page, spu, search=True)
+        if recheck_state == "on":
+            result["opened"] = True
+            verified_by_state = True
+    # 商品行状态快照：opened 时回读一次作非权威快照（兜底路径已读过则复用其结论）。
+    result["row_state_snapshot"] = (
+        "on" if verified_by_state
+        else (await read_accel_state(page, spu) if result["opened"] else "off")
+    )
+    if result["opened"] and verified_by_state:
+        result["note"] = (f"已开启加速、加速价设为 {accel_price}（{price['rows_filled']} 个 SKC，"
+                          f"最终按钮点击 {feedback['clicks']} 次；未捕获成功提示，"
+                          f"但回查流量页确认状态=加速中）")
+    elif result["opened"]:
+        result["note"] = (f"已开启加速、加速价设为 {accel_price}（{price['rows_filled']} 个 SKC，"
+                          f"最终按钮点击 {feedback['clicks']} 次，成功提示：{feedback['message']}）")
+    else:
+        result["note"] = (f"最终按钮点击 {feedback['clicks']} 次、填价 {accel_price}；"
+                          f"未捕获成功提示且回查流量页状态非加速中"
+                          f"（{feedback['message'] or feedback['status']}）")
     return result
 
 
-async def open_accel(page, spu, allow=False, accel_price=None) -> dict:
-    """开启流量加速；具体防护与平台火爆重试见 `_open_accel_once`。"""
-    return await _open_accel_once(page, spu, allow=allow, accel_price=accel_price)
+async def open_accel(page, spu, allow=False, accel_price=None, tries=3) -> dict:
+    """开启流量加速，外层「开启→回查状态确认」重试，最多 tries 次（用户要求 2026-07-24）。
+
+    单次执行（`_open_accel_once`）内部已有两级判定：点「立即加速」后先等成功 toast，toast 抓不到
+    （unknown）时回查一次流量页状态兜底。本外层再包一层：一轮结束仍未确认开启成功（opened=False）
+    时，等状态回显后【重来一轮】，直到成功或用尽 tries 次。
+
+    安全前提（关键）：每轮 `_open_accel_once` 开头都 `read_accel_state(search=True)` 按 SPU 回查
+    状态，读到 on 即 no-op 直接判成功——所以「上一轮其实已开成、只是没抓到 toast」时，下一轮
+    precheck 会读到 on 并成功返回，绝不会重复点「立即开启」（开流量不可逆、锁 24h）。故这里的
+    重试对已开成的品是幂等的。busy（平台火爆）的按钮级重试仍在 `_click_open_with_busy_retries`
+    里，与本外层的整轮重试是两个层级：前者只重点按钮，后者从 precheck 重走整套开启流程。
+
+    半程（allow=False）不真开、opened 恒为 False，整轮重试无意义且徒增页面查询，故只跑一次。
+    """
+    if not allow:
+        return await _open_accel_once(page, spu, allow=allow, accel_price=accel_price)
+    last = None
+    for attempt in range(1, tries + 1):
+        result = await _open_accel_once(page, spu, allow=allow, accel_price=accel_price)
+        result["open_attempts"] = attempt
+        if result.get("opened"):
+            if attempt > 1:
+                # 前几轮未确认、这轮成功：把尝试次数并进 note，便于事后判读是靠重试救回来的。
+                result["note"] = f"第 {attempt} 次尝试确认开启成功；{result.get('note', '')}"
+            return result
+        last = result
+        if attempt < tries:
+            logger.warning(
+                f"[流量] SPU={spu} 第 {attempt} 次开启未确认成功，等待状态回显后重试："
+                f"{result.get('note', '')}"
+            )
+            await asyncio.sleep(2)
+    if last is not None:
+        last["note"] = f"重试 {tries} 次仍未确认开启成功；{last.get('note', '')}"
+    return last if last is not None else {
+        "state": "unknown", "precheck_state": "unknown", "opened": False,
+        "open_attempts": 0, "note": "开启未执行",
+    }
 
 
 async def _wait_accel_submit_feedback(page, tries=32) -> dict:

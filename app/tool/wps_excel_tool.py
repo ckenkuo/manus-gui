@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from app.config import get_output_dir
+from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
 
 
@@ -33,8 +34,8 @@ NS_ETC = "http://www.wps.cn/officeDocument/2017/etCustomData"
 _CELL_REF_RE = re.compile(r"(?<![A-Za-z0-9_$])(\$?)([A-Z]{1,3})(\$?)(\d+)")
 
 # 逻辑字段 → 表头标题判定。采集管道要往【任意布局】的 Sheet 写，绝不能再假设固定列序：
-# 实测同一工作簿里 pawly美国/pawly全球/wintak/VibeMakers 各 Sheet 的列序都不同（SPU 在
-# C 还是 D、图片在 D 还是 E、采购价在 I 还是 J…全不一样），旧代码把字段硬编码成 pawly全球
+# 实测同一工作簿里 storeA美国/storeA全球/storeB/StoreC 各 Sheet 的列序都不同（SPU 在
+# C 还是 D、图片在 D 还是 E、采购价在 I 还是 J…全不一样），旧代码把字段硬编码成 storeA全球
 # 的列 → 换 Sheet 就整体错位（SPU 写进"产品图片"列、采购价写进"重量"列）。改为按【表头标题】
 # 把每个逻辑字段解析到该 Sheet 的真实列。
 # 规则顺序即认领优先级；一列至多归一个字段（先到先得）。pick='last' 用于"备注"——有的
@@ -80,6 +81,27 @@ def _xml_escape(text: str) -> str:
     )
 
 
+def _xml_unescape(text: str) -> str:
+    """XML 预定义实体与数字字符引用还原成真实字符。
+
+    为什么必须做：登记表里手工录入的尺码常带软换行，sharedStrings 存的是
+    `蓝色 / 120&#10;`。判重时拿它跟导出文件里的 `蓝色 / 120` 比永远不相等，
+    同一行每次跑都会被当成新订单重写一遍。&amp; 必须最后还原，否则
+    `&amp;lt;` 会被二次解成 `<`。
+    """
+    if "&" not in text:
+        return text
+    text = re.sub(r"&#x([0-9a-fA-F]+);", lambda m: chr(int(m.group(1), 16)), text)
+    text = re.sub(r"&#(\d+);", lambda m: chr(int(m.group(1))), text)
+    return (
+        text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", '"')
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+    )
+
+
 class WpsExcelTool(BaseTool):
     """安全读写 WPS DISPIMG 嵌入图表格，不破坏嵌入图与格式。
 
@@ -116,7 +138,7 @@ class WpsExcelTool(BaseTool):
             },
             "sheet_name": {
                 "type": "string",
-                "description": "工作表名称，如 'wintak童装货盘记录'",
+                "description": "工作表名称，如 'storeB童装货盘记录'",
             },
             "column_values": {
                 "type": "object",
@@ -158,7 +180,161 @@ class WpsExcelTool(BaseTool):
 
     @staticmethod
     def _parse_rows(sheet_xml: str) -> List[tuple]:
-        return re.findall(r'<row r="(\d+)"[^>]*>(.*?)</row>', sheet_xml, re.S)
+        """解析 sheetData → [(行号字符串, 行内容)]；自闭合空行 <row .../> 的内容为空串。
+
+        为什么不能只写 `<row r="(\\d+)"[^>]*>(.*?)</row>`：WPS 表尾常有整片只带行高的
+        预留空行 `<row r="283" ht="41" customHeight="1"/>`，`[^>]*` 会连自闭合的 `/` 一起
+        吃掉、把它后面那个 `>` 当成开标签结束，于是这一行的 body 一路吞到【下一个带内容
+        行】的 `</row>`——既漏掉中间所有空行，又把别人的单元格算进它头上。订单登记表
+        实测 3080 个 <row> 只解析出 3062 个，末行定位与判重随之失真。
+        """
+        out: List[tuple] = []
+        for m in re.finditer(
+            r'<row\s+r="(\d+)"[^>]*?(?:/>|>(.*?)</row>)', sheet_xml, re.S
+        ):
+            out.append((m.group(1), m.group(2) or ""))
+        return out
+
+    @staticmethod
+    def _row_positions(sheet_xml: str) -> Dict[int, tuple]:
+        """一次扫描建 {行号: (起始偏移, 结束偏移, 开标签)}，供批量追加定位替换/插入点。
+
+        开标签统一归一成带 `>` 的形式：自闭合空行 `<row r="283" ht="41"/>` 归一为
+        `<row r="283" ht="41">`，这样复用它就能保留预留空行的行高（ht="41" 正是给
+        嵌入图留的高度），而不必从模板行猜。
+        """
+        pos: Dict[int, tuple] = {}
+        for m in re.finditer(
+            r'<row\s+r="(\d+)"[^>]*?(?:/>|>.*?</row>)', sheet_xml, re.S
+        ):
+            text = m.group(0)
+            if text.endswith("/>"):
+                open_tag = text[:-2].rstrip() + ">"
+            else:
+                open_tag = re.match(r"<row\b[^>]*>", text).group(0)
+            pos[int(m.group(1))] = (m.start(), m.end(), open_tag)
+        return pos
+
+    @staticmethod
+    def _shift_ref_rows(ref: str, at: int, n: int) -> str:
+        """把区域字符串里 >= at 的行号统一 +n，用于插行后修正 mergeCell / 条件格式 / 筛选区。
+
+        规则等同 Excel「在 at 行插入 n 行」：行号 < at 的端点不动（表头那一端要留在第 1 行），
+        >= at 的端点后移。上限死死卡在 1048576——条件格式的 `C200:C1048576` 这种到底的区域
+        再加就越界，整个 sqref 会被 WPS 判为非法而丢掉整条规则。
+        `sqref` 可能是空格分隔的多段，`definedName` 里还带 `$`，都要吃得下。
+        """
+        def one(mo: "re.Match") -> str:
+            row = int(mo.group(2))
+            return mo.group(1) + str(min(row + n, 1048576) if row >= at else row)
+
+        return " ".join(
+            re.sub(r"(\$?[A-Z]+\$?)(\d+)", one, seg)
+            for seg in ref.split()
+        )
+
+    @classmethod
+    def _shift_data_region(cls, region: str, at: int, n: int) -> str:
+        """把一段 sheetData 切片里所有行号 +n（行本身的 r、单元格的 r、共享公式的 ref）。
+
+        只对「表头下一行起的连续整段」用，所以段内行号必然 >= at，无需再筛。
+        为什么不顺手平移公式文本里的引用：本表 362 个公式全是 DISPIMG（参数是图片 ID，
+        与行号无关）。真出现带单元格引用的公式就直接抛错——移了行不改公式等于静默算错，
+        比中止危险得多。
+        """
+        # 负向预查排掉自闭合的 `<f t="shared" si="0"/>`（共享公式的从属格）：把它当开标签
+        # 会一路吃到下一个 </f>，把中间那些 <v>=DISPIMG(...) 缓存值误当成公式内容
+        for mo in re.finditer(r"<f(?![^>]*/>)[^>]*>(.*?)</f>", region, re.S):
+            # 先摘掉整个 DISPIMG(...) 调用：它的参数是 ID_8C37B8B8... 这种十六进制串，
+            # 只摘函数名会把 ID 里的「字母+数字」误判成单元格引用
+            expr = re.sub(r"DISPIMG\([^)]*\)", "", mo.group(1))
+            if re.search(r"\$?[A-Z]{1,3}\$?\d+", expr):
+                raise ValueError(
+                    f"插行会让公式引用错位（公式片段：{mo.group(1)[:60]}），已中止，"
+                    "请改用追加模式或先人工处理该公式"
+                )
+        region = re.sub(
+            r'(<row\s+r=")(\d+)', lambda m: m.group(1) + str(int(m.group(2)) + n), region
+        )
+        region = re.sub(
+            r'(<c\s+r="[A-Z]+)(\d+)', lambda m: m.group(1) + str(int(m.group(2)) + n), region
+        )
+        return re.sub(
+            r'(\sref=")([^"]+)(")',
+            lambda m: m.group(1) + cls._shift_ref_rows(m.group(2), at, n) + m.group(3),
+            region,
+        )
+
+    @classmethod
+    def _shift_tail_refs(cls, tail: str, at: int, n: int) -> str:
+        """平移 `</sheetData>` 之后的引用：mergeCell / autoFilter / 条件格式 sqref，
+        外加 cfRule 公式里的【绝对】行号。
+
+        cfRule 公式里两种引用混着用：绝对的（`$C$1:$C$10`，指向 sqref 圈定的那几段，
+        必须跟着动）和相对的（`C1`，代表「当前被求值的单元格」，锚在 sqref 左上角、
+        行号是 1 不能动）。只动带 `$` 的那种正是 Excel 插行的语义——只改 sqref 不改公式，
+        登记表那条「订单号重复就标红」的规则会整段错位。
+        """
+        def abs_row(mo: "re.Match") -> str:
+            row = int(mo.group(2))
+            return mo.group(1) + (str(min(row + n, 1048576)) if row >= at else mo.group(2))
+
+        tail = re.sub(
+            r'(\s(?:ref|sqref)=")([^"]+)(")',
+            lambda m: m.group(1) + cls._shift_ref_rows(m.group(2), at, n) + m.group(3),
+            tail,
+        )
+        return re.sub(
+            r"(<formula>)(.*?)(</formula>)",
+            lambda m: m.group(1)
+            + re.sub(r"(\$[A-Z]+\$)(\d+)", abs_row, m.group(2))
+            + m.group(3),
+            tail,
+            flags=re.S,
+        )
+
+    @classmethod
+    def _shift_for_insert(
+        cls, sheet_xml: str, row_pos: Dict[int, tuple], header_row: int, n: int
+    ) -> str:
+        """为「表头下插 n 行」腾位：表头以下所有行号 +n，表尾区域引用同步平移。
+
+        语义对齐 Excel 的「插入行」：表头下方的一切（数据行、预留空行、底部纯格式空行）
+        整体下移。被挤出 1048576 上限的行直接丢弃——但只准丢纯格式空行，一旦有带值的行
+        会被挤掉就抛错中止：悄悄吃掉数据比写失败危险得多。
+        （登记表底部那 2781 个纯格式空行在 1045692 起，按每批百来行算要几十批才够挤，
+        真挤到了丢的也只是空行的行高样式。）
+        """
+        at = header_row + 1
+        movable = sorted(r for r in row_pos if r >= at)
+        if not movable:
+            return sheet_xml
+        over = [r for r in movable if r + n > 1048576]
+        for r in over:
+            s, e, _ = row_pos[r]
+            if "<v>" in sheet_xml[s:e]:
+                raise ValueError(
+                    f"下移 {n} 行会把第 {r} 行挤出 1048576 上限、而该行有数据，已中止"
+                )
+        if over:
+            logger.warning(f"插行挤掉 {len(over)} 个越界的纯格式空行（第 {over[0]} 行起）")
+        start = row_pos[movable[0]][0]
+        stop = row_pos[over[0]][0] if over else row_pos[movable[-1]][1]
+        end = row_pos[movable[-1]][1]
+        cut = sheet_xml.index("</sheetData>", end) + len("</sheetData>")
+        # dimension 的下界跟着最大行号走（上限内），免得它比实际行范围还小
+        head = re.sub(
+            r'(<dimension ref="[A-Z]+\d+:[A-Z]+)(\d+)(")',
+            lambda m: m.group(1) + str(min(int(m.group(2)) + n, 1048576)) + m.group(3),
+            sheet_xml[:start],
+            count=1,
+        )
+        return (
+            head
+            + cls._shift_data_region(sheet_xml[start:stop], at, n)
+            + sheet_xml[end:cut]
+            + cls._shift_tail_refs(sheet_xml[cut:], at, n)
+        )
 
     @staticmethod
     def _shared_strings(zf: zipfile.ZipFile) -> List[str]:
@@ -175,19 +351,23 @@ class WpsExcelTool(BaseTool):
 
     @classmethod
     def _cell_text(cls, cell_xml: str, shared: List[str]) -> str:
-        """取单元格显示文本：t="s" 查 sharedStrings，否则取 <v> 或 <f>。"""
+        """取单元格显示文本：t="s" 查 sharedStrings，否则取 <v> 或 <f>。
+
+        统一做 XML 实体反转义（见 _xml_unescape）：sharedStrings / <v> 里存的是转义后的
+        文本（尺码里的软换行是 `&#10;`），不还原就没法跟外部数据做等值判重。
+        """
         t = re.search(r'\st="([^"]+)"', cell_xml)
         v = re.search(r"<v>(.*?)</v>", cell_xml, re.S)
         f = re.search(r"<f[^>]*>(.*?)</f>", cell_xml, re.S)
         if t and t.group(1) == "s" and v:
             try:
-                return shared[int(v.group(1))]
+                return _xml_unescape(shared[int(v.group(1))])
             except (ValueError, IndexError):
                 return ""
         if f:
-            return "=" + f.group(1)
+            return "=" + _xml_unescape(f.group(1))
         if v:
-            return v.group(1)
+            return _xml_unescape(v.group(1))
         return ""
 
     # ---- 共享公式解析 ----------------------------------------------------
@@ -250,10 +430,19 @@ class WpsExcelTool(BaseTool):
         return None
 
     @classmethod
-    def _find_last_data_row(cls, rows: List[tuple], key_cols: List[str]) -> int:
-        """最后一个真实数据行：key_cols 中任一列有 <v> 值的最大行号。"""
-        last = 1
+    def _find_last_data_row(
+        cls, rows: List[tuple], key_cols: List[str], header_row: int = 1
+    ) -> int:
+        """最后一个真实数据行：key_cols 中任一列有 <v> 值的最大行号。
+
+        header_row 既是【下界兜底】也是【跳过线】：表里一条数据都没有时返回 header_row，
+        调用方 +1 才不会把新行写到表头上；订单登记表里 `牛仔裤`/`童装` 的表头在第 2 行，
+        用默认 1 会把表头行本身当成数据行。默认 1 保持既有调用行为不变。
+        """
+        last = header_row
         for rid, body in rows:
+            if int(rid) <= header_row:
+                continue
             for col in key_cols:
                 if re.search(r'<c r="%s%s"[^>]*>(?:<f[^>]*>.*?</f>)?<v>' % (col, rid), body, re.S):
                     last = max(last, int(rid))
@@ -262,12 +451,33 @@ class WpsExcelTool(BaseTool):
 
     @classmethod
     def existing_key_values(
-        cls, file_path: str, sheet_name: str, col: str = "D"
+        cls, file_path: str, sheet_name: str, col: str = "D", header_row: int = 1
     ) -> set:
-        """返回某列（默认 D=SPU）在数据行(row>1)里所有非空值的集合（字符串）。
+        """返回某列（默认 D=SPU）在数据行(row>header_row)里所有非空值的集合（字符串）。
 
         供批量采集在开跑前判断某 SPU 是否已入库、可跳过（幂等 / 断点续跑）。
         文件或工作表缺失、解析异常时返回空集，绝不抛错。
+        """
+        return {
+            t[0]
+            for t in cls.existing_key_tuples(file_path, sheet_name, [col], header_row)
+            if t[0]
+        }
+
+    @classmethod
+    def existing_key_tuples(
+        cls,
+        file_path: str,
+        sheet_name: str,
+        cols: List[str],
+        header_row: int = 1,
+    ) -> set:
+        """返回数据行(row>header_row)里 cols 各列文本组成的元组集合，用于【组合键】判重。
+
+        为什么要组合键：订单登记表一个订单可含多个子订单（同一订单号、不同尺码各占一行），
+        只按订单号判重会把后面的子订单全当重复丢掉；而表里又没有子订单号列，只能用
+        (订单号, 尺码) 这种多列组合作等价键。整行各列都为空的行不计入。
+        文件/表缺失或解析异常返回空集，绝不抛错（判重失效只会多写，不会写坏表）。
         """
         try:
             with zipfile.ZipFile(file_path) as zf:
@@ -276,22 +486,33 @@ class WpsExcelTool(BaseTool):
                     return set()
                 sheet_xml = zf.read(part).decode("utf-8")
                 shared = cls._shared_strings(zf)
-                vals = set()
+                out = set()
                 for rid, body in cls._parse_rows(sheet_xml):
-                    if rid == "1":
+                    if int(rid) <= header_row:
                         continue
-                    m = re.search(r'<c r="%s%s"[^>]*>.*?</c>' % (col, rid), body, re.S)
-                    if m:
-                        txt = cls._cell_text(m.group(0), shared).strip()
-                        if txt:
-                            vals.add(txt)
-                return vals
+                    vals = []
+                    for col in cols:
+                        m = re.search(
+                            r'<c r="%s%s"[^>]*>.*?</c>' % (col, rid), body, re.S
+                        )
+                        vals.append(
+                            cls._cell_text(m.group(0), shared).strip() if m else ""
+                        )
+                    if any(vals):
+                        out.add(tuple(vals))
+                return out
         except Exception:
             return set()
 
     @classmethod
-    def read_header(cls, file_path: str, sheet_name: str) -> Dict[str, str]:
-        """读某 Sheet 第一行表头：{列字母: 标题}。文件/表缺失或损坏返回 {}，绝不抛错。"""
+    def read_header(
+        cls, file_path: str, sheet_name: str, header_row: int = 1
+    ) -> Dict[str, str]:
+        """读某 Sheet 表头行：{列字母: 标题}。文件/表缺失或损坏返回 {}，绝不抛错。
+
+        header_row 默认 1；订单登记表里 `牛仔裤`/`童装` 第 1 行是跨列大标题、第 2 行才是
+        真表头，这类表要显式传 2（定位逻辑见 detect_header_row）。
+        """
         try:
             with zipfile.ZipFile(file_path) as zf:
                 part = cls._resolve_sheet_part(zf, sheet_name)
@@ -301,9 +522,10 @@ class WpsExcelTool(BaseTool):
                 shared = cls._shared_strings(zf)
                 row_map = dict(cls._parse_rows(sheet_xml))
                 header: Dict[str, str] = {}
-                if "1" in row_map:
+                body = row_map.get(str(header_row))
+                if body:
                     for cm in re.finditer(
-                        r'<c r="([A-Z]+)1"[^>]*>.*?</c>', row_map["1"], re.S
+                        r'<c r="([A-Z]+)%d"[^>]*>.*?</c>' % header_row, body, re.S
                     ):
                         txt = cls._cell_text(cm.group(0), shared)
                         if txt:
@@ -311,6 +533,39 @@ class WpsExcelTool(BaseTool):
                 return header
         except Exception:
             return {}
+
+    @classmethod
+    def detect_header_row(
+        cls, file_path: str, sheet_name: str, max_scan: int = 3
+    ) -> int:
+        """探测表头在第几行：前 max_scan 行里【非空单元格最多】的那一行，并列取最靠前。
+
+        为什么不写死第 1 行：订单登记表 13 个 Sheet 里 `牛仔裤`/`童装` 第 1 行是只占一两格的
+        跨列大标题，真表头在第 2 行。按「填得最满的那行是表头」判定，对两种布局都成立，
+        比维护一张「哪个 Sheet 表头在第几行」的表更耐改名。探测失败返回 1。
+        """
+        try:
+            with zipfile.ZipFile(file_path) as zf:
+                part = cls._resolve_sheet_part(zf, sheet_name)
+                if not part:
+                    return 1
+                sheet_xml = zf.read(part).decode("utf-8")
+                shared = cls._shared_strings(zf)
+                row_map = dict(cls._parse_rows(sheet_xml))
+                best_row, best_n = 1, -1
+                for r in range(1, max_scan + 1):
+                    body = row_map.get(str(r), "")
+                    n = 0
+                    for cm in re.finditer(
+                        r'<c r="[A-Z]+%d"[^>]*>.*?</c>' % r, body, re.S
+                    ):
+                        if cls._cell_text(cm.group(0), shared).strip():
+                            n += 1
+                    if n > best_n:
+                        best_row, best_n = r, n
+                return best_row
+        except Exception:
+            return 1
 
     @classmethod
     def read_row_by_key(
@@ -402,7 +657,7 @@ class WpsExcelTool(BaseTool):
 
         为什么需要：不同 Sheet 的成本模型不同——除采购价/重量这类逐商品输入外，还有 ros、
         操作费、尾程这类【每行固定的数值常量输入】，下游公式(成本=采购价+操作费+尾程+…)依赖
-        它们。旧代码只硬编码 ros=7，换到 pawly美国(ros=6、另有操作费=5/尾程=8)就让这些格留空、
+        它们。旧代码只硬编码 ros=7，换到 storeA美国(ros=6、另有操作费=5/尾程=8)就让这些格留空、
         公式算错。此法从历史行学出这些常量并复制到新行，天然适配任意 Sheet。
 
         只认【纯数字】常量：文本型批次标注(编号筛选/总出货数)不返回，避免误抄。
@@ -835,6 +1090,328 @@ class WpsExcelTool(BaseTool):
             "提示": "请在 WPS 中打开确认新行的图片与格式。原有数据、图片、公式均未改动。",
         }
         return self.success_response(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # ---- 批量追加（订单登记管线用）--------------------------------------
+    # 为什么不直接循环调 append_product_row：那条路每写一行都要 shutil.copyfile 整份备份
+    # 再解压重压整个 zip。订单登记表 102MB、单批 200+ 行，逐行走要跑几个小时，还会甩出
+    # 200 多份备份把输出目录塞爆。批量版把「备份 / 读 zip / 改 XML / 写 zip」各做一次，
+    # N 行 N 图一次落盘；不改 append_product_row 的既有行为（采集管线仍走单行路径）。
+
+    def append_rows(
+        self,
+        file_path: str,
+        sheet_name: str,
+        rows_data: List[Dict[str, Any]],
+        header_row: int = 1,
+        key_cols: Optional[List[str]] = None,
+        insert_at_top: bool = False,
+    ) -> Dict[str, Any]:
+        """在最后一个数据行之后批量追加若干行，每行可带一张 DISPIMG 嵌入图。
+
+        insert_at_top=True 改为**插到表头正下方**，表头以下所有行整体下移 len(rows_data) 行：
+        订单登记表要「时间越新的越在上面」，追加到表尾正好相反。mergeCell / 条件格式 /
+        autoFilter 以及 workbook.xml 里指向本表的 definedName 都随之平移，
+        细节见 _shift_for_insert / _shift_ref_rows。
+
+        rows_data 每项：
+            {"values": {列字母: 值}, "formulas": {列字母: 公式模板(用 {r} 占位行号)},
+             "image_column": "G", "image_path": r"...\\a.jpg"}
+        values 里的空值（None / 空串）【不写单元格】——待发货订单的运单号等本就为空，
+        写个空 <v> 只会把预留空行的原格式冲掉。
+
+        写入是主流程，失败直接抛异常交上层重试兜底（不吞）；写前照例做一次时间戳备份。
+        返回 {"written": N, "first_row": r1, "last_row": rN, "images": M, "backup": 路径}。
+        """
+        src = Path(file_path)
+        if not src.exists():
+            raise FileNotFoundError(f"文件不存在：{file_path}")
+        if not rows_data:
+            return {"written": 0, "first_row": None, "last_row": None,
+                    "images": 0, "backup": None}
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = get_output_dir("backup") / f"{src.stem}_备份{ts}{src.suffix}"
+        shutil.copyfile(src, backup)
+
+        with zipfile.ZipFile(src) as zf:
+            part = self._resolve_sheet_part(zf, sheet_name)
+            if not part:
+                raise ValueError(f"找不到工作表 '{sheet_name}'")
+            sheet_xml = zf.read(part).decode("utf-8")
+            rows = self._parse_rows(sheet_xml)
+            row_pos = self._row_positions(sheet_xml)
+
+            try:
+                styles_xml = zf.read("xl/styles.xml").decode("utf-8")
+            except KeyError:
+                styles_xml = ""
+            wrap_ctx = self._init_wrap_ctx(styles_xml)
+
+            # 末行定位：默认按本批要写的所有列判定，避免只看某一列时被历史稀疏行带偏
+            if key_cols is None:
+                kc: set = set()
+                for item in rows_data:
+                    kc |= set(item.get("values") or {})
+                    kc |= set(item.get("formulas") or {})
+                key_cols = sorted(kc, key=_col_to_idx) or ["A"]
+            last_data = self._find_last_data_row(rows, list(key_cols), header_row)
+            tpl_body = dict(rows).get(str(last_data), "")
+            cell_styles = dict(re.findall(r'<c r="([A-Z]+)\d+"\s+s="(\d+)"', tpl_body))
+
+            # 预解析每列基样式。_wrap_style_for / _formula_cell_style 在 cell_styles 缺列时
+            # 会扫全表找样式，逐行调用等于 N×列数 次全表扫描（3000 行表写 200 行实测要几分钟）。
+            # 这里按列各扫一次填满，后续逐行取值全是字典命中。
+            base_styles = dict(cell_styles)
+            want_cols: set = set()
+            for item in rows_data:
+                want_cols |= set(item.get("values") or {})
+            for col in want_cols - set(base_styles):
+                st = self._text_cell_style(rows, col)
+                if st:
+                    base_styles[col] = st
+            f_styles: Dict[str, str] = {}
+            for item in rows_data:
+                for col in (item.get("formulas") or {}):
+                    if col not in f_styles:
+                        f_styles[col] = cell_styles.get(col) or (
+                            self._formula_cell_style(rows, col) or ""
+                        )
+            img_styles: Dict[str, str] = {}
+            for item in rows_data:
+                col = item.get("image_column")
+                if col and col not in img_styles:
+                    img_styles[col] = self._img_cell_style(rows, col) or cell_styles.get(col, "")
+
+            changed: Dict[str, bytes] = {}
+            new_media: List[tuple] = []
+
+            # 图片：整批一次性追加 media + cellimages + rels，编号连续递增
+            disp_ids: Dict[int, str] = {}
+            if any(it.get("image_path") for it in rows_data):
+                cellimages = zf.read("xl/cellimages.xml").decode("utf-8")
+                ci_rels = zf.read("xl/_rels/cellimages.xml.rels").decode("utf-8")
+                # 编号基数要同时看 rels 引用和 zip 里【实际存在】的 media 文件：普通浮动图
+                # （drawing）也占用 image{N} 名字却不在 cellimages.rels 里，只看 rels 会撞名
+                # 覆盖掉别人的图。单行版一次只加一张撞上的概率低，批量一次 200 张必须堵死。
+                nums = [int(n) for n in re.findall(r"media/image(\d+)\.", ci_rels)]
+                nums += [
+                    int(m.group(1))
+                    for m in (re.match(r"xl/media/image(\d+)\.", nm) for nm in zf.namelist())
+                    if m
+                ]
+                img_n = max(nums) if nums else 0
+                rid_nums = [int(n) for n in re.findall(r'Id="rId(\d+)"', ci_rels)]
+                rel_n = max(rid_nums) if rid_nums else 0
+                pic_ids = [int(n) for n in re.findall(r'<xdr:cNvPr id="(\d+)"', cellimages)]
+                pic_n = max(pic_ids) if pic_ids else 1
+
+                add_ci: List[str] = []
+                add_rel: List[str] = []
+                for idx, item in enumerate(rows_data):
+                    ipath = item.get("image_path")
+                    if not ipath:
+                        continue
+                    if not item.get("image_column"):
+                        raise ValueError(f"第 {idx} 项给了 image_path 却没有 image_column")
+                    img = Path(ipath)
+                    if not img.exists():
+                        raise FileNotFoundError(f"图片不存在：{ipath}")
+                    ext = img.suffix.lower().lstrip(".")
+                    if ext == "jpg":
+                        ext = "jpeg"
+                    img_n += 1
+                    rel_n += 1
+                    pic_n += 1
+                    rel_id = f"rId{rel_n}"
+                    disp_id = f"ID_{ts}{img_n:08d}".ljust(36, "0")[:36]
+                    disp_ids[idx] = disp_id
+                    add_ci.append(
+                        '<etc:cellImage><xdr:pic><xdr:nvPicPr>'
+                        f'<xdr:cNvPr id="{pic_n}" name="{disp_id}" descr="collected_image"/>'
+                        '<xdr:cNvPicPr/></xdr:nvPicPr><xdr:blipFill>'
+                        f'<a:blip r:embed="{rel_id}"/><a:stretch><a:fillRect/></a:stretch>'
+                        '</xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/>'
+                        '<a:ext cx="514350" cy="514350"/></a:xfrm>'
+                        '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr>'
+                        "</xdr:pic></etc:cellImage>"
+                    )
+                    add_rel.append(
+                        f'<Relationship Id="{rel_id}" '
+                        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+                        f'Target="media/image{img_n}.{ext}"/>'
+                    )
+                    new_media.append((f"xl/media/image{img_n}.{ext}", img.read_bytes()))
+
+                changed["xl/cellimages.xml"] = cellimages.replace(
+                    "</etc:cellImages>", "".join(add_ci) + "</etc:cellImages>"
+                ).encode("utf-8")
+                changed["xl/_rels/cellimages.xml.rels"] = ci_rels.replace(
+                    "</Relationships>", "".join(add_rel) + "</Relationships>"
+                ).encode("utf-8")
+
+            # 逐行构造 XML
+            tpl_open = row_pos.get(last_data, (0, 0, f'<row r="{last_data}">'))[2]
+            n_new = len(rows_data)
+            first_new = header_row + 1 if insert_at_top else last_data + 1
+            patches: List[tuple] = []  # (起, 止, 文本)；插入表示为 (p, p, 文本)
+            if insert_at_top:
+                sheet_xml = self._shift_for_insert(sheet_xml, row_pos, header_row, n_new)
+                # 下移后 [first_new, first_new+n) 是空档，不会遇到「复用预留空行」的情形，
+                # 所以把 row_pos 清空让所有新行统一走模板行开标签（带 ht="41"，
+                # 嵌入图要靠这个行高才显示得出来）；插入点取第一个下移后的行的起始偏移。
+                shifted = self._row_positions(sheet_xml)
+                after = sorted(r for r in shifted if r >= first_new)
+                anchor = (
+                    shifted[after[0]][0] if after else sheet_xml.index("</sheetData>")
+                )
+                row_pos = {}
+            else:
+                anchor = (
+                    row_pos[last_data][1]
+                    if last_data in row_pos
+                    else sheet_xml.index("</sheetData>")
+                )
+            for i, item in enumerate(rows_data):
+                new_rid = first_new + i
+                pos = row_pos.get(new_rid)
+                # 目标行已存在（多半是只带行高的预留空行）→ 复用它自己的开标签保住行高；
+                # 不存在 → 拿模板行的开标签换行号。
+                open_tag = (
+                    pos[2]
+                    if pos
+                    else tpl_open.replace('r="%d"' % last_data, 'r="%d"' % new_rid)
+                )
+                body = self._build_cells(
+                    new_rid, item, disp_ids.get(i),
+                    base_styles, f_styles, img_styles, wrap_ctx,
+                )
+                text = open_tag + body + "</row>"
+                if pos:
+                    patches.append((pos[0], pos[1], text))
+                    anchor = pos[1]
+                else:
+                    patches.append((anchor, anchor, text))
+
+            # 一次性重建 sheet XML：逐行 re.sub 是 O(行数 × 文件长度)，
+            # 468KB × 200 行要反复扫近 100MB，且插入后偏移全部失效。
+            patches.sort(key=lambda p: p[0])  # 稳定排序：同一插入点保持原顺序
+            out_parts: List[str] = []
+            cur = 0
+            for s, e, t in patches:
+                out_parts.append(sheet_xml[cur:s])
+                out_parts.append(t)
+                cur = e
+            out_parts.append(sheet_xml[cur:])
+            sheet_new = "".join(out_parts)
+
+            # dimension 只扩不缩：本表 ref 是 A1:P1048472（格式撑出来的），
+            # 改小无意义还可能影响 WPS 的滚动区域判断。
+            last_rid = last_data + len(rows_data)
+            sheet_new = re.sub(
+                r'<dimension ref="([A-Z]+\d+:[A-Z]+)(\d+)"/>',
+                lambda m: '<dimension ref="%s%d"/>'
+                % (m.group(1), max(int(m.group(2)), last_rid)),
+                sheet_new,
+                count=1,
+            )
+            changed[part] = sheet_new.encode("utf-8")
+
+            # 插行还要同步 workbook.xml 里指向本表的 definedName（筛选区缓存
+            # `_xlnm._FilterDatabase` 就是这个），不然筛选下拉的范围跟表内 autoFilter 打架
+            if insert_at_top:
+                wbx = zf.read("xl/workbook.xml").decode("utf-8")
+                # 必须先切掉 `表名!` 再平移：表名本身可能以数字结尾（如 `StoreB2`），
+                # 直接对整串套行号正则会把表名尾数当成行号改掉
+                def shift_dn(mo: "re.Match") -> str:
+                    hit = re.fullmatch(
+                        r"(%s!)(\$?[A-Z]+\$?\d+(?::\$?[A-Z]+\$?\d+)?)" % re.escape(sheet_name),
+                        mo.group(2),
+                    )
+                    if not hit:
+                        return mo.group(0)
+                    return (
+                        mo.group(1)
+                        + hit.group(1)
+                        + self._shift_ref_rows(hit.group(2), header_row + 1, n_new)
+                        + mo.group(3)
+                    )
+
+                new_wbx = re.sub(
+                    r"(<definedName\b[^>]*>)([^<]*)(</definedName>)", shift_dn, wbx
+                )
+                if new_wbx != wbx:
+                    changed["xl/workbook.xml"] = new_wbx.encode("utf-8")
+
+            new_styles = self._rebuild_styles(wrap_ctx, styles_xml)
+            if new_styles is not None:
+                changed["xl/styles.xml"] = new_styles.encode("utf-8")
+
+            tmp = src.with_name(src.stem + f"_tmp{ts}" + src.suffix)
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zf.infolist():
+                    data = changed.get(item.filename)
+                    if data is None:
+                        data = zf.read(item.filename)
+                    zout.writestr(item, data)
+                for arc, blob in new_media:
+                    zout.writestr(arc, blob)
+
+        shutil.move(str(tmp), str(src))
+
+        return {
+            "written": len(rows_data),
+            "first_row": first_new,
+            "last_row": first_new + n_new - 1,
+            "images": len(new_media),
+            "backup": str(backup),
+        }
+
+    def _build_cells(
+        self,
+        new_rid: int,
+        item: Dict[str, Any],
+        disp_id: Optional[str],
+        base_styles: Dict[str, str],
+        f_styles: Dict[str, str],
+        img_styles: Dict[str, str],
+        wrap_ctx: dict,
+    ) -> str:
+        """构造一行的 <c> 序列。样式索引全部来自预解析好的字典，不再扫表。"""
+        values = item.get("values") or {}
+        formulas = item.get("formulas") or {}
+        image_column = item.get("image_column")
+
+        cols_all = set(values) | set(formulas)
+        if image_column and disp_id:
+            cols_all.add(image_column)
+
+        cells: List[str] = []
+        for col in sorted(cols_all, key=_col_to_idx):
+            ref = f"{col}{new_rid}"
+            if col == image_column and disp_id:
+                st = img_styles.get(col, "")
+                sa = f' s="{st}"' if st else ""
+                disp = f'_xlfn.DISPIMG(&quot;{disp_id}&quot;,1)'
+                cached = f'=DISPIMG(&quot;{disp_id}&quot;,1)'
+                cells.append(f'<c r="{ref}"{sa} t="str"><f>{disp}</f><v>{cached}</v></c>')
+            elif col in formulas:
+                f = _xml_escape(formulas[col].format(r=new_rid).lstrip("="))
+                st = f_styles.get(col, "")
+                sa = f' s="{st}"' if st else ""
+                cells.append(f'<c r="{ref}"{sa}><f>{f}</f></c>')
+            elif col in values:
+                val = values[col]
+                if val is None or val == "":
+                    continue  # 空值不落单元格，保住预留行原格式
+                if isinstance(val, (int, float)) and not isinstance(val, bool):
+                    st = base_styles.get(col, "")
+                    sa = f' s="{st}"' if st else ""
+                    cells.append(f'<c r="{ref}"{sa}><v>{val}</v></c>')
+                else:
+                    wcol = self._wrap_style_for(wrap_ctx, col, base_styles, [])
+                    sa = f' s="{wcol}"' if wcol else ""
+                    cells.append(f'<c r="{ref}"{sa} t="str"><v>{_xml_escape(val)}</v></c>')
+        return "".join(cells)
 
     @staticmethod
     def _img_cell_style(rows: List[tuple], col: str) -> Optional[str]:

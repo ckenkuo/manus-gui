@@ -231,7 +231,8 @@ def _run(results, live, monkeypatch, runtime_states=None):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         calls["fill"].append((page.tag, spu, act, price, allow_submit))
         return {"filled": True, "submitted": False, "note": ""}
 
@@ -325,7 +326,8 @@ def test_each_enroll_page_closed_after_activity(monkeypatch):
         opened.append(pg)
         return pg
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         # 报名前该页必须是打开的（未被提前关）
         assert page.closed is False
         return {"filled": True, "submitted": False, "note": ""}
@@ -351,6 +353,26 @@ def test_each_enroll_page_closed_after_activity(monkeypatch):
     assert all(pg.closed for pg in opened)
 
 
+def test_build_over_ref_note_backsolves_suggested_daily_price():
+    """超参考价失败提示应反推平台认可日常价（参考价/折扣率），并与当前 Excel 日常价并排给出。"""
+    # 实机数据：限时秒杀 8.5 折，申报价 7.0、参考价 6.65，Excel 日常价 8.24。
+    over = pipeline.build_over_ref_note(7.0, 6.65, 8.24, 0.85)
+    assert over["suggested_daily_price"] == 7.82  # 6.65 / 0.85
+    assert over["current_daily_price"] == 8.24
+    assert "平台认可日常价约 7.82" in over["note"]
+    assert "当前 Excel 日常价 8.24" in over["note"]
+    assert "7.0 高于提报页参考价 6.65" in over["note"]
+
+
+def test_build_over_ref_note_without_discount_falls_back():
+    """折扣率缺失/非法时不反推，退回原「请核对 Excel 日常价」文案，不得抛错或给错误建议。"""
+    over = pipeline.build_over_ref_note(7.0, 6.65, 8.24, None)
+    assert over["suggested_daily_price"] is None
+    assert "疑 Excel 日常价与商品前端实际售价不一致" in over["note"]
+    zero = pipeline.build_over_ref_note(7.0, 6.65, 8.24, 0)
+    assert zero["suggested_daily_price"] is None
+
+
 def test_over_ref_recorded_as_failed(monkeypatch):
     """填价时申报价超过提报页参考价（Excel 与前端售价不一致）→ 记入 summary['failed']
     并带原因，exec_fill/exec_done 事件如实回报，绝不误报成功。"""
@@ -366,7 +388,8 @@ def test_over_ref_recorded_as_failed(monkeypatch):
     async def fake_open_page(activity_page, name, timeout_s=25):
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         # 模拟超参考价：未填成功、over_ref 标记 + 参考价 + 原因
         return {"filled": False, "submitted": False, "over_ref": True,
                 "ref_price": 47.31,
@@ -416,7 +439,8 @@ def test_empty_fill_skips_submit(monkeypatch):
     async def fake_open_page(activity_page, name, timeout_s=25):
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         return {"filled": False, "submitted": False, "note": "搜索后定位行数=0（非唯一），保守跳过"}
 
     async def fake_submit(page, allow=False):
@@ -455,7 +479,8 @@ def test_first_activity_rpa_failure_continues_scanning_without_open(monkeypatch)
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         return {"filled": False, "submitted": False, "failed_step": "query",
                 "note": "查询结果为 0 行"}
 
@@ -500,7 +525,8 @@ def test_unverified_submit_uses_log_and_continues(monkeypatch):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(_page, _spu, _act, _price, allow_submit=False, on_step=None):
+    async def fake_enroll(_page, _spu, _act, _price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         return {"filled": True, "detail_eligible": True, "note": "已填价"}
 
     async def fake_submit(_page, allow=False):
@@ -548,7 +574,8 @@ def test_success_feedback_without_log_record_fails_after_full_scan(monkeypatch):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(_page, _spu, _act, _price, allow_submit=False, on_step=None):
+    async def fake_enroll(_page, _spu, _act, _price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         return {"filled": True, "detail_eligible": True, "note": "已填价"}
 
     async def fake_submit(_page, allow=False):
@@ -592,7 +619,8 @@ def test_detail_ineligible_skips_activity_and_continues(monkeypatch):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         if act == "活动A":
             return {"filled": False, "submitted": False, "detail_eligible": False,
                     "note": "详情页查询结果为 0"}
@@ -885,6 +913,175 @@ def test_open_accel_retries_same_final_button(monkeypatch):
     assert calls.count(("立即加速",)) == 3
 
 
+def _patch_open_accel_full_path(monkeypatch, feedback, read_states):
+    """把 _open_accel_once 完整路径里的页面交互全打桩，只保留最终判定逻辑受测。
+
+    read_states：read_accel_state 每次调用按顺序返回的状态（precheck 先取一个 off，
+    之后 toast unknown 兜底回读再取一个）。feedback：最终点「立即加速」后的反馈字典。
+    """
+    states = iter(read_states)
+
+    async def fake_dismiss(_page):
+        return False
+
+    async def fake_read(_page, _spu, search=False):
+        return next(states)
+
+    async def fake_mark(_page, _arg=None):
+        return True
+
+    async def fake_click_marked(_page):
+        return True
+
+    async def fake_select_super(_page, tries=6):
+        return True
+
+    async def fake_set_prices(_page, _accel_price):
+        return {"rows_total": 1, "rows_over": 0, "rows_filled": 1, "over_detail": ""}
+
+    async def fake_click_first(_page, _names):
+        return True
+
+    async def fake_evaluate(_script, _arg=None):
+        return True  # 「去获取」入口点击
+
+    async def fake_busy_retries(_page, tries=3):
+        return {"clicks": 1, **feedback}
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(pipeline, "dismiss_all_page_popups", fake_dismiss)
+    monkeypatch.setattr(pipeline, "read_accel_state", fake_read)
+    monkeypatch.setattr(pipeline, "_select_super_tier", fake_select_super)
+    monkeypatch.setattr(pipeline, "_set_accel_prices", fake_set_prices)
+    monkeypatch.setattr(pipeline, "_click_marked", fake_click_marked)
+    monkeypatch.setattr(pipeline, "_click_first_button", fake_click_first)
+    monkeypatch.setattr(pipeline, "_click_open_with_busy_retries", fake_busy_retries)
+    monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
+
+    class FakeMarkPage:
+        async def evaluate(self, _script, _arg=None):
+            return True
+
+    return FakeMarkPage()
+
+
+def test_open_accel_retries_whole_flow_until_confirmed(monkeypatch):
+    """外层重试：前两轮 opened=False，第三轮确认成功即返回，并记录尝试次数。"""
+    outcomes = iter([
+        {"opened": False, "note": "未捕获成功提示且回查流量页状态非加速中"},
+        {"opened": False, "note": "未捕获成功提示且回查流量页状态非加速中"},
+        {"opened": True, "state": "on", "note": "已开启加速"},
+    ])
+    calls = []
+
+    async def fake_once(_page, spu, allow=False, accel_price=None):
+        calls.append((spu, allow, accel_price))
+        return dict(next(outcomes))
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
+    monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
+
+    result = asyncio.run(
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True, accel_price=41.0, tries=3)
+    )
+    assert result["opened"] is True
+    assert result["open_attempts"] == 3
+    assert "第 3 次尝试确认开启成功" in result["note"]
+    assert len(calls) == 3
+
+
+def test_open_accel_retry_is_idempotent_when_already_on(monkeypatch):
+    """幂等安全：上一轮其实已开成时，下一轮 precheck 读到 on 会 no-op 成功，不重复开启。
+
+    这里让首轮就返回 no-op 成功（模拟 precheck=on），断言只调用一次、不进入重试。
+    """
+    calls = []
+
+    async def fake_once(_page, spu, allow=False, accel_price=None):
+        calls.append(spu)
+        return {"opened": True, "precheck_state": "on", "note": "本就在加速中，无需开启（no-op）"}
+
+    monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
+    result = asyncio.run(
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True, accel_price=41.0, tries=3)
+    )
+    assert result["opened"] is True and result["open_attempts"] == 1
+    assert len(calls) == 1
+
+
+def test_open_accel_reports_failure_after_exhausting_retries(monkeypatch):
+    """三轮都未确认成功时，如实报失败并在 note 标注已重试次数。"""
+    async def fake_once(_page, spu, allow=False, accel_price=None):
+        return {"opened": False, "note": "未捕获成功提示且回查流量页状态非加速中"}
+
+    async def no_wait(_seconds):
+        return None
+
+    monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
+    monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
+
+    result = asyncio.run(
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True, accel_price=41.0, tries=3)
+    )
+    assert result["opened"] is False
+    assert result["open_attempts"] == 3
+    assert "重试 3 次仍未确认开启成功" in result["note"]
+
+
+def test_open_accel_half_run_does_not_retry(monkeypatch):
+    """半程 allow=False：不真开、opened 恒 False，整轮重试无意义，只跑一次。"""
+    calls = []
+
+    async def fake_once(_page, spu, allow=False, accel_price=None):
+        calls.append((spu, allow))
+        return {"opened": False, "note": "半程：未点「立即加速」（allow=False）"}
+
+    monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
+    result = asyncio.run(
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=False, accel_price=41.0, tries=3)
+    )
+    assert result["opened"] is False
+    assert len(calls) == 1
+
+
+def test_open_accel_verifies_by_state_when_toast_unknown(monkeypatch):
+    """toast 一闪而过没抓到成功提示（unknown）时，回读流量页确认状态=加速中即判成功。
+
+    根因（2026-07-24 实机）：点「立即加速」后动作已执行、填价成功，但成功 toast 未被捕获
+    → 旧代码直接判未开、上层报「流量加速失败」。持久的接口状态才是权威判据。
+    """
+    page = _patch_open_accel_full_path(
+        monkeypatch,
+        feedback={"status": "unknown", "message": "等待流量加速结果提示超时"},
+        read_states=["off", "on"],  # precheck=off → 走完整路径；toast unknown 后回读=on
+    )
+    result = asyncio.run(
+        pipeline._open_accel_once(page, "2801689369", allow=True, accel_price=41.0)
+    )
+    assert result["opened"] is True
+    assert result["row_state_snapshot"] == "on"
+    assert "回查流量页确认状态=加速中" in result["note"]
+
+
+def test_open_accel_stays_failed_when_toast_unknown_and_state_off(monkeypatch):
+    """toast unknown 且回读状态仍非加速中时，不得误判成功，如实报失败。"""
+    page = _patch_open_accel_full_path(
+        monkeypatch,
+        feedback={"status": "unknown", "message": "等待流量加速结果提示超时"},
+        read_states=["off", "off"],  # 回读仍 off
+    )
+    result = asyncio.run(
+        pipeline._open_accel_once(page, "2801689369", allow=True, accel_price=41.0)
+    )
+    assert result["opened"] is False
+    assert "回查流量页状态非加速中" in result["note"]
+
+
 def test_popup_closer_clicks_merchant_helper_button():
     """阶段入口只点击商家助手的关闭按钮，不依赖具体随机弹窗结构。"""
     class FakePopupPage:
@@ -916,7 +1113,8 @@ def test_cooldown_close_does_not_block_enroll(monkeypatch):
     async def fake_open_page(activity_page, name, timeout_s=25):
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None):
+    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
+                          daily_price=None, discount_rate=None):
         calls["fill"].append(spu)
         return {"filled": True, "submitted": False, "note": ""}
 
@@ -1093,6 +1291,75 @@ def test_activity_rule_button_supports_non_dialog_fullscreen_layer():
     assert "text.includes('活动详情')" in script
     assert "text.includes(target)" in script
     assert "node !== document.body" in script
+    # 正文「加载中」期间活动名未渲染，须返回 loading 让调用方继续轮询，而不是误判 mismatch。
+    assert "加载中" in script
+    assert "status: 'loading'" in script
+
+
+def test_open_enroll_page_waits_out_rule_popup_loading(monkeypatch):
+    """规则弹窗正文「加载中」时不得整轮重试（实测 2026-07-23 白等 ~8s/活动）；
+    应在本次尝试内继续轮询，等正文渲染出活动名后再绑定点击。"""
+    class FakeDetailPage:
+        def __init__(self, url):
+            self.url = url
+            self.closed = False
+
+        async def wait_for_load_state(self, _state, timeout=None):
+            return None
+
+        async def close(self):
+            self.closed = True
+
+    class FakeContext:
+        def __init__(self):
+            self.pages = []
+
+    class FakeActivityPage:
+        def __init__(self, context):
+            self.url = pipeline.ACTIVITY_URL
+            self.context = context
+            self.created = None
+            self.mark_calls = 0
+            self.rule_calls = 0
+
+        async def evaluate(self, script, arg=None):
+            if script == pipeline._MARK_ENROLL_JS:
+                self.mark_calls += 1
+                return "目标活动行"
+            if script == pipeline._CLICK_ACTIVITY_RULE_JS:
+                self.rule_calls += 1
+                if self.rule_calls < 3:
+                    return {"status": "loading", "actual": "活动详情 加载中..."}
+                self.created = FakeDetailPage(
+                    "https://agentseller.temu.com/activity/marketing-activity/detail-new?type=5"
+                )
+                self.context.pages.append(self.created)
+                return {"status": "clicked", "actual": arg}
+            return None
+
+    context = FakeContext()
+    activity_page = FakeActivityPage(context)
+    context.pages = [activity_page]
+
+    async def no_wait(_seconds):
+        return None
+
+    async def no_dismiss(_page):
+        return False
+
+    async def matched(_page, expected_name, tries=20):
+        return {"matched": True, "actual": expected_name, "ready": True}
+
+    monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
+    monkeypatch.setattr(pipeline, "dismiss_all_page_popups", no_dismiss)
+    monkeypatch.setattr(pipeline, "verify_enroll_page_activity", matched)
+
+    opened = asyncio.run(pipeline.open_enroll_page(activity_page, "官方大促", timeout_s=6))
+
+    assert opened is activity_page.created
+    # loading 被当失败时会在整轮重试里重新标记报名按钮；标记只来一次说明在首次尝试内等到点击。
+    assert activity_page.mark_calls == 1
+    assert activity_page.rule_calls == 3
 
 
 def test_parse_activity_reads_registered_column():
@@ -1113,9 +1380,22 @@ def test_parse_activity_reads_registered_column():
     assert dash["registered_count"] == 0 and dash["registered_display"] == "-"
 
 
-def test_parse_activity_log_item_uses_enroll_status_four():
-    """实机报名记录接口 enrollStatus=4 表示成功；场次失败原因存在时仍不能算成功。"""
-    success = pipeline._parse_activity_log_item({
+def test_parse_activity_log_item_listed_not_exited_is_success():
+    """用户实机规则 2026-07-24：报名记录出现在列表且非「已退出」即成功。1=进行中、3=进行中、
+    4=报名成功待开始均为成功态；场次失败原因不再否决；仅文本/数值命中「已退出」才判失败。"""
+    ongoing = pipeline._parse_activity_log_item({
+        "productId": 2801689369,
+        "activityThematicName": "【营销热点】夏季促销8折专场",
+        "enrollStatus": 1,
+        "assignSessionList": [{"sessionFailReason": None}],
+    })
+    ongoing_three = pipeline._parse_activity_log_item({
+        "productId": 2801689369,
+        "activityThematicName": "【营销热点】半托管活动85折专区",
+        "enrollStatus": 3,
+        "assignSessionList": [],
+    })
+    pending_start = pipeline._parse_activity_log_item({
         "productId": 9072868889,
         "activityThematicName": "【营销热点】回归日常&周年庆大促85折专场",
         "enrollStatus": 4,
@@ -1135,12 +1415,29 @@ def test_parse_activity_log_item_uses_enroll_status_four():
         "enrollStatus": 4,
         "assignSessionList": [],
     })
+    # 已退出=enrollStatus 6（2026-07-24 用户后台核对确认），数值命中即判退出，无需文本。
+    exited = pipeline._parse_activity_log_item({
+        "productId": 9072868889,
+        "activityThematicName": "活动B",
+        "enrollStatus": 6,
+    })
+    # 文本探测兜底：接口带「已退出」文案时也判退出。
+    exited_by_text = pipeline._parse_activity_log_item({
+        "productId": 9072868889,
+        "activityThematicName": "活动C",
+        "enrollStatus": 99,
+        "enrollStatusDesc": "已退出",
+    })
 
-    assert success["success"] is True
-    assert success["spu"] == "9072868889"
-    assert failed_session["success"] is False
+    assert ongoing["success"] is True
+    assert ongoing_three["success"] is True
+    assert pending_start["success"] is True
+    assert pending_start["spu"] == "9072868889"
+    assert failed_session["success"] is True
     assert failed_session["session_failures"] == ["类目不符合"]
     assert fixed_activity["activity"] == "限时秒杀"
+    assert exited["success"] is False
+    assert exited_by_text["success"] is False
 
 
 def test_activity_log_pagination_collects_total_fourteen():

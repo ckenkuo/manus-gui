@@ -164,3 +164,60 @@ use_data_analysis_agent = false     # The Data Analysi Agent to solve various da
 min_margin = 0.15
 # 申报价策略：'discount_ceiling'=贴活动折扣上限取最高价（守利润同时少让利）。
 price_strategy = "discount_ceiling"
+
+# 订单登记管线（Temu 待发货订单 → 本地订单登记表）。
+# 走页面自带「导出订单」拿官方 xlsx，产品主图从 DOM 抓（导出文件里没有图）。
+[orders]
+# 订单登记表绝对路径（换成本机实际路径；下面的店铺/Sheet 映射同样是占位示例，
+# 必须按自己登记表的真实 Sheet 名和店铺名改写，照抄会写错表）。
+workbook = "C:\\Users\\<用户名>\\Desktop\\订单登记表.xlsx"
+# 待发货订单页 URL（含筛选参数；管线不切店铺，用当前 CDP 里已登录的那个店）。
+list_url = "https://agentseller.temu.com/mmsos/orders.html?fulfillmentMode=0&queryType=2&sortType=1&timeZone=UTC%2B8&needBuySignService=0&sellerNoteLabelList=&packageAbnormalTypeList="
+# 判重键：登记表没有子订单号列，一个订单又可含多个子订单（多行、尺码不同），
+# 故用「订单号 + 尺码」作等价键。改成 ["订单号"] 会把同订单的其余子订单全当重复丢掉。
+dedupe_by = ["订单号", "尺码"]
+
+# 店铺/站点 → 目标 Sheet 映射。未命中的订单跳过并在进度里报告，绝不臆测落点
+# （例：StoreA牛仔裤 虽是 StoreA 的美国单，但列结构是牛仔裤专用，不能当 StoreA 美国站的落点）。
+# store      = 页面右上角的登录店铺名
+# sites      = 归一化后的站点（导出的「哥伦比亚站」会先去掉尾字「站」）
+# sheet      = 目标工作表名
+# store_value= 写进「订单店铺」列的值，照抄表内既有写法（可能 ≠ 登录店铺名）
+#
+# 下列映射由 2026-07-27 对登记表的只读探测反推：按【出现频次】统计各 Sheet 已登记行的
+# 「订单店铺 / 站点区分」取值（去重集合分不清真值与脏数据——表里混着被贴进这两列的尺码
+# 和 DISPIMG 公式，各只有 1 行；真值动辄几十上百行）。只配了「表里数据能唯一确定落点」
+# 的组合，其余留空等人工确认，宁可报未映射也不猜。
+[[orders.sheet_map]]
+store = "StoreA"
+sites = ["哥伦比亚", "秘鲁"]
+sheet = "StoreA全球1"
+store_value = "StoreA全球"
+
+# StoreB 主表：哥伦比亚/秘鲁两站混写在同一张表，店铺列多数行写「StoreB」。
+[[orders.sheet_map]]
+store = "StoreB"
+sites = ["哥伦比亚", "秘鲁"]
+sheet = "StoreB"
+store_value = "StoreB"
+
+# StoreB 欧区单独一张表：德国/西班牙/意大利/法国/波兰/匈牙利（店铺列历史上多为空，
+# 仍写 StoreB 以便判重口径一致——判重键是订单号+尺码，不含店铺列）。
+[[orders.sheet_map]]
+store = "StoreB"
+sites = ["德国", "西班牙", "意大利", "法国", "波兰", "匈牙利"]
+sheet = "StoreB欧区"
+store_value = "StoreB"
+
+# StoreC 按站点分两张表：美国单独一张，哥伦比亚/秘鲁进「全球」。
+[[orders.sheet_map]]
+store = "StoreC"
+sites = ["美国"]
+sheet = "StoreC美国"
+store_value = "StoreC"
+
+[[orders.sheet_map]]
+store = "StoreC"
+sites = ["哥伦比亚", "秘鲁"]
+sheet = "StoreC全球"
+store_value = "StoreC"
