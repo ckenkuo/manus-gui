@@ -9,6 +9,7 @@ from datetime import datetime
 from functools import partial
 from json import dumps
 from pathlib import Path
+from typing import Optional
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -102,6 +103,26 @@ async def index(request: Request):
 async def collect_page(request: Request):
     """批量采集页：清单展示 + 一键开跑 + SSE 实时进度（独立于通用对话页）。"""
     return templates.TemplateResponse("collect.html", {"request": request})
+
+
+@app.get("/activity", response_class=HTMLResponse)
+async def activity_page(request: Request):
+    """活动管理页：SPU 清单 + dry-run/正式执行开关 + SSE 实时进度（独立页）。
+
+    最高优先级安全：涉及真实商家账号的不可逆操作，前端「正式执行」默认关闭，
+    默认只跑 dry-run（只读+算计划+出报名清单，不点任何变更按钮），对标采集页 base_only。
+    """
+    return templates.TemplateResponse("activity.html", {"request": request})
+
+
+@app.get("/orders", response_class=HTMLResponse)
+async def orders_page(request: Request):
+    """订单登记页：Temu 待发货订单 → 本地订单登记表（含 DISPIMG 主图），SSE 实时进度。
+
+    同活动页的安全语义：写登记表不可逆（虽有自动备份），前端「正式写入」默认关闭，
+    默认只跑试跑——走完导出与解析，只把「将写入什么」列出来给人核对。
+    """
+    return templates.TemplateResponse("orders.html", {"request": request})
 
 
 @app.get("/download")
@@ -434,6 +455,258 @@ async def collect_batch_events(job_id: str):
                 yield f"event: done\ndata: {dumps(job.summary)}\n\n"
                 break
             yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ==== 活动管理（关加速器→报活动→重开加速器）：确定性批处理，独立于通用 agent ========
+# 对标上面的采集接口：ActivityJob 照抄 CollectJob（内部队列 + on_progress 塞事件 + SSE 逐条
+# yield）。与采集不同的是【安全语义】：涉及真实商家账号的不可逆操作，dry_run 默认 True，
+# 只有前端显式开「正式执行」才 False。工作簿/Sheet 枚举复用采集 service，不重复造。
+
+from app.activity import service as activity_service
+
+
+class ActivityJob:
+    """一次活动管理作业：持有进度队列，供 SSE 消费（对标 CollectJob）。"""
+
+    def __init__(
+        self, job_id: str, excel: str = "", sheet: str = "", dry_run: bool = True,
+    ):
+        self.id = job_id
+        self.excel = excel
+        self.sheet = sheet
+        self.dry_run = dry_run
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.done = False
+        self.summary: dict = {}
+
+    async def push(self, event: dict):
+        await self.queue.put(event)
+
+
+activity_jobs: dict = {}
+
+
+@app.get("/activity/worklist")
+async def activity_worklist(excel: str = "", sheet: str = ""):
+    """活动页首屏：可选工作簿/Sheet 列表 + 上次选择回显 + 全局毛利率红线默认。
+
+    工作簿/Sheet 枚举直接复用采集 service 的 get_worklist_status（同一数据源，不重复造），
+    只额外附上活动模块的全局默认毛利率（config [activity].min_margin，缺失兜底 0.15）。
+    纯读、不触发任何变更。
+    """
+    status = collect_service.get_worklist_status(
+        excel=excel or None, sheet=sheet or None,
+    )
+    return JSONResponse(content={
+        "excel": status.get("excel", ""),
+        "sheet": status.get("sheet", ""),
+        "workbooks": status.get("workbooks", []),
+        "sheets": status.get("sheets", []),
+        "excel_locked": status.get("excel_locked", False),
+        # 活动模块的全局默认毛利率红线（前端批量毛利率输入框初值）
+        "min_margin": activity_service.global_min_margin(),
+    })
+
+
+@app.post("/activity/batch")
+async def activity_batch(
+    excel: str = Body("", embed=True),
+    sheet: str = Body("", embed=True),
+    spus: str = Body("", embed=True),
+    min_margin: Optional[float] = Body(None, embed=True),
+    dry_run: bool = Body(True, embed=True),
+):
+    """启动一批活动管理作业，返回 job_id；进度经 /activity/batch/{job_id}/events (SSE) 消费。
+
+    安全：dry_run 默认 True（只读+算计划+出报名清单，不点任何变更按钮）；只有前端显式
+    开「正式执行」才传 False。spus 为原始清单文本（支持逐品 "spu:margin" 语法），min_margin
+    为本批统一毛利率红线（缺省走 config 全局默认）。excel/sheet 为目标成本核算表与 Sheet。
+    """
+    job_id = str(uuid.uuid4())
+    job = ActivityJob(job_id, excel, sheet, dry_run)
+    activity_jobs[job_id] = job
+
+    async def _on_progress(event: dict):
+        await job.push(event)
+
+    async def _run():
+        try:
+            job.summary = await activity_service.run_activity_batch(
+                spus, excel, sheet,
+                min_margin=min_margin, dry_run=dry_run, live=not dry_run,
+                on_progress=_on_progress,
+            )
+        except Exception as e:
+            await job.push({"type": "aborted", "reason": f"活动管理异常：{e}"})
+        finally:
+            job.done = True
+            await job.push({"type": "_end"})  # 哨兵：通知 SSE 收尾
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/activity/batch/{job_id}/events")
+async def activity_batch_events(job_id: str):
+    """SSE 推送某次活动管理作业的结构化进度事件（原样转发 service 的 on_progress 事件）。"""
+
+    async def event_generator():
+        job = activity_jobs.get(job_id)
+        if job is None:
+            yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
+            return
+        while True:
+            try:
+                event = await job.queue.get()
+            except asyncio.CancelledError:
+                break
+            if event.get("type") == "_end":
+                yield f"event: done\ndata: {dumps(job.summary)}\n\n"
+                break
+            yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---- 订单登记接口（对标 /activity/*）---------------------------------------
+# 同样的作业模式：POST 起作业拿 job_id，进度走 SSE。安全语义也一致——写登记表不可逆
+# （虽有自动备份），dry_run 默认 True，只有前端显式开「正式写入」才 False。
+# 目标工作簿/Sheet 由用户在页面上选（对标活动页的工作簿+Sheet 选择器），config 只提供缺省
+# 值；显式选了 Sheet 就绕过 sheet_map 的站点分流——用户自己判断落点，管线不猜也不拦。
+
+from app.orders import service as orders_service
+
+
+class OrdersJob:
+    """一次订单登记作业：持有进度队列，供 SSE 消费（对标 ActivityJob）。"""
+
+    def __init__(self, job_id: str, store: str = "", dry_run: bool = True):
+        self.id = job_id
+        self.store = store
+        self.dry_run = dry_run
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.done = False
+        self.summary: dict = {}
+
+    async def push(self, event: dict):
+        await self.queue.put(event)
+
+
+orders_jobs: dict = {}
+
+
+@app.get("/orders/worklist")
+async def orders_worklist(store: str = "", workbook: str = "", sheet: str = ""):
+    """订单页首屏/切换：可选工作簿与 Sheet 列表、上次选择回显、选中 Sheet 的可写性。
+
+    query 参数缺省（不传）时回填「上次选择」，再兜底 config 的 [orders].workbook。
+    注意 store/sheet 用空串表示「本次不覆盖」，与 service 的 None 语义对齐：显式传空串
+    是「清空选择」，不传则沿用偏好。纯读，不触发采集或写入。
+    """
+    return JSONResponse(content=orders_service.get_worklist_status(
+        store=store or None, workbook=workbook or None, sheet=sheet or None,
+    ))
+
+
+@app.get("/orders/sheet_info")
+async def orders_sheet_info(workbook: str, sheet: str):
+    """单独探测某 Sheet 的可写性（判重列是否齐、图片列、表头行）。
+
+    独立成一个接口是因为登记表 102MB，切 Sheet 时只该解析这一张表的表头，不必把整个
+    worklist（含工作簿枚举）重算一遍。
+    """
+    cfg = orders_service.load_orders_config()
+    return JSONResponse(content=orders_service.inspect_sheet(
+        workbook, sheet, list(cfg.get("dedupe_by") or []),
+    ))
+
+
+@app.post("/orders/batch")
+async def orders_batch(
+    store: str = Body("", embed=True),
+    dry_run: bool = Body(True, embed=True),
+    max_pages: int = Body(200, embed=True),
+    workbook: str = Body("", embed=True),
+    sheet: str = Body("", embed=True),
+    allow_no_price: bool = Body(False, embed=True),
+):
+    """启动一批订单登记作业，返回 job_id；进度经 /orders/batch/{job_id}/events (SSE) 消费。
+
+    store 为空则由页面识别当前登录店铺；识别不到会中止（店铺决定写哪张表，不猜）。
+    workbook/sheet 为空则用 config 缺省值并按 sheet_map 分流；显式给了 sheet 就全部写进
+    那一张表。max_pages 供冒烟用（只翻前 N 页）。
+
+    allow_no_price 默认 False：页面暂无「成交单价」的订单留到下批，不带空价入库
+    （判重键含尺码，入库后重跑不补价）。
+    """
+    job_id = str(uuid.uuid4())
+    job = OrdersJob(job_id, store, dry_run)
+    orders_jobs[job_id] = job
+    # 记住本次选择，下次开页直接回填（写失败不影响本批）
+    orders_service.save_prefs(store=store, workbook=workbook, sheet=sheet)
+
+    async def _on_progress(event: dict):
+        await job.push(event)
+
+    async def _run():
+        try:
+            job.summary = await orders_service.run_orders_batch(
+                store=store, dry_run=dry_run, max_pages=max_pages,
+                workbook=workbook, sheet=sheet,
+                on_progress=_on_progress,
+                require_price=not allow_no_price,
+            )
+        except Exception as e:
+            await job.push({"type": "aborted", "reason": f"订单登记异常：{e}"})
+        finally:
+            job.done = True
+            await job.push({"type": "_end"})  # 哨兵：通知 SSE 收尾
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/orders/batch/{job_id}/events")
+async def orders_batch_events(job_id: str):
+    """SSE 推送某次订单登记作业的结构化进度事件（原样转发 service 的 on_progress 事件）。"""
+
+    async def event_generator():
+        job = orders_jobs.get(job_id)
+        if job is None:
+            yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
+            return
+        while True:
+            try:
+                event = await job.queue.get()
+            except asyncio.CancelledError:
+                break
+            if event.get("type") == "_end":
+                yield f"event: done\ndata: {dumps(job.summary)}\n\n"
+                break
+            # service 的 batch 收尾事件也叫 done，与 SSE 收尾哨兵撞名，转发时改名成
+            # batch_done，避免前端 done 处理器被同样的汇总触发两次。
+            name = event.get("type", "log")
+            if name == "done":
+                name = "batch_done"
+            yield f"event: {name}\ndata: {dumps(event)}\n\n"
 
     return StreamingResponse(
         event_generator(),

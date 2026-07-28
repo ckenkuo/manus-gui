@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>订单登记 · 待发货订单 → 订单登记表</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+    <link href="/static/bootstrap.min.css" rel="stylesheet" />
+    <link
+      href="https://gcore.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css"
+      rel="stylesheet"
+    />
+    <style>
+      body {
+        background: var(--bs-body-bg);
+      }
+      .stat-card {
+        border: 1px solid var(--bs-border-color);
+        border-radius: 0.75rem;
+      }
+      .stat-num {
+        font-size: 1.75rem;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      /* 进度日志：等宽、可滚动，实时 append（与活动页一致） */
+      #eventLog {
+        height: 240px;
+        overflow-y: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        background: var(--bs-tertiary-bg);
+        border-radius: 0.5rem;
+        padding: 0.5rem 0.75rem;
+      }
+      #eventLog .line {
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .plan-table {
+        font-size: 0.85rem;
+      }
+      .plan-table td,
+      .plan-table th {
+        vertical-align: middle;
+      }
+      .table-scroll {
+        max-height: 460px;
+        overflow-y: auto;
+      }
+      .path-text {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.78rem;
+        word-break: break-all;
+      }
+      .cell-ellipsis {
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="navbar navbar-expand bg-body-tertiary border-bottom mb-3">
+      <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">
+          <i class="bi bi-clipboard-check me-1"></i> 订单登记
+          <small class="text-muted fs-6">待发货订单 → 订单登记表（含主图）</small>
+        </span>
+        <div class="ms-auto">
+          <a href="/collect" class="btn btn-sm btn-outline-secondary me-1">
+            <i class="bi bi-box-seam"></i> 批量采集
+          </a>
+          <a href="/activity" class="btn btn-sm btn-outline-secondary me-1">
+            <i class="bi bi-megaphone"></i> 活动管理
+          </a>
+          <a href="/" class="btn btn-sm btn-outline-secondary">
+            <i class="bi bi-chat-dots"></i> 返回对话
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="container-fluid px-4 pb-5">
+      <!-- 登记表占用告警：写入是 zip 重写，被 WPS 独占锁着必失败 -->
+      <div id="lockAlert" class="alert alert-warning d-none" role="alert">
+        <i class="bi bi-exclamation-triangle-fill"></i>
+        登记表正被 WPS/Excel 占用，正式写入会失败。请先关闭该文件（试跑不受影响）。
+      </div>
+      <div id="missAlert" class="alert alert-danger d-none" role="alert">
+        <i class="bi bi-exclamation-octagon-fill"></i>
+        配置里的登记表路径不存在，请检查 config.toml 的 <code>[orders].workbook</code>。
+      </div>
+
+      <!-- 安全告警：正式写入开启时才出现 -->
+      <div id="writeAlert" class="alert alert-danger d-none" role="alert">
+        <i class="bi bi-exclamation-octagon-fill"></i>
+        <strong>正式写入已开启：</strong>会把订单行连同 DISPIMG 主图写进登记表。写入前
+        自动备份，但仍属不可逆操作，请先跑一次试跑核对行数与字段。
+      </div>
+
+      <!-- 统计卡片 -->
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num" id="statTotal">–</div>
+            <div class="text-muted small">页面待发货总数</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-primary" id="statPending">0</div>
+            <div class="text-muted small">待登记（去重后）</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-warning" id="statDup">0</div>
+            <div class="text-muted small">已登记跳过</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-success" id="statWritten">0</div>
+            <div class="text-muted small">实际写入行</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 目标选择：登记表 + Sheet 由用户选，config 只提供缺省值 -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row g-2 align-items-end">
+            <div class="col-12 col-md-7">
+              <label class="form-label small text-muted mb-1">订单登记表</label>
+              <select id="workbookSelect" class="form-select form-select-sm">
+                <option value="">读取中…</option>
+              </select>
+            </div>
+            <div class="col-12 col-md-5">
+              <label class="form-label small text-muted mb-1">
+                目标 Sheet
+                <span class="text-body-tertiary">（选定后本批全部写进这张表）</span>
+              </label>
+              <select id="sheetSelect" class="form-select form-select-sm">
+                <option value="">按配置的站点映射自动分表</option>
+              </select>
+            </div>
+          </div>
+          <div class="row g-2 mt-1">
+            <div class="col-12 col-md-7">
+              <div id="workbookPath" class="path-text text-body-tertiary"></div>
+            </div>
+            <div class="col-12 col-md-5">
+              <div id="sheetInfo" class="small"></div>
+            </div>
+          </div>
+          <hr class="my-3" />
+          <div class="row g-2 align-items-end">
+            <div class="col-12 col-md-5">
+              <label class="form-label small text-muted mb-1">
+                当前登录店铺
+                <span class="text-body-tertiary">（留空＝自动识别）</span>
+              </label>
+              <!-- 用 datalist 而不是 select：候选来自 sheet_map，但店铺名必须允许手填 -->
+              <input
+                id="storeInput"
+                type="text"
+                class="form-control form-control-sm"
+                list="storeOptions"
+                placeholder="如 StoreA；识别不到会中止，不猜"
+              />
+              <datalist id="storeOptions"></datalist>
+            </div>
+            <div class="col-6 col-md-3">
+              <label class="form-label small text-muted mb-1">最多翻页</label>
+              <input
+                id="maxPagesInput"
+                type="number"
+                class="form-control form-control-sm"
+                value="200"
+                min="1"
+              />
+            </div>
+          </div>
+          <div class="alert alert-light border small py-2 mt-3 mb-2" role="note">
+            <i class="bi bi-info-circle"></i>
+            订单只来自「当前 CDP 里已登录的店铺」，管线自己不切店；数据取页面自带的
+            「导出订单」官方 xlsx，主图另从列表 DOM 抓取后以 DISPIMG 嵌入。
+            管线不会新建表，只往已存在的 Sheet 追加；人工填写列（如实际重量等）一律不动。
+            选了目标 Sheet 就<strong>不再按站点分流</strong>，本批全部写进那张表。
+          </div>
+          <div class="d-flex flex-wrap gap-2 align-items-center">
+            <div class="form-check form-switch ms-1">
+              <input class="form-check-input" type="checkbox" id="switchWrite" />
+              <label
+                class="form-check-label small text-danger fw-semibold"
+                for="switchWrite"
+                title="默认关闭=只试跑（走完导出与解析，只列出将写入什么）。开启才真正落盘"
+                >正式写入（默认只试跑）</label
+              >
+            </div>
+            <button id="btnStart" class="btn btn-primary btn-sm ms-auto">
+              <span
+                id="startSpinner"
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+              ></span>
+              <i class="bi bi-play-fill"></i>
+              <span id="startLabel">开始（试跑）</span>
+            </button>
+            <span id="statusText" class="text-muted small"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 事件日志 -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="d-flex justify-content-between small text-muted mb-2">
+            <span>运行日志</span>
+            <span id="phaseLabel">未开始</span>
+          </div>
+          <div id="eventLog"></div>
+        </div>
+      </div>
+
+      <!-- 分表计划：每张 Sheet 一行，试跑时给出样例行供人工核对 -->
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-table"></i> 分表计划</span>
+          <span class="badge text-bg-light text-dark">
+            未映射跳过 <span id="statUnmapped">0</span> 单
+          </span>
+        </div>
+        <div class="table-scroll">
+          <table class="table table-sm table-hover plan-table mb-0">
+            <thead class="sticky-top bg-body">
+              <tr>
+                <th style="width: 170px">Sheet</th>
+                <th style="width: 90px">待登记</th>
+                <th style="width: 90px">已登记跳过</th>
+                <th style="width: 80px">带主图</th>
+                <th style="width: 150px">写入结果</th>
+                <th>样例行 / 说明</th>
+              </tr>
+            </thead>
+            <tbody id="planBody">
+              <tr>
+                <td colspan="6" class="text-center text-muted py-4">
+                  点「开始」后，分表计划将在此逐条出现
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="position-fixed top-0 end-0 p-3" style="z-index: 1100">
+      <div id="toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="toast-header">
+          <strong class="me-auto" id="toastTitle">提示</strong>
+          <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+        </div>
+        <div class="toast-body" id="toastBody"></div>
+      </div>
+    </div>
+
+    <script src="/static/bootstrap.bundle.min.js"></script>
+    <script>
+      // 订单登记页前端：全部走 /orders/* 接口，进度经 SSE 消费 service 的结构化事件。
+      // 登记表路径与 Sheet 映射只回显不可编辑——落点由 config 决定，前端乱填就是写错表。
+      const $ = (id) => document.getElementById(id);
+      let evtSource = null;
+      let cfg = {};
+      // 分表计划状态：sheet → {pending, dup, with_image, note, result}
+      let sheets = {};
+      let order = [];
+
+      function showToast(title, body, kind = "primary") {
+        $("toastTitle").textContent = title;
+        $("toastBody").textContent = body;
+        const el = $("toast");
+        el.className = `toast text-bg-${kind}`;
+        new bootstrap.Toast(el, { delay: 4000 }).show();
+      }
+
+      function logLine(text, cls = "") {
+        const box = $("eventLog");
+        const div = document.createElement("div");
+        div.className = "line " + cls;
+        const t = new Date().toLocaleTimeString();
+        div.textContent = `[${t}] ${text}`;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      function esc(s) {
+        return String(s == null ? "" : s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            }[c])
+        );
+      }
+
+      function isWrite() {
+        return $("switchWrite").checked;
+      }
+
+      // ---- 首屏 / 切换工作簿 ----
+      // params 为空＝首屏（回填上次选择）；传了就是用户切换了某一项
+      async function loadWorklist(params = {}) {
+        const qs = new URLSearchParams(params).toString();
+        try {
+          const r = await fetch("/orders/worklist" + (qs ? "?" + qs : ""));
+          cfg = await r.json();
+          fillSelect($("workbookSelect"), cfg.workbooks || [], cfg.workbook, null);
+          $("workbookPath").textContent = cfg.workbook || "";
+          fillSelect(
+            $("sheetSelect"),
+            cfg.sheets || [],
+            cfg.sheet,
+            "按配置的站点映射自动分表"
+          );
+          $("storeOptions").innerHTML = (cfg.store_options || [])
+            .map((s) => `<option value="${esc(s)}"></option>`)
+            .join("");
+          if (cfg.store && !$("storeInput").value) $("storeInput").value = cfg.store;
+          $("lockAlert").classList.toggle("d-none", !cfg.workbook_locked);
+          $("missAlert").classList.toggle("d-none", !!cfg.workbook_exists);
+          renderSheetInfo(cfg.sheet_info || {});
+          updateStartEnabled();
+        } catch (e) {
+          showToast("加载工作簿列表失败", String(e), "danger");
+        }
+      }
+
+      // placeholder 非 null 时插一个空值选项（表示「不指定」）
+      function fillSelect(sel, items, selected, placeholder) {
+        const opts = [];
+        if (placeholder !== null) {
+          opts.push(`<option value="">${esc(placeholder)}</option>`);
+        }
+        (items || []).forEach((v) => {
+          const on = v === selected ? " selected" : "";
+          opts.push(`<option value="${esc(v)}"${on}>${esc(v)}</option>`);
+        });
+        sel.innerHTML = opts.join("");
+      }
+
+      // 目标 Sheet 的可写性：判重列缺任一列 → service 会整表跳过，这里提前红字警告
+      function renderSheetInfo(info) {
+        const box = $("sheetInfo");
+        if (!info || !info.sheet) {
+          const dd = (cfg.dedupe_by || []).join(" + ");
+          box.innerHTML = `<span class="text-muted">判重键 ${esc(dd || "–")}</span>`;
+          return;
+        }
+        if (!info.writable) {
+          box.innerHTML =
+            `<span class="text-danger"><i class="bi bi-x-octagon-fill"></i> ` +
+            `不可写：${esc(info.reason)}（会整表跳过，一行不写）</span>`;
+          return;
+        }
+        const img = info.image_col
+          ? `图片列 ${esc(info.image_col)}`
+          : `<span class="text-warning">无图片列，主图不写</span>`;
+        box.innerHTML =
+          `<span class="text-success"><i class="bi bi-check-circle-fill"></i> 可写</span>` +
+          `<span class="text-muted"> · 表头第 ${info.header_row} 行 · ${img} · ` +
+          `${esc((info.titles || []).length)} 列</span>`;
+      }
+
+      // 登记表不存在、或选中 Sheet 不可写时无从下手；被占用只挡正式写入，试跑仍放行
+      function updateStartEnabled() {
+        const miss = !cfg.workbook_exists;
+        const unwritable =
+          cfg.sheet_info && cfg.sheet_info.sheet && !cfg.sheet_info.writable;
+        const blockWrite = isWrite() && cfg.workbook_locked;
+        $("btnStart").disabled = miss || blockWrite || unwritable;
+        $("btnStart").title = miss
+          ? "登记表路径不存在"
+          : unwritable
+          ? "选中的 Sheet 缺判重列，写不进去"
+          : blockWrite
+          ? "登记表被占用，请先关闭 WPS/Excel"
+          : "";
+      }
+
+      // ---- 分表计划渲染 ----
+      function planRow(name) {
+        const s = sheets[name] || {};
+        const result = s.result
+          ? s.result.error
+            ? `<span class="badge text-bg-danger">失败</span>`
+            : `<span class="badge text-bg-success">写入 ${s.result.written} 行</span>`
+          : s.writing
+          ? `<span class="badge text-bg-primary">写入中…</span>`
+          : `<span class="badge text-bg-light text-dark">未写入</span>`;
+        return `<tr>
+          <td>${esc(name)}</td>
+          <td>${s.pending ?? "–"}</td>
+          <td>${s.dup ?? "–"}</td>
+          <td>${s.with_image ?? "–"}</td>
+          <td>${result}</td>
+          <td class="small text-muted">${s.note || ""}</td>
+        </tr>`;
+      }
+
+      function renderPlanTable() {
+        const body = $("planBody");
+        if (!order.length) {
+          body.innerHTML = `<tr><td colspan="6" class="text-center text-muted py-4">
+            点「开始」后，分表计划将在此逐条出现</td></tr>`;
+          return;
+        }
+        body.innerHTML = order.map(planRow).join("");
+      }
+
+      function touchSheet(name) {
+        if (!sheets[name]) {
+          sheets[name] = {};
+          order.push(name);
+        }
+        return sheets[name];
+      }
+
+      // 样例行：把 {列标题: 值} 压成一行短文本，供人工核对字段落位
+      function previewText(rows) {
+        return (rows || [])
+          .map((r) =>
+            Object.entries(r)
+              .filter(([k]) => !k.startsWith("_"))
+              .slice(0, 6)
+              .map(([k, v]) => `${k}=${v}`)
+              .join(" | ")
+          )
+          .join("；");
+      }
+
+      function refreshStats(d) {
+        if (d.total_on_page != null) $("statTotal").textContent = d.total_on_page;
+        if (d.pending != null) $("statPending").textContent = d.pending;
+        if (d.dup_skipped != null) $("statDup").textContent = d.dup_skipped;
+        if (d.written_rows != null) $("statWritten").textContent = d.written_rows;
+        if (d.unmapped_skipped != null)
+          $("statUnmapped").textContent = d.unmapped_skipped;
+      }
+
+      // ---- SSE 事件分发（事件名与 app/orders/service.py 的 _emit 一一对应）----
+      function onEvent(type, d) {
+        switch (type) {
+          case "started":
+            $("phaseLabel").textContent = d.dry_run ? "试跑中" : "正式写入中";
+            logLine(
+              `开始：${d.dry_run ? "试跑（不落盘）" : "正式写入"} → ${d.workbook}` +
+                (d.sheet ? `［全部写入 ${d.sheet}］` : "［按站点映射分表］")
+            );
+            break;
+          case "store":
+            logLine(`当前店铺：${d.store}`, "text-info");
+            break;
+          case "page":
+            $("statTotal").textContent = d.total ?? "–";
+            $("phaseLabel").textContent = `翻页采集 第 ${d.page ?? "?"} 页`;
+            logLine(
+              `第 ${d.page ?? "?"} 页（已翻 ${d.pages_done ?? "?"}）：已勾选 ` +
+                `${d.selected ?? "?"} / ${d.total ?? "?"}，累计抓图 ${d.images ?? 0}`
+            );
+            break;
+          case "swept":
+            $("statTotal").textContent = d.total ?? "–";
+            logLine(
+              `翻页完成：${d.pages} 页 / 共 ${d.total} 单，勾选 ${d.selected}，抓到主图 ${d.images} 个`,
+              "text-info"
+            );
+            break;
+          case "exported":
+            $("phaseLabel").textContent = "解析导出文件";
+            logLine(`导出文件：${d.file}`);
+            break;
+          case "parsed":
+            logLine(
+              `解析：${d.rows} 行 / ${d.orders} 个订单号；配图命中 ${d.image ?? 0}、` +
+                `配价命中 ${d.price ?? 0}、缺图 ${d.miss ?? 0}`,
+              "text-info"
+            );
+            break;
+          case "images":
+            $("phaseLabel").textContent = "生成分表计划";
+            logLine(`主图下载：成功 ${d.ok ?? 0}，失败 ${d.fail ?? 0}`);
+            break;
+          case "plan": {
+            const s = touchSheet(d.sheet);
+            s.pending = d.pending;
+            s.dup = d.dup;
+            s.with_image = d.with_image;
+            if (d.no_key) {
+              s.note = "判重列缺失，整表跳过（避免重复登记）";
+            }
+            renderPlanTable();
+            logLine(
+              `计划 ${d.sheet}：待登记 ${d.pending}，已登记跳过 ${d.dup}，带图 ${d.with_image}` +
+                (d.no_key ? "（判重列缺失，整表跳过）" : "")
+            );
+            break;
+          }
+          case "unmapped":
+            $("statUnmapped").textContent = d.count;
+            logLine(
+              `${d.count} 单没匹配到 Sheet（店铺/站点未在 sheet_map 里），已跳过：` +
+                JSON.stringify(d.samples || []),
+              "text-warning"
+            );
+            break;
+          case "writing": {
+            const s = touchSheet(d.sheet);
+            s.writing = true;
+            renderPlanTable();
+            $("phaseLabel").textContent = `写入 ${d.sheet}`;
+            logLine(`开始写入 ${d.sheet}：${d.rows} 行`);
+            break;
+          }
+          case "written": {
+            const s = touchSheet(d.sheet);
+            s.writing = false;
+            s.result = { written: d.written };
+            s.note = `行 ${d.first_row}–${d.last_row}，嵌图 ${d.images ?? 0}`;
+            renderPlanTable();
+            logLine(
+              `${d.sheet} 写入完成：${d.written} 行（${d.first_row}–${d.last_row}），` +
+                `嵌图 ${d.images ?? 0}；备份 ${d.backup || "无"}`,
+              "text-success"
+            );
+            break;
+          }
+          case "write_failed": {
+            const s = touchSheet(d.sheet);
+            s.writing = false;
+            s.result = { error: d.error };
+            s.note = d.error;
+            renderPlanTable();
+            logLine(`${d.sheet} 写入失败：${d.error}`, "text-danger");
+            break;
+          }
+          case "batch_done":
+            refreshStats(d);
+            // 试跑时把样例行补进计划表，供人工核对字段落位
+            Object.entries(d.sheets || {}).forEach(([name, info]) => {
+              const s = touchSheet(name);
+              if (!s.result) s.note = previewText(info.preview) || s.note;
+            });
+            renderPlanTable();
+            if (d.aborted) {
+              logLine(`已中止：${d.aborted}`, "text-danger");
+            } else if (d.dry_run) {
+              logLine(
+                `试跑结束：待登记 ${d.pending} 行、已登记跳过 ${d.dup_skipped}、` +
+                  `未映射 ${d.unmapped_skipped}、无价留待下批 ${
+                    d.unpriced_skipped ?? 0
+                  }。核对无误后勾「正式写入」重跑。`,
+                "text-info"
+              );
+              // 只打前 3 行核对不了几十行，完整清单落成 CSV，这里给出路径
+              (d.plan_files || []).forEach((f) =>
+                logLine(`完整待写计划（逐行核对用）：${f}`, "text-info")
+              );
+            } else {
+              logLine(
+                `写入结束：共 ${d.written_rows} 行；失败表 ${
+                  (d.failed_sheets || []).join("、") || "无"
+                }`,
+                "text-success"
+              );
+            }
+            break;
+          case "unpriced":
+            logLine(
+              `${d.count} 条订单页面暂无「成交单价」，本批不登记、留到下批` +
+                `（插件回填约一天延迟）`,
+              "text-warning"
+            );
+            break;
+          case "aborted":
+            logLine(`中止：${d.reason}`, "text-danger");
+            showToast("已中止", d.reason, "danger");
+            break;
+          default:
+            logLine(`${type}: ${JSON.stringify(d)}`);
+        }
+      }
+
+      function finishRun() {
+        if (evtSource) {
+          evtSource.close();
+          evtSource = null;
+        }
+        $("startSpinner").classList.add("d-none");
+        $("statusText").textContent = "";
+        $("phaseLabel").textContent = "已结束";
+        updateStartEnabled();
+        // 写入后占用状态可能变；带上当前选择，别让刷新把用户的选择重置掉
+        loadWorklist({ workbook: cfg.workbook || "", sheet: cfg.sheet || "" });
+      }
+
+      async function startBatch() {
+        const write = isWrite();
+        const sheet = $("sheetSelect").value;
+        // 正式写入会改动 102MB 的登记表（有自动备份），二次确认时把落点写清楚
+        const target = sheet ? `目标表：${sheet}（本批全部写这张）` : "按站点映射自动分表";
+        if (
+          write &&
+          !confirm(
+            `正式写入会把订单行连同 DISPIMG 主图写进登记表（写前自动备份）。\n\n` +
+              `${$("workbookSelect").value}\n${target}\n\n确认继续？`
+          )
+        ) {
+          return;
+        }
+        sheets = {};
+        order = [];
+        renderPlanTable();
+        ["statTotal", "statPending", "statDup", "statWritten", "statUnmapped"].forEach(
+          (id) => ($(id).textContent = id === "statTotal" ? "–" : 0)
+        );
+        $("btnStart").disabled = true;
+        $("startSpinner").classList.remove("d-none");
+        $("statusText").textContent = write ? "正式写入中…" : "试跑中…";
+        try {
+          const r = await fetch("/orders/batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              store: $("storeInput").value.trim(),
+              dry_run: !write, // 默认试跑；仅「正式写入」勾选才 false
+              max_pages: Number($("maxPagesInput").value) || 200,
+              workbook: $("workbookSelect").value,
+              sheet: $("sheetSelect").value, // 空＝按 sheet_map 分流
+            }),
+          });
+          const { job_id } = await r.json();
+          evtSource = new EventSource(`/orders/batch/${job_id}/events`);
+          [
+            "started",
+            "store",
+            "page",
+            "swept",
+            "exported",
+            "parsed",
+            "images",
+            "plan",
+            "unmapped",
+            "writing",
+            "written",
+            "write_failed",
+            "batch_done",
+            "aborted",
+            "log",
+          ].forEach((ev) =>
+            evtSource.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)))
+          );
+          evtSource.addEventListener("done", () => finishRun());
+          evtSource.onerror = () => {
+            // 流正常结束后浏览器也会触发一次 error，只在真关闭时收尾
+            if (evtSource && evtSource.readyState === EventSource.CLOSED) finishRun();
+          };
+        } catch (e) {
+          showToast("启动失败", String(e), "danger");
+          finishRun();
+        }
+      }
+
+      // 正式写入开关：显示/隐藏红色告警，并改按钮文案
+      $("switchWrite").addEventListener("change", (e) => {
+        const on = e.target.checked;
+        $("writeAlert").classList.toggle("d-none", !on);
+        $("startLabel").textContent = on ? "开始（正式写入）" : "开始（试跑）";
+        $("btnStart").classList.toggle("btn-danger", on);
+        $("btnStart").classList.toggle("btn-primary", !on);
+        updateStartEnabled();
+      });
+
+      // 换工作簿：Sheet 列表要跟着重取（并清空已选 Sheet，避免指向不存在的表）
+      $("workbookSelect").addEventListener("change", (e) => {
+        $("sheetSelect").innerHTML = '<option value="">读取中…</option>';
+        $("sheetInfo").textContent = "";
+        loadWorklist({ workbook: e.target.value, sheet: "" });
+      });
+
+      // 换 Sheet：只探测这一张表，不重算整个 worklist（登记表 102MB）
+      $("sheetSelect").addEventListener("change", async (e) => {
+        const sheet = e.target.value;
+        cfg.sheet = sheet;
+        if (!sheet) {
+          cfg.sheet_info = {};
+          renderSheetInfo({});
+          updateStartEnabled();
+          return;
+        }
+        $("sheetInfo").innerHTML =
+          '<span class="text-muted"><span class="spinner-border spinner-border-sm"></span> 探测表头…</span>';
+        try {
+          const qs = new URLSearchParams({ workbook: cfg.workbook, sheet });
+          cfg.sheet_info = await (await fetch("/orders/sheet_info?" + qs)).json();
+        } catch (err) {
+          cfg.sheet_info = { sheet, writable: false, reason: String(err) };
+        }
+        renderSheetInfo(cfg.sheet_info);
+        updateStartEnabled();
+      });
+
+      $("btnStart").addEventListener("click", startBatch);
+
+      loadWorklist();
+    </script>
+  </body>
+</html>

@@ -161,14 +161,21 @@
         ></path>
       </symbol>
     </svg>
-    <!-- 采集页入口：固定在左上角，跳到 /collect 批量采集页 -->
-    <a
-      href="/collect"
-      class="btn btn-primary position-fixed top-0 start-0 mt-3 ms-3 shadow"
+    <!-- 独立作业页入口：固定在左上角，跳到 /collect 批量采集、/activity 活动管理、/orders 订单登记 -->
+    <div
+      class="position-fixed top-0 start-0 mt-3 ms-3 d-flex gap-2"
       style="z-index: 1500"
     >
-      <i class="bi bi-box-seam me-1"></i> 批量采集
-    </a>
+      <a href="/collect" class="btn btn-primary shadow">
+        <i class="bi bi-box-seam me-1"></i> 批量采集
+      </a>
+      <a href="/activity" class="btn btn-danger shadow">
+        <i class="bi bi-megaphone me-1"></i> 活动管理
+      </a>
+      <a href="/orders" class="btn btn-success shadow">
+        <i class="bi bi-clipboard-check me-1"></i> 订单登记
+      </a>
+    </div>
 
     <div class="container-fluid">
       <div class="row">

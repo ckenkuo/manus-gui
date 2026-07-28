@@ -1,0 +1,1091 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>活动管理 · 关加速器 → 报活动 → 重开加速器</title>
+    <link rel="icon" href="/static/favicon.ico" type="image/x-icon" />
+    <link href="/static/bootstrap.min.css" rel="stylesheet" />
+    <link
+      href="https://gcore.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css"
+      rel="stylesheet"
+    />
+    <style>
+      body {
+        background: var(--bs-body-bg);
+      }
+      .stat-card {
+        border: 1px solid var(--bs-border-color);
+        border-radius: 0.75rem;
+      }
+      .stat-num {
+        font-size: 1.75rem;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+      /* 进度日志：等宽、可滚动，实时 append */
+      #eventLog {
+        height: 220px;
+        overflow-y: auto;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.8rem;
+        background: var(--bs-tertiary-bg);
+        border-radius: 0.5rem;
+        padding: 0.5rem 0.75rem;
+      }
+      #eventLog .line {
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .plan-table {
+        font-size: 0.85rem;
+      }
+      .plan-table td,
+      .plan-table th {
+        vertical-align: middle;
+      }
+      .accel-flow-table {
+        font-size: 0.85rem;
+      }
+      .accel-flow-table td,
+      .accel-flow-table th {
+        vertical-align: middle;
+      }
+      .accel-flow-arrow {
+        color: var(--bs-secondary-color);
+        font-size: 1.1rem;
+        text-align: center;
+      }
+      .accel-flow-note {
+        max-width: 240px;
+        color: var(--bs-secondary-color);
+        font-size: 0.72rem;
+        line-height: 1.2;
+        margin-top: 0.2rem;
+      }
+      .table-scroll {
+        max-height: 480px;
+        overflow-y: auto;
+      }
+      .cell-ellipsis {
+        max-width: 220px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #spusInput {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 0.85rem;
+      }
+    </style>
+  </head>
+  <body>
+    <nav class="navbar navbar-expand bg-body-tertiary border-bottom mb-3">
+      <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">
+          <i class="bi bi-megaphone me-1"></i> 活动管理
+          <small class="text-muted fs-6">关加速器 → 报活动 → 重开加速器</small>
+        </span>
+        <div class="ms-auto">
+          <a href="/collect" class="btn btn-sm btn-outline-secondary me-1">
+            <i class="bi bi-box-seam"></i> 批量采集
+          </a>
+          <a href="/" class="btn btn-sm btn-outline-secondary">
+            <i class="bi bi-chat-dots"></i> 返回对话
+          </a>
+        </div>
+      </div>
+    </nav>
+
+    <div class="container-fluid px-4 pb-5">
+      <!-- Excel 占用告警 -->
+      <div id="lockAlert" class="alert alert-warning d-none" role="alert">
+        <i class="bi bi-exclamation-triangle-fill"></i>
+        成本核算表正被 WPS/Excel 占用，读价可能失败。建议先关闭该文件。
+      </div>
+
+      <!-- 安全告警：正式执行开启时才出现 -->
+      <div id="execAlert" class="alert alert-danger d-none" role="alert">
+        <i class="bi bi-exclamation-octagon-fill"></i>
+        <strong>正式执行已开启：</strong>将对真实商家账号执行不可逆操作（关加速器 /
+        报名活动 / 重开加速器）。请确认无误后再开始。
+      </div>
+
+      <!-- 统计卡片：total / done / skip / fail -->
+      <div class="row g-3 mb-3">
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num" id="statTotal">–</div>
+            <div class="text-muted small">SPU 总数</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-success" id="statDone">0</div>
+            <div class="text-muted small">已处理（done）</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-warning" id="statSkip">0</div>
+            <div class="text-muted small">跳过（skip）</div>
+          </div>
+        </div>
+        <div class="col-6 col-md-3">
+          <div class="stat-card p-3 text-center">
+            <div class="stat-num text-danger" id="statFail">0</div>
+            <div class="text-muted small">失败（fail）</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 目标选择：工作簿 → Sheet（级联，复用采集页数据源） -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="row g-2 align-items-end">
+            <div class="col-12 col-md-7">
+              <label class="form-label small text-muted mb-1">成本核算表（工作簿）</label>
+              <select id="selExcel" class="form-select form-select-sm"></select>
+              <input
+                id="inputExcelPath"
+                type="text"
+                class="form-control form-control-sm mt-1 d-none"
+                placeholder="粘贴 .xlsx 完整路径后按回车"
+              />
+            </div>
+            <div class="col-12 col-md-5">
+              <label class="form-label small text-muted mb-1">目标 Sheet</label>
+              <select id="selSheet" class="form-select form-select-sm"></select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SPU 清单 + 参数条 -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <label class="form-label small text-muted mb-1">
+            SPU 清单（换行 / 逗号 / 空格分隔）
+          </label>
+          <textarea
+            id="spusInput"
+            class="form-control mb-2"
+            rows="4"
+            placeholder="9072868889&#10;9072868890&#10;9072868891"
+          ></textarea>
+          <div class="alert alert-light border small py-2 mb-2" role="note">
+            <i class="bi bi-info-circle"></i>
+            红线取自 Excel 销售价（销售底价）：申报价 ≥ 销售底价且库存 ≥ 活动库存门槛时标记为初筛通过；最终能否报名以进入活动详情后查询到可报名商品行为准。
+          </div>
+          <div class="d-flex flex-wrap gap-2 align-items-center">
+            <div class="form-check form-switch ms-1">
+              <input class="form-check-input" type="checkbox" id="switchExecute" />
+              <label
+                class="form-check-label small text-danger fw-semibold"
+                for="switchExecute"
+                title="默认关闭=只跑 dry-run（只读+算计划，不点任何变更按钮）。开启才真正对商家账号执行不可逆操作"
+                >正式执行（默认 dry-run 只读）</label
+              >
+            </div>
+            <button id="btnStart" class="btn btn-primary btn-sm ms-auto">
+              <span
+                id="startSpinner"
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+              ></span>
+              <i class="bi bi-play-fill"></i> <span id="startLabel">开始（dry-run）</span>
+            </button>
+            <span id="statusText" class="text-muted small"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- 进度条 + 事件日志 -->
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="d-flex justify-content-between small text-muted mb-1">
+            <span>本批进度</span>
+            <span id="progressLabel">0 / 0</span>
+          </div>
+          <div class="progress mb-3" style="height: 8px">
+            <div
+              id="progressBar"
+              class="progress-bar"
+              role="progressbar"
+              style="width: 0%"
+            ></div>
+          </div>
+          <div id="eventLog"></div>
+        </div>
+      </div>
+
+      <!-- 流量加速关闭/开启可视化 -->
+      <div class="card mb-3" id="accelFlowCard">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-speedometer2"></i> 流量加速流程（按 SPU 实时确认）</span>
+          <span class="small text-muted">关闭前检查 → 关闭动作 → 报活动 → 开启前检查 → 开启动作</span>
+        </div>
+        <div class="table-responsive">
+          <table class="table table-sm accel-flow-table mb-0">
+            <thead class="bg-body-tertiary">
+              <tr>
+                <th style="width: 130px">SPU</th>
+                <th>关闭前按 SPU 确认</th>
+                <th>关闭动作</th>
+                <th style="width: 42px"></th>
+                <th>开启前按 SPU 确认</th>
+                <th>开启动作</th>
+              </tr>
+            </thead>
+            <tbody id="accelFlowBody">
+              <tr>
+                <td colspan="6" class="text-center text-muted py-3">等待生成 SPU 计划</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 报名计划表格 -->
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <span><i class="bi bi-table"></i> 报名计划（每个入选活动一行）</span>
+          <span class="badge text-bg-light text-dark">
+            初筛活动 <span id="statEnrolled">0</span> 条
+          </span>
+        </div>
+        <div class="table-scroll">
+          <table class="table table-sm table-hover plan-table mb-0">
+            <thead class="sticky-top bg-body">
+              <tr>
+                <th style="width: 110px">SPU</th>
+                <th>活动</th>
+                <th style="width: 80px">日常价</th>
+                <th style="width: 80px">销售底价</th>
+                <th style="width: 80px">申报价</th>
+                <th style="width: 80px">达底价</th>
+                <th style="width: 70px">库存</th>
+                <th style="width: 70px">门槛</th>
+                <th style="width: 130px">入选</th>
+                <th style="width: 170px">状态</th>
+              </tr>
+            </thead>
+            <tbody id="planBody">
+              <tr>
+                <td colspan="10" class="text-center text-muted py-4">
+                  填入 SPU 清单后点「开始」，计划将在此逐条出现
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- Toast -->
+    <div class="position-fixed top-0 end-0 p-3" style="z-index: 1100">
+      <div id="toast" class="toast" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="toast-header">
+          <strong class="me-auto" id="toastTitle">提示</strong>
+          <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+        </div>
+        <div class="toast-body" id="toastBody"></div>
+      </div>
+    </div>
+
+    <script src="/static/bootstrap.bundle.min.js"></script>
+    <script>
+      // 活动管理页前端：全部走 /activity/* 接口，进度经 SSE 消费 service 抛出的结构化事件。
+      // 工作簿/Sheet 下拉复用采集页的数据源（/activity/worklist 内部转调采集 service）。
+      const $ = (id) => document.getElementById(id);
+      let evtSource = null;
+      // 当前选择：工作簿 / Sheet（后端回显「上次选择」作初值）
+      let sel = { excel: "", sheet: "" };
+      const MANUAL = "__manual__"; // 工作簿下拉里「手填路径」哨兵值
+      // 计划表状态：order 记录 SPU 首次出现顺序；plans[spu] 是「达底价」活动数组（一 SPU 多行）；
+      // dones[spu] 存 SPU 级最终状态；activityStates[spu][activity] 存每个活动行的实时状态。
+      let order = [];
+      let plans = {};
+      let dones = {};
+      let activityStates = {};
+      let accelStates = {};
+      let currentDryRun = true;
+
+      function showToast(title, body, kind = "primary") {
+        $("toastTitle").textContent = title;
+        $("toastBody").textContent = body;
+        const el = $("toast");
+        el.className = `toast text-bg-${kind}`;
+        new bootstrap.Toast(el, { delay: 4000 }).show();
+      }
+
+      function logLine(text, cls = "") {
+        const box = $("eventLog");
+        const div = document.createElement("div");
+        div.className = "line " + cls;
+        const t = new Date().toLocaleTimeString();
+        div.textContent = `[${t}] ${text}`;
+        box.appendChild(div);
+        box.scrollTop = box.scrollHeight;
+      }
+
+      // 短化工作簿路径为文件名（下拉更好读；title 保留完整路径）
+      function baseName(p) {
+        return (p || "").split(/[\\/]/).pop() || p;
+      }
+
+      function fmtNum(v) {
+        return v == null || v === "" ? "–" : v;
+      }
+      function fmtPct(v) {
+        return v == null ? "–" : `${(v * 100).toFixed(1)}%`;
+      }
+
+      function fillSelectors(s) {
+        // 工作簿下拉：扫描到的 .xlsx + 「手填路径」
+        const excelSel = $("selExcel");
+        const wbs = s.workbooks || [];
+        excelSel.innerHTML =
+          wbs
+            .map(
+              (p) =>
+                `<option value="${p}" title="${p}"${
+                  p === s.excel ? " selected" : ""
+                }>${baseName(p)}</option>`
+            )
+            .join("") + `<option value="${MANUAL}">手填路径…</option>`;
+        // 当前生效工作簿不在扫描列表里（手填过的）→ 也补一项选中
+        if (s.excel && !wbs.includes(s.excel)) {
+          const opt = document.createElement("option");
+          opt.value = s.excel;
+          opt.title = s.excel;
+          opt.textContent = baseName(s.excel);
+          opt.selected = true;
+          excelSel.insertBefore(opt, excelSel.lastElementChild);
+        }
+
+        // Sheet 下拉：选中工作簿的所有表；首项为「请选择」
+        const sheetSel = $("selSheet");
+        sheetSel.innerHTML =
+          `<option value="">— 请选择 —</option>` +
+          (s.sheets || [])
+            .map(
+              (n) =>
+                `<option value="${n}"${n === s.sheet ? " selected" : ""}>${n}</option>`
+            )
+            .join("");
+      }
+
+      async function loadWorklist() {
+        try {
+          const qs = new URLSearchParams({ excel: sel.excel, sheet: sel.sheet });
+          const r = await fetch("/activity/worklist?" + qs.toString());
+          const s = await r.json();
+          // 用后端回显的生效值同步本地选择（首屏即「上次选择」）
+          sel.excel = s.excel || "";
+          sel.sheet = s.sheet || "";
+          fillSelectors(s);
+          $("lockAlert").classList.toggle("d-none", !s.excel_locked);
+          // 红线改为来自 Excel 销售价列，本页不再需要毛利率入参；worklist 若仍回显 min_margin 直接忽略。
+          updateStartEnabled();
+        } catch (e) {
+          showToast("加载失败", String(e), "danger");
+        }
+      }
+
+      // 未选 Sheet / SPU 清单为空时禁用「开始」
+      function updateStartEnabled() {
+        const bad = !sel.sheet || !$("spusInput").value.trim();
+        $("btnStart").disabled = bad;
+        $("btnStart").title = !sel.sheet
+          ? "请先选目标 Sheet"
+          : bad
+          ? "请先填入 SPU 清单"
+          : "";
+      }
+
+      function isExecute() {
+        return $("switchExecute").checked;
+      }
+
+      // ---- 计划表渲染 ----
+      function planStatusBadge(spu) {
+        const st = dones[spu];
+        if (!st) return '<span class="badge text-bg-light text-dark">待定</span>';
+        if (st === "planned")
+          return '<span class="badge text-bg-info">计划就绪</span>';
+        if (st === "executing")
+          return '<span class="badge text-bg-primary">执行中</span>';
+        if (st === "preview")
+          return '<span class="badge text-bg-secondary">半程预览</span>';
+        if (st === "done")
+          return '<span class="badge text-bg-success">done</span>';
+        if (st === "fail")
+          return '<span class="badge text-bg-danger">fail</span>';
+        // skip_nofloor（无活动达底价）/ skip_nomatch（无匹配活动）一律黄
+        return `<span class="badge text-bg-warning">${st}</span>`;
+      }
+
+      function escapeHtml(value) {
+        return String(value == null ? "" : value)
+          .replaceAll("&", "&amp;")
+          .replaceAll('"', "&quot;")
+          .replaceAll("<", "&lt;")
+          .replaceAll(">", "&gt;");
+      }
+
+      function activityStatusBadge(spu, activity) {
+        const state = activityStates[spu]?.[activity];
+        if (!state) return '<span class="badge text-bg-light text-dark">待执行</span>';
+        const classes = {
+          planned: "text-bg-light text-dark",
+          queued: "text-bg-secondary",
+          running: "text-bg-primary",
+          filled: "text-bg-info",
+          pending: "text-bg-warning",
+          success: "text-bg-success",
+          skipped: "text-bg-warning",
+          failed: "text-bg-danger",
+          preview: "text-bg-secondary",
+          not_selected: "text-bg-light text-dark",
+        };
+        const cls = classes[state.code] || "text-bg-light text-dark";
+        return `<span class="badge ${cls}" title="${escapeHtml(state.note || state.label)}">${
+          escapeHtml(state.label || state.code)
+        }</span>`;
+      }
+
+      function ensureAccelState(spu) {
+        const key = String(spu);
+        if (!accelStates[key]) {
+          accelStates[key] = {
+            closePre: { code: "pending", label: "待确认", note: "等待执行阶段" },
+            closeAction: { code: "pending", label: "等待", note: "等待关闭前确认" },
+            openPre: { code: "pending", label: "待确认", note: "等待活动报名完成" },
+            openAction: { code: "pending", label: "等待", note: "等待开启前确认" },
+          };
+        }
+        return accelStates[key];
+      }
+
+      function accelFlowBadge(state) {
+        const classes = {
+          pending: "text-bg-light text-dark",
+          checking: "text-bg-primary",
+          running: "text-bg-info",
+          on: "text-bg-success",
+          off: "text-bg-secondary",
+          success: "text-bg-success",
+          noop: "text-bg-info",
+          warning: "text-bg-warning",
+          skipped: "text-bg-secondary",
+          failed: "text-bg-danger",
+        };
+        const cls = classes[state?.code] || "text-bg-light text-dark";
+        const label = escapeHtml(state?.label || "等待");
+        const note = escapeHtml(state?.note || state?.label || "");
+        const visibleNote = state?.note && ["warning", "skipped", "failed"].includes(state.code)
+          ? `<div class="accel-flow-note">${note}</div>`
+          : "";
+        return `<span class="badge ${cls}" title="${note}">${label}</span>${visibleNote}`;
+      }
+
+      function renderAccelFlow() {
+        const body = $("accelFlowBody");
+        if (!order.length) {
+          body.innerHTML = '<tr><td colspan="6" class="text-center text-muted py-3">等待生成 SPU 计划</td></tr>';
+          return;
+        }
+        body.innerHTML = order.map((spu) => {
+          const state = ensureAccelState(spu);
+          return `<tr data-accel-spu="${escapeHtml(spu)}">
+            <td class="fw-semibold">${escapeHtml(spu)}</td>
+            <td>${accelFlowBadge(state.closePre)}</td>
+            <td>${accelFlowBadge(state.closeAction)}</td>
+            <td class="accel-flow-arrow"><i class="bi bi-arrow-right"></i></td>
+            <td>${accelFlowBadge(state.openPre)}</td>
+            <td>${accelFlowBadge(state.openAction)}</td>
+          </tr>`;
+        }).join("");
+      }
+
+      function setActivityStatus(spu, activity, code, label, note = "", render = true) {
+        const update = (targetSpu) => {
+          if (!(plans[targetSpu] || []).some((plan) => plan.activity === activity)) return;
+          if (!activityStates[targetSpu]) activityStates[targetSpu] = {};
+          activityStates[targetSpu][activity] = { code, label, note };
+        };
+        if (spu) update(String(spu));
+        else order.forEach(update);
+        if (render) renderPlanTable();
+      }
+
+      function setAllSelectedActivityStatuses(code, label) {
+        order.forEach((spu) => {
+          (plans[spu] || []).forEach((plan) => {
+            if (plan.selected) setActivityStatus(spu, plan.activity, code, label, "", false);
+          });
+        });
+        renderPlanTable();
+      }
+
+      // 「达底价」列：product_plan 发出来的 within_floor 恒为 true，仍按字段显示以防契约变动
+      function floorCell(ok) {
+        if (ok == null) return '<span class="text-muted">–</span>';
+        return ok
+          ? '<span class="text-success"><i class="bi bi-check-lg"></i> 是</span>'
+          : '<span class="text-danger"><i class="bi bi-x-lg"></i> 否</span>';
+      }
+
+      // 「入选」列：selected=true 绿「是」；false 黄「否」并带 reason（多为库存不足）
+      function selectedCell(p) {
+        if (p.selected) {
+          return '<span class="badge text-bg-info">初筛通过</span>';
+        }
+        const reason = p.reason || "未入选";
+        return `<span class="badge text-bg-warning">否</span>
+          <span class="small text-muted cell-ellipsis d-inline-block align-middle" title="${reason}">${reason}</span>`;
+      }
+
+      function renderPlanTable() {
+        const body = $("planBody");
+        if (!order.length) {
+          body.innerHTML =
+            '<tr><td colspan="10" class="text-center text-muted py-4">暂无计划</td></tr>';
+          return;
+        }
+        const rows = [];
+        order.forEach((spu) => {
+          const arr = plans[spu] || [];
+          const span = Math.max(arr.length, 1); // 无「达底价」活动时也占一行
+          if (!arr.length) {
+            // 该 SPU 暂无达底价活动：占位一行，仅显示 SPU 与状态
+            rows.push(`<tr data-spu="${spu}">
+              <td class="small text-muted">${spu}</td>
+              <td class="text-muted small" colspan="7">暂无达底价活动</td>
+              <td class="small">–</td>
+              <td>${planStatusBadge(spu)}</td>
+            </tr>`);
+            return;
+          }
+          arr.forEach((p, i) => {
+            // SPU 列按商品合并；状态列必须每个活动一格，实时显示当前活动自身进度。
+            const spuTd =
+              i === 0
+                ? `<td class="small text-muted" rowspan="${span}">${spu}</td>`
+                : "";
+            rows.push(`<tr data-spu="${spu}">
+              ${spuTd}
+              <td class="cell-ellipsis" title="${p.activity || ""}">${
+              p.activity || '<span class="text-muted">–</span>'
+            }</td>
+              <td class="small">${fmtNum(p.daily_price)}</td>
+              <td class="small">${fmtNum(p.sale)}</td>
+              <td class="small fw-semibold">${fmtNum(p.submit_price)}</td>
+              <td class="small">${floorCell(p.within_floor)}</td>
+              <td class="small">${fmtNum(p.stock)}</td>
+              <td class="small">${fmtNum(p.min_stock)}</td>
+              <td class="small">${selectedCell(p)}</td>
+              <td class="small">${activityStatusBadge(spu, p.activity)}</td>
+            </tr>`);
+          });
+        });
+        body.innerHTML = rows.join("");
+      }
+
+      // ---- 事件处理：把 service 的结构化事件映射到 UI ----
+      function onEvent(type, data) {
+        if (type === "batch_start") {
+          currentDryRun = Boolean(data.dry_run);
+          delete $("statusText").dataset.final;
+          $("statTotal").textContent = data.total;
+          $("statDone").textContent = 0;
+          $("statSkip").textContent = 0;
+          $("statFail").textContent = 0;
+          $("statEnrolled").textContent = 0;
+          $("progressLabel").textContent = `0 / ${data.batch}`;
+          $("progressBar").style.width = "0%";
+          logLine(
+            `批次开始：SPU ${data.total} 个，本批 ${data.batch}，${
+              data.dry_run ? "dry-run 只读" : "正式执行"
+            }`,
+            data.dry_run ? "text-info" : "text-danger"
+          );
+        } else if (type === "product_start") {
+          if (!plans[data.spu]) {
+            order.push(data.spu);
+            plans[data.spu] = [];
+          }
+          $("progressLabel").textContent = `${data.index} / ${data.total}`;
+          $("progressBar").style.width =
+            Math.round((data.index / data.total) * 100) + "%";
+          logLine(`[${data.index}/${data.total}] 处理 SPU=${data.spu} ${data.name || ""}`);
+          ensureAccelState(data.spu);
+          renderAccelFlow();
+          renderPlanTable();
+        } else if (type === "product_plan") {
+          // 一个 SPU 会发多条（每个达底价活动一条）→ 追加进数组，逐条渲染成行
+          if (!plans[data.spu]) {
+            order.push(data.spu);
+            plans[data.spu] = [];
+          }
+          plans[data.spu].push(data);
+          if (!activityStates[data.spu]) activityStates[data.spu] = {};
+          activityStates[data.spu][data.activity] = data.selected
+            ? { code: "planned", label: "待执行", note: "初筛通过，等待详情扫描" }
+            : { code: "not_selected", label: "未入选", note: data.reason || "未入选" };
+          // 入选活动总数小计：累加 selected=true
+          if (data.selected) {
+            $("statEnrolled").textContent = +$("statEnrolled").textContent + 1;
+          }
+          // product_plan 量大（一 SPU 可达数十条），只把「入选」的记进日志，避免刷屏
+          if (data.selected) {
+            logLine(
+              `[计划] SPU=${data.spu} 入选活动「${data.activity || ""}」 申报价${fmtNum(
+                data.submit_price
+              )}（底价${fmtNum(data.sale)}，库存${fmtNum(data.stock)}≥门槛${fmtNum(
+                data.min_stock
+              )}）`
+            );
+          }
+          renderPlanTable();
+        } else if (type === "product_done") {
+          // 正式执行时 product_done 只代表规划完成，不能提前标成最终 done。
+          const isPlannedForExecution = !currentDryRun && data.status === "done";
+          dones[data.spu] = isPlannedForExecution ? "planned" : data.status;
+          if (data.status === "done" && currentDryRun) {
+            $("statDone").textContent = +$("statDone").textContent + 1;
+          } else if (data.status === "fail") {
+            $("statFail").textContent = +$("statFail").textContent + 1;
+          } else if (data.status !== "done") {
+            $("statSkip").textContent = +$("statSkip").textContent + 1;
+          }
+          const cls =
+            data.status === "done"
+              ? "text-success"
+              : data.status === "fail"
+              ? "text-danger"
+              : "text-warning";
+          const nEnrolled = (data.enrolled_activities || []).length;
+          (plans[data.spu] || []).forEach((plan) => {
+            if (!plan.selected) return;
+            setActivityStatus(
+              data.spu,
+              plan.activity,
+              isPlannedForExecution ? "planned" : "preview",
+              isPlannedForExecution ? "待执行" : "计划完成",
+              data.note || "",
+              false
+            );
+          });
+          logLine(
+            `[${isPlannedForExecution ? "计划就绪" : "结果"}] SPU=${data.spu} → ${
+              isPlannedForExecution ? "等待正式执行" : data.status
+            }，入选 ${nEnrolled} 个活动（${
+              data.note || ""
+            }）`,
+            isPlannedForExecution ? "text-info" : cls
+          );
+          renderPlanTable();
+        } else if (type === "exec_start") {
+          Object.keys(dones).forEach((spu) => {
+            if (dones[spu] === "planned") dones[spu] = "executing";
+          });
+          $("statusText").textContent = "正式执行中：关流量 → 报名 → 开流量";
+          $("progressLabel").textContent = "执行中";
+          $("progressBar").classList.add("progress-bar-striped", "progress-bar-animated");
+          setAllSelectedActivityStatuses("queued", "排队中");
+          order.forEach((spu) => {
+            const state = ensureAccelState(spu);
+            state.closePre = { code: "pending", label: "排队中", note: "等待按 SPU 查询" };
+          });
+          renderAccelFlow();
+          logLine(`正式执行开始：${data.spu_count} 个 SPU`, "text-danger");
+        } else if (type === "exec_accel_step") {
+          const state = ensureAccelState(data.spu);
+          if (data.phase === "close" && data.step === "checking") {
+            state.closePre = { code: "checking", label: "正在查询", note: data.note || "按 SPU 查询关闭前状态" };
+            state.closeAction = { code: "pending", label: "等待确认", note: "先确认当前状态" };
+          } else if (data.phase === "close" && data.step === "acting") {
+            state.closePre = data.state === "on"
+              ? { code: "on", label: "已开启", note: "关闭前状态已确认" }
+              : data.state === "off"
+                ? { code: "off", label: "已关闭", note: "关闭前状态已确认" }
+                : { code: "failed", label: "状态未知", note: data.note || "关闭前状态未确认" };
+            state.closeAction = { code: "running", label: "正在关闭", note: data.note || "等待平台关闭结果" };
+          } else if (data.phase === "open" && data.step === "checking") {
+            state.openPre = { code: "checking", label: "正在查询", note: data.note || "按 SPU 查询开启前状态" };
+            state.openAction = { code: "pending", label: "等待确认", note: "先确认当前状态" };
+          }
+          renderAccelFlow();
+        } else if (type === "exec_close") {
+          const state = ensureAccelState(data.spu);
+          state.closePre = data.state === "on"
+            ? { code: "on", label: "已开启", note: "关闭前按 SPU 查询：商品信息列含流量加速中" }
+            : data.state === "off"
+              ? { code: "off", label: "已关闭", note: "关闭前按 SPU 查询：商品信息列无流量加速中" }
+              : { code: "failed", label: "状态未知", note: data.note || "未能确认关闭前状态" };
+          state.closeAction = data.already_off
+            ? { code: "noop", label: "无需关闭", note: data.note || "本就关闭" }
+            : data.cooldown
+              ? { code: "warning", label: "冷却未关闭", note: data.note || "24小时冷却" }
+              : data.ok
+                ? { code: "success", label: "关闭成功", note: data.note || "平台已确认关闭" }
+                : { code: "failed", label: "关闭失败", note: data.note || "关闭未完成" };
+          if (data.cooldown) {
+            state.openPre = { code: "on", label: "仍为开启", note: "冷却拦截，状态未关闭" };
+            state.openAction = { code: "noop", label: "无需恢复", note: "流量始终保持开启" };
+          }
+          renderAccelFlow();
+          const closeLabel = data.already_off ? "关流量确认" : "关流量";
+          const closeResult = data.already_off
+            ? "当前已关闭，无需操作"
+            : data.ok
+              ? "成功"
+              : "失败";
+          logLine(
+            `[${closeLabel}] SPU=${data.spu} ${closeResult}：${data.note || ""}`,
+            data.ok ? "text-success" : "text-danger"
+          );
+        } else if (type === "exec_rpa_step") {
+          const stepNames = {
+            open_activity: "打开活动详情页",
+            input_spu: "输入 SPU ID",
+            query: "查询",
+            select_product: "勾选列表",
+            set_sessions: "填写场次",
+            fill_price: "填写活动申报价",
+            submit: "提交",
+          };
+          const stepLabels = {
+            open_activity: "详情页已打开",
+            input_spu: "SPU已输入",
+            query: "查询完成",
+            select_product: "商品已勾选",
+            set_sessions: "场次已填写",
+            fill_price: "价格已填写",
+            submit: "提交动作完成",
+          };
+          setActivityStatus(
+            data.spu,
+            data.activity,
+            data.ok ? (data.step === "fill_price" ? "filled" : "running") : "failed",
+            data.ok ? stepLabels[data.step] || "执行中" : `${stepNames[data.step] || data.step}失败`,
+            data.note || ""
+          );
+          logLine(
+            `[RPA] ${data.activity || ""}${data.spu ? ` / SPU=${data.spu}` : ""} / ${
+              stepNames[data.step] || data.step
+            }：${data.ok ? "完成" : "失败"}${data.note ? `（${data.note}）` : ""}`,
+            data.ok ? "" : "text-danger"
+          );
+        } else if (type === "exec_activity_skip") {
+          setActivityStatus(
+            data.spu,
+            data.activity,
+            "skipped",
+            "详情不符",
+            data.note || "详情页无可报名商品行"
+          );
+          logLine(
+            `[详情资格] ${data.activity || ""} / SPU=${data.spu}：不可报名，跳过当前活动（${
+              data.note || "详情页无可报名商品行"
+            }）`,
+            "text-warning"
+          );
+        } else if (type === "exec_fill") {
+          const detailSkipped = Boolean(data.ineligible);
+          setActivityStatus(
+            data.spu,
+            data.activity,
+            data.ok ? "filled" : detailSkipped ? "skipped" : "failed",
+            data.ok ? "价格已填写" : detailSkipped ? "详情不符" : "填价失败",
+            data.note || ""
+          );
+          logLine(
+            `[填价] ${data.activity || ""} / SPU=${data.spu} / ${fmtNum(
+              data.submit_price
+            )}：${data.ok ? "完成" : detailSkipped ? "详情不可报，未填价" : "失败"}${
+              data.note ? `（${data.note}）` : ""
+            }`,
+            data.ok ? "" : detailSkipped ? "text-warning" : "text-danger"
+          );
+        } else if (type === "exec_enroll") {
+          const submitted = Boolean(data.submitted || data.clicked_submit);
+          const verified = Boolean(data.verified);
+          const feedbackVerified = Boolean(data.feedback_verified);
+          const label = !submitted
+            ? "未提交/失败"
+            : verified
+              ? "报名记录页已确认"
+              : feedbackVerified
+                ? "结果页确认已提交，待报名记录页最终核验"
+                : "已点击提交，待报名记录页最终核验";
+          const targets = (data.filled || []).map(String);
+          if (submitted) {
+            targets.forEach((spu) =>
+              setActivityStatus(
+                spu,
+                data.activity,
+                "pending",
+                feedbackVerified ? "结果页成功·待记录" : "已提交·待记录",
+                data.note || ""
+              )
+            );
+          } else if (!(data.ineligible || []).length) {
+            if (targets.length) {
+              targets.forEach((spu) =>
+                setActivityStatus(spu, data.activity, "failed", "提交异常·待记录", data.note || "")
+              );
+            } else {
+              setActivityStatus(null, data.activity, "failed", "活动操作失败", data.note || "");
+            }
+          }
+          logLine(
+            `[提交] ${data.activity || ""}：${label}${data.note ? `（${data.note}）` : ""}`,
+            verified ? "text-success" : submitted ? "text-warning" : "text-danger"
+          );
+        } else if (type === "exec_log_verify") {
+          const labels = {
+            success: "报名成功记录已确认",
+            detail_ineligible: "详情无可报名商品，已记录跳过",
+            not_verified: "未查到成功记录",
+          };
+          setActivityStatus(
+            data.spu,
+            data.activity,
+            data.status === "success" ? "success" : data.status === "detail_ineligible" ? "skipped" : "failed",
+            data.status === "success"
+              ? "报名成功"
+              : data.status === "detail_ineligible"
+                ? "详情不符"
+                : "记录未确认",
+            data.note || ""
+          );
+          logLine(
+            `[记录核验] ${data.activity || ""} / SPU=${data.spu}：${
+              labels[data.status] || data.status
+            }${data.note ? `（${data.note}）` : ""}`,
+            data.ok ? "text-success" : data.status === "detail_ineligible" ? "text-warning" : "text-danger"
+          );
+        } else if (type === "exec_reopen") {
+          const state = ensureAccelState(data.spu);
+          state.openPre = data.precheck_state === "on"
+            ? { code: "on", label: "已开启", note: "开启前按 SPU 查询：商品信息列含流量加速中" }
+            : data.precheck_state === "off"
+              ? { code: "off", label: "已关闭", note: "开启前按 SPU 查询：商品信息列无流量加速中" }
+              : { code: "failed", label: "状态未知", note: data.note || "未能确认开启前状态" };
+          state.openAction = data.already_on
+            ? { code: "noop", label: "无需重复开启", note: data.note || "当前已经开启" }
+            : data.ok
+              ? { code: "success", label: "开启成功", note: data.note || "平台成功提示已确认" }
+              : { code: "failed", label: "开启失败", note: data.note || "未捕获平台成功提示" };
+          renderAccelFlow();
+          const precheckLabel = data.precheck_state === "on"
+            ? "已开启"
+            : data.precheck_state === "off"
+              ? "已关闭"
+              : "未知";
+          logLine(
+            `[开流量] SPU=${data.spu} 开启前按SPU确认=${precheckLabel}；${
+              data.already_on ? "无需重复开启" : data.ok ? "开启成功" : "开启失败"
+            }，价格 ${fmtNum(
+              data.accel_price
+            )}：${data.note || ""}`,
+            data.ok ? "text-success" : "text-danger"
+          );
+        } else if (type === "exec_product_done") {
+          const accelState = ensureAccelState(data.spu);
+          if (accelState.openAction.code === "pending") {
+            accelState.openAction = data.status === "skip"
+              ? { code: "skipped", label: "未执行", note: "无成功报名活动，不新增开启流量" }
+              : data.accel_ok
+                ? { code: "success", label: "状态已完成", note: data.note || "流量状态已满足" }
+                : { code: "failed", label: "未完成", note: data.note || "流量最终状态未完成" };
+            renderAccelFlow();
+          }
+          dones[data.spu] = data.status;
+          if (data.status === "done") {
+            $("statDone").textContent = +$("statDone").textContent + 1;
+          } else if (data.status === "skip") {
+            $("statSkip").textContent = +$("statSkip").textContent + 1;
+          } else {
+            $("statFail").textContent = +$("statFail").textContent + 1;
+          }
+          logLine(
+            `[执行结果] SPU=${data.spu} → ${data.status}，提交 ${data.submitted}、详情不符合 ${
+              data.ineligible || 0
+            }、初筛 ${data.planned} 个活动，流量=${
+              data.accel_ok ? "完成" : "未完成"
+            }（${data.note || ""}）`,
+            data.status === "done" ? "text-success" : data.status === "skip" ? "text-warning" : "text-danger"
+          );
+          renderPlanTable();
+        } else if (type === "exec_done") {
+          $("statusText").textContent = "执行步骤结束，正在汇总…";
+          logLine(
+            `执行步骤结束：活动 ${data.activities} 个，关闭 ${data.closed}，开启 ${
+              data.reopened
+            }，错误 ${(data.errors || []).length}`,
+            (data.errors || []).length ? "text-danger" : "text-info"
+          );
+        } else if (type === "batch_done") {
+          // 以汇总为准回填三统计
+          $("statDone").textContent = data.done;
+          $("statSkip").textContent = data.skip;
+          $("statFail").textContent = data.fail;
+          logLine(
+            `${data.live ? "正式执行" : "dry-run"}完成：done ${data.done}，skip ${
+              data.skip
+            }，fail ${data.fail}`,
+            "text-info"
+          );
+          $("progressLabel").textContent = "完成";
+          $("progressBar").style.width = "100%";
+          $("progressBar").classList.remove("progress-bar-striped", "progress-bar-animated");
+          $("statusText").textContent = data.live ? "正式执行完成" : "dry-run 完成";
+          $("statusText").dataset.final = "1";
+        } else if (type === "aborted") {
+          logLine(`中止：${data.reason}`, "text-danger");
+          showToast("活动批次中止", data.reason, "danger");
+          $("statusText").textContent = "已中止";
+          $("statusText").dataset.final = "1";
+        } else if (type === "log") {
+          const cls =
+            data.level === "error"
+              ? "text-danger"
+              : data.level === "warning"
+              ? "text-warning"
+              : "text-muted";
+          logLine(data.message || "", cls);
+        }
+      }
+
+      function finishRun() {
+        if (evtSource) {
+          evtSource.close();
+          evtSource = null;
+        }
+        $("startSpinner").classList.add("d-none");
+        if (!$("statusText").dataset.final) $("statusText").textContent = "";
+        updateStartEnabled();
+      }
+
+      async function startBatch() {
+        if (!sel.sheet) {
+          showToast("无法开始", "请先选择目标 Sheet", "warning");
+          return;
+        }
+        const spus = $("spusInput").value.trim();
+        if (!spus) {
+          showToast("无法开始", "请先填入 SPU 清单", "warning");
+          return;
+        }
+        const execute = isExecute();
+        // 正式执行为不可逆操作，二次确认后才发
+        if (execute && !confirm(
+          "正式执行将对真实商家账号执行不可逆操作（关加速器/报名/重开加速器）。\n确认继续？"
+        )) {
+          return;
+        }
+        // 复位表格与统计
+        order = [];
+        plans = {};
+        dones = {};
+        activityStates = {};
+        accelStates = {};
+        $("statEnrolled").textContent = 0;
+        renderAccelFlow();
+        renderPlanTable();
+        $("btnStart").disabled = true;
+        $("startSpinner").classList.remove("d-none");
+        $("statusText").textContent = execute ? "正式执行中…" : "dry-run 中…";
+        try {
+          const r = await fetch("/activity/batch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              excel: sel.excel,
+              sheet: sel.sheet,
+              spus,
+              dry_run: !execute, // 默认 dry-run；仅「正式执行」勾选才 false
+            }),
+          });
+          const { job_id } = await r.json();
+          evtSource = new EventSource(`/activity/batch/${job_id}/events`);
+          [
+            "batch_start",
+            "product_start",
+            "product_plan",
+            "product_done",
+            "exec_start",
+            "exec_accel_step",
+            "exec_close",
+            "exec_rpa_step",
+            "exec_activity_skip",
+            "exec_fill",
+            "exec_enroll",
+            "exec_log_verify",
+            "exec_reopen",
+            "exec_product_done",
+            "exec_done",
+            "batch_done",
+            "aborted",
+            "log",
+          ].forEach((ev) =>
+            evtSource.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)))
+          );
+          evtSource.addEventListener("done", () => finishRun());
+          evtSource.onerror = () => {
+            // 流结束或断开：done 事件后浏览器会触发一次 error，忽略即可
+            if (evtSource && evtSource.readyState === EventSource.CLOSED) finishRun();
+          };
+        } catch (e) {
+          showToast("启动失败", String(e), "danger");
+          finishRun();
+        }
+      }
+
+      // 正式执行开关：显示/隐藏红色告警，并改按钮文案
+      $("switchExecute").addEventListener("change", (e) => {
+        const on = e.target.checked;
+        $("execAlert").classList.toggle("d-none", !on);
+        $("startLabel").textContent = on ? "开始（正式执行）" : "开始（dry-run）";
+        $("btnStart").classList.toggle("btn-danger", on);
+        $("btnStart").classList.toggle("btn-primary", !on);
+      });
+
+      $("btnStart").addEventListener("click", startBatch);
+      $("spusInput").addEventListener("input", updateStartEnabled);
+
+      // 工作簿切换：选「手填路径」→ 显示输入框；否则换 excel、清空 sheet（表可能不同）后重拉
+      $("selExcel").addEventListener("change", (e) => {
+        const v = e.target.value;
+        if (v === MANUAL) {
+          $("inputExcelPath").classList.remove("d-none");
+          $("inputExcelPath").focus();
+          return;
+        }
+        $("inputExcelPath").classList.add("d-none");
+        sel.excel = v;
+        sel.sheet = ""; // 换工作簿，旧 Sheet 未必存在
+        loadWorklist();
+      });
+      $("inputExcelPath").addEventListener("keydown", (e) => {
+        if (e.key !== "Enter") return;
+        const v = e.target.value.trim();
+        if (!v) return;
+        sel.excel = v;
+        sel.sheet = "";
+        $("inputExcelPath").classList.add("d-none");
+        loadWorklist();
+      });
+      $("selSheet").addEventListener("change", (e) => {
+        sel.sheet = e.target.value;
+        updateStartEnabled();
+      });
+
+      loadWorklist();
+    </script>
+  </body>
+</html>

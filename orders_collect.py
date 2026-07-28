@@ -1,0 +1,150 @@
+# -*- coding: utf-8 -*-
+"""订单登记 CLI 薄壳：Temu「待发货」订单 → 本地订单登记表（含 DISPIMG 主图）。
+
+编排全在 app/orders/service.py（UI 与 CLI 共用同一套确定性管线 + 结构化进度）。
+本文件只解析参数、把进度打到控制台。
+
+**默认 dry-run**：只导出+解析+算出「将写入什么」，不碰登记表。方案要求人工核对
+行数与字段后，再加 --write 真正落盘（写入不可逆，虽有自动备份）。
+
+用法：
+    python orders_collect.py                      # dry-run，看会写什么
+    python orders_collect.py --store StoreA        # 显式指定店铺（识别不到时必须给）
+    python orders_collect.py --write              # 真正写入登记表
+    python orders_collect.py --max-pages 2        # 冒烟：只翻 2 页
+"""
+import argparse
+import asyncio
+
+from app.logger import logger
+from app.orders import service
+
+
+def _print_progress(event: dict) -> None:
+    """把 service 抛的结构化进度事件打到控制台。"""
+    t = event.get("type")
+    if t == "started":
+        mode = "试跑（不写入）" if event.get("dry_run") else "写入模式"
+        logger.info(f"=== 订单登记开始 · {mode} · 登记表={event.get('workbook')} ===")
+    elif t == "store":
+        logger.info(f"当前登录店铺：{event.get('store')}")
+    elif t == "page":
+        logger.info(
+            f"--- 第 {event.get('page')} 页（累计 {event.get('pages_done')} 页）"
+            f" 已抓图 {event.get('images')} 张，已选 {event.get('selected')}"
+            f"/{event.get('total')} 条 ---"
+        )
+    elif t == "swept":
+        logger.info(
+            f"翻页完成：{event.get('pages')} 页，共 {event.get('total')} 条，"
+            f"已勾选 {event.get('selected')}，抓到 {event.get('images')} 个子订单的图"
+        )
+    elif t == "exported":
+        logger.info(f"官方导出已落地：{event.get('file')}")
+    elif t == "parsed":
+        logger.info(
+            f"解析导出：{event.get('rows')} 行 / {event.get('orders')} 个订单，"
+            f"匹配到图 {event.get('image')} 张，成交价 {event.get('price')} 条"
+            + (f"，{event.get('miss')} 条无图" if event.get("miss") else "")
+        )
+    elif t == "images":
+        logger.info(f"主图下载：成功 {event.get('ok')}，失败 {event.get('fail')}")
+    elif t == "plan":
+        note = "（判重列缺失，跳过该表）" if event.get("no_key") else ""
+        logger.info(
+            f"计划写入「{event.get('sheet')}」：{event.get('pending')} 行"
+            f"（带图 {event.get('with_image')}），判重跳过 {event.get('dup')} {note}"
+        )
+    elif t == "unmapped":
+        logger.warning(
+            f"⚠️ {event.get('count')} 条订单未命中 sheet_map（已跳过，不臆测落点）："
+            f"{event.get('samples')}"
+        )
+    elif t == "unpriced":
+        logger.warning(
+            f"⏸ {event.get('count')} 条订单页面暂无「成交单价」，本批不登记、留到下批"
+            f"（插件回填约一天延迟；如需先占位用 --allow-no-price）"
+        )
+    elif t == "writing":
+        logger.info(f"正在写入「{event.get('sheet')}」{event.get('rows')} 行…")
+    elif t == "written":
+        logger.info(
+            f"✅ 「{event.get('sheet')}」已写入 {event.get('written')} 行"
+            f"（第 {event.get('first_row')}~{event.get('last_row')} 行，"
+            f"嵌图 {event.get('images')} 张）；备份：{event.get('backup')}"
+        )
+    elif t == "write_failed":
+        logger.error(f"❌ 写入「{event.get('sheet')}」失败：{event.get('error')}")
+    elif t == "aborted":
+        logger.error(f"❌ 已中止：{event.get('reason')}")
+    elif t == "done":
+        _print_summary(event)
+
+
+def _print_summary(s: dict) -> None:
+    """收尾汇总。dry-run 时额外打前几行预览，供人工核对字段是否对得上。"""
+    if s.get("aborted"):
+        return
+    logger.info(
+        f"=== 完成：解析 {s.get('parsed_rows')} 行 → 待写 {s.get('pending')} 行，"
+        f"判重跳过 {s.get('dup_skipped')}，未映射跳过 {s.get('unmapped_skipped')}，"
+        f"无价留待下批 {s.get('unpriced_skipped', 0)} ==="
+    )
+    if s.get("no_key_sheets"):
+        logger.warning(f"⚠️ 判重列缺失被整表跳过：{s['no_key_sheets']}")
+    if s.get("failed_sheets"):
+        logger.error(f"❌ 写入失败的表：{s['failed_sheets']}")
+
+    if s.get("dry_run"):
+        for sheet, info in (s.get("sheets") or {}).items():
+            logger.info(f"--- 预览「{sheet}」（待写 {info.get('pending')} 行，前 3 行）---")
+            for row in info.get("preview") or []:
+                logger.info(f"    {row}")
+        for f in s.get("plan_files") or []:
+            logger.info(f"完整待写计划（逐行核对用）：{f}")
+        logger.info("试跑结束，未写入任何数据。核对无误后加 --write 正式写入。")
+    else:
+        logger.info(f"实际写入 {s.get('written_rows')} 行。")
+
+
+async def main() -> None:
+    parser = argparse.ArgumentParser(description="Temu 待发货订单 → 本地订单登记表")
+    parser.add_argument(
+        "--write", action="store_true",
+        help="真正写入登记表（默认只试跑不写；写入不可逆，虽有自动备份）",
+    )
+    parser.add_argument(
+        "--store", default="",
+        help="当前登录店铺名（缺省=从页面识别；识别不到会中止，此时必须显式指定）",
+    )
+    parser.add_argument("--workbook", default="", help="登记表路径（缺省=[orders].workbook）")
+    parser.add_argument(
+        "--sheet", default="",
+        help="目标 Sheet：指定后本批全部写这张表，不再按 sheet_map 的站点分流"
+             "（须同时给 --store，它要写进「订单店铺」列）",
+    )
+    parser.add_argument("--list-url", default="", help="待发货订单页 URL（缺省=配置）")
+    parser.add_argument(
+        "--max-pages", type=int, default=200, help="最多翻几页（冒烟用，缺省 200）"
+    )
+    parser.add_argument(
+        "--allow-no-price", action="store_true",
+        help="连页面暂无「成交单价」的订单也登记（默认跳过留到下批：判重键含尺码，"
+             "带空价入库后重跑不会补价，只能人工填）",
+    )
+    args = parser.parse_args()
+
+    await service.run_orders_batch(
+        store=args.store,
+        dry_run=not args.write,
+        workbook=args.workbook,
+        sheet=args.sheet,
+        list_url=args.list_url,
+        on_progress=_print_progress,
+        max_pages=args.max_pages,
+        require_price=not args.allow_no_price,
+    )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
