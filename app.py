@@ -646,7 +646,8 @@ async def orders_batch(
     max_pages: int = Body(200, embed=True),
     workbook: str = Body("", embed=True),
     sheet: str = Body("", embed=True),
-    allow_no_price: bool = Body(False, embed=True),
+    allow_no_price: bool = Body(True, embed=True),
+    incremental: bool = Body(True, embed=True),
 ):
     """启动一批订单登记作业，返回 job_id；进度经 /orders/batch/{job_id}/events (SSE) 消费。
 
@@ -654,8 +655,12 @@ async def orders_batch(
     workbook/sheet 为空则用 config 缺省值并按 sheet_map 分流；显式给了 sheet 就全部写进
     那一张表。max_pages 供冒烟用（只翻前 N 页）。
 
-    allow_no_price 默认 False：页面暂无「成交单价」的订单留到下批，不带空价入库
-    （判重键含尺码，入库后重跑不补价）。
+    allow_no_price 默认 True（2026-07-29 确认允许空成交价）：插件回填成交单价有约一天
+    延迟，等价会让当天的单全部积压，故「平台成交价」允许留空、订单照常登记。传 False 才
+    恢复「无价留到下批」的旧口径。
+
+    incremental 默认 True，但只在显式指定了 sheet 时真正生效：采集前读该 Sheet 已登记的
+    订单号当水位，翻页追上就停。按 sheet_map 分流时水位有歧义，自动退全量。
     """
     job_id = str(uuid.uuid4())
     job = OrdersJob(job_id, store, dry_run)
@@ -673,6 +678,7 @@ async def orders_batch(
                 workbook=workbook, sheet=sheet,
                 on_progress=_on_progress,
                 require_price=not allow_no_price,
+                incremental=incremental,
             )
         except Exception as e:
             await job.push({"type": "aborted", "reason": f"订单登记异常：{e}"})

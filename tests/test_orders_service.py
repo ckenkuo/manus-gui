@@ -101,8 +101,8 @@ def workbook(tmp_path, monkeypatch):
 
 
 def _order(no: str, size: str, **kw) -> OrderRow:
-    # deal_price 默认给值＝正常态：plan_writes 默认 require_price=True 会拦掉无价订单，
-    # 不给默认价的话每个用例都要自己填。无价路径由 test_plan_writes_*_price 专门覆盖。
+    # deal_price 默认给值＝正常态（页面已回填成交单价）。默认口径已允许空价，
+    # 空价路径由 test_*_deal_price / 严格模式用例专门覆盖。
     base = dict(
         order_no=no, site="哥伦比亚", sub_order_no=f"sub-{no}-{size}",
         attrs=size, created_at="2026-07-27 10:16:38", deal_price="71.16",
@@ -214,7 +214,12 @@ def _patch_collect(monkeypatch, orders, store="StoreA"):
     用例结果就随开发机填了什么而变（脱敏后仓库里的 example 是占位映射，更对不上）。
     需要自定义映射的用例自己再 patch 一次覆盖即可。
     """
-    async def fake_collect(list_url, store="", on_progress=None, max_pages=200):
+    seen_watermark: dict = {}
+
+    async def fake_collect(list_url, store="", on_progress=None, max_pages=200,
+                           known_order_nos=None):
+        # 记下 service 算出来的水位，供增量用例断言（单表模式才该非空）
+        seen_watermark["known"] = set(known_order_nos or ())
         return {
             "orders": orders, "store": store or "StoreA",
             "export_file": "X.xlsx", "total": len(orders), "pages": 1,
@@ -228,6 +233,7 @@ def _patch_collect(monkeypatch, orders, store="StoreA"):
     monkeypatch.setattr(S, "collect_orders", fake_collect)
     monkeypatch.setattr(S, "ensure_cdp_alive", lambda *a, **k: _true())
     monkeypatch.setattr(P, "download_images", lambda o, d: {"ok": 0, "fail": 0})
+    return seen_watermark
 
 
 async def _true():
@@ -275,6 +281,7 @@ def test_real_run_writes_rows(workbook, monkeypatch):
 
     assert res["written_rows"] == 2 and res["dup_skipped"] == 1
     assert res["failed_sheets"] == []
+    assert res["purchase"]["rows"] == 2
     from app.tool.wps_excel_tool import WpsExcelTool
 
     keys = WpsExcelTool.existing_key_tuples(str(workbook), "StoreA全球1", ["C", "D"])
@@ -284,6 +291,7 @@ def test_real_run_writes_rows(workbook, monkeypatch):
     # 重复跑一次：全部判重跳过，不再新增
     res2 = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
     assert res2["written_rows"] == 0 and res2["dup_skipped"] == 3
+    assert res2["purchase"]["rows"] == 0
 
 
 def test_write_failure_is_reported_not_swallowed(workbook, monkeypatch):
@@ -502,13 +510,14 @@ def test_dump_plan_csv_skips_empty_and_survives_failure(tmp_path):
     assert S.dump_plan_csv({"a": _plan_with_rows()}, str(tmp_path / "无此目录"), "s") == []
 
 
-# ---- 无价订单：留到下批，不带空价入库 --------------------------------------
+# ---- 成交价：默认允许为空，严格模式才留到下批 ------------------------------
 
 
-def test_plan_writes_defers_unpriced_orders(workbook):
-    """页面暂无成交单价的订单不排入本批，单独归 unpriced 上报（不混进 unmapped）。
+def test_plan_writes_allows_empty_deal_price_by_default(workbook):
+    """默认口径（2026-07-29 确认）：成交单价为空照常登记，不产生 unpriced。
 
-    2026-07-28 实机：当天下的 14 单页面上连「成交单价」标签都没有，插件回填约一天延迟。
+    插件回填成交单价约有一天延迟（2026-07-28 实机：当天 14 单全部无「成交单价」标签），
+    等价会让当天的单整批积压，故这一格允许留空。
     """
     orders = [
         _order("PO-045-有价", "杏色 / 3-4Y"),
@@ -518,30 +527,112 @@ def test_plan_writes_defers_unpriced_orders(workbook):
 
     plans, unmapped, unpriced = S.plan_writes(orders, str(workbook), "StoreA", SHEET_MAP)
 
-    assert len(plans["StoreA全球1"].rows) == 1, "只有带价那条能写"
+    assert len(plans["StoreA全球1"].rows) == 3, "三条都要能写，空价不拦"
+    assert unpriced == [] and unmapped == []
+
+
+def test_plan_writes_defers_unpriced_in_strict_mode(workbook):
+    """require_price=True 才恢复旧口径：无价单独归 unpriced，不混进 unmapped。"""
+    orders = [
+        _order("PO-045-有价", "杏色 / 3-4Y"),
+        _order("PO-045-无价", "杏色 / 9-12M", deal_price=""),
+        _order("PO-045-空白价", "杏色 / 5-6Y", deal_price="   "),
+    ]
+
+    plans, unmapped, unpriced = S.plan_writes(
+        orders, str(workbook), "StoreA", SHEET_MAP, require_price=True
+    )
+
+    assert len(plans["StoreA全球1"].rows) == 1, "严格模式下只有带价那条能写"
     assert unmapped == [], "无价不是映射问题，别混进 unmapped"
     assert [u["order_no"] for u in unpriced] == ["PO-045-无价", "PO-045-空白价"]
     assert "成交单价" in unpriced[0]["reason"]
 
 
-def test_plan_writes_allows_unpriced_when_opted_in(workbook):
-    """require_price=False 时无价订单照常入库（明确要占位时用）。"""
-    orders = [_order("PO-045-无价", "杏色 / 9-12M", deal_price="")]
-
-    plans, _, unpriced = S.plan_writes(
-        orders, str(workbook), "StoreA", SHEET_MAP, require_price=False
-    )
-
-    assert len(plans["StoreA全球1"].rows) == 1 and unpriced == []
-
-
-def test_unpriced_never_reaches_workbook(workbook, monkeypatch):
-    """端到端：无价订单不进表，且汇总/事件里都能看到它被留下了。"""
+def test_empty_deal_price_reaches_workbook(workbook, monkeypatch):
+    """端到端：默认口径下无价订单也进表，成交价那一格留空。"""
     _patch_collect(monkeypatch, [
         _order("PO-045-有价", "杏色 / 3-4Y"),
         _order("PO-045-无价", "杏色 / 9-12M", deal_price=""),
     ])
     res = _run(store="StoreA", dry_run=False, workbook=str(workbook), sheet="StoreA全球1")
+
+    assert res["unpriced_skipped"] == 0
+    assert res["written_rows"] == 2, "两条都写"
+    assert not any(e["type"] == "unpriced" for e in res["_events"])
+    body = zipfile.ZipFile(workbook).read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert "PO-045-无价" in body and "PO-045-有价" in body
+
+
+# ---- 增量采集：水位读取与启用条件 ------------------------------------------
+
+
+def test_read_known_order_nos_reads_registered_orders(workbook):
+    """水位＝该 Sheet「订单号」列已登记的值，按真实表头定位列、不硬编码列字母。"""
+    known = S.read_known_order_nos(str(workbook), "StoreA全球1")
+
+    assert "PO-045-已入库" in known
+
+
+def test_read_known_order_nos_returns_empty_on_missing_sheet(workbook):
+    """表不存在 → 空集（调用方据此退全量），绝不抛错。"""
+    assert S.read_known_order_nos(str(workbook), "不存在的表") == set()
+
+
+def test_incremental_uses_watermark_in_single_sheet_mode(workbook, monkeypatch):
+    """单表模式：水位传给 collect_orders，汇总里标 enabled。"""
+    seen = _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(store="StoreA", dry_run=True, workbook=str(workbook),
+               sheet="StoreA全球1")
+
+    assert "PO-045-已入库" in seen["known"], "单表模式必须把已登记订单号当水位传下去"
+    assert res["incremental"]["enabled"] is True
+    assert res["incremental"]["known"] >= 1
+
+
+def test_incremental_disabled_when_sheet_map_routing(workbook, monkeypatch):
+    """按 sheet_map 分流（未指定 sheet）→ 不用水位：多张表新旧不同，取并集会漏单。"""
+    seen = _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(store="StoreA", dry_run=True, workbook=str(workbook))
+
+    assert seen["known"] == set(), "分流模式绝不能传水位"
+    assert res["incremental"]["enabled"] is False
+    assert "分流" in res["incremental"]["reason"]
+
+
+def test_incremental_can_be_turned_off(workbook, monkeypatch):
+    """显式关掉增量 → 即使单表模式也不读水位。"""
+    seen = _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(store="StoreA", dry_run=True, workbook=str(workbook),
+               sheet="StoreA全球1", incremental=False)
+
+    assert seen["known"] == set()
+    assert res["incremental"]["enabled"] is False
+    assert "关闭" in res["incremental"]["reason"]
+
+
+def test_watermark_event_is_emitted(workbook, monkeypatch):
+    """水位要作为事件上报，UI/CLI 才能显示「增量已启用/为何全量」。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(store="StoreA", dry_run=True, workbook=str(workbook),
+               sheet="StoreA全球1")
+
+    wm = next(e for e in res["_events"] if e["type"] == "watermark")
+    assert wm["enabled"] is True and wm["sheet"] == "StoreA全球1"
+
+
+def test_unpriced_never_reaches_workbook_in_strict_mode(workbook, monkeypatch):
+    """端到端严格模式：无价订单不进表，且汇总/事件里都能看到它被留下了。"""
+    _patch_collect(monkeypatch, [
+        _order("PO-045-有价", "杏色 / 3-4Y"),
+        _order("PO-045-无价", "杏色 / 9-12M", deal_price=""),
+    ])
+    res = _run(store="StoreA", dry_run=False, workbook=str(workbook),
+               sheet="StoreA全球1", require_price=True)
 
     assert res["unpriced_skipped"] == 1
     assert res["written_rows"] == 1, "只写带价那条"
