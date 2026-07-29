@@ -306,6 +306,9 @@ async def _process_one_spu(
         if selected:
             enrolled.append({
                 "activity": act["name"], "submit_price": submit_price,
+                # daily_price/discount_rate 仅在超参考价失败时反推「建议核对的日常价」用，
+                # 不参与任何主流程判定（申报价仍是既算好的 submit_price）。
+                "daily_price": daily_price, "discount_rate": dr,
                 "registered_count": act.get("registered_count"),
                 "registered_display": act.get("registered_display"),
             })
@@ -444,6 +447,7 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
             by_activity.setdefault(e["activity"], []).append(
                 {
                     "spu": r["spu"], "submit_price": e["submit_price"],
+                    "daily_price": e.get("daily_price"), "discount_rate": e.get("discount_rate"),
                     "registered_count": e.get("registered_count"),
                     "registered_display": e.get("registered_display"),
                     "registration_baseline_known": "registered_count" in e,
@@ -683,9 +687,12 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary) ->
                     if not (str(failure.get("spu")) == spu and failure.get("activity") == activity)
                 ]
                 current = summary["activity_results"].setdefault(activity, {})
+                # 场次失败原因不再否决成功（用户规则 2026-07-24），但仍附注出来供人工核对。
+                note = f"报名记录页确认成功（enrollId={success_record.get('enroll_id')}）"
+                if success_record.get("session_failures"):
+                    note += f"；注意存在场次失败原因：{'、'.join(success_record['session_failures'])}"
                 current.update({
-                    "verified": True, "status": "log_verified",
-                    "note": f"报名记录页确认成功（enrollId={success_record.get('enroll_id')}）",
+                    "verified": True, "status": "log_verified", "note": note,
                 })
                 await _emit(on_progress, {
                     "type": "exec_log_verify", "spu": spu, "activity": activity,
@@ -713,8 +720,9 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary) ->
                 None,
             )
             if record:
+                # 走到这里说明记录在列表但被判「已退出」（2026-07-24 起列表内非退出即成功）。
                 reason = (
-                    f"报名记录存在但未成功（enrollStatus={record.get('enroll_status')}"
+                    f"报名记录存在但已退出（enrollStatus={record.get('enroll_status')}"
                     f"，场次原因={record.get('session_failures') or '无'}）"
                 )
             elif not result.get("complete"):
@@ -780,7 +788,9 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
 
                     r = await pipeline.enroll_activity(page, it["spu"], act_name,
                                                        it["submit_price"], allow_submit=False,
-                                                       on_step=on_step)
+                                                       on_step=on_step,
+                                                       daily_price=it.get("daily_price"),
+                                                       discount_rate=it.get("discount_rate"))
                     if r.get("detail_eligible") is False:
                         ineligible.append(it["spu"])
                         summary["ineligible_activities"].setdefault(act_name, []).append(it["spu"])

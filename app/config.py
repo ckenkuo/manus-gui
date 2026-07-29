@@ -33,6 +33,13 @@ OUTPUT_SUBDIRS = {
     # 已提取白底主图但严格判"无同款"、拿不到采购价的漏采品：主图归档于此（命名带 SPU），
     # 供人工后续手动找货源补价。见 pipeline.archive_unmatched_image。
     "unmatched": "未找到同款主图",
+    # 订单登记管线：Temu 官方「导出订单」落地的 xlsx（保留原件便于人工复核/追溯）
+    "orders_export": "订单导出",
+    # 订单登记管线：按子订单号命名的产品主图（写入登记表前的落地副本）
+    "orders_image": "订单商品图片",
+    "orders_purchase": "订单采购汇总",
+    # 订单登记管线 dry-run 的「待写计划」CSV：日志只打 3 行，逐行核对靠这个
+    "orders_plan": "订单待写计划",
 }
 
 
