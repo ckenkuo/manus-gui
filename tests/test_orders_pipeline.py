@@ -135,6 +135,241 @@ def test_parse_export_is_column_order_agnostic(tmp_path):
     assert rows[0].tracking_no == ""
 
 
+def test_summarize_purchases_groups_same_spu_and_sku():
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-A",
+               sku_code="CODE-A", qty="1", goods_name="连衣裙", attrs="杏色 / 3-4Y"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-A", sku_id="SKU-A",
+               sku_code="CODE-A", qty="2", goods_name="连衣裙", attrs="杏色 / 3-4Y"),
+        _order(order_no="PO-3", sub_order_no="045-3", spu_id="SPU-A", sku_id="SKU-B",
+               sku_code="CODE-B", qty="1", goods_name="连衣裙", attrs="粉色 / 5-6Y"),
+    ]
+
+    groups = P.summarize_purchases(orders)
+
+    assert len(groups) == 2
+    repeated = next(group for group in groups if group["sku_id"] == "SKU-A")
+    assert repeated["total_qty"] == 3
+    assert repeated["order_count"] == 2 and repeated["sub_order_count"] == 2
+    assert repeated["is_repeated"] is True
+    assert repeated["order_nos"] == ["PO-1", "PO-2"]
+
+
+def test_export_purchase_summary_contains_summary_and_details(tmp_path):
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-A", qty="1"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-A", sku_id="SKU-A", qty="2"),
+    ]
+
+    result = P.export_purchase_summary(orders, str(tmp_path), "20260729")
+
+    assert result["rows"] == 2 and result["groups"] == 1
+    assert result["repeated_groups"] == 1 and result["total_qty"] == 3
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(result["file"], read_only=True, data_only=True)
+    assert workbook.sheetnames == ["商品汇总", "SPU_SKU汇总", "订单明细"]
+    product_rows = list(workbook["商品汇总"].iter_rows(values_only=True))
+    summary_rows = list(workbook["SPU_SKU汇总"].iter_rows(values_only=True))
+    detail_rows = list(workbook["订单明细"].iter_rows(values_only=True))
+    workbook.close()
+    # 商品级放第一张：采购按商品链接下单，先看这款要买哪些码各几件
+    assert product_rows[0][0:6] == (
+        "需多规格", "商品名称", "SPU ID", "规格数", "采购总件数", "采购清单",
+    )
+    assert summary_rows[0][0:3] == ("是否重复采购", "SPU ID", "SKU ID")
+    assert summary_rows[1][0:3] == ("是", "SPU-A", "SKU-A")
+    assert len(detail_rows) == 3
+
+
+def test_summarize_products_merges_sizes_of_same_goods():
+    """同商品不同尺码必须并成一组、尺码收进 variants——采购是按商品链接下单的。
+
+    这是实机撞出来的：一条公主裙 5 个尺码，按 (SPU,SKU) 聚合成了 5 组，看的人得自己
+    在表里认哪几行是同一款，正好是这份统计该替他做的事。
+    """
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-3-4",
+               qty="2", goods_name="公主裙", attrs="杏色 / 3-4Y"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-A", sku_id="SKU-5-6",
+               qty="1", goods_name="公主裙", attrs="杏色 / 5-6Y"),
+        _order(order_no="PO-3", sub_order_no="045-3", spu_id="SPU-B", sku_id="SKU-B",
+               qty="1", goods_name="牛仔裤", attrs="蓝色 / 5-6Y"),
+    ]
+
+    products = P.summarize_products(orders)
+
+    assert len(products) == 2, "同 SPU 不同尺码要并成一个商品"
+    dress = next(p for p in products if p["spu_id"] == "SPU-A")
+    assert dress["variant_count"] == 2 and dress["total_qty"] == 3
+    assert dress["is_multi"] is True
+    assert [v["attrs"] for v in dress["variants"]] == ["杏色 / 3-4Y", "杏色 / 5-6Y"]
+    assert [v["qty"] for v in dress["variants"]] == [2, 1]
+    assert dress["order_nos"] == ["PO-1", "PO-2"]
+    jeans = next(p for p in products if p["spu_id"] == "SPU-B")
+    assert jeans["is_multi"] is False and jeans["variant_count"] == 1
+
+
+def test_summarize_products_falls_back_to_goods_name_without_spu():
+    """SPU 缺失时按商品名并，不要每条各成一组；不同商品仍要分开。"""
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="", sku_id="S1",
+               qty="1", goods_name="无SPU裙", attrs="3-4Y"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="", sku_id="S2",
+               qty="1", goods_name="无SPU裙", attrs="5-6Y"),
+        _order(order_no="PO-3", sub_order_no="045-3", spu_id="", sku_id="S3",
+               qty="1", goods_name="另一款", attrs="7-8Y"),
+    ]
+
+    products = P.summarize_products(orders)
+
+    assert len(products) == 2
+    assert next(p for p in products if "无SPU裙" in p["goods_names"])["variant_count"] == 2
+
+
+def test_summarize_products_merges_same_size_across_orders():
+    """同商品同尺码被多张单买到 → 件数累加成一个规格，不重复列。"""
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-A",
+               qty="1", goods_name="连衣裙", attrs="杏色 / 3-4Y"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-A", sku_id="SKU-A",
+               qty="2", goods_name="连衣裙", attrs="杏色 / 3-4Y"),
+    ]
+
+    products = P.summarize_products(orders)
+
+    assert len(products) == 1
+    assert products[0]["variant_count"] == 1
+    assert products[0]["variants"][0]["qty"] == 3
+    assert products[0]["variants"][0]["order_nos"] == ["PO-1", "PO-2"]
+    assert products[0]["is_multi"] is True, "同规格多单也要拎出来（要合单采购）"
+
+
+def test_export_purchase_markdown_groups_sizes_under_one_product(tmp_path):
+    """md 要按商品分小节，同款的所有尺码列在一张表里——打开一次链接买齐。"""
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-3-4",
+               qty="2", goods_name="公主裙", attrs="杏色 / 3-4Y"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-A", sku_id="SKU-5-6",
+               qty="1", goods_name="公主裙", attrs="杏色 / 5-6Y"),
+        _order(order_no="PO-3", sub_order_no="045-3", spu_id="SPU-B", sku_id="SKU-B",
+               qty="1", goods_name="牛仔裤", attrs="蓝色 / 5-6Y"),
+    ]
+
+    result = P.export_purchase_markdown(orders, str(tmp_path), "20260729_101530")
+
+    assert result["rows"] == 3 and result["products"] == 2
+    assert result["multi_products"] == 1 and result["total_qty"] == 4
+    assert result["variants"] == 3
+    path = Path(result["md_file"])
+    assert path.name == "新增订单采购统计_20260729_101530.md"
+    text = path.read_text(encoding="utf-8")
+    assert "本批待登记子订单：3 条" in text
+    assert "涉及商品（SPU）：2 个" in text
+    assert "一、需一次买多个码数" in text and "二、单规格单次采购" in text
+    assert "三、子订单明细" in text
+    # 公主裙自成一节，两个尺码同表；牛仔裤只有一个规格，进第二段
+    multi = text.split("一、需一次买多个码数")[1].split("## 二、")[0]
+    assert "### 公主裙" in multi and "SPU `SPU-A`" in multi
+    assert "2 个规格" in multi
+    assert "杏色 / 3-4Y" in multi and "杏色 / 5-6Y" in multi
+    assert "牛仔裤" not in multi, "单规格商品不进第一段"
+    detail = text.split("三、子订单明细")[1]
+    assert "PO-1" in detail and "PO-2" in detail and "PO-3" not in detail
+
+
+def test_export_purchase_markdown_escapes_pipe(tmp_path):
+    """商品名带竖线会截断表格列，必须转义。"""
+    orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
+                     sku_id="SKU-A", qty="1", goods_name="连衣裙|夏款")]
+
+    result = P.export_purchase_markdown(orders, str(tmp_path), "20260729")
+
+    assert "连衣裙\\|夏款" in Path(result["md_file"]).read_text(encoding="utf-8")
+
+
+# ---- 增量早停判据（纯函数，不需要浏览器）-----------------------------------
+
+
+def _page(*items) -> list:
+    """构造一页的 [{order_no, created_at}]，items 传 (订单号, 时间) 或只传订单号。"""
+    out = []
+    for it in items:
+        no, t = it if isinstance(it, tuple) else (it, "")
+        out.append({"order_no": no, "created_at": t})
+    return out
+
+
+def test_stop_when_whole_page_known_after_seeing_new():
+    """整页全已登记 + 本批见过新单 → 早停（正常追上的情形）。"""
+    stop, reason = P.should_stop_incremental(
+        _page("PO-1", "PO-2"), {"PO-1", "PO-2"}, seen_new=True
+    )
+    assert stop is True and "追上" in reason
+
+
+def test_no_stop_while_page_has_new_orders():
+    """本页还有没登记的单 → 继续翻。"""
+    stop, reason = P.should_stop_incremental(
+        _page("PO-new", "PO-1"), {"PO-1"}, seen_new=False
+    )
+    assert stop is False and reason == ""
+
+
+def test_stop_on_first_page_all_known_means_no_new_orders():
+    """第一页就全已登记（还没见过新单）→ 停，判定为「本批无新单」。"""
+    stop, reason = P.should_stop_incremental(
+        _page("PO-1", "PO-2"), {"PO-1", "PO-2"}, seen_new=False
+    )
+    assert stop is True and "未发现新单" in reason
+
+
+def test_interleaved_known_and_new_blocks_early_stop():
+    """已登记与未登记交错 → 不早停：排序可能被改，或表里有空洞，都要翻完全量。
+
+    这是主力护栏，纯顺序判断、不依赖任何时间字段。
+    """
+    stop, reason = P.should_stop_incremental(
+        _page("PO-1", "PO-new", "PO-2"), {"PO-1", "PO-2"}, seen_new=True
+    )
+    assert stop is False and "交错" in reason
+
+
+def test_empty_page_does_not_stop():
+    """读不到订单号时绝不早停——宁可多翻几页也不能因为读不到就停。"""
+    stop, reason = P.should_stop_incremental([], {"PO-1"}, seen_new=True)
+    assert stop is False and "读不到" in reason
+
+
+def test_empty_watermark_never_stops():
+    """水位为空（首次登记）→ 全是新单，自然翻到底。"""
+    stop, _ = P.should_stop_incremental(_page("PO-1", "PO-2"), set(), seen_new=False)
+    assert stop is False
+
+
+def test_check_created_desc_accepts_descending():
+    """页内倒序且不比上一页更新 → 通过。"""
+    page = _page(("PO-2", "2026-07-28 10:00:00"), ("PO-1", "2026-07-27 09:00:00"))
+    assert P.check_created_desc("2026-07-29 12:00:00", page) == ""
+
+
+def test_check_created_desc_flags_ascending_within_page():
+    """页内出现升序 → 报排序异常。"""
+    page = _page(("PO-1", "2026-07-27 09:00:00"), ("PO-2", "2026-07-28 10:00:00"))
+    assert "倒序" in P.check_created_desc("", page)
+
+
+def test_check_created_desc_flags_newer_than_prev_page():
+    """本页出现比上一页更新的时间 → 报排序异常。"""
+    page = _page(("PO-9", "2026-07-30 10:00:00"))
+    assert "更新的创建时间" in P.check_created_desc("2026-07-28 10:00:00", page)
+
+
+def test_check_created_desc_degrades_without_times():
+    """列表页读不到创建时间 → 返回空串，静默降级到只靠交错检测。"""
+    assert P.check_created_desc("2026-07-28 10:00:00", _page("PO-1", "PO-2")) == ""
+
+
 # ---- 列映射 / 判重键 -------------------------------------------------------
 
 
@@ -317,10 +552,19 @@ class _CheckboxPage:
     才可点。这里让点 input 直接抛错，钉住「必须点 label」。
     """
 
-    def __init__(self, has_label=True, click_works=True):
+    def __init__(self, has_label=True, click_works=True, evaluate_boom=False):
         self.has_label, self.click_works = has_label, click_works
+        self.evaluate_boom = evaluate_boom
         self.checked = False
         self.clicked: list = []
+        # 记录调用顺序，用来钉「先屏蔽悬浮层再点击」
+        self.calls: list = []
+
+    async def evaluate(self, js, *a):
+        if self.evaluate_boom:
+            raise RuntimeError("页面已关闭")
+        self.calls.append("evaluate")
+        return 3
 
     def locator(self, sel):
         page = self
@@ -339,6 +583,7 @@ class _CheckboxPage:
                 if not is_label:
                     raise AssertionError("点了隐形 input——它 0×0 opacity:0，实机必超时")
                 page.clicked.append(sel)
+                page.calls.append("click")
                 if page.click_works:
                     page.checked = True
 
@@ -374,6 +619,124 @@ def test_select_all_is_idempotent():
     asyncio.run(P.select_all_on_page(page))
 
     assert page.clicked == []
+
+
+def test_select_all_disables_overlay_before_clicking():
+    """先屏蔽悬浮层再点：商家助手悬浮球压在操作区上，不先屏蔽就是 30s hit-target 超时。"""
+    page = _CheckboxPage()
+
+    asyncio.run(P.select_all_on_page(page))
+
+    assert page.calls == ["evaluate", "click"], "顺序反了等于没修"
+
+
+# ---- 悬浮层遮挡（商家助手插件注入，2026-07-29 实机复现）----------------------
+
+
+class _OverlayPage:
+    """页面替身：只实现 evaluate，用来验 disable_pointer_overlays 的 best-effort 语义。"""
+
+    def __init__(self, ret=0, boom=False):
+        self.ret, self.boom = ret, boom
+        self.args: list = []
+
+    async def evaluate(self, js, *a):
+        if self.boom:
+            raise RuntimeError("Execution context was destroyed")
+        self.args.append((js, a))
+        return self.ret
+
+
+def test_disable_pointer_overlays_targets_extension_container():
+    """选择器要能命中 #temu-ass-core-ui-dashboder-root（报错里点名的那个容器）。"""
+    page = _OverlayPage(ret=4)
+
+    assert asyncio.run(P.disable_pointer_overlays(page)) == 4
+    js, args = page.args[0]
+    assert args == (P._POINTER_OVERLAYS,)
+    assert "pointer-events" in js and "important" in js
+    # 用前缀匹配而不是全等 id：`_123` 那类版本后缀会跳，见 pipeline 顶部注释
+    assert "temu-ass" in P._POINTER_OVERLAYS
+
+
+def test_disable_pointer_overlays_swallows_errors():
+    """辅助路径失败不中断主流程：真被遮挡了后面的 click 会自己超时，报错更有诊断价值。"""
+    assert asyncio.run(P.disable_pointer_overlays(_OverlayPage(boom=True))) == 0
+
+
+def test_disable_pointer_overlays_sets_descendants_too():
+    """必须连后代一起设：报错里拦住点击的是子节点 img，只设根节点会被子节点的 auto 盖掉。"""
+    js = P._DISABLE_OVERLAY_JS
+
+    assert "querySelectorAll('*')" in js
+
+
+class _NextPage:
+    """页面替身：分页容器 + 「下一页」。data-status 在点击后才翻，模拟异步换页。"""
+
+    def __init__(self, next_cls="PGT_next_123 ", flip=True):
+        self.next_cls, self.flip = next_cls, flip
+        self.status = "beast-core-pagination-20-1"
+        self.calls: list = []
+
+    async def evaluate(self, js, *a):
+        self.calls.append("evaluate")
+        return 1
+
+    def locator(self, sel):
+        page = self
+        is_next = "next" in sel
+
+        class _Loc:
+            first = property(lambda s: s)
+
+            async def count(s):
+                return 1
+
+            async def get_attribute(s, name):
+                if is_next:
+                    return page.next_cls if name == "class" else None
+                return page.status if name == "data-status" else None
+
+            async def click(s):
+                page.calls.append("click")
+                if page.flip:
+                    page.status = "beast-core-pagination-20-2"
+
+            def locator(s, sub):
+                return page.locator(sub)
+
+        return _Loc()
+
+    async def wait_for_selector(self, sel, timeout=None):
+        return None
+
+    async def wait_for_timeout(self, ms):
+        return None
+
+
+def test_goto_next_page_disables_overlay_before_clicking():
+    """翻页前必须屏蔽悬浮层——实机就是在这一步卡 30s 超时后整批中止的。"""
+    page = _NextPage()
+
+    assert asyncio.run(P.goto_next_page(page)) is True
+    assert page.calls == ["evaluate", "click"]
+
+
+def test_goto_next_page_returns_false_on_last_page():
+    """尾页（PGT_disabled）返回 False，不该点也不该抛。"""
+    page = _NextPage(next_cls="PGT_next_123 PGT_disabled_123")
+
+    assert asyncio.run(P.goto_next_page(page)) is False
+    assert page.calls == []
+
+
+def test_goto_next_page_raises_when_page_never_changes():
+    """点了但分页状态没变要抛：静默当成翻页成功会把上一页重复抓一遍。"""
+    page = _NextPage(flip=False)
+
+    with pytest.raises(RuntimeError, match="分页状态没变"):
+        asyncio.run(P.goto_next_page(page, timeout_ms=500))
 
 
 def test_sweep_pages_awaits_async_on_page(monkeypatch):
@@ -495,3 +858,112 @@ def test_sweep_pages_handles_zero_max_pages(monkeypatch):
     res = asyncio.run(P.sweep_pages(object(), max_pages=0))
 
     assert res["pages"] == 0 and res["images"] == {}
+
+
+# ---- 增量早停在 sweep 循环里的落地 -----------------------------------------
+
+
+def _patch_sweep_incremental(monkeypatch, page_orders_by_page: dict, total=100,
+                             page_size=20):
+    """在 _patch_sweep 之上，让每页返回指定的订单号列表（模拟新→旧的列表）。"""
+    cur = {"page": 1}
+
+    async def fake_read(page):
+        return {"total": total, "page": cur["page"], "page_size": page_size,
+                "has_next": cur["page"] * page_size < total}
+
+    async def fake_next(page):
+        cur["page"] += 1
+
+    async def fake_read_orders(page):
+        return page_orders_by_page.get(cur["page"], [])
+
+    _patch_sweep(monkeypatch, total=total, page_size=page_size)
+    monkeypatch.setattr(P, "read_pagination", fake_read)
+    monkeypatch.setattr(P, "goto_next_page", fake_next)
+    monkeypatch.setattr(P, "read_page_orders", fake_read_orders)
+    return cur
+
+
+def test_sweep_stops_early_when_caught_up(monkeypatch):
+    """第 1 页有新单、第 2 页全已登记 → 停在第 2 页，不再翻剩下 3 页。"""
+    _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-new1", "PO-new2"),
+        2: _page("PO-old1", "PO-old2"),
+        3: _page("PO-old3"),
+    })
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5, known_order_nos={"PO-old1", "PO-old2", "PO-old3"}
+    ))
+
+    assert res["pages"] == 2, "追上就停，不翻到底"
+    assert res["stopped_early"] is True
+    assert res["truncated"] is False, "早停不是截断，语义相反，绝不能混"
+    assert res["fell_back"] is False
+
+
+def test_sweep_early_stop_skips_total_check(monkeypatch):
+    """早停时已选 < 总数是必然的，不能抛「勾选不全」。"""
+    _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-new1"),
+        2: _page("PO-old1"),
+    }, total=100)
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5, known_order_nos={"PO-old1"}
+    ))
+
+    assert res["stopped_early"] is True and res["selected"] < res["total"]
+
+
+def test_sweep_falls_back_to_full_on_interleave(monkeypatch):
+    """页内已登记与未登记交错 → 退全量翻到底，并标 fell_back。
+
+    交错意味着排序被改（会漏单）或表里有空洞（要补齐），两种都必须翻完。
+    """
+    _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-old1", "PO-new1"),   # 已登记后又出现新单 = 交错
+        2: _page("PO-old2"),
+        3: _page("PO-old3"),
+        4: _page("PO-old4"),
+        5: _page("PO-old5"),
+    })
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5,
+        known_order_nos={"PO-old1", "PO-old2", "PO-old3", "PO-old4", "PO-old5"},
+    ))
+
+    assert res["stopped_early"] is False
+    assert res["fell_back"] is True, "退全量要能在汇总里看出来"
+    assert res["pages"] == 5
+
+
+def test_sweep_without_watermark_keeps_full_behavior(monkeypatch):
+    """不传水位＝改动前的行为：翻到底、不早停、不标 fell_back。"""
+    _patch_sweep_incremental(monkeypatch, {1: _page("PO-1")}, total=40)
+
+    res = asyncio.run(P.sweep_pages(object(), max_pages=5))
+
+    assert res["stopped_early"] is False and res["fell_back"] is False
+    assert res["pages"] == 2 and res["truncated"] is False
+
+
+def test_sweep_reports_new_and_known_counts_per_page(monkeypatch):
+    """页进度要带本页新/已登记计数，UI 上才看得出增量在起作用。"""
+    _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-new1", "PO-old1"),
+        2: _page("PO-old1", "PO-old2"),
+    })
+    got = []
+
+    async def on_page(info):
+        got.append(info)
+
+    asyncio.run(P.sweep_pages(
+        object(), on_page=on_page, max_pages=5,
+        known_order_nos={"PO-old1", "PO-old2"},
+    ))
+
+    assert (got[0]["new_on_page"], got[0]["known_on_page"]) == (1, 1)

@@ -201,6 +201,21 @@
                 >正式写入（默认只试跑）</label
               >
             </div>
+            <div class="form-check form-switch ms-3">
+              <input
+                class="form-check-input"
+                type="checkbox"
+                id="switchIncremental"
+                checked
+              />
+              <label
+                class="form-check-label small"
+                for="switchIncremental"
+                title="选了目标 Sheet 时生效：先读该表已登记的订单号当水位，翻页翻到「整页都已登记」就停，不必每次翻十几页。未选目标 Sheet（按站点分流）时水位有歧义，自动全量"
+                >增量采集（追上已登记就停）</label
+              >
+              <span id="incrementalNote" class="d-block small text-muted"></span>
+            </div>
             <button id="btnStart" class="btn btn-primary btn-sm ms-auto">
               <span
                 id="startSpinner"
@@ -381,7 +396,20 @@
       }
 
       // 登记表不存在、或选中 Sheet 不可写时无从下手；被占用只挡正式写入，试跑仍放行
+      // 增量只在选了目标 Sheet 时有意义：按站点分流时一次 sweep 喂多张表，各表新旧程度
+      // 不同，取并集会让落后的表被领先的表掩盖而漏单。所以未选 Sheet 就置灰并说明原因，
+      // 而不是让开关看着是开的、实际后端在退全量。
+      function updateIncrementalHint() {
+        const sheet = $("sheetSelect").value;
+        const box = $("switchIncremental");
+        box.disabled = !sheet;
+        $("incrementalNote").textContent = sheet
+          ? ""
+          : "未选目标 Sheet：按站点分流，本批全量翻页";
+      }
+
       function updateStartEnabled() {
+        updateIncrementalHint();
         const miss = !cfg.workbook_exists;
         const unwritable =
           cfg.sheet_info && cfg.sheet_info.sheet && !cfg.sheet_info.writable;
@@ -469,20 +497,42 @@
           case "store":
             logLine(`当前店铺：${d.store}`, "text-info");
             break;
-          case "page":
+          case "watermark":
+            if (d.enabled) {
+              logLine(
+                `增量采集：${d.sheet} 已登记 ${d.known} 个订单号作水位，翻到整页都已登记就停`,
+                "text-info"
+              );
+            } else {
+              logLine(`全量采集：${d.reason}`, "text-muted");
+            }
+            break;
+          case "page": {
             $("statTotal").textContent = d.total ?? "–";
             $("phaseLabel").textContent = `翻页采集 第 ${d.page ?? "?"} 页`;
+            const inc =
+              d.new_on_page || d.known_on_page
+                ? `，本页新 ${d.new_on_page} / 已登记 ${d.known_on_page}`
+                : "";
             logLine(
               `第 ${d.page ?? "?"} 页（已翻 ${d.pages_done ?? "?"}）：已勾选 ` +
-                `${d.selected ?? "?"} / ${d.total ?? "?"}，累计抓图 ${d.images ?? 0}`
+                `${d.selected ?? "?"} / ${d.total ?? "?"}，累计抓图 ${d.images ?? 0}${inc}`
             );
             break;
+          }
           case "swept":
             $("statTotal").textContent = d.total ?? "–";
             logLine(
               `翻页完成：${d.pages} 页 / 共 ${d.total} 单，勾选 ${d.selected}，抓到主图 ${d.images} 个`,
               "text-info"
             );
+            if (d.stopped_early)
+              logLine(`增量早停：${d.stop_reason}`, "text-success");
+            if (d.fell_back)
+              logLine(
+                "增量护栏触发，本批已退回全量翻页（排序可能被改，或表里有未登记的空洞）",
+                "text-warning"
+              );
             break;
           case "exported":
             $("phaseLabel").textContent = "解析导出文件";
@@ -583,10 +633,19 @@
               );
             }
             break;
+          case "purchase_summary":
+            logLine(
+              `采购统计：新增 ${d.rows} 条，涉及 ${d.products} 个商品（${d.variants} 个规格），` +
+                `其中 ${d.multi_products} 个需一次买多规格，总件数 ${d.total_qty}`,
+              "text-info"
+            );
+            if (d.md_file) logLine(`采购统计（md）：${d.md_file}`, "text-info");
+            if (d.file) logLine(`采购汇总表（xlsx）：${d.file}`, "text-info");
+            break;
           case "unpriced":
             logLine(
-              `${d.count} 条订单页面暂无「成交单价」，本批不登记、留到下批` +
-                `（插件回填约一天延迟）`,
+              `${d.count} 条订单页面暂无「成交单价」，因开了严格模式本批不登记、` +
+                `留到下批（默认口径是允许空价照常登记）`,
               "text-warning"
             );
             break;
@@ -645,6 +704,7 @@
               max_pages: Number($("maxPagesInput").value) || 200,
               workbook: $("workbookSelect").value,
               sheet: $("sheetSelect").value, // 空＝按 sheet_map 分流
+              incremental: $("switchIncremental").checked,
             }),
           });
           const { job_id } = await r.json();
@@ -656,9 +716,12 @@
             "swept",
             "exported",
             "parsed",
+            "watermark",
             "images",
+            "purchase_summary",
             "plan",
             "unmapped",
+            "unpriced",
             "writing",
             "written",
             "write_failed",

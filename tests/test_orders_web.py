@@ -87,10 +87,11 @@ def _fake_runner(seen: dict):
     """替身 run_orders_batch：记录入参，推几个事件，返回可辨识的汇总。"""
 
     async def _run(store="", dry_run=True, workbook="", list_url="",
-                   on_progress=None, max_pages=200, sheet="", require_price=True):
+                   on_progress=None, max_pages=200, sheet="", require_price=False,
+                   incremental=True):
         seen.update({"store": store, "dry_run": dry_run, "max_pages": max_pages,
                      "workbook": workbook, "sheet": sheet,
-                     "require_price": require_price})
+                     "require_price": require_price, "incremental": incremental})
         await on_progress({"type": "started", "dry_run": dry_run, "workbook": "W"})
         await on_progress({"type": "plan", "sheet": "S", "pending": 2, "dup": 1,
                            "no_key": False, "with_image": 2})
@@ -115,7 +116,8 @@ def test_batch_defaults_to_dry_run(client, monkeypatch, webapp, no_prefs):
     events = _sse_events(client.get(f"/orders/batch/{job_id}/events").text)
     assert seen["dry_run"] is True
     assert seen["max_pages"] == 200
-    assert seen["require_price"] is True, "默认必须拦掉无价订单，不带空价入库"
+    assert seen["require_price"] is False, "默认允许成交价为空，无价订单照常登记"
+    assert seen["incremental"] is True, "默认增量采集（单表模式下才真正生效）"
     names = [ev for ev, _ in events]
     # service 的收尾 done 转发成 batch_done，SSE 自己的 done 只出现一次
     assert "batch_done" in names
@@ -136,18 +138,28 @@ def test_batch_passes_selection(client, monkeypatch, webapp, no_prefs):
     assert seen == {
         "store": "StoreA", "dry_run": False, "max_pages": 3,
         "workbook": "D:/wb.xlsx", "sheet": "StoreA全球1",
-        "require_price": True,
+        "require_price": False, "incremental": True,
     }
 
 
-def test_batch_allow_no_price_opt_in(client, monkeypatch, webapp, no_prefs):
-    """勾了「连无价订单一起登记」才放行，默认不放。"""
+def test_batch_incremental_can_be_disabled(client, monkeypatch, webapp, no_prefs):
+    """页面上关掉增量开关要原样传到 service。"""
     seen: dict = {}
     monkeypatch.setattr(webapp.orders_service, "run_orders_batch", _fake_runner(seen))
-    r = client.post("/orders/batch", json={"allow_no_price": True})
+    r = client.post("/orders/batch", json={"incremental": False})
     client.get(f"/orders/batch/{r.json()['job_id']}/events")
 
-    assert seen["require_price"] is False
+    assert seen["incremental"] is False
+
+
+def test_batch_require_price_opt_in(client, monkeypatch, webapp, no_prefs):
+    """显式传 allow_no_price=False 才恢复「无价留到下批」的严格口径。"""
+    seen: dict = {}
+    monkeypatch.setattr(webapp.orders_service, "run_orders_batch", _fake_runner(seen))
+    r = client.post("/orders/batch", json={"allow_no_price": False})
+    client.get(f"/orders/batch/{r.json()['job_id']}/events")
+
+    assert seen["require_price"] is True
 
 
 def test_batch_remembers_selection(client, monkeypatch, webapp):

@@ -28,17 +28,33 @@ def _print_progress(event: dict) -> None:
         logger.info(f"=== 订单登记开始 · {mode} · 登记表={event.get('workbook')} ===")
     elif t == "store":
         logger.info(f"当前登录店铺：{event.get('store')}")
+    elif t == "watermark":
+        if event.get("enabled"):
+            logger.info(
+                f"增量采集已启用：「{event.get('sheet')}」已登记 {event.get('known')} 个订单号，"
+                f"翻到全部已登记就停"
+            )
+        else:
+            logger.info(f"全量采集：{event.get('reason')}")
     elif t == "page":
+        inc = ""
+        if event.get("new_on_page") or event.get("known_on_page"):
+            inc = (f"，本页新 {event.get('new_on_page')} / 已登记 "
+                   f"{event.get('known_on_page')}")
         logger.info(
             f"--- 第 {event.get('page')} 页（累计 {event.get('pages_done')} 页）"
             f" 已抓图 {event.get('images')} 张，已选 {event.get('selected')}"
-            f"/{event.get('total')} 条 ---"
+            f"/{event.get('total')} 条{inc} ---"
         )
     elif t == "swept":
         logger.info(
             f"翻页完成：{event.get('pages')} 页，共 {event.get('total')} 条，"
             f"已勾选 {event.get('selected')}，抓到 {event.get('images')} 个子订单的图"
         )
+        if event.get("stopped_early"):
+            logger.info(f"增量早停：{event.get('stop_reason')}")
+        if event.get("fell_back"):
+            logger.warning("增量护栏触发，本批已退回全量 sweep（详见上文告警）")
     elif t == "exported":
         logger.info(f"官方导出已落地：{event.get('file')}")
     elif t == "parsed":
@@ -49,6 +65,15 @@ def _print_progress(event: dict) -> None:
         )
     elif t == "images":
         logger.info(f"主图下载：成功 {event.get('ok')}，失败 {event.get('fail')}")
+    elif t == "purchase_summary":
+        logger.info(
+            f"采购统计：新增 {event.get('rows')} 条，涉及 {event.get('products')} 个商品"
+            f"（{event.get('variants')} 个规格），其中 {event.get('multi_products')} 个"
+            f"需一次买多规格，总件数 {event.get('total_qty')}"
+        )
+        for label, key in (("汇总表", "file"), ("统计 md", "md_file")):
+            if event.get(key):
+                logger.info(f"    {label}：{event[key]}")
     elif t == "plan":
         note = "（判重列缺失，跳过该表）" if event.get("no_key") else ""
         logger.info(
@@ -62,8 +87,8 @@ def _print_progress(event: dict) -> None:
         )
     elif t == "unpriced":
         logger.warning(
-            f"⏸ {event.get('count')} 条订单页面暂无「成交单价」，本批不登记、留到下批"
-            f"（插件回填约一天延迟；如需先占位用 --allow-no-price）"
+            f"{event.get('count')} 条订单页面暂无「成交单价」，因开了 --require-price "
+            f"本批不登记、留到下批（默认口径是允许空价照常登记）"
         )
     elif t == "writing":
         logger.info(f"正在写入「{event.get('sheet')}」{event.get('rows')} 行…")
@@ -90,6 +115,12 @@ def _print_summary(s: dict) -> None:
         f"判重跳过 {s.get('dup_skipped')}，未映射跳过 {s.get('unmapped_skipped')}，"
         f"无价留待下批 {s.get('unpriced_skipped', 0)} ==="
     )
+    inc = s.get("incremental") or {}
+    if inc.get("enabled"):
+        logger.info(
+            f"增量：水位 {inc.get('known')} 个订单号，本批翻 {inc.get('pages_swept')} 页"
+            + ("（追上后早停）" if inc.get("stopped_early") else "（未触发早停，已翻到底）")
+        )
     if s.get("no_key_sheets"):
         logger.warning(f"⚠️ 判重列缺失被整表跳过：{s['no_key_sheets']}")
     if s.get("failed_sheets"):
@@ -105,6 +136,14 @@ def _print_summary(s: dict) -> None:
         logger.info("试跑结束，未写入任何数据。核对无误后加 --write 正式写入。")
     else:
         logger.info(f"实际写入 {s.get('written_rows')} 行。")
+    purchase = s.get("purchase") or {}
+    if purchase.get("file"):
+        logger.info(f"本批采购汇总表：{purchase['file']}")
+    if purchase.get("md_file"):
+        logger.info(
+            f"本批采购统计（按商品合并，{purchase.get('multi_products', 0)} 个商品"
+            f"需一次买多规格）：{purchase['md_file']}"
+        )
 
 
 async def main() -> None:
@@ -128,9 +167,16 @@ async def main() -> None:
         "--max-pages", type=int, default=200, help="最多翻几页（冒烟用，缺省 200）"
     )
     parser.add_argument(
-        "--allow-no-price", action="store_true",
-        help="连页面暂无「成交单价」的订单也登记（默认跳过留到下批：判重键含尺码，"
-             "带空价入库后重跑不会补价，只能人工填）",
+        "--no-incremental", action="store_true",
+        help="关掉增量：翻完全部页。默认增量——给了 --sheet 时先读该表已登记的订单号当水位，"
+             "翻页追上就停，不必每次翻十几页（未给 --sheet 时本就按 sheet_map 分流，"
+             "水位有歧义，自动全量）",
+    )
+    parser.add_argument(
+        "--require-price", action="store_true",
+        help="严格模式：页面暂无「成交单价」的订单本批不登记、留到下批。"
+             "默认不开——允许成交价为空，订单照常登记（插件回填约一天延迟，等价会积压"
+             "当天全部订单；代价是那一格后续需人工补填，重跑不会补）",
     )
     args = parser.parse_args()
 
@@ -142,7 +188,8 @@ async def main() -> None:
         list_url=args.list_url,
         on_progress=_print_progress,
         max_pages=args.max_pages,
-        require_price=not args.allow_no_price,
+        require_price=args.require_price,
+        incremental=not args.no_incremental,
     )
 
 

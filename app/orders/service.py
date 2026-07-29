@@ -53,6 +53,7 @@ class SheetPlan:
     header_row: int = 1
     image_col: Optional[str] = None
     rows: List[dict] = field(default_factory=list)   # 待写：append_rows 的入参格式
+    orders: List[pipeline.OrderRow] = field(default_factory=list)
     preview: List[dict] = field(default_factory=list)  # 人工核对用：{列标题: 值}
     dup: int = 0
     no_key: bool = False
@@ -192,6 +193,33 @@ def get_worklist_status(
     }
 
 
+def read_known_order_nos(workbook: str, sheet: str) -> set:
+    """读某 Sheet 已登记的订单号集合，作增量采集的水位。纯读，失败返回空集。
+
+    为什么只在【单表模式】用（调用方保证）：sheet_map 分流一次 sweep 同时喂 7 张表，各表
+    新旧程度不同（某张上周登记过、另一张停了一个月）。取并集会让落后的表被领先的表掩盖——
+    它的旧单在并集里「已知」，于是早停，那批就永远补不回来。单表模式落点唯一、水位唯一，
+    语义无歧义。
+
+    返回空集＝调用方退回全量 sweep（订单号列缺失、文件损坏都走这条），不会误早停：
+    should_stop_incremental 在水位为空时第一页就全是新单，自然翻到底。
+    """
+    try:
+        header, header_row, _ = _sheet_schema(workbook, sheet)
+    except Exception as e:
+        logger.warning(f"读 Sheet「{sheet}」表头失败，本批退全量采集：{e}")
+        return set()
+    col = pipeline.resolve_title_column(header, "订单号")
+    if not col:
+        logger.warning(f"Sheet「{sheet}」没有「订单号」列，本批退全量采集")
+        return set()
+    known = WpsExcelTool.existing_key_values(
+        workbook, sheet, col=col, header_row=header_row
+    )
+    logger.info(f"Sheet「{sheet}」已登记 {len(known)} 个订单号（增量水位）")
+    return known
+
+
 def _sheet_schema(workbook: str, sheet: str) -> tuple:
     """解析一次目标 Sheet 的表头结构，全批复用：(header, header_row, image_col)。
 
@@ -209,18 +237,21 @@ def plan_writes(
     store: str,
     sheet_map: List[dict],
     dedupe_by: Optional[List[str]] = None,
-    require_price: bool = True,
+    require_price: bool = False,
 ) -> tuple:
     """把订单按目标 Sheet 分组、判重，产出 {sheet: SheetPlan}、未映射清单、无价清单。
 
     返回 (plans, unmapped, unpriced)。两类跳过语义完全不同，刻意分开报：
       - unmapped：店铺+站点没配 sheet_map，是配置缺失，要人工补配置才能登记。
         绝不臆测落点（`StoreA牛仔裤` 是列结构完全不同的专用表，不是 StoreA 美国站）。
-      - unpriced：成交单价是商家助手插件注入 DOM 的、不是 Temu 官方字段，实测回填有约
-        一天延迟（2026-07-28 实机：当天 12 单全部无「成交单价」标签，前一天的都有）。
-        这类订单**本批不登记、留到下批**：判重键是订单号+尺码，一旦带空价入库，下次重跑
-        会判定已入库而永不补价，那一格就只能人工填。等一天比人工补一列划算。
-        require_price=False 可关掉这条规则（明确要先占位时用）。
+      - unpriced：仅在 require_price=True 时才产生，含义是「本批不登记、留到下批」。
+
+    **require_price 默认 False（2026-07-29 确认）**：成交单价是商家助手插件注入 DOM 的、
+    不是 Temu 官方字段，实测回填有约一天延迟（2026-07-28 实机：当天 12 单全部无「成交
+    单价」标签，前一天的都有）。等一天再登记会让当天的单全部积压，而登记表的主用途是发货
+    与采购跟单，成交价只是参考列——所以允许「平台成交价」这一格为空，订单照常入库。
+    代价已知：判重键是订单号+尺码，带空价入库后重跑会判定已入库而不再补价，那一格需人工
+    补填。要恢复「无价就留到下批」的旧口径，显式传 require_price=True。
     """
     titles = dedupe_by or _DEFAULT_DEDUPE_BY
     plans: Dict[str, SheetPlan] = {}
@@ -235,7 +266,8 @@ def plan_writes(
     orders = sorted(orders, key=lambda x: str(x.created_at or ""), reverse=True)
 
     for o in orders:
-        # 无价先拦：早于分表/判重，免得白读表头。判重键含尺码，带空价入库就补不回来了
+        # 严格模式（require_price=True）才拦无价：拦在分表/判重之前，免得白读表头。
+        # 默认模式下这段整体跳过，无价订单带空「平台成交价」照常登记。
         if require_price and not str(o.deal_price or "").strip():
             unpriced.append({
                 "order_no": o.order_no, "sub_order_no": o.sub_order_no,
@@ -311,6 +343,7 @@ def _stage_order(
         item["image_column"] = plan.image_col
         item["image_path"] = o.image_path
     plan.rows.append(item)
+    plan.orders.append(o)
     plan.preview.append({
         plan.header.get(c, c): v for c, v in sorted(values.items())
     } | {"_图片": "有" if item.get("image_path") else "无"})
@@ -321,6 +354,7 @@ async def collect_orders(
     store: str = "",
     on_progress: ProgressCB = None,
     max_pages: int = 200,
+    known_order_nos: Optional[set] = None,
 ) -> dict:
     """连 CDP、开专用页签、翻页勾选抓图、触发导出、解析。返回 {orders, store, stat...}。
 
@@ -356,11 +390,17 @@ async def collect_orders(
         async def _on_page(info: dict) -> None:
             await _emit(on_progress, {"type": "page", **info})
 
-        swept = await pipeline.sweep_pages(page, on_page=_on_page, max_pages=max_pages)
+        swept = await pipeline.sweep_pages(
+            page, on_page=_on_page, max_pages=max_pages,
+            known_order_nos=known_order_nos,
+        )
         await _emit(on_progress, {
             "type": "swept", "pages": swept["pages"], "total": swept["total"],
             "selected": swept["selected"], "images": len(swept["images"]),
             "truncated": swept.get("truncated", False),
+            "stopped_early": swept.get("stopped_early", False),
+            "stop_reason": swept.get("stop_reason", ""),
+            "fell_back": swept.get("fell_back", False),
         })
 
         out_dir = str(get_output_dir("orders_export"))
@@ -378,6 +418,10 @@ async def collect_orders(
             "total": swept["total"], "pages": swept["pages"], "join": join_stat,
             # 被 max_pages 截断＝本批不是全量，一路传到汇总，别让人误读成「全跑完了」
             "truncated": swept.get("truncated", False),
+            # 增量早停＝故意只取新单（与 truncated 语义相反，见 sweep_pages）
+            "stopped_early": swept.get("stopped_early", False),
+            "stop_reason": swept.get("stop_reason", ""),
+            "fell_back": swept.get("fell_back", False),
         }
     finally:
         if page is not None:
@@ -418,9 +462,10 @@ async def run_orders_batch(
     on_progress: ProgressCB = None,
     max_pages: int = 200,
     sheet: str = "",
-    require_price: bool = True,
+    require_price: bool = False,
+    incremental: bool = True,
 ) -> dict:
-    """整批入口：预检 → 采集 → 计划 → （dry_run 则止步）→ 批量写入 → 汇总。
+    """整批入口：预检 →（读水位）→ 采集 → 计划 →（dry_run 则止步）→ 批量写入 → 汇总。
 
     dry_run 默认 True：写登记表是不可逆操作（虽有自动备份），方案文档要求实机 dry-run
     结果人工确认后才开写入。UI/CLI 必须显式传 dry_run=False 才会落盘。
@@ -428,7 +473,12 @@ async def run_orders_batch(
     sheet 非空＝用户显式指定落点，绕过 sheet_map 的站点分流（见 _explicit_sheet_map）；
     此时 store 也必须显式给出，因为合成映射要拿它当匹配键。
 
-    require_price 默认 True：页面还没注入成交单价的订单本批不登记（见 plan_writes）。
+    require_price 默认 False：允许「平台成交价」为空，页面还没注入成交单价的订单照常
+    登记（见 plan_writes 的说明）；传 True 才恢复「无价留到下批」的旧口径。
+
+    incremental 默认 True，但**只在单表模式（sheet 非空）真正生效**：采集前读该 Sheet
+    已登记的订单号当水位，翻页追上就停，不必每次全量翻十几页。sheet_map 分流模式下水位
+    有歧义（见 read_known_order_nos），一律退全量 sweep 靠判重兜底，行为与改动前一致。
     """
     cfg = load_orders_config()
     workbook = workbook or str(cfg.get("workbook") or "")
@@ -471,12 +521,31 @@ async def run_orders_batch(
     await _emit(on_progress, {
         "type": "started", "dry_run": dry_run, "workbook": workbook,
         # sheet 非空表示本批不按站点分流，全部进这张表——务必让用户在日志里看见
-        "sheet": sheet, "store": store,
+        "sheet": sheet, "store": store, "incremental": incremental,
     })
+
+    # 水位：采集之前读，纯读操作，dry-run 下同样生效（试跑就是要看有哪些新单）
+    known: set = set()
+    inc_reason = ""
+    if not incremental:
+        inc_reason = "已显式关闭增量，本批全量采集"
+    elif not sheet:
+        inc_reason = "未指定目标 Sheet（按 sheet_map 分站点分流），水位有歧义，本批全量采集"
+    else:
+        known = read_known_order_nos(workbook, sheet)
+        if not known:
+            inc_reason = "该 Sheet 读不到已登记订单号（首次登记或缺订单号列），本批全量采集"
+    await _emit(on_progress, {
+        "type": "watermark", "enabled": bool(known), "known": len(known),
+        "sheet": sheet, "reason": inc_reason,
+    })
+    if inc_reason:
+        logger.info(f"增量未启用：{inc_reason}")
+
     try:
         got = await asyncio.wait_for(
             collect_orders(list_url, store=store, on_progress=on_progress,
-                           max_pages=max_pages),
+                           max_pages=max_pages, known_order_nos=known),
             timeout=ORDERS_BATCH_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -497,6 +566,13 @@ async def run_orders_batch(
         orders, workbook, got["store"], sheet_map, dedupe_by,
         require_price=require_price,
     )
+    pending_orders = [order for plan in plans.values() for order in plan.orders]
+    purchase = _export_purchase(
+        pending_orders,
+        Path(got.get("export_file") or "").stem.replace("订单导出_", "") or "batch",
+    )
+    if purchase.get("file") or purchase.get("md_file"):
+        await _emit(on_progress, {"type": "purchase_summary", **purchase})
     for plan in plans.values():
         await _emit(on_progress, {
             "type": "plan", "sheet": plan.sheet, "pending": len(plan.rows),
@@ -525,10 +601,47 @@ async def run_orders_batch(
     summary = _summary(
         dry_run, orders=orders, plans=plans, unmapped=unmapped,
         written=written, got=got, img_stat=img_stat, plan_files=plan_files,
-        unpriced=unpriced,
+        unpriced=unpriced, purchase=purchase,
+        incremental={
+            "enabled": bool(known), "known": len(known), "reason": inc_reason,
+            "stopped_early": bool(got.get("stopped_early")),
+            "stop_reason": got.get("stop_reason", ""),
+            "fell_back": bool(got.get("fell_back")),
+            "pages_swept": got.get("pages", 0),
+        },
     )
     await _emit(on_progress, {"type": "done", **summary})
     return summary
+
+
+def _export_purchase(pending_orders: List[pipeline.OrderRow], stamp: str) -> dict:
+    """出本批的采购统计：xlsx（筛选核对用）+ md（合并下单速览用），各批一份新文件。
+
+    两份各自独立 try：它们是两个用途不同的产物，一个写失败不该连坐另一个。整段都是
+    best-effort——采购统计是辅助产物，坏了不能影响登记表写入这条主流程。
+
+    dry-run 也照样出：试跑时人最需要的就是「这批要采什么、哪些能合单」，等到正式写入才
+    给统计就晚了。
+    """
+    purchase = {
+        "file": "", "md_file": "", "rows": len(pending_orders),
+        "groups": 0, "repeated_groups": 0, "total_qty": 0,
+        # 商品级：products=涉及几个 SPU，multi_products=要一次买多规格的有几个
+        "products": 0, "multi_products": 0, "variants": 0,
+    }
+    if not pending_orders:
+        return purchase
+
+    out_dir = str(get_output_dir("orders_purchase"))
+    try:
+        purchase.update(pipeline.export_purchase_summary(pending_orders, out_dir, stamp))
+    except Exception as e:
+        logger.warning(f"导出新增订单采购汇总 xlsx 失败（不影响登记表写入）：{e}")
+    try:
+        purchase.update(pipeline.export_purchase_markdown(pending_orders, out_dir, stamp))
+    except Exception as e:
+        logger.warning(f"导出新增订单采购统计 md 失败（不影响登记表写入）：{e}")
+    return purchase
 
 
 async def _write_plans(
@@ -605,6 +718,8 @@ def _summary(
     img_stat: Optional[dict] = None,
     plan_files: Optional[List[str]] = None,
     unpriced: Optional[List[dict]] = None,
+    purchase: Optional[dict] = None,
+    incremental: Optional[dict] = None,
 ) -> dict:
     """汇总本批结果。字段对 UI/CLI 都是稳定契约，别随手改名。"""
     plans = plans or {}
@@ -612,6 +727,9 @@ def _summary(
     return {
         "dry_run": dry_run,
         "aborted": aborted,
+        # 增量采集：enabled/known/stopped_early/fell_back/pages_swept/reason。
+        # 与 truncated 分开看：truncated=可能漏，stopped_early=故意只取新单、不漏。
+        "incremental": incremental or {"enabled": False, "known": 0, "reason": ""},
         # dry-run 导出的「待写计划」CSV 路径，供人工逐行核对
         "plan_files": list(plan_files or []),
         "store": (got or {}).get("store", ""),
@@ -621,6 +739,7 @@ def _summary(
         "truncated": bool((got or {}).get("truncated", False)),
         "parsed_rows": len(orders or []),
         "images": img_stat or {},
+        "purchase": purchase or {},
         "pending": sum(len(p.rows) for p in plans.values()),
         "dup_skipped": sum(p.dup for p in plans.values()),
         "unmapped_skipped": len(unmapped or []),
