@@ -79,11 +79,14 @@
     </nav>
 
     <div class="container-fluid px-4 pb-5">
-      <!-- Excel 占用告警 -->
+      <!-- Excel 占用告警（仅本地 xlsx 模式；云端模式 service 不返回 excel_locked） -->
       <div id="lockAlert" class="alert alert-warning d-none" role="alert">
         <i class="bi bi-exclamation-triangle-fill"></i>
         Excel 正被 WPS/Excel 占用，采集将无法写入。请先关闭该文件。
       </div>
+
+      <!-- 协作文档读取失败告警（云端模式） -->
+      <div id="cloudAlert" class="alert alert-danger d-none" role="alert"></div>
 
       <!-- 统计卡片 -->
       <div class="row g-3 mb-3">
@@ -118,14 +121,20 @@
         <div class="card-body">
           <div class="row g-2 align-items-end">
             <div class="col-12 col-md-5">
-              <label class="form-label small text-muted mb-1">目标工作簿</label>
-              <select id="selExcel" class="form-select form-select-sm"></select>
+              <label class="form-label small text-muted mb-1">
+                目标工作簿
+                <span class="text-body-tertiary">（本地 xlsx 路径，或粘贴协作文档链接）</span>
+              </label>
+              <!-- input+datalist 而不是 select：允许直接粘贴 kdocs 链接，候选仅作回显 -->
               <input
-                id="inputExcelPath"
+                id="inputExcel"
                 type="text"
-                class="form-control form-control-sm mt-1 d-none"
-                placeholder="粘贴 .xlsx 完整路径后按回车"
+                class="form-control form-control-sm"
+                list="excelOptions"
+                placeholder="C:\...\核算表.xlsx 或 https://www.kdocs.cn/l/..."
               />
+              <datalist id="excelOptions"></datalist>
+              <div id="excelHint" class="small text-body-tertiary mt-1"></div>
             </div>
             <div class="col-6 col-md-3">
               <label class="form-label small text-muted mb-1">目标 Sheet</label>
@@ -272,7 +281,6 @@
       let evtSource = null;
       // 三级选择当前值（后端回显「上次选择」作初值）
       let sel = { excel: "", sheet: "", store: "", status: "" };
-      const MANUAL = "__manual__"; // 工作簿下拉里「手填路径」哨兵值
 
       function showToast(title, body, kind = "primary") {
         $("toastTitle").textContent = title;
@@ -358,35 +366,22 @@
         $("statDone").textContent = s.done == null ? "–" : s.done;
         $("statTodo").textContent = s.todo;
         $("lockAlert").classList.toggle("d-none", !s.excel_locked);
-      }
-
-      // 短化工作簿路径为文件名（下拉更好读；title 保留完整路径）
-      function baseName(p) {
-        return (p || "").split(/[\\/]/).pop() || p;
+        // 云端模式读失败（kdocs-cli 没装上/未认证/链接无效）→ 红条直接显示原因
+        $("cloudAlert").classList.toggle("d-none", !(s.cloud && s.cloud_error));
+        if (s.cloud && s.cloud_error) {
+          $("cloudAlert").textContent = `协作文档读取失败：${s.cloud_error}`;
+        }
       }
 
       function fillSelectors(s) {
-        // 工作簿下拉：扫描到的 .xlsx + 「手填路径」
-        const excelSel = $("selExcel");
-        const wbs = s.workbooks || [];
-        excelSel.innerHTML =
-          wbs
-            .map(
-              (p) =>
-                `<option value="${p}" title="${p}"${
-                  p === s.excel ? " selected" : ""
-                }>${baseName(p)}</option>`
-            )
-            .join("") + `<option value="${MANUAL}">✎ 手填路径…</option>`;
-        // 当前生效工作簿不在扫描列表里（手填过的）→ 也补一项选中
-        if (s.excel && !wbs.includes(s.excel)) {
-          const opt = document.createElement("option");
-          opt.value = s.excel;
-          opt.title = s.excel;
-          opt.textContent = baseName(s.excel);
-          opt.selected = true;
-          excelSel.insertBefore(opt, excelSel.lastElementChild);
-        }
+        // 工作簿是 input+datalist：datalist 只放扫描到的本地 .xlsx 候选，
+        // 当前值（本地路径或粘贴的协作文档链接）直接回填进输入框
+        $("excelOptions").innerHTML = (s.workbooks || [])
+          .map((p) => `<option value="${p}"></option>`)
+          .join("");
+        $("inputExcel").value = s.excel || "";
+        // 云端目标给个明确标识，避免把链接当成本地路径误解
+        $("excelHint").textContent = s.cloud ? "协作文档（在线表格）" : "";
 
         // Sheet 下拉：选中工作簿的所有表；首项为「请选择」
         const sheetSel = $("selSheet");
@@ -582,26 +577,13 @@
         $(id).addEventListener("change", renderTable)
       );
 
-      // 工作簿切换：选「手填路径」→ 显示输入框；否则换 excel、清空 sheet（表可能不同）后重拉
-      $("selExcel").addEventListener("change", (e) => {
-        const v = e.target.value;
-        if (v === MANUAL) {
-          $("inputExcelPath").classList.remove("d-none");
-          $("inputExcelPath").focus();
-          return;
-        }
-        $("inputExcelPath").classList.add("d-none");
-        sel.excel = v;
-        sel.sheet = ""; // 换工作簿，旧 Sheet 未必存在
-        loadWorklist();
-      });
-      $("inputExcelPath").addEventListener("keydown", (e) => {
-        if (e.key !== "Enter") return;
+      // 工作簿切换：input+datalist，输入本地路径或粘贴协作文档链接后失焦/回车生效；
+      // 换工作簿时清空 Sheet（新文档里旧 Sheet 未必存在）后重拉
+      $("inputExcel").addEventListener("change", (e) => {
         const v = e.target.value.trim();
-        if (!v) return;
+        if (v === sel.excel) return;
         sel.excel = v;
         sel.sheet = "";
-        $("inputExcelPath").classList.add("d-none");
         loadWorklist();
       });
       $("selSheet").addEventListener("change", (e) => {

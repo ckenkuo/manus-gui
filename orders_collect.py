@@ -65,11 +65,22 @@ def _print_progress(event: dict) -> None:
         )
     elif t == "images":
         logger.info(f"主图下载：成功 {event.get('ok')}，失败 {event.get('fail')}")
+    elif t == "qty_column":
+        for item in event.get("sheets") or []:
+            if item.get("inserted"):
+                logger.info(
+                    f"「{item.get('sheet')}」已在「尺码」右侧插入「数量」列"
+                    f"（{item.get('column')} 列）；插列前备份：{item.get('backup')}"
+                )
     elif t == "purchase_summary":
         logger.info(
             f"采购统计：新增 {event.get('rows')} 条，涉及 {event.get('products')} 个商品"
             f"（{event.get('variants')} 个规格），其中 {event.get('multi_products')} 个"
             f"需一次买多规格，总件数 {event.get('total_qty')}"
+        )
+        logger.info(
+            f"    汇总表嵌图：商品级 {event.get('product_images', 0)} 张，"
+            f"SKU 级 {event.get('sku_images', 0)} 张"
         )
         for label, key in (("汇总表", "file"), ("统计 md", "md_file")):
             if event.get(key):

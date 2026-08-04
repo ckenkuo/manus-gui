@@ -337,6 +337,155 @@ class WpsExcelTool(BaseTool):
         )
 
     @staticmethod
+    def _shift_ref_cols(ref: str, at: int, n: int = 1) -> str:
+        """把区域字符串里列号 >= at 的列字母整体 +n，用于插列后修正各类区域引用。
+
+        与 _shift_ref_rows 对称（那个动行号、这个动列字母），语义同 Excel「在第 at 列
+        插入 n 列」：at 左侧的端点不动，at 及右侧后移。上限卡在 16384（XFD）——超了整个
+        ref 会被 WPS 判非法而丢掉整条规则（条件格式的 `C1:C1048576` 那种到底区域同理）。
+        `$` 绝对标记原样保留，空格分隔的多段 sqref 逐段处理。
+        """
+        def one(mo: "re.Match") -> str:
+            idx = _col_to_idx(mo.group(2))
+            col = _idx_to_col(min(idx + n, 16384)) if idx >= at else mo.group(2)
+            return mo.group(1) + col + mo.group(3) + mo.group(4)
+
+        return " ".join(
+            _CELL_REF_RE.sub(one, seg) for seg in ref.split()
+        )
+
+    @classmethod
+    def _shift_data_cols(cls, region: str, at: int, n: int = 1) -> str:
+        """把整段 sheetData 里 >= at 的列右移 n：单元格 r、行 spans、共享公式 ref。
+
+        公式文本【不平移】，取而代之的是先校验：本表 5 张登记 Sheet 实测 6111 个公式全是
+        `_xlfn.DISPIMG`（参数是图片 ID，与列号无关），一旦出现带单元格引用的其他公式就抛错
+        中止——移了列不改公式等于静默算错，比写失败危险得多（同 _shift_data_region 的取向）。
+        """
+        for mo in re.finditer(r"<f(?![^>]*/>)[^>]*>(.*?)</f>", region, re.S):
+            expr = re.sub(r"DISPIMG\([^)]*\)", "", mo.group(1))
+            if re.search(r"\$?[A-Z]{1,3}\$?\d+", expr):
+                raise ValueError(
+                    f"插列会让公式引用错位（公式片段：{mo.group(1)[:60]}），已中止"
+                )
+
+        def cell(mo: "re.Match") -> str:
+            idx = _col_to_idx(mo.group(2))
+            col = _idx_to_col(min(idx + n, 16384)) if idx >= at else mo.group(2)
+            return mo.group(1) + col + mo.group(3)
+
+        region = re.sub(r'(<c r=")([A-Z]{1,3})(\d+")', cell, region)
+        region = re.sub(
+            r'(\sspans=")(\d+):(\d+)(")',
+            lambda m: "%s%d:%d%s" % (
+                m.group(1),
+                int(m.group(2)) + n if int(m.group(2)) >= at else int(m.group(2)),
+                int(m.group(3)) + n if int(m.group(3)) >= at else int(m.group(3)),
+                m.group(4),
+            ),
+            region,
+        )
+        return re.sub(
+            r'(\sref=")([^"]+)(")',
+            lambda m: m.group(1) + cls._shift_ref_cols(m.group(2), at, n) + m.group(3),
+            region,
+        )
+
+    @classmethod
+    def _shift_head_cols(cls, head: str, at: int, style: str, width: float) -> str:
+        """平移 `<sheetData>` 之前的列引用：dimension / sheetView 视口与选区 / cols 定义。
+
+        `<cols>` 的处理是这里唯一不平凡的部分。Excel 插列的语义是「新列继承左邻列的格式」，
+        所以：
+          - min/max 都 >= at 的整段右移；
+          - 跨过 at 的段（min < at <= max）只把 max +n，等于把新列并进这一段、自然继承它的
+            样式与列宽；
+          - 没有任何段覆盖 at 时（新列左邻自成一段），补一条显式 <col> 给新列，样式取左邻
+            那段的 style，列宽用调用方给的 width（数量列不需要跟「尺码」一样宽）。
+        不这么做的后果是新列拿 defaultColWidth 且无边框，跟左右两列格式明显不一致。
+        """
+        head = re.sub(
+            r'(<dimension ref=")([^"]+)(")',
+            lambda m: m.group(1) + cls._shift_ref_cols(m.group(2), at) + m.group(3),
+            head,
+            count=1,
+        )
+        head = re.sub(
+            r'(\s(?:topLeftCell|activeCell|sqref)=")([^"]+)(")',
+            lambda m: m.group(1) + cls._shift_ref_cols(m.group(2), at) + m.group(3),
+            head,
+        )
+        covered = False
+        for mo in re.finditer(r'<col min="(\d+)" max="(\d+)"', head):
+            if int(mo.group(1)) < at <= int(mo.group(2)):
+                covered = True
+
+        def one_col(mo: "re.Match") -> str:
+            lo, hi = int(mo.group(2)), int(mo.group(3))
+            if lo >= at:
+                lo += 1
+            if hi >= at:
+                hi += 1
+            return f'{mo.group(1)}{lo}" max="{hi}"'
+
+        head = re.sub(r'(<col min=")(\d+)" max="(\d+)"', one_col, head)
+        if not covered:
+            sa = f' style="{style}"' if style else ""
+            new = f'<col min="{at}" max="{at}" width="{width}"{sa} customWidth="1"/>'
+            # 插到最后一个 max < at 的 <col> 之后：<col> 必须按列号升序排，而左邻列可能是
+            # 某个多列段的末列（`min="1" max="4"`），按字面找 `min="4" max="4"` 会落空。
+            end = None
+            for mo in re.finditer(r'<col min="(\d+)" max="(\d+)"[^>]*/>', head):
+                if int(mo.group(2)) < at:
+                    end = mo.end()
+            if end is not None:
+                head = head[:end] + new + head[end:]
+            elif "<cols>" in head:
+                head = head.replace("<cols>", "<cols>" + new, 1)
+            else:
+                logger.warning("本表没有 <cols> 定义，新列用默认列宽（不影响数据）")
+        return head
+
+    @classmethod
+    def _shift_tail_cols(cls, tail: str, at: int) -> str:
+        """平移 `</sheetData>` 之后的列引用：mergeCell / autoFilter / 条件格式 sqref，
+        外加 cfRule 公式里的【绝对】列引用。
+
+        只动带 `$` 的公式引用，同 _shift_tail_refs 的理由：cfRule 里相对引用（`C1`）代表
+        「当前被求值的单元格」、锚在 sqref 左上角，跟着 sqref 走就够了；绝对引用（`$C$1`）
+        指向固定区域，必须自己平移。
+
+        autoFilter 的 `<filterColumn colId="k">` 是【相对 ref 起点】的 0-based 序号：插列
+        落在筛选区内会让它指错列。本表实测无 filterColumn（筛选条件没存盘），真出现就抛错
+        中止而不是猜——把筛选条件挪错列，用户看到的是「表里数据凭空少了一半」。
+        """
+        af = re.search(r'<autoFilter ref="([^"]+)"', tail)
+        if af and re.search(r"<filterColumn\b", tail):
+            lo = _col_to_idx(re.match(r"\$?([A-Z]+)", af.group(1)).group(1))
+            if at > lo:
+                raise ValueError("本表 autoFilter 存了筛选条件（filterColumn），插列会让它指错列，已中止")
+
+        def abs_col(mo: "re.Match") -> str:
+            idx = _col_to_idx(mo.group(2))
+            return mo.group(1) + (
+                _idx_to_col(min(idx + 1, 16384)) if idx >= at else mo.group(2)
+            ) + mo.group(3)
+
+        tail = re.sub(
+            r'(\s(?:ref|sqref)=")([^"]+)(")',
+            lambda m: m.group(1) + cls._shift_ref_cols(m.group(2), at) + m.group(3),
+            tail,
+        )
+        return re.sub(
+            r"(<formula>)(.*?)(</formula>)",
+            lambda m: m.group(1)
+            + re.sub(r"(\$)([A-Z]{1,3})(\$\d+)", abs_col, m.group(2))
+            + m.group(3),
+            tail,
+            flags=re.S,
+        )
+
+    @staticmethod
     def _shared_strings(zf: zipfile.ZipFile) -> List[str]:
         try:
             ss = zf.read("xl/sharedStrings.xml").decode("utf-8")
@@ -1169,6 +1318,13 @@ class WpsExcelTool(BaseTool):
                 st = self._text_cell_style(rows, col)
                 if st:
                     base_styles[col] = st
+            # 全表都找不到该列样式 → 取模板行左邻列的（Excel 插列本就是「继承左邻格式」）。
+            # 撞上的场景：刚插出来的「数量」列，整表一个该列单元格都没有，学不到样式，
+            # 写出来的格没有边框、跟左右邻明显不一致。
+            for col in sorted(want_cols - set(base_styles), key=_col_to_idx):
+                st = self._left_neighbor_style(cell_styles, col)
+                if st:
+                    base_styles[col] = st
             f_styles: Dict[str, str] = {}
             for item in rows_data:
                 for col in (item.get("formulas") or {}):
@@ -1366,6 +1522,137 @@ class WpsExcelTool(BaseTool):
             "backup": str(backup),
         }
 
+    @classmethod
+    def insert_column_after(
+        cls,
+        file_path: str,
+        sheet_name: str,
+        after_title: str,
+        new_title: str,
+        header_row: int = 1,
+        width: float = 9.0,
+    ) -> Dict[str, Any]:
+        """在标题为 after_title 的列右侧插入一列、表头写 new_title，返回操作结果。
+
+        为什么不用 openpyxl 的 insert_cols：本工作簿是 WPS DISPIMG 表，openpyxl 一 save
+        就毁嵌入图（见模块开头），只能走 zip/XML 直改。
+
+        列号绑定的结构逐个平移（细节见各 _shift_*_cols）：单元格 r、行 spans、共享公式 ref、
+        dimension、sheetView 视口/选区、cols 定义、mergeCell、autoFilter、条件格式 sqref 与
+        cfRule 绝对引用、workbook.xml 里指向本表的 definedName（筛选区缓存）。
+        既有数据行【不】补空单元格：新列的填充/边框由 <col> 的 style 提供，逐行插空 <c> 会给
+        WINTAK 这种 5600 行的表凭空加几千个单元格。
+
+        幂等：new_title 已存在则直接返回 inserted=False，不动文件、不做备份。
+        改结构是不可逆操作，故照例先做时间戳备份；失败直接抛异常（不吞）。
+        """
+        src = Path(file_path)
+        if not src.exists():
+            raise FileNotFoundError(f"文件不存在：{file_path}")
+
+        header = cls.read_header(file_path, sheet_name, header_row=header_row)
+        titles = {t.strip(): c for c, t in header.items()}
+        if new_title in titles:
+            return {"inserted": False, "column": titles[new_title], "backup": None,
+                    "reason": f"「{new_title}」列已存在"}
+        anchor = titles.get(after_title)
+        if not anchor:
+            raise ValueError(
+                f"Sheet「{sheet_name}」找不到「{after_title}」列，无法确定插列位置"
+            )
+        at = _col_to_idx(anchor) + 1
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup = get_output_dir("backup") / f"{src.stem}_插列前备份{ts}{src.suffix}"
+        shutil.copyfile(src, backup)
+
+        with zipfile.ZipFile(src) as zf:
+            part = cls._resolve_sheet_part(zf, sheet_name)
+            if not part:
+                raise ValueError(f"找不到工作表 '{sheet_name}'")
+            xml = zf.read(part).decode("utf-8")
+            i = xml.index("<sheetData")
+            j = xml.index("</sheetData>") + len("</sheetData>")
+            style = cls._col_style(xml[:i], at - 1)
+            new_xml = (
+                cls._shift_head_cols(xml[:i], at, style, width)
+                + cls._insert_header_cell(
+                    cls._shift_data_cols(xml[i:j], at), header_row, at, new_title, anchor
+                )
+                + cls._shift_tail_cols(xml[j:], at)
+            )
+            changed = {part: new_xml.encode("utf-8")}
+            wbx = zf.read("xl/workbook.xml").decode("utf-8")
+            new_wbx = cls._shift_defined_names(wbx, sheet_name, at)
+            if new_wbx != wbx:
+                changed["xl/workbook.xml"] = new_wbx.encode("utf-8")
+
+            tmp = src.with_name(src.stem + f"_tmp{ts}" + src.suffix)
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zf.infolist():
+                    zout.writestr(item, changed.get(item.filename) or zf.read(item.filename))
+
+        shutil.move(str(tmp), str(src))
+        col = _idx_to_col(at)
+        logger.info(
+            f"Sheet「{sheet_name}」已在「{after_title}」({anchor}) 右侧插入「{new_title}」列({col})"
+            f"，备份：{backup}"
+        )
+        return {"inserted": True, "column": col, "backup": str(backup)}
+
+    @staticmethod
+    def _col_style(head: str, idx: int) -> str:
+        """取第 idx 列 <col> 的 style 索引（新列继承左邻格式用）；没有就返回空串。"""
+        for mo in re.finditer(r'<col min="(\d+)" max="(\d+)"[^>]*/>', head):
+            if int(mo.group(1)) <= idx <= int(mo.group(2)):
+                st = re.search(r'style="(\d+)"', mo.group(0))
+                return st.group(1) if st else ""
+        return ""
+
+    @classmethod
+    def _insert_header_cell(
+        cls, data: str, header_row: int, at: int, title: str, anchor: str
+    ) -> str:
+        """在表头行插入新列的标题单元格，样式抄左邻表头格（字体/填充/边框全跟着一致）。
+
+        写成内联字符串 `t="str"`，不往 sharedStrings.xml 加条目：那份表 3500 多条共享串，
+        动它要同步 count/uniqueCount，收益为零。read_header 走 _cell_text，两种都认。
+        """
+        col = _idx_to_col(at)
+        mo = re.search(r'<row r="%d"[^>]*?>(.*?)</row>' % header_row, data, re.S)
+        if not mo:
+            raise ValueError(f"找不到表头行（第 {header_row} 行），无法写入新列标题")
+        body = mo.group(1)
+        st = re.search(r'<c r="%s%d"\s+s="(\d+)"' % (anchor, header_row), body)
+        sa = f' s="{st.group(1)}"' if st else ""
+        cell = f'<c r="{col}{header_row}"{sa} t="str"><v>{_xml_escape(title)}</v></c>'
+        # 插到第一个列号 > at 的单元格之前；表头行末尾没有更右的列时直接追加
+        nxt = None
+        for c in re.finditer(r'<c r="([A-Z]{1,3})%d"' % header_row, body):
+            if _col_to_idx(c.group(1)) > at:
+                nxt = c.start()
+                break
+        new_body = body[:nxt] + cell + body[nxt:] if nxt is not None else body + cell
+        return data[:mo.start(1)] + new_body + data[mo.end(1):]
+
+    @classmethod
+    def _shift_defined_names(cls, wbx: str, sheet_name: str, at: int) -> str:
+        """平移 workbook.xml 里指向本表的 definedName（筛选区缓存 _FilterDatabase）。
+
+        必须先切掉 `表名!` 再动列字母：表名本身可能含大写字母+数字（`Pawly全球1`、`StoreB2`），
+        直接对整串套列引用正则会把表名的一部分当成列号改掉。
+        """
+        def one(mo: "re.Match") -> str:
+            hit = re.fullmatch(
+                r"(%s!)(\$?[A-Z]+\$?\d+(?::\$?[A-Z]+\$?\d+)?)" % re.escape(sheet_name),
+                mo.group(2),
+            )
+            if not hit:
+                return mo.group(0)
+            return mo.group(1) + hit.group(1) + cls._shift_ref_cols(hit.group(2), at) + mo.group(3)
+
+        return re.sub(r"(<definedName\b[^>]*>)([^<]*)(</definedName>)", one, wbx)
+
     def _build_cells(
         self,
         new_rid: int,
@@ -1434,6 +1721,15 @@ class WpsExcelTool(BaseTool):
             m = re.search(r'<c r="%s\d+"\s+s="(\d+)"[^>]*?><f\b' % col, body)
             if m:
                 return m.group(1)
+        return None
+
+    @staticmethod
+    def _left_neighbor_style(cell_styles: Dict[str, str], col: str) -> Optional[str]:
+        """在模板行里往左找最近一个有样式的列，返回它的样式索引；一路到 A 都没有则 None。"""
+        for idx in range(_col_to_idx(col) - 1, 0, -1):
+            st = cell_styles.get(_idx_to_col(idx))
+            if st:
+                return st
         return None
 
     @staticmethod

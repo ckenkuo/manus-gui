@@ -10,6 +10,7 @@ WPS 工作簿（复用 test_wps_excel_batch 的构造思路，走真实 append_r
   3. 判重同时防「已入库」和「同批内重复」。
 """
 import asyncio
+import re
 import zipfile
 
 import pytest
@@ -18,6 +19,7 @@ from app.orders import pipeline as P
 from app.orders import service as S
 from app.orders.pipeline import OrderRow
 from app.tool import wps_excel_tool as wet
+from app.tool.wps_excel_tool import WpsExcelTool
 
 SHEET_MAP = [
     {"store": "StoreA", "sites": ["哥伦比亚", "秘鲁"], "sheet": "StoreA全球1",
@@ -294,6 +296,87 @@ def test_real_run_writes_rows(workbook, monkeypatch):
     assert res2["purchase"]["rows"] == 0
 
 
+# ---- 「数量」列：表里本来没有，写入模式下自动插到「尺码」右侧 ---------------
+
+
+def test_write_mode_inserts_quantity_column_and_fills_it(workbook, monkeypatch):
+    """写入模式：先给目标表插「数量」列，再把应履约件数写进去（数字，能求和）。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="2")])
+
+    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+
+    assert res["written_rows"] == 1
+    header = WpsExcelTool.read_header(str(workbook), "StoreA全球1")
+    assert header["E"] == "数量", "插在「尺码」(D) 右侧"
+    assert header["H"] == "产品图片", "原 G 起的列整体右移"
+    row = WpsExcelTool.read_row_by_key(
+        str(workbook), "StoreA全球1", key="PO-新A", cols={"qty": "E"}, key_col="C",
+    )
+    assert row["qty"] == "2"
+    # 必须是数值单元格（没有 t="str"）——这一列要能直接求和、筛出多件单
+    with zipfile.ZipFile(workbook) as zf:
+        xml = zf.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert re.search(r'<c r="E[2-9]\d*"[^>]*><v>2</v></c>', xml)
+    assert not re.search(r'<c r="E[2-9]\d*"[^>]*t="str"', xml), "数量格不能是文本"
+    # 事件里要报出来，插列前的备份路径也要给（改结构不可逆）
+    qty_ev = [e for e in res["_events"] if e["type"] == "qty_column"]
+    assert qty_ev and qty_ev[0]["sheets"][0]["column"] == "E"
+    assert qty_ev[0]["sheets"][0]["backup"]
+
+
+def test_quantity_column_insert_is_idempotent_across_batches(workbook, monkeypatch):
+    """连跑两批不能插出第二列「数量」，判重也不能因为多了一列而失效。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="2")])
+    _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+
+    _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="2"),
+                                 _order("PO-新B", "34", qty="1")])
+    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+
+    header = WpsExcelTool.read_header(str(workbook), "StoreA全球1")
+    assert [t for t in header.values() if t == "数量"] == ["数量"]
+    assert res["written_rows"] == 1 and res["dup_skipped"] == 1, "首批那条要判成已入库"
+    assert not [e for e in res["_events"] if e["type"] == "qty_column"]
+
+
+def test_dry_run_shows_quantity_without_touching_structure(workbook, monkeypatch):
+    """dry-run 只读：不插列，但预览/CSV 里要带虚拟「数量*」列供核对多件单。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="3")])
+    before = workbook.read_bytes()
+
+    res = _run(dry_run=True, workbook=str(workbook), list_url="https://x")
+
+    assert workbook.read_bytes() == before
+    preview = res["sheets"]["StoreA全球1"]["preview"][0]
+    assert preview["数量*"] == 3
+    # 位置要紧跟「尺码」，人对着看才顺
+    titles = list(preview)
+    assert titles[titles.index("尺码") + 1] == "数量*"
+
+
+def test_ensure_qty_columns_only_touches_sheets_this_batch_writes(workbook, monkeypatch):
+    """只给本批真有订单落进去的表插列——改结构不可逆，不碰无关的表。"""
+    orders = [_order("PO-新A", "32"), _order("PO-211", "34", site="美国")]
+
+    got = S.ensure_qty_columns(orders, str(workbook), "StoreA", SHEET_MAP)
+
+    assert [item["sheet"] for item in got] == ["StoreA全球1"], "未映射的美国单不该触发插列"
+    assert got[0]["inserted"] is True and got[0]["column"] == "E"
+
+
+def test_ensure_qty_columns_survives_insert_failure(workbook, monkeypatch):
+    """插列失败只告警：那张表数量列留空，不能连累整批订单登记不了。"""
+    def boom(*_a, **_k):
+        raise RuntimeError("表结构对不上")
+
+    monkeypatch.setattr(S.WpsExcelTool, "insert_column_after", boom)
+
+    got = S.ensure_qty_columns([_order("PO-新A", "32")], str(workbook), "StoreA", SHEET_MAP)
+
+    assert got == [{"sheet": "StoreA全球1", "inserted": False, "reason": "表结构对不上"}]
+    assert "数量" not in WpsExcelTool.read_header(str(workbook), "StoreA全球1").values()
+
+
 def test_write_failure_is_reported_not_swallowed(workbook, monkeypatch):
     """写失败要进汇总与事件（表被 WPS 独占锁定是常见情形），不静默。"""
     _patch_collect(monkeypatch, [_order("PO-新A", "32")])
@@ -447,6 +530,9 @@ def test_inspect_sheet_survives_missing_sheet(workbook):
 
 def test_worklist_status_filters_reserved_and_validates_sheet(workbook, monkeypatch):
     """WpsReserved_* 不是数据表不给选；上次选的 Sheet 不在本工作簿里则视为未选。"""
+    # 本用例钉的是本地工作簿路径的行为；本机 config.toml 可能已开协作文档模式，
+    # 显式钉死本地后端，避免用例结果依赖机器配置
+    monkeypatch.setattr(S, "cloud_backend", lambda cfg: None)
     monkeypatch.setattr(S, "list_workbooks", lambda: [str(workbook)])
     monkeypatch.setattr(S, "load_prefs", lambda: {"sheet": "别的工作簿的表"})
     monkeypatch.setattr(
@@ -467,7 +553,55 @@ def test_prefs_roundtrip(tmp_path, monkeypatch):
 
     assert S.load_prefs() == {
         "store": "StoreB", "workbook": "D:/wb.xlsx", "sheet": "StoreB欧区",
+        "cloud_url": "",
     }
+
+
+def test_prefs_cloud_link_goes_to_cloud_url(tmp_path, monkeypatch):
+    """协作文档链接单独存 cloud_url，且显式选本地路径会清掉旧链接。"""
+    monkeypatch.setattr(S, "ORDERS_PREFS", tmp_path / "orders_prefs.json")
+    S.save_prefs(store="Pawly", workbook="https://www.kdocs.cn/l/abc123",
+                 sheet="Pawly全球1")
+    assert S.load_prefs() == {
+        "store": "Pawly", "workbook": "", "sheet": "Pawly全球1",
+        "cloud_url": "https://www.kdocs.cn/l/abc123",
+    }
+    S.save_prefs(store="Pawly", workbook="D:/wb.xlsx", sheet="")
+    assert S.load_prefs()["cloud_url"] == ""
+
+
+def test_worklist_explicit_cloud_link(monkeypatch):
+    """UI 粘贴协作文档链接：走云端分支列出该文档的 Sheet，不回退 config/本地。"""
+    class FakeCloud:
+        def sheet_names(self):
+            return ["Pawly全球1", "WINTAK"]
+
+    seen = {}
+
+    def fake_backend(cfg, cloud_url=""):
+        seen["url"] = cloud_url
+        return FakeCloud()
+
+    monkeypatch.setattr(S, "cloud_backend", fake_backend)
+    monkeypatch.setattr(S, "load_orders_config", lambda: {"dedupe_by": ["订单号", "尺码"]})
+    monkeypatch.setattr(S, "load_prefs", lambda: {})
+
+    st = S.get_worklist_status(workbook="https://www.kdocs.cn/l/new-doc")
+    assert seen["url"] == "https://www.kdocs.cn/l/new-doc"
+    assert st["cloud"] is True
+    assert st["workbook"] == "https://www.kdocs.cn/l/new-doc"
+    assert st["sheets"] == ["Pawly全球1", "WINTAK"]
+    assert st["workbook_exists"] is True
+
+    # 显式传本地路径 → 本地模式（cloud_backend 不该被用于目标）
+    monkeypatch.setattr(S, "list_workbooks", lambda: [])
+    monkeypatch.setattr(
+        S.WpsExcelTool, "list_sheets",
+        classmethod(lambda cls, p: ["Sheet1"]),
+    )
+    st = S.get_worklist_status(workbook="D:/local.xlsx")
+    assert "cloud" not in st
+    assert st["sheets"] == ["Sheet1"]
 
 
 def test_load_prefs_tolerates_garbage(tmp_path, monkeypatch):

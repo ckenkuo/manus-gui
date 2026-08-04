@@ -33,6 +33,7 @@ from app.collect.service import (
 from app.config import PROJECT_ROOT, config, get_output_dir
 from app.logger import logger
 from app.orders import pipeline
+from app.orders.kdocs_sheet import KdocsSheet
 from app.tool.wps_excel_tool import WpsExcelTool
 
 # 整批护栏：翻完 N 页 + 导出 + 下 N 张图，247 条实测约 3~5 分钟，给足余量。
@@ -41,6 +42,24 @@ ORDERS_BATCH_TIMEOUT = 1800
 _DEFAULT_DEDUPE_BY = ["订单号", "尺码"]
 # 订单页「上次选择」（店铺/工作簿/Sheet）。与采集页的 collect_prefs.json 分开存。
 ORDERS_PREFS = config.workspace_root / "orders_prefs.json"
+
+
+def is_cloud_link(value: str) -> bool:
+    """是协作文档链接（http(s)://...）而非本地路径/文件 ID。"""
+    return str(value or "").strip().lower().startswith(("http://", "https://"))
+
+
+def cloud_backend(cfg: dict, cloud_url: str = "") -> Optional[KdocsSheet]:
+    """确定本批的云端登记目标；返回 None 表示走本地 xlsx 路径（行为不变）。
+
+    优先级：显式给的协作文档链接（UI 粘贴的）> config 的 cloud_file_id。
+    云端模式下水位/判重/写入全部打在协作文档上，本地 workbook 不再参与读写
+    （采购汇总不受影响，始终落本地）。
+    """
+    target = cloud_url.strip() or str(cfg.get("cloud_file_id") or "").strip()
+    if not target:
+        return None
+    return KdocsSheet(target)
 
 
 @dataclass
@@ -98,30 +117,38 @@ def load_prefs() -> dict:
 
 
 def save_prefs(store: str = "", workbook: str = "", sheet: str = "") -> None:
-    """记住本次选择，供下次 UI 缺省回填。写失败只告警、不阻断本批。"""
+    """记住本次选择，供下次 UI 缺省回填。写失败只告警、不阻断本批。
+
+    workbook 是协作文档链接时存到 cloud_url（与本地路径分开）：下次首屏按
+    「prefs.cloud_url > config.cloud_file_id」回填，而显式选过本地路径则清掉
+    cloud_url，避免旧链接盖掉用户后来的选择。
+    """
+    data = {"store": store, "sheet": sheet, "workbook": "", "cloud_url": ""}
+    if is_cloud_link(workbook):
+        data["cloud_url"] = workbook.strip()
+    else:
+        data["workbook"] = workbook
     try:
         ORDERS_PREFS.parent.mkdir(parents=True, exist_ok=True)
         ORDERS_PREFS.write_text(
-            json.dumps(
-                {"store": store, "workbook": workbook, "sheet": sheet},
-                ensure_ascii=False, indent=2,
-            ),
+            json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception as e:
         logger.warning(f"保存订单页偏好失败（忽略）：{e}")
 
 
-def inspect_sheet(workbook: str, sheet: str, dedupe_by: Optional[List[str]] = None) -> dict:
+def inspect_sheet(workbook: str, sheet: str, dedupe_by: Optional[List[str]] = None,
+                  cloud: Optional[KdocsSheet] = None) -> dict:
     """探测某 Sheet 能不能写：判重列是否齐、图片列在哪、表头行第几行。
 
     为什么 UI 必须先看这个：判重列（订单号+尺码）缺任一列时 service 会把整表标 no_key
     并跳过——一行都不写。让用户在点「开始」前就知道，而不是跑完几分钟导出才发现白跑。
-    纯读，异常返回 writable=False，不抛错。
+    纯读，异常返回 writable=False，不抛错。cloud 非空时探测协作文档而非本地工作簿。
     """
     titles = dedupe_by or _DEFAULT_DEDUPE_BY
     try:
-        header, header_row, image_col = _sheet_schema(workbook, sheet)
+        header, header_row, image_col = _sheet_schema(workbook, sheet, cloud=cloud)
     except Exception as e:
         logger.warning(f"探测 Sheet「{sheet}」失败：{e}")
         return {"sheet": sheet, "writable": False, "reason": f"读表头失败：{e}"}
@@ -142,6 +169,53 @@ def inspect_sheet(workbook: str, sheet: str, dedupe_by: Optional[List[str]] = No
     }
 
 
+def _cloud_worklist(
+    cfg: dict, prefs: dict, cloud_url: str, store: Optional[str],
+    sheet: Optional[str], dedupe_by: List[str], store_options: List[str],
+) -> dict:
+    """云端模式的 worklist：Sheet 列表与可写性都查协作文档，本地枚举不参与。
+
+    cloud_url 为空＝用 config 的 cloud_file_id（展示用 cloud_link 回显）。
+    读失败（未认证/网络/链接无效）不抛错：返回空列表 + cloud_error，由 UI 红条展示。
+    """
+    cloud = cloud_backend(cfg, cloud_url=cloud_url)
+    display = cloud_url or str(cfg.get("cloud_link") or cfg.get("cloud_file_id") or "")
+    if store is None:
+        store = prefs.get("store") or ""
+    if sheet is None:
+        sheet = prefs.get("sheet") or ""
+    cloud_err = ""
+    try:
+        sheets = cloud.sheet_names()
+    except Exception as e:
+        logger.warning(f"读协作文档工作表列表失败：{e}")
+        sheets, cloud_err = [], str(e)
+    sheet = sheet if sheet in sheets else ""
+    # datalist 候选：当前目标 + 上次用过的 + config 配过的链接，去重保序
+    suggestions: List[str] = []
+    for v in (display, str(prefs.get("cloud_url") or "").strip(),
+              str(cfg.get("cloud_link") or "").strip()):
+        if v and v not in suggestions:
+            suggestions.append(v)
+    return {
+        "store": store,
+        "workbook": display,
+        "workbook_exists": not cloud_err,
+        "workbook_locked": False,
+        "workbooks": suggestions,
+        "sheet": sheet,
+        "sheets": sheets,
+        "dedupe_by": dedupe_by,
+        "store_options": store_options,
+        "cloud": True,
+        "cloud_error": cloud_err,
+        "sheet_info": (
+            inspect_sheet("", sheet, dedupe_by, cloud=cloud)
+            if sheet and not cloud_err else {}
+        ),
+    }
+
+
 def get_worklist_status(
     store: Optional[str] = None,
     workbook: Optional[str] = None,
@@ -149,15 +223,32 @@ def get_worklist_status(
 ) -> dict:
     """订单页首屏：可选工作簿/Sheet 列表 + 上次选择回显 + 选中 Sheet 的可写性。
 
-    缺省值优先级：显式传入 > 上次选择 > config 的 [orders].workbook。
-    工作簿枚举复用采集 service 的 list_workbooks（同一数据源，不重复造）。
+    目标优先级：显式传入（本地路径或粘贴的协作文档链接）> 上次使用的协作链接
+    （prefs.cloud_url）> config 的 cloud_file_id > 本地工作簿（prefs > config）。
+    显式传入本地路径时走本地模式，即使 config 配了云端——用户的选择永远优先。
     纯读、不触发任何采集或写入。
     """
     cfg = load_orders_config()
     prefs = load_prefs()
     dedupe_by = list(cfg.get("dedupe_by") or _DEFAULT_DEDUPE_BY)
+    store_options = sorted(
+        {str(m.get("store", "")).strip() for m in (cfg.get("sheet_map") or [])
+         if str(m.get("store", "")).strip()}
+    )
 
-    workbook = workbook or prefs.get("workbook") or str(cfg.get("workbook") or "")
+    wb = (workbook or "").strip()
+    if wb and is_cloud_link(wb):
+        return _cloud_worklist(cfg, prefs, wb, store, sheet, dedupe_by, store_options)
+    if not wb:
+        pref_url = str(prefs.get("cloud_url") or "").strip()
+        if pref_url:
+            return _cloud_worklist(cfg, prefs, pref_url, store, sheet,
+                                   dedupe_by, store_options)
+        if str(cfg.get("cloud_file_id") or "").strip():
+            return _cloud_worklist(cfg, prefs, "", store, sheet,
+                                   dedupe_by, store_options)
+
+    workbook = wb or prefs.get("workbook") or str(cfg.get("workbook") or "")
     if store is None:
         store = prefs.get("store") or ""
     if sheet is None:
@@ -193,7 +284,8 @@ def get_worklist_status(
     }
 
 
-def read_known_order_nos(workbook: str, sheet: str) -> set:
+def read_known_order_nos(workbook: str, sheet: str,
+                         cloud: Optional[KdocsSheet] = None) -> set:
     """读某 Sheet 已登记的订单号集合，作增量采集的水位。纯读，失败返回空集。
 
     为什么只在【单表模式】用（调用方保证）：sheet_map 分流一次 sweep 同时喂 7 张表，各表
@@ -203,9 +295,10 @@ def read_known_order_nos(workbook: str, sheet: str) -> set:
 
     返回空集＝调用方退回全量 sweep（订单号列缺失、文件损坏都走这条），不会误早停：
     should_stop_incremental 在水位为空时第一页就全是新单，自然翻到底。
+    cloud 非空时从协作文档读，口径相同。
     """
     try:
-        header, header_row, _ = _sheet_schema(workbook, sheet)
+        header, header_row, _ = _sheet_schema(workbook, sheet, cloud=cloud)
     except Exception as e:
         logger.warning(f"读 Sheet「{sheet}」表头失败，本批退全量采集：{e}")
         return set()
@@ -213,22 +306,85 @@ def read_known_order_nos(workbook: str, sheet: str) -> set:
     if not col:
         logger.warning(f"Sheet「{sheet}」没有「订单号」列，本批退全量采集")
         return set()
-    known = WpsExcelTool.existing_key_values(
-        workbook, sheet, col=col, header_row=header_row
-    )
+    if cloud is not None:
+        known = cloud.existing_key_values(sheet, col=col, header_row=header_row)
+    else:
+        known = WpsExcelTool.existing_key_values(
+            workbook, sheet, col=col, header_row=header_row
+        )
     logger.info(f"Sheet「{sheet}」已登记 {len(known)} 个订单号（增量水位）")
     return known
 
 
-def _sheet_schema(workbook: str, sheet: str) -> tuple:
+def _sheet_schema(workbook: str, sheet: str,
+                  cloud: Optional[KdocsSheet] = None) -> tuple:
     """解析一次目标 Sheet 的表头结构，全批复用：(header, header_row, image_col)。
 
     13 个登记 Sheet 的表头行位置（第 1 或第 2 行）与列序都不一样，且工作簿 102MB——
-    每行都去解析一次表头等于把 zip 解压几百遍。
+    每行都去解析一次表头等于把 zip 解压几百遍。cloud 非空时改查协作文档（API 0-based
+    索引在 kdocs_sheet 内部转换，返回口径与本地一致：列字母 + 1-based 行号）。
     """
-    header_row = WpsExcelTool.detect_header_row(workbook, sheet)
-    header = WpsExcelTool.read_header(workbook, sheet, header_row=header_row)
+    if cloud is not None:
+        header, header_row = cloud.read_header(sheet)
+    else:
+        header_row = WpsExcelTool.detect_header_row(workbook, sheet)
+        header = WpsExcelTool.read_header(workbook, sheet, header_row=header_row)
     return header, header_row, pipeline.image_column(header)
+
+
+def ensure_qty_columns(
+    orders: List[pipeline.OrderRow], workbook: str, store: str, sheet_map: List[dict],
+    cloud: Optional[KdocsSheet] = None,
+) -> List[dict]:
+    """给本批真要写的每张 Sheet 补上「数量」列（在「尺码」右侧），返回逐表结果。
+
+    为什么要插列：导出的「应履约件数」一直有值，但 5 张登记 Sheet 的表头里根本没有数量列，
+    于是一单买 2 件跟买 1 件在表里长得一样（2026-07-30 用户反馈）。改结构是不可逆操作，
+    所以只在【真写入】时做、且只碰本批实际有订单落进去的表——dry-run 全程只读不动结构。
+
+    目标表用 resolve_sheet 纯配置查，不读工作簿：插列必须发生在 plan_writes 之前
+    （它一进去就缓存表头），而那时还没有 plans。
+    WpsExcelTool.insert_column_after 自身幂等（已有该列直接返回 inserted=False），
+    所以重跑不会插出第二列。
+
+    best-effort：某张表插失败只告警并继续——插不上的后果是那张表的数量列留空，
+    而不是整批订单登记不了（沿用本项目「辅助路径坏了不影响主流程」的取向）。
+
+    云端模式：协作文档是多人共享的，管线不擅自改它的列结构，只检查并报告缺列的表，
+    由人手动在协作文档里补（缺列的后果同上：数量格留空，订单照常登记）。
+    """
+    wanted: List[str] = []
+    for o in orders:
+        cfg = pipeline.resolve_sheet(store, o.site, sheet_map)
+        name = str((cfg or {}).get("sheet") or "")
+        if name and name not in wanted:
+            wanted.append(name)
+
+    out: List[dict] = []
+    for name in wanted:
+        try:
+            if cloud is not None:
+                header, _ = cloud.read_header(name)
+                if any(t.strip() in pipeline.QTY_TITLES for t in header.values()):
+                    out.append({"sheet": name, "inserted": False, "reason": "已存在"})
+                else:
+                    logger.warning(
+                        f"云端 Sheet「{name}」缺「数量」列：请手动在协作文档「尺码」右侧补一列，"
+                        "本批该列留空、订单照常登记"
+                    )
+                    out.append({"sheet": name, "inserted": False,
+                                "reason": "云端表缺「数量」列，需手动补"})
+                continue
+            header_row = WpsExcelTool.detect_header_row(workbook, name)
+            res = WpsExcelTool.insert_column_after(
+                workbook, name, pipeline.QTY_AFTER_TITLE, pipeline.QTY_TITLE,
+                header_row=header_row,
+            )
+            out.append({"sheet": name, **res})
+        except Exception as e:
+            logger.warning(f"Sheet「{name}」补「数量」列失败（该列留空，不影响登记）：{e}")
+            out.append({"sheet": name, "inserted": False, "reason": str(e)})
+    return out
 
 
 def plan_writes(
@@ -238,6 +394,7 @@ def plan_writes(
     sheet_map: List[dict],
     dedupe_by: Optional[List[str]] = None,
     require_price: bool = False,
+    cloud: Optional[KdocsSheet] = None,
 ) -> tuple:
     """把订单按目标 Sheet 分组、判重，产出 {sheet: SheetPlan}、未映射清单、无价清单。
 
@@ -287,13 +444,13 @@ def plan_writes(
         sheet = str(cfg.get("sheet") or "")
         plan = plans.get(sheet)
         if plan is None:
-            header, header_row, image_col = _sheet_schema(workbook, sheet)
+            header, header_row, image_col = _sheet_schema(workbook, sheet, cloud=cloud)
             plan = SheetPlan(
                 sheet=sheet, store_value=str(cfg.get("store_value") or store),
                 header=header, header_row=header_row, image_col=image_col,
             )
             plans[sheet] = plan
-            seen[sheet] = _existing_keys(workbook, plan, titles)
+            seen[sheet] = _existing_keys(workbook, plan, titles, cloud=cloud)
             if not header:
                 logger.warning(f"Sheet「{sheet}」读不到表头，本批跳过它")
 
@@ -302,11 +459,12 @@ def plan_writes(
     return plans, unmapped, unpriced
 
 
-def _existing_keys(workbook: str, plan: SheetPlan, titles: List[str]) -> set:
+def _existing_keys(workbook: str, plan: SheetPlan, titles: List[str],
+                   cloud: Optional[KdocsSheet] = None) -> set:
     """读该 Sheet 已入库的判重键集合。任一判重列缺失 → 标记 no_key 并返回空集。
 
     no_key 的 Sheet 会被 _stage_order 整体跳过：没法判重就意味着重复跑会堆重复行，
-    宁可不写。
+    宁可不写。cloud 非空时从协作文档读，口径相同。
     """
     cols: List[str] = []
     for t in titles:
@@ -316,6 +474,10 @@ def _existing_keys(workbook: str, plan: SheetPlan, titles: List[str]) -> set:
             logger.warning(f"Sheet「{plan.sheet}」找不到判重列「{t}」，本批跳过它")
             return set()
         cols.append(col)
+    if cloud is not None:
+        return cloud.existing_key_tuples(
+            plan.sheet, cols, header_row=plan.header_row
+        )
     return WpsExcelTool.existing_key_tuples(
         workbook, plan.sheet, cols, header_row=plan.header_row
     )
@@ -344,9 +506,26 @@ def _stage_order(
         item["image_path"] = o.image_path
     plan.rows.append(item)
     plan.orders.append(o)
-    plan.preview.append({
-        plan.header.get(c, c): v for c, v in sorted(values.items())
-    } | {"_图片": "有" if item.get("image_path") else "无"})
+    plan.preview.append(_preview_row(o, plan, values, item))
+
+
+def _preview_row(
+    o: pipeline.OrderRow, plan: SheetPlan, values: Dict[str, str], item: Dict[str, Any]
+) -> Dict[str, Any]:
+    """人工核对用的一行：{列标题: 值}，按目标表列序排。
+
+    表里还没有「数量」列时（dry-run 不动表结构）补一个虚拟的 `数量*`，插在「尺码」右边——
+    否则 dry-run 的待写计划 CSV 里看不到件数，而这批订单里恰恰有多件单要核对。
+    带 `*` 是为了跟真实列区分：写入模式下这一列会变成表里真实存在的「数量」。
+    """
+    row: Dict[str, Any] = {}
+    has_qty = any(t.strip() in pipeline.QTY_TITLES for t in plan.header.values())
+    for col, value in sorted(values.items(), key=lambda kv: pipeline._col_key(kv[0])):
+        title = plan.header.get(col, col)
+        row[title] = value
+        if not has_qty and title.strip() == pipeline.QTY_AFTER_TITLE:
+            row[pipeline.QTY_TITLE + "*"] = pipeline._qty_number(o.qty)
+    return row | {"_图片": "有" if item.get("image_path") else "无"}
 
 
 async def collect_orders(
@@ -481,7 +660,14 @@ async def run_orders_batch(
     有歧义（见 read_known_order_nos），一律退全量 sweep 靠判重兜底，行为与改动前一致。
     """
     cfg = load_orders_config()
-    workbook = workbook or str(cfg.get("workbook") or "")
+    # workbook 参数是协作文档链接时，本批目标就是它（覆盖 config 的 cloud_file_id）；
+    # 是本地路径/空时按原逻辑：config 开了云端走云端，否则本地 xlsx
+    if is_cloud_link(workbook):
+        cloud = cloud_backend(cfg, cloud_url=workbook)
+        workbook = ""
+    else:
+        cloud = cloud_backend(cfg)
+        workbook = workbook or str(cfg.get("workbook") or "")
     list_url = list_url or str(cfg.get("list_url") or "")
     dedupe_by = list(cfg.get("dedupe_by") or _DEFAULT_DEDUPE_BY)
     sheet = (sheet or "").strip()
@@ -494,18 +680,21 @@ async def run_orders_batch(
     else:
         sheet_map = list(cfg.get("sheet_map") or [])
 
-    missing = [n for n, v in (("workbook", workbook), ("list_url", list_url)) if not v]
+    # 云端模式不需要本地登记表：workbook 缺失/被占用都不再是中止条件
+    missing = [n for n, v in (("list_url", list_url),) if not v]
+    if cloud is None and not workbook:
+        missing.append("workbook")
     if missing or not sheet_map:
         reason = f"[orders] 配置不完整：缺 {missing or ['sheet_map']}"
         await _emit(on_progress, {"type": "aborted", "reason": reason})
         return _summary(dry_run, aborted=reason)
-    if not Path(workbook).exists():
+    if cloud is None and not Path(workbook).exists():
         reason = f"登记表不存在：{workbook}"
         await _emit(on_progress, {"type": "aborted", "reason": reason})
         return _summary(dry_run, aborted=reason)
     # 占用预检只在真要写时做：dry-run 全程只读，表开着也能跑。放在采集【之前】是为了
-    # 别让人白等几分钟翻页导出，最后卡在「文件被 WPS 锁着」。
-    if not dry_run and excel_write_locked(workbook):
+    # 别让人白等几分钟翻页导出，最后卡在「文件被 WPS 锁着」。云端表无文件锁，跳过。
+    if cloud is None and not dry_run and excel_write_locked(workbook):
         reason = (
             f"登记表正被占用（疑似 WPS/Excel 打开中），无法写入：{workbook}\n"
             "请先在 WPS/Excel 里关闭该文件再重跑。"
@@ -522,6 +711,7 @@ async def run_orders_batch(
         "type": "started", "dry_run": dry_run, "workbook": workbook,
         # sheet 非空表示本批不按站点分流，全部进这张表——务必让用户在日志里看见
         "sheet": sheet, "store": store, "incremental": incremental,
+        "cloud": bool(cloud),
     })
 
     # 水位：采集之前读，纯读操作，dry-run 下同样生效（试跑就是要看有哪些新单）
@@ -532,7 +722,7 @@ async def run_orders_batch(
     elif not sheet:
         inc_reason = "未指定目标 Sheet（按 sheet_map 分站点分流），水位有歧义，本批全量采集"
     else:
-        known = read_known_order_nos(workbook, sheet)
+        known = read_known_order_nos(workbook, sheet, cloud=cloud)
         if not known:
             inc_reason = "该 Sheet 读不到已登记订单号（首次登记或缺订单号列），本批全量采集"
     await _emit(on_progress, {
@@ -562,9 +752,17 @@ async def run_orders_batch(
     img_stat = pipeline.download_images(orders, str(get_output_dir("orders_image")))
     await _emit(on_progress, {"type": "images", **img_stat})
 
+    # 插「数量」列必须在 plan_writes 之前：它一进去就把表头缓存进 SheetPlan 全批复用，
+    # 插完再读才拿得到新列。dry-run 不动表结构，只在预览里虚拟一列（见 _stage_order）。
+    if not dry_run:
+        qty_cols = ensure_qty_columns(orders, workbook, got["store"], sheet_map,
+                                      cloud=cloud)
+        if any(item.get("inserted") for item in qty_cols):
+            await _emit(on_progress, {"type": "qty_column", "sheets": qty_cols})
+
     plans, unmapped, unpriced = plan_writes(
         orders, workbook, got["store"], sheet_map, dedupe_by,
-        require_price=require_price,
+        require_price=require_price, cloud=cloud,
     )
     pending_orders = [order for plan in plans.values() for order in plan.orders]
     purchase = _export_purchase(
@@ -597,7 +795,7 @@ async def run_orders_batch(
     if plan_files:
         await _emit(on_progress, {"type": "plan_files", "files": plan_files})
 
-    written = await _write_plans(plans, workbook, dry_run, on_progress)
+    written = await _write_plans(plans, workbook, dry_run, on_progress, cloud=cloud)
     summary = _summary(
         dry_run, orders=orders, plans=plans, unmapped=unmapped,
         written=written, got=got, img_stat=img_stat, plan_files=plan_files,
@@ -628,6 +826,8 @@ def _export_purchase(pending_orders: List[pipeline.OrderRow], stamp: str) -> dic
         "groups": 0, "repeated_groups": 0, "total_qty": 0,
         # 商品级：products=涉及几个 SPU，multi_products=要一次买多规格的有几个
         "products": 0, "multi_products": 0, "variants": 0,
+        # 汇总两张表各嵌进去多少张主图（下不到图的行留空格）
+        "product_images": 0, "sku_images": 0,
     }
     if not pending_orders:
         return purchase
@@ -645,7 +845,8 @@ def _export_purchase(pending_orders: List[pipeline.OrderRow], stamp: str) -> dic
 
 
 async def _write_plans(
-    plans: Dict[str, SheetPlan], workbook: str, dry_run: bool, on_progress: ProgressCB
+    plans: Dict[str, SheetPlan], workbook: str, dry_run: bool, on_progress: ProgressCB,
+    cloud: Optional[KdocsSheet] = None,
 ) -> Dict[str, dict]:
     """按 Sheet 逐个批量写入（插到表头正下方，不是追加到表尾）。dry_run 时只报告不落盘。
 
@@ -654,6 +855,10 @@ async def _write_plans(
 
     一个 Sheet 写失败不连坐其它 Sheet（各自独立一次 zip 重写 + 独立备份），失败信息进
     汇总。不做重试：失败多半是表被 WPS 独占锁定或磁盘满，重试同样失败还多一份备份。
+
+    cloud 非空时改写协作文档：先插空行再一次批量写值+按 URL 嵌图（图片用订单的在线
+    主图 image_url，不经本地文件），写后读回首行验证。kdocs_sheet 内部已对限频做
+    一次重试，这里同样不做额外重试。
     """
     written: Dict[str, dict] = {}
     for sheet, plan in plans.items():
@@ -664,11 +869,21 @@ async def _write_plans(
             continue
         await _emit(on_progress, {"type": "writing", "sheet": sheet, "rows": len(plan.rows)})
         try:
-            res = await asyncio.to_thread(
-                WpsExcelTool().append_rows,
-                workbook, sheet, plan.rows, plan.header_row,
-                key_cols=None, insert_at_top=True,
-            )
+            if cloud is not None:
+                # plan.rows 与 plan.orders 在 _stage_order 里成对追加，按下标对齐取在线图
+                items = [
+                    {**item, "image_url": order.image_url}
+                    for item, order in zip(plan.rows, plan.orders)
+                ]
+                res = await asyncio.to_thread(
+                    cloud.write_rows, sheet, items, plan.header_row,
+                )
+            else:
+                res = await asyncio.to_thread(
+                    WpsExcelTool().append_rows,
+                    workbook, sheet, plan.rows, plan.header_row,
+                    key_cols=None, insert_at_top=True,
+                )
             written[sheet] = res
             await _emit(on_progress, {"type": "written", "sheet": sheet, **res})
         except Exception as e:

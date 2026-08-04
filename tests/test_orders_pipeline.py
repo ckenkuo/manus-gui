@@ -174,12 +174,99 @@ def test_export_purchase_summary_contains_summary_and_details(tmp_path):
     detail_rows = list(workbook["订单明细"].iter_rows(values_only=True))
     workbook.close()
     # 商品级放第一张：采购按商品链接下单，先看这款要买哪些码各几件
-    assert product_rows[0][0:6] == (
-        "需多规格", "商品名称", "SPU ID", "规格数", "采购总件数", "采购清单",
+    # 前两列固定是「主图」+ 人工勾的「是否采购完成」（2026-07-30 口径）
+    assert product_rows[0][0:8] == (
+        "主图", "是否采购完成", "需多规格", "商品名称", "SPU ID", "规格数",
+        "采购总件数", "采购清单",
     )
-    assert summary_rows[0][0:3] == ("是否重复采购", "SPU ID", "SKU ID")
-    assert summary_rows[1][0:3] == ("是", "SPU-A", "SKU-A")
+    assert summary_rows[0][0:5] == (
+        "主图", "是否采购完成", "是否重复采购", "SPU ID", "SKU ID",
+    )
+    assert summary_rows[1][0:5] == (None, None, "是", "SPU-A", "SKU-A")
+    # 时间列只保留一个「创建时间」＝该组最早下单时间，不再出最早/最晚两列
+    assert "创建时间" in product_rows[0] and "最晚下单时间" not in product_rows[0]
     assert len(detail_rows) == 3
+
+
+def test_export_purchase_summary_uses_earliest_created_time(tmp_path):
+    """合并成的那一个「创建时间」取该组【最早】下单时间：采购紧急度看它。"""
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-A",
+               qty="1", created_at="2026-07-28 09:00:00"),
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-A", sku_id="SKU-A",
+               qty="1", created_at="2026-07-26 08:00:00"),
+    ]
+
+    result = P.export_purchase_summary(orders, str(tmp_path), "20260730")
+
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(result["file"], read_only=True, data_only=True)
+    rows = list(workbook["商品汇总"].iter_rows(values_only=True))
+    workbook.close()
+    assert rows[1][rows[0].index("创建时间")] == "2026-07-26 08:00:00"
+
+
+def test_export_purchase_summary_embeds_images_and_fits_one_screen(tmp_path):
+    """两张汇总表逐行嵌主图；列宽合计不超过一屏可用宽度（只上下滚、不左右滚）。"""
+    from PIL import Image
+
+    img = tmp_path / "045-1.jpg"
+    Image.new("RGB", (800, 800), (200, 120, 80)).save(img)
+    orders = [
+        _order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A", sku_id="SKU-A",
+               qty="2", image_path=str(img)),
+        # 没下到图的那条照常出行，只是图那格空着
+        _order(order_no="PO-2", sub_order_no="045-2", spu_id="SPU-B", sku_id="SKU-B",
+               qty="1", image_path=""),
+    ]
+
+    result = P.export_purchase_summary(orders, str(tmp_path), "20260730")
+
+    assert result["product_images"] == 1 and result["sku_images"] == 1
+    import openpyxl
+
+    workbook = openpyxl.load_workbook(result["file"])
+    avail = P.screen_client_px()
+    for name, height in (("商品汇总", 60.0), ("SPU_SKU汇总", 60.0), ("订单明细", 25.0)):
+        ws = workbook[name]
+        total = sum(
+            ws.column_dimensions[ws.cell(1, i).column_letter].width * 7 + 5
+            for i in range(1, ws.max_column + 1)
+        )
+        assert total <= avail + 1, f"{name} 列宽合计 {total} 超出一屏 {avail}"
+        assert ws.row_dimensions[2].height == height
+        assert ws["C2"].alignment.wrap_text is True
+        assert ws["C2"].alignment.vertical == "center"
+        assert ws.freeze_panes == "A2"
+    assert len(workbook["商品汇总"]._images) == 1
+    assert len(workbook["SPU_SKU汇总"]._images) == 1
+    assert len(workbook["订单明细"]._images) == 0, "明细是分单用的长表，不放图"
+    # 锚定必须是「随单元格移动并调整大小」：这两张表开着筛选，浮动图筛完会糊在剩下的行上
+    anchor = workbook["SPU_SKU汇总"]._images[0].anchor
+    assert anchor.editAs == "twoCell"
+    assert (anchor._from.col, anchor._from.row) == (0, 1), "落在 A2"
+    assert (anchor.to.col, anchor.to.row) == (0, 1), "两个锚点同格，不跨到右边列"
+    # 「是否采购完成」给是/否下拉，防手输五花八门的写法
+    dv = workbook["商品汇总"].data_validations.dataValidation
+    assert [(str(v.sqref), v.formula1) for v in dv] == [("B2:B3", '"是,否"')]
+    workbook.close()
+
+
+def test_export_purchase_summary_tolerates_missing_image_file(tmp_path):
+    """图文件被删/路径失效只该那一格空着，不能让整份统计导不出来。"""
+    orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
+                     sku_id="SKU-A", qty="1", image_path=str(tmp_path / "没有这个.jpg"))]
+
+    result = P.export_purchase_summary(orders, str(tmp_path), "20260730")
+
+    assert result["product_images"] == 0 and Path(result["file"]).exists()
+
+
+def test_screen_client_px_reserves_room_and_has_floor():
+    """列宽预算＝屏宽减去行号列/滚动条/边框的余量，且有下限兜住异常小的屏。"""
+    assert P.screen_client_px(reserve=0) - P.screen_client_px(reserve=130) == 130
+    assert P.screen_client_px(reserve=99999) == 800
 
 
 def test_summarize_products_merges_sizes_of_same_goods():
@@ -390,6 +477,40 @@ def test_build_row_values_uses_real_header():
         assert col not in values, f"{col}({STORE_A_HEADER[col]}) 应由人工填，管线不该碰"
     # 图片列不走 values（走 DISPIMG 嵌图）
     assert "G" not in values and "H" not in values
+
+
+def test_build_row_values_writes_quantity_as_number():
+    """有「数量」列就写应履约件数，且必须是数字——这一列要能求和、筛多件单。"""
+    header = dict(STORE_A_HEADER)
+    header["P"] = "数量"
+    values = P.build_row_values(_order(qty="2"), header, store_value="StoreA全球")
+
+    assert values["P"] == 2 and isinstance(values["P"], int)
+
+
+def test_build_row_values_quantity_column_aliases():
+    """用户可能早先手工加过「件数」这类写法，一并认下来，免得插出第二列同义列。"""
+    for title in ("件数", "商品数量", "采购件数", "应履约件数"):
+        header = dict(STORE_A_HEADER, P=title)
+        assert P.build_row_values(_order(qty="3"), header, "S")["P"] == 3
+
+
+def test_quantity_number_keeps_dirty_text_and_skips_empty():
+    """空值不落单元格；解析不出的脏值留原文给人看，不要静默写 0。"""
+    assert P._qty_number("") == "" and P._qty_number("--") == ""
+    assert P._qty_number("2") == 2
+    assert P._qty_number("1.5") == 1.5
+    assert P._qty_number("两件") == "两件"
+
+
+def test_dedupe_key_unaffected_by_quantity_column():
+    """判重键是订单号+尺码，加了数量列不能改变键——否则历史行会被判成新行重写。"""
+    header = dict(STORE_A_HEADER, P="数量")
+    o = _order(qty="2")
+
+    assert P.dedupe_key(o, header, ["订单号", "尺码"], "StoreA全球") == P.dedupe_key(
+        o, STORE_A_HEADER, ["订单号", "尺码"], "StoreA全球"
+    )
 
 
 def test_image_column_prefers_exact_title():

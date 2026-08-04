@@ -165,12 +165,23 @@ min_margin = 0.15
 # 申报价策略：'discount_ceiling'=贴活动折扣上限取最高价（守利润同时少让利）。
 price_strategy = "discount_ceiling"
 
+# 商品采集管线（Temu 商品 → 1688 比价 → 成本核算表）的云端协作表格（金山文档）。
+# 填了 cloud_file_id 后，采集默认写入云端而非本地 xlsx；UI/CLI 显式粘贴的链接优先于此。
+[collect]
+cloud_file_id = ""
+cloud_link = ""   # 人类可读的分享链接，仅用于 UI 回显
+
 # 订单登记管线（Temu 待发货订单 → 本地订单登记表）。
 # 走页面自带「导出订单」拿官方 xlsx，产品主图从 DOM 抓（导出文件里没有图）。
 [orders]
 # 订单登记表绝对路径（换成本机实际路径；下面的店铺/Sheet 映射同样是占位示例，
 # 必须按自己登记表的真实 Sheet 名和店铺名改写，照抄会写错表）。
 workbook = "C:\\Users\\<用户名>\\Desktop\\订单登记表.xlsx"
+# 协作文档模式（可选）：cloud_file_id 非空时，订单登记的水位/判重/写入全部打在金山
+# 协作表格上（本地 workbook 不再参与；采购汇总仍落本地）。file_id 用 kdocs-cli 上传
+# 本地表后获得。留空则走本地 xlsx 路径。
+cloud_file_id = ""
+cloud_link = ""
 # 待发货订单页 URL（含筛选参数；管线不切店铺，用当前 CDP 里已登录的那个店）。
 list_url = "https://agentseller.temu.com/mmsos/orders.html?fulfillmentMode=0&queryType=2&sortType=1&timeZone=UTC%2B8&needBuySignService=0&sellerNoteLabelList=&packageAbnormalTypeList="
 # 判重键：登记表没有子订单号列，一个订单又可含多个子订单（多行、尺码不同），

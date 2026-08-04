@@ -120,3 +120,41 @@
 - `app/prompt/manus.py`：1688 规则重塑（框选主体、关键词兜底防 GBK 乱码、挑同款用新动作禁 execute_js 捞 `<a>`）。
 - `app/tool/browser_use_tool.py`：新增 `read_1688_results` 动作（限定 `searchOfferWrapper` 卡片内解析 offerId → `detail.1688.com/offer/<id>.html` 直链），已端到端验证返回 24 条干净结果。
 - `experience/recipes.jsonl`：删脏 recipe #2（task 录成模板、教 execute_js 捞列表），留 recipe #1；备份 `recipes.jsonl.bak`。
+
+---
+
+## 云端协作文档模式（2026-08-04 增补）
+
+商品采集管线打通金山协作文档（Kdocs），复用订单管线的云端后端
+（`app/orders/kdocs_sheet.py` 的 `KdocsSheet`，经 kdocs-cli 读写云端表格）。
+CLI（`batch_collect.py --excel <链接>`）与采集页面（工作簿输入框直接粘贴链接）都支持。
+
+**配置键**（`config/config.toml` 的 `[collect]` 段，缺失时回退 config.example.toml）：
+
+```toml
+[collect]
+cloud_file_id = ""   # 非空时采集默认写云端；UI/CLI 显式粘贴的链接优先于此
+cloud_link = ""      # 人类可读的分享链接，仅用于 UI 回显
+```
+
+**目标优先级**（`app/collect/service.py` 的 run_batch / get_worklist_status 同一口径）：
+显式粘贴的协作文档链接 > `cloud_url` 参数 > prefs 的 `cloud_url` > `[collect].cloud_file_id`
+> 本地 xlsx（无云端目标时行为完全不变）。prefs 里链接与本地路径互斥：
+`save_prefs` 把链接拆到 `cloud_url` 键、清空 `excel`（对齐订单页），显式选本地路径则清掉旧链接。
+
+**公式模板从云端学出**：云端 API `sheet.get_range_data` 的响应里 `fmlaText` 返回公式原文、
+`cellText` 是显示值。`KdocsSheet.read_data_sample` 读表头下前 10 行数据区，
+`resolve_sheet_schema_cloud` 逐列取第一条 `fmlaText`（跳过图片列与含 `DISPIMG` 的坏行），
+用与本地同一正则把行号换成 `{r}` 占位——无需本地 xlsx 模板。常量列是本地
+`_scan_numeric_constants` 的简化版：公式引用到、非公式列、非逐商品字段列的列里，
+采样行非空 `cellText` 全是同一个纯数字 → 收为常量。表头→字段映射复用本地同一个纯函数
+`WpsExcelTool._resolve_fields_from_header`，两条路径口径一致。
+
+**与订单管线的差异**：
+- 采集写「值 + 公式列」同批（公式经 `cell_operation_type_formula` 写入，行号 =
+  header_row + 1）；订单只写值。values 里普通值在前、公式最后——`write_rows` 的读回校验
+  取第一个非空值比对 `cellText`，公式格的显示值是计算结果而非公式串。
+- 采集逐商品单行写（每商品一次插行+写入）；订单是整批计划后批量写。
+- 采集云端模式跳过 `excel_write_locked` 预检与主图本地下载（图片走 `item["image"]`
+  的 kwcdn URL 嵌入，`write_rows` 内部已做 avif→jpeg）；纯 agent 兜底路径
+  （`--no-pipeline`）自己 inspect 本地表，云端模式下在 run_batch 开头中止。

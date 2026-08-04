@@ -90,7 +90,7 @@
       </div>
       <div id="missAlert" class="alert alert-danger d-none" role="alert">
         <i class="bi bi-exclamation-octagon-fill"></i>
-        配置里的登记表路径不存在，请检查 config.toml 的 <code>[orders].workbook</code>。
+        <span id="missAlertText">配置里的登记表路径不存在，请检查 config.toml 的 <code>[orders].workbook</code>。</span>
       </div>
 
       <!-- 安全告警：正式写入开启时才出现 -->
@@ -133,10 +133,19 @@
         <div class="card-body">
           <div class="row g-2 align-items-end">
             <div class="col-12 col-md-7">
-              <label class="form-label small text-muted mb-1">订单登记表</label>
-              <select id="workbookSelect" class="form-select form-select-sm">
-                <option value="">读取中…</option>
-              </select>
+              <label class="form-label small text-muted mb-1">
+                订单登记表
+                <span class="text-body-tertiary">（本地 xlsx 路径，或粘贴协作文档链接）</span>
+              </label>
+              <!-- input+datalist 而不是 select：允许直接粘贴 kdocs 链接，候选仅作回显 -->
+              <input
+                id="workbookSelect"
+                type="text"
+                class="form-control form-control-sm"
+                list="workbookOptions"
+                placeholder="C:\...\登记表.xlsx 或 https://www.kdocs.cn/l/..."
+              />
+              <datalist id="workbookOptions"></datalist>
             </div>
             <div class="col-12 col-md-5">
               <label class="form-label small text-muted mb-1">
@@ -338,8 +347,14 @@
         try {
           const r = await fetch("/orders/worklist" + (qs ? "?" + qs : ""));
           cfg = await r.json();
-          fillSelect($("workbookSelect"), cfg.workbooks || [], cfg.workbook, null);
-          $("workbookPath").textContent = cfg.workbook || "";
+          // 工作簿是 input+datalist：datalist 只放候选，当前值直接回填进输入框
+          $("workbookOptions").innerHTML = (cfg.workbooks || [])
+            .map((v) => `<option value="${esc(v)}"></option>`)
+            .join("");
+          $("workbookSelect").value = cfg.workbook || "";
+          $("workbookPath").textContent = cfg.cloud
+            ? "协作文档（在线表格）"
+            : cfg.workbook || "";
           fillSelect(
             $("sheetSelect"),
             cfg.sheets || [],
@@ -352,6 +367,13 @@
           if (cfg.store && !$("storeInput").value) $("storeInput").value = cfg.store;
           $("lockAlert").classList.toggle("d-none", !cfg.workbook_locked);
           $("missAlert").classList.toggle("d-none", !!cfg.workbook_exists);
+          // 云端模式下「不存在」的真实原因多半在 cloud_error（kdocs-cli 没装上/未认证/
+          // 网络不通），直接显示出来，别误导人去查本地路径
+          if (!cfg.workbook_exists) {
+            $("missAlertText").textContent = cfg.cloud && cfg.cloud_error
+              ? `协作文档读取失败：${cfg.cloud_error}`
+              : "配置里的登记表路径不存在，请检查 config.toml 的 [orders].workbook。";
+          }
           renderSheetInfo(cfg.sheet_info || {});
           updateStartEnabled();
         } catch (e) {
@@ -416,7 +438,7 @@
         const blockWrite = isWrite() && cfg.workbook_locked;
         $("btnStart").disabled = miss || blockWrite || unwritable;
         $("btnStart").title = miss
-          ? "登记表路径不存在"
+          ? (cfg.cloud && cfg.cloud_error ? "协作文档读取失败" : "登记表路径不存在")
           : unwritable
           ? "选中的 Sheet 缺判重列，写不进去"
           : blockWrite
@@ -549,6 +571,17 @@
             $("phaseLabel").textContent = "生成分表计划";
             logLine(`主图下载：成功 ${d.ok ?? 0}，失败 ${d.fail ?? 0}`);
             break;
+          case "qty_column":
+            (d.sheets || [])
+              .filter((it) => it.inserted)
+              .forEach((it) =>
+                logLine(
+                  `${it.sheet}：已在「尺码」右侧插入「数量」列（${it.column} 列）；` +
+                    `插列前备份 ${it.backup || "无"}`,
+                  "text-info"
+                )
+              );
+            break;
           case "plan": {
             const s = touchSheet(d.sheet);
             s.pending = d.pending;
@@ -639,6 +672,10 @@
                 `其中 ${d.multi_products} 个需一次买多规格，总件数 ${d.total_qty}`,
               "text-info"
             );
+            logLine(
+              `汇总表嵌图：商品级 ${d.product_images ?? 0} 张，SKU 级 ${d.sku_images ?? 0} 张`,
+              "text-info"
+            );
             if (d.md_file) logLine(`采购统计（md）：${d.md_file}`, "text-info");
             if (d.file) logLine(`采购汇总表（xlsx）：${d.file}`, "text-info");
             break;
@@ -674,13 +711,15 @@
       async function startBatch() {
         const write = isWrite();
         const sheet = $("sheetSelect").value;
-        // 正式写入会改动 102MB 的登记表（有自动备份），二次确认时把落点写清楚
+        // 正式写入是不可逆操作，二次确认时把落点写清楚（本地表有自动备份，云端没有）
         const target = sheet ? `目标表：${sheet}（本批全部写这张）` : "按站点映射自动分表";
+        const how = cfg.cloud
+          ? "正式写入会把订单行写进协作文档（图片按 URL 嵌入，无本地备份）。\n\n"
+          : "正式写入会把订单行连同 DISPIMG 主图写进登记表（写前自动备份）。\n\n";
         if (
           write &&
           !confirm(
-            `正式写入会把订单行连同 DISPIMG 主图写进登记表（写前自动备份）。\n\n` +
-              `${$("workbookSelect").value}\n${target}\n\n确认继续？`
+            how + `${$("workbookSelect").value}\n${target}\n\n确认继续？`
           )
         ) {
           return;
@@ -718,6 +757,7 @@
             "parsed",
             "watermark",
             "images",
+            "qty_column",
             "purchase_summary",
             "plan",
             "unmapped",

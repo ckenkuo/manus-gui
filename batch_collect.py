@@ -21,6 +21,8 @@ CLI（本文件）和 UI（app.py 的 FastAPI 接口）都调它。
     # 多店铺 / 多工作簿 / 多 Sheet（缺省回填上次选择，再兜底出厂默认）：
     python batch_collect.py --store <mallid> --sheet <表名> --limit 20
     python batch_collect.py --excel "D:\\另一个核算表.xlsx" --sheet 店A --store <mallidA>
+    # 云端协作文档（金山 Kdocs）：--excel 直接粘贴链接，水位/判重/写入全在云端
+    python batch_collect.py --excel "https://www.kdocs.cn/l/..." --sheet <表名> --limit 1
 """
 import argparse
 import asyncio
@@ -77,7 +79,12 @@ async def main():
         action="store_true",
         help="仅 --with-1688 时生效：关掉确定性管道，改走纯 agent 自由循环",
     )
-    parser.add_argument("--excel", default=None, help="目标工作簿路径（缺省=上次选择/出厂默认）")
+    parser.add_argument(
+        "--excel",
+        default=None,
+        help="目标工作簿路径，或直接粘贴协作文档链接（https://www.kdocs.cn/l/...，"
+        "链接时写云端协作表格）；缺省=上次选择/出厂默认",
+    )
     parser.add_argument("--sheet", default=None, help="目标 Sheet 名（缺省=上次选择/出厂默认）")
     parser.add_argument("--store", default=None, help="只采该店铺（mallid 或店名；缺省=全部）")
     args = parser.parse_args()
@@ -90,8 +97,10 @@ async def main():
     # 解析目标工作簿（显式 > 上次选择 > 出厂默认），用于预检占用
     excel = service.resolve_excel(args.excel)
 
-    # 采集前预检：Excel 被占用就别启动 agent（省去浏览器/MCP 初始化与 LLM 开销）
-    if service.excel_write_locked(excel):
+    # 采集前预检：Excel 被占用就别启动 agent（省去浏览器/MCP 初始化与 LLM 开销）。
+    # 走协作文档（显式链接，或未显式指定但 prefs/config 配了云端目标）时没有本地
+    # 占用锁，跳过预检——否则默认本地表恰好被 WPS 打开会误拦本要走云端的批次。
+    if service.resolve_cloud(args.excel) is None and service.excel_write_locked(excel):
         logger.error(
             f"❌ Excel 正被占用（疑似 WPS/Excel 打开中），无法写入：{excel}\n"
             "   请先在 WPS/Excel 里【关闭该文件】，再重新运行。"

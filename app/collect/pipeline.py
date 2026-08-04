@@ -38,6 +38,7 @@ from app.config import config
 from app.llm import LLM
 from app.logger import logger
 from app.schema import Message
+from app.tool.wps_excel_tool import WpsExcelTool
 
 # ---- 已实测确认的选择器（勿凭记忆改；改前对真站重验）----------------------
 # 结果页单个商品卡片容器（s.1688.com 图搜/关键词结果页通用）。
@@ -846,6 +847,8 @@ class SheetSchema:
     - formula_columns：公式列 → 模板（行号已换成 {r} 占位，随行自适应）。
     - constant_columns：公式依赖的固定数值列（操作费/尾程等）→ 历史学出的常量。
     - ok / error：结构是否可写（解析不出 SPU 列即不可写，error 带原因）。
+    - header_row：表头行号（1-based）。云端写行/判重需要它（新行插到表头正下方、
+      公式行号 = header_row + 1）；本地路径用不上，默认 1 无影响。
     """
 
     sheet: str
@@ -854,6 +857,7 @@ class SheetSchema:
     constant_columns: dict = field(default_factory=dict)
     ok: bool = False
     error: str = ""
+    header_row: int = 1
 
 
 async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> SheetSchema:
@@ -905,28 +909,14 @@ async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> Sheet
     )
 
 
-async def write_product_row(
-    excel_tool,
-    excel_path: str,
-    sheet: str,
-    item: dict,
-    res: CollectResult,
-    image_path: str,
-    schema: Optional[SheetSchema] = None,
-) -> tuple[bool, str]:
-    """把采集结果按【本 Sheet 真实表头】写入 Excel。
+def _build_column_values(item: dict, res: CollectResult, schema: SheetSchema) -> dict:
+    """构造新行的 {列字母: 值}（不含公式列），本地/云端两个写入口共用。
 
-    schema：批次开始时 resolve_sheet_schema 解析好的结构，全批复用（省去逐商品重 inspect
-    大工作簿）。未传时就地解析一次（CLI/单元测试等场景的兜底）。
-    返回 (是否成功, 消息)。存疑（res.note 非空）时写入备注列，不阻断。
+    含：采购价=货价+运费、售价剥¥转数字、重量克→公斤、常量输入列回填、ros 兜底、
+    存疑备注列。字段没解析到的列跳过，不误写。公式列由调用方按各自行号规则补上
+    （本地是 _append 复制样式时 format，云端是写前 format(r=header_row+1)）。
     """
-    if schema is None:
-        schema = await resolve_sheet_schema(excel_tool, excel_path, sheet)
-    if not schema.ok:
-        return False, schema.error
     fields = schema.fields
-    image_col = fields.get("image")
-    formula_columns = schema.formula_columns
 
     # 采购价/重量：有值就写，无值（如所有主体框均未匹配的快速失败）留空待人工补。
     if res.purchase_price is not None:
@@ -975,6 +965,33 @@ async def write_product_row(
     if note and note_col:
         column_values[note_col] = note  # 存疑标记，不阻断
 
+    return column_values
+
+
+async def write_product_row(
+    excel_tool,
+    excel_path: str,
+    sheet: str,
+    item: dict,
+    res: CollectResult,
+    image_path: str,
+    schema: Optional[SheetSchema] = None,
+) -> tuple[bool, str]:
+    """把采集结果按【本 Sheet 真实表头】写入 Excel。
+
+    schema：批次开始时 resolve_sheet_schema 解析好的结构，全批复用（省去逐商品重 inspect
+    大工作簿）。未传时就地解析一次（CLI/单元测试等场景的兜底）。
+    返回 (是否成功, 消息)。存疑（res.note 非空）时写入备注列，不阻断。
+    """
+    if schema is None:
+        schema = await resolve_sheet_schema(excel_tool, excel_path, sheet)
+    if not schema.ok:
+        return False, schema.error
+    fields = schema.fields
+    image_col = fields.get("image")
+    formula_columns = schema.formula_columns
+    column_values = _build_column_values(item, res, schema)
+
     kwargs = dict(
         action="append_product_row",
         file_path=excel_path,
@@ -990,3 +1007,112 @@ async def write_product_row(
     if r.error:
         return False, f"写入失败：{r.error}"
     return True, r.output or "已写入"
+
+
+async def resolve_sheet_schema_cloud(cloud, sheet: str) -> SheetSchema:
+    """云端协作文档版的 resolve_sheet_schema：从 KdocsSheet 读表头与采样数据行，
+    解析出与本地同构的 SheetSchema（字段列/公式模板/常量列）。每批调用一次。
+
+    与本地版的差异只在数据源：云端 API 的 fmlaText 直接给公式原文（本地要解 xlsx
+    里的 <f> 节点），cellText 是显示值。表头→字段映射复用本地同一个纯函数
+    （WpsExcelTool._resolve_fields_from_header），保证两条路径口径一致。
+    缺 SPU 列 → ok=False（表头认不出，拒绝写入，避免列错位乱写）。
+    """
+    header, header_row = await asyncio.to_thread(cloud.read_header, sheet)
+    fields = WpsExcelTool._resolve_fields_from_header(header)
+    if not fields.get("spu"):
+        return SheetSchema(
+            sheet=sheet,
+            error=f"无法在 Sheet「{sheet}」表头解析出 SPU 列（避免列错位，拒绝写入）",
+        )
+    image_col = fields.get("image")
+
+    sample = await asyncio.to_thread(cloud.read_data_sample, sheet, header_row)
+
+    # 公式列：逐列取采样行里第一条 fmlaText（跳过图片列与含 DISPIMG 的坏行污染），
+    # 行号模板化与本地同一正则（见 resolve_sheet_schema 的注释）。
+    formula_columns = {}
+    for row in sample:
+        for col, cell in row.items():
+            if col in formula_columns or col == image_col:
+                continue
+            f = cell.get("formula") or ""
+            if not f.startswith("=") or "DISPIMG" in f:
+                continue
+            formula_columns[col] = re.sub(
+                r"(?<![A-Za-z$])([A-Z]{1,3})\d+", r"\1{r}", f
+            )
+
+    # 常量输入列：公式引用到、但本身不是公式列也不是逐商品字段列的列；采样行里该列
+    # 非空 cellText 全是同一个纯数字 → 收为常量（本地 _scan_numeric_constants 的简化版：
+    # 采样只有约 10 行，样本少故用「全同」的严口径，避免把逐行变化的列误当常量）。
+    referenced = set()
+    for tpl in formula_columns.values():
+        referenced.update(
+            re.findall(r"(?<![A-Za-z$])([A-Z]{1,3})(?:\{r\}|\d+)", tpl)
+        )
+    field_cols = {
+        fields.get(k)
+        for k in ("spu", "image", "site", "category", "daily", "sale",
+                  "purchase", "weight", "note")
+    }
+    field_cols.discard(None)
+    constant_columns = {}
+    for col in sorted(referenced - set(formula_columns) - field_cols):
+        texts = [
+            row[col]["text"].strip()
+            for row in sample
+            if col in row and row[col]["text"].strip()
+        ]
+        if not texts:
+            continue
+        try:
+            nums = {float(t) for t in texts}
+        except ValueError:
+            continue
+        if len(nums) == 1:
+            n = nums.pop()
+            constant_columns[col] = int(n) if n == int(n) else n
+
+    return SheetSchema(
+        sheet=sheet,
+        fields=fields,
+        formula_columns=formula_columns,
+        constant_columns=constant_columns,
+        ok=True,
+        header_row=header_row,
+    )
+
+
+async def write_product_row_cloud(
+    cloud,
+    sheet: str,
+    item: dict,
+    res: CollectResult,
+    schema: SheetSchema,
+) -> tuple[bool, str]:
+    """云端协作文档版 write_product_row：单行写入（插到表头正下方），值+公式同批，
+    主图走 item["image"] 的在线 URL 嵌入（不经本地下载，KdocsSheet.write_rows 内部
+    已做 avif→jpeg 转换）。
+
+    KdocsSheetError → 返回 (False, msg)，单商品失败不连坐（与本地「写入失败」同口径）。
+    """
+    from app.orders.kdocs_sheet import KdocsSheetError
+
+    if not schema.ok:
+        return False, schema.error
+    values = _build_column_values(item, res, schema)
+    # 公式放最后：write_rows 的读回校验取 values 里第一个非空值比对 cellText，
+    # 公式格的 cellText 是计算值而非公式串，放前面必误判「写入验证失败」。
+    for col, tpl in schema.formula_columns.items():
+        values[col] = tpl.format(r=schema.header_row + 1)
+    row = {
+        "values": values,
+        "image_column": schema.fields.get("image"),
+        "image_url": item.get("image"),
+    }
+    try:
+        await asyncio.to_thread(cloud.write_rows, sheet, [row], schema.header_row)
+    except KdocsSheetError as e:
+        return False, f"写入失败：{e}"
+    return True, "已写入"

@@ -29,15 +29,17 @@ import asyncio
 import inspect
 import json
 import os
+import tomllib
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
 
 from playwright.async_api import async_playwright
 
 if TYPE_CHECKING:
     from app.collect.pipeline import SheetSchema
+    from app.orders.kdocs_sheet import KdocsSheet
 
 from app.agent.manus import Manus
-from app.config import config
+from app.config import PROJECT_ROOT, config
 from app.logger import logger
 from app.tool.wps_excel_tool import WpsExcelTool
 
@@ -68,6 +70,67 @@ CDP_PING_WAIT = 5.0  # 每次 CDP ping 失败后的等待秒数
 ProgressCB = Optional[Callable[[dict], Union[None, Awaitable[None]]]]
 
 
+# ---- 云端协作文档目标（对齐 app/orders/service.py 的模式）--------------------
+def is_cloud_link(value: str) -> bool:
+    """是协作文档链接（http(s)://...）而非本地路径/文件 ID。"""
+    return str(value or "").strip().lower().startswith(("http://", "https://"))
+
+
+def load_collect_config() -> dict:
+    """读 [collect] 段：config.toml 优先，**该段缺失时退到 config.example.toml**。
+
+    与 load_orders_config 同一回退策略：现网 config.toml 未必有 [collect] 段，
+    随仓库分发的 example 充当默认值（占位空值），用户在 config.toml 写了就完全覆盖。
+    解析失败只告警返回 {}，由调用方按「无云端目标」走本地路径。
+    """
+    for name in ("config.toml", "config.example.toml"):
+        p = PROJECT_ROOT / "config" / name
+        if not p.exists():
+            continue
+        try:
+            with p.open("rb") as f:
+                section = tomllib.load(f).get("collect") or {}
+            if section:
+                return section
+        except Exception as e:
+            logger.warning(f"读 {name} 的 [collect] 配置失败：{e}")
+    return {}
+
+
+def cloud_backend(cfg: dict, cloud_url: str = "") -> Optional["KdocsSheet"]:
+    """确定本批的云端写入目标；返回 None 表示走本地 xlsx 路径（行为不变）。
+
+    优先级：显式给的协作文档链接（UI/CLI 粘贴的）> config 的 cloud_file_id。
+    云端模式下判重/写入全部打在协作文档上，本地工作簿不再参与读写。
+    """
+    from app.orders.kdocs_sheet import KdocsSheet
+
+    target = cloud_url.strip() or str(cfg.get("cloud_file_id") or "").strip()
+    if not target:
+        return None
+    return KdocsSheet(target)
+
+
+def resolve_cloud(excel: Optional[str] = None,
+                  cloud_url: Optional[str] = None) -> Optional["KdocsSheet"]:
+    """按调用方参数解析本批云端目标；返回 None 表示走本地 xlsx。
+
+    优先级：显式给的协作文档链接 → 云端；【显式给的本地路径 → 本地】——必须压制
+    prefs/config 里的云端目标，否则用户改选本地后，这一批仍会被写进旧云端文档
+    （同名 Sheet 存在时不报任何错，直接落错文档）；未显式指定（空/None）→
+    cloud_url 参数 > prefs.cloud_url > [collect].cloud_file_id。
+    """
+    explicit = (excel or "").strip()
+    cfg = load_collect_config()
+    if is_cloud_link(explicit):
+        return cloud_backend(cfg, cloud_url=explicit)
+    if explicit:
+        return None
+    url = (cloud_url or "").strip() or str(
+        load_prefs().get("cloud_url") or "").strip()
+    return cloud_backend(cfg, cloud_url=url)
+
+
 async def _emit(on_progress: ProgressCB, event: dict) -> None:
     """调用进度回调（兼容同步/异步）；回调异常只告警、不阻断采集。"""
     if on_progress is None:
@@ -82,7 +145,10 @@ async def _emit(on_progress: ProgressCB, event: dict) -> None:
 
 # ---- 偏好持久化（记住上次选的工作簿/Sheet/店铺）-----------------------------
 def load_prefs() -> dict:
-    """读上次选择 {excel, sheet, store, status}；缺失/损坏返回 {}（best-effort，不抛错）。"""
+    """读上次选择 {excel, cloud_url, sheet, store, status}；缺失/损坏返回 {}（best-effort，不抛错）。
+
+    excel 是本地路径、cloud_url 是协作文档链接，两者互斥（见 save_prefs）。
+    """
     if not COLLECT_PREFS.exists():
         return {}
     try:
@@ -92,18 +158,33 @@ def load_prefs() -> dict:
         return {}
 
 
+def _looks_like_local_path(value: str) -> bool:
+    """粗略判定本地路径形态（盘符/路径分隔符/.xlsx 后缀），供 prefs 拆分用。"""
+    v = value.strip().lower()
+    return (":" in v) or ("\\" in v) or ("/" in v) or v.endswith(".xlsx")
+
+
 def save_prefs(
     excel: str = "", sheet: str = "", store: str = "", status: str = ""
 ) -> None:
-    """记住本次选择（含采集页签 status），供下次 UI/CLI 缺省回填。写失败只告警、不阻断采集。"""
+    """记住本次选择（含采集页签 status），供下次 UI/CLI 缺省回填。写失败只告警、不阻断采集。
+
+    excel 是协作文档链接或云端 file_id（非本地路径形态）时存到 cloud_url、清空 excel
+    （对齐 orders 的 prefs 拆分）：下次首屏按「显式链接 > prefs.cloud_url >
+    config.cloud_file_id」解析云端目标；显式选过本地路径则清掉 cloud_url，
+    避免旧链接盖掉用户后来的选择。
+    """
+    data = {"excel": "", "cloud_url": "", "sheet": sheet, "store": store,
+            "status": status}
+    v = (excel or "").strip()
+    if is_cloud_link(v) or (v and not _looks_like_local_path(v)):
+        data["cloud_url"] = v
+    else:
+        data["excel"] = excel
     try:
         COLLECT_PREFS.parent.mkdir(parents=True, exist_ok=True)
         COLLECT_PREFS.write_text(
-            json.dumps(
-                {"excel": excel, "sheet": sheet, "store": store, "status": status},
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     except Exception as e:
@@ -521,15 +602,36 @@ def get_worklist_status(
 ) -> dict:
     """UI 展示用：返回清单总量 / 已入库 / 待采、可选工作簿/Sheet/店铺列表及每条状态。
 
-    不触发任何采集，纯读 worklist.json + Excel 已入库 SPU 集合，供 UI 渲染。
+    不触发任何采集，纯读 worklist.json + 已入库 SPU 集合，供 UI 渲染。
     - excel/sheet/store 均缺省回填「上次选择」偏好，再兜底出厂默认。
     - 传了 store → items 过滤到该店；有有效 sheet → done 按该工作簿/Sheet 判重，
       否则 done=None（跨店对单 sheet 判重无意义）。
     - 回传当前生效的 excel/sheet/store 供 UI 回显选中态。
+    - 云端分支：excel 是协作文档链接、或无显式本地目标但 prefs/config 配了云端时，
+      Sheet 列表与判重都查协作文档（KdocsSheet）；返回带 cloud=True，读失败不抛错、
+      带 cloud_error 由 UI 红条展示（对齐订单页的展示契约）。云端模式不返回
+      excel_locked（本地锁预检不适用）。
     Excel 不可读（缺失/被占用/无此 Sheet）时 done 视为空集，不抛错。
     """
     prefs = load_prefs()
-    excel = excel or prefs.get("excel") or DEFAULT_EXCEL
+    cfg = load_collect_config()
+    # 目标解析（与 run_batch 同一优先级）：显式链接 → 云端；无显式目标时
+    # prefs.cloud_url > config.cloud_file_id → 云端；否则本地（行为不变）。
+    explicit = (excel or "").strip()
+    cloud = None
+    if is_cloud_link(explicit):
+        cloud = cloud_backend(cfg, cloud_url=explicit)
+        excel = explicit
+    elif not explicit:
+        url = str(prefs.get("cloud_url") or "").strip() or str(
+            cfg.get("cloud_file_id") or "").strip()
+        if url:
+            cloud = cloud_backend(cfg, cloud_url=url)
+            excel = url  # 回显目标（链接或 file_id）
+        else:
+            excel = prefs.get("excel") or DEFAULT_EXCEL
+    else:
+        excel = explicit
     if sheet is None:
         sheet = prefs.get("sheet") or ""
     if store is None:
@@ -538,16 +640,34 @@ def get_worklist_status(
     worklist = load_worklist()
     stores = summarize_stores(worklist)
     workbooks = list_workbooks()
-    sheets = WpsExcelTool.list_sheets(excel)
-    # 选中的 sheet 若不在该工作簿里（换了工作簿导致失配）→ 视为未选
-    sheet_valid = bool(sheet) and sheet in sheets
+    cloud_err = ""
+    if cloud is not None:
+        try:
+            sheets = cloud.sheet_names()
+        except Exception as e:
+            logger.warning(f"读协作文档工作表列表失败：{e}")
+            sheets, cloud_err = [], str(e)
+        sheet_valid = bool(sheet) and sheet in sheets
+        done: set = set()
+        if sheet_valid and not cloud_err:
+            try:  # 云端判重：按真实表头定位 SPU 列（勿硬编码 D）
+                header, header_row = cloud.read_header(sheet)
+                spu_col = WpsExcelTool._resolve_fields_from_header(header).get("spu")
+                if spu_col:
+                    done = set(cloud.existing_key_values(sheet, spu_col, header_row))
+            except Exception as e:
+                logger.warning(f"读协作文档判重水位失败：{e}")
+                cloud_err = str(e)
+    else:
+        sheets = WpsExcelTool.list_sheets(excel)
+        # 选中的 sheet 若不在该工作簿里（换了工作簿导致失配）→ 视为未选
+        sheet_valid = bool(sheet) and sheet in sheets
+        done = (
+            WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
+            if sheet_valid else set()
+        )
     # 选中的 store 若不在清单里（换清单）→ 视为未选（全部）
     store_valid = bool(store) and any(s["key"] == store for s in stores)
-
-    done = (
-        WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
-        if sheet_valid else set()
-    )
 
     items = []
     todo = 0
@@ -571,7 +691,7 @@ def get_worklist_status(
                 "done": is_done,
             }
         )
-    return {
+    result = {
         "total": len(items),
         "done": len([i for i in items if i["done"]]) if sheet_valid else None,
         "todo": todo,
@@ -584,9 +704,14 @@ def get_worklist_status(
         # 采集范围：可选覆盖页签清单 + 上次选择（空串=跟随页面当前，供前端下拉渲染与回显）
         "status_tabs": STATUS_TABS,
         "status": prefs.get("status") or "",
-        "excel_locked": excel_write_locked(excel),
         "items": items,
     }
+    if cloud is not None:
+        result["cloud"] = True
+        result["cloud_error"] = cloud_err
+    else:
+        result["excel_locked"] = excel_write_locked(excel)
+    return result
 
 
 def excel_write_locked(path: str) -> bool:
@@ -736,11 +861,13 @@ async def collect_one_pipeline(
     excel: str = DEFAULT_EXCEL,
     sheet: str = DEFAULT_SHEET,
     schema: Optional["SheetSchema"] = None,
+    cloud=None,
 ) -> "CollectOutcome":
     """确定性管道采集单商品（阶段二），失败退回 agent 兜底。
 
     schema：批次开始时解析好的目标 Sheet 写入结构，全批复用（见 pipeline.SheetSchema）；
-    未传则 write_product_row 内部就地解析一次。
+    未传则 write_product_row 内部就地解析一次。cloud 非空时写协作文档
+    （write_product_row_cloud，主图走在线 URL），判重确认也改读云端。
     返回 CollectOutcome（携带落库结果与来源），供上层生成结构化进度事件。
     """
     from app.collect.pipeline import (
@@ -749,12 +876,31 @@ async def collect_one_pipeline(
         judge_price,
         read_detail_price,
         write_product_row,
+        write_product_row_cloud,
     )
 
     spu = str(item.get("spu", ""))
     browser_tool = agent.available_tools.get_tool("browser_use")
     excel_tool = WpsExcelTool()
     img_path = os.path.join(str(config.output_dir("image")), f"{spu}.jpeg")
+
+    async def _write_row(res) -> tuple[bool, str]:
+        """按当前后端（云端/本地）写一行，口径与本地一致。"""
+        if cloud is not None:
+            return await write_product_row_cloud(cloud, sheet, item, res, schema)
+        return await write_product_row(
+            excel_tool, excel, sheet, item, res, img_path, schema=schema
+        )
+
+    def _written_confirmed() -> bool:
+        """写后判重确认：云端读协作文档的 SPU 列，本地读 xlsx。"""
+        if cloud is not None:
+            return spu in cloud.existing_key_values(
+                sheet, schema.fields["spu"], schema.header_row
+            )
+        return spu in WpsExcelTool.existing_key_values(
+            excel, sheet, spu_col_of(excel, sheet)
+        )
 
     reset_pipeline_llms()  # 单商品护栏：清零 samematch/default 单例 token 计数
 
@@ -812,16 +958,12 @@ async def collect_one_pipeline(
         res = None
 
     if res is not None and res.ok:
-        wrote, msg = await write_product_row(
-            excel_tool, excel, sheet, item, res, img_path, schema=schema
-        )
+        wrote, msg = await _write_row(res)
         try:
             await browser_tool.execute(action="close_tabs", text="1688")
         except Exception:
             pass
-        if wrote and spu in WpsExcelTool.existing_key_values(
-            excel, sheet, spu_col_of(excel, sheet)
-        ):
+        if wrote and _written_confirmed():
             logger.info(
                 f"管道成功：SPU={spu} offer={res.offer_id} 采购价={res.purchase_price} "
                 f"运费={res.shipping} 重量={res.weight_g}g {('存疑:' + res.note) if res.note else ''}"
@@ -833,9 +975,7 @@ async def collect_one_pipeline(
         reason = res.fail_reason if res is not None else "超时/异常"
         # 「无同款」跳过 agent 兜底：写入留空行、采购价/重量待人工补，记为已处理。
         if res is not None and res.no_same_match:
-            wrote, msg = await write_product_row(
-                excel_tool, excel, sheet, item, res, img_path, schema=schema
-            )
+            wrote, msg = await _write_row(res)
             archived = archive_unmatched_image(spu)
             try:
                 await browser_tool.execute(action="close_tabs", text="1688")
@@ -919,37 +1059,53 @@ async def collect_one_base(
     excel: str = DEFAULT_EXCEL,
     sheet: str = DEFAULT_SHEET,
     schema: Optional["SheetSchema"] = None,
+    cloud=None,
 ) -> "CollectOutcome":
     """基础采集单商品：只写 Temu 基础行（站点/类目/SPU/销售价/主图），采购价(J)/重量(K)
     留空待人工填。【不跑 1688 图搜/判同款/读价】，故不用浏览器/CDP/LLM，纯下图 + 写 Excel。
 
     复用 pipeline.write_product_row 的留空写入逻辑（res.purchase_price/weight_g 为 None →
     对应列写空串），与「无同款留空行」同一套机制，只是这里【无条件】留空。
+
+    cloud 非空时写协作文档（write_product_row_cloud）：主图走 item["image"] 的在线
+    URL 嵌入，跳过本地下载；写后判重确认也改读云端。
     """
     from app.collect.pipeline import (
         CollectResult,
         _download_main_image,
+        resolve_sheet_schema_cloud,
         write_product_row,
+        write_product_row_cloud,
     )
 
     spu = str(item.get("spu", ""))
-    excel_tool = WpsExcelTool()
     img_path = os.path.join(str(config.output_dir("image")), f"{spu}.jpeg")
 
+    if cloud is not None and schema is None:
+        schema = await resolve_sheet_schema_cloud(cloud, sheet)
+
     # 主图：能下就下（供 Excel 产品图片列），下不到只告警、仍写基础行。
-    if not os.path.exists(img_path) and item.get("image"):
+    # 云端模式走在线 URL 嵌入，不需要本地图，跳过下载。
+    if cloud is None and not os.path.exists(img_path) and item.get("image"):
         try:
             await asyncio.to_thread(_download_main_image, item["image"], img_path)
         except Exception as e:
             logger.warning(f"SPU={spu} 主图下载失败（忽略，仍写基础行）：{e}")
 
     res = CollectResult(spu=spu, ok=True, note="采购价/重量待人工填")
-    wrote, msg = await write_product_row(
-        excel_tool, excel, sheet, item, res, img_path, schema=schema
-    )
-    if wrote and spu in WpsExcelTool.existing_key_values(
-        excel, sheet, spu_col_of(excel, sheet)
-    ):
+    if cloud is not None:
+        wrote, msg = await write_product_row_cloud(cloud, sheet, item, res, schema)
+        confirmed = wrote and spu in cloud.existing_key_values(
+            sheet, schema.fields["spu"], schema.header_row
+        )
+    else:
+        wrote, msg = await write_product_row(
+            WpsExcelTool(), excel, sheet, item, res, img_path, schema=schema
+        )
+        confirmed = wrote and spu in WpsExcelTool.existing_key_values(
+            excel, sheet, spu_col_of(excel, sheet)
+        )
+    if confirmed:
         logger.info(f"⬜ SPU={spu} 基础行已写入（采购价/重量留空待人工填）")
         return CollectOutcome(
             spu=spu, ok=True, status="base", via="base", note="采购价/重量待人工填",
@@ -967,11 +1123,16 @@ async def run_batch(
     sheet: Optional[str] = None,
     store: Optional[str] = None,
     base_only: bool = True,
+    cloud_url: Optional[str] = None,
 ) -> dict:
     """跑一批未入库商品的采集，进度经 on_progress 抛出。返回汇总 {ok, fail, batch}。
 
     - excel/sheet 缺省回填「上次选择」偏好、再兜底出厂默认；store 非空则只采该店商品。
       本次组合成功启动后 save_prefs 记住，供下次缺省回填。
+    - 云端目标（resolve_cloud）：excel 是协作文档链接 → 云端；显式给的本地路径 →
+      本地（压制 prefs/config 的云端目标）；未显式指定 → cloud_url 参数 >
+      prefs.cloud_url > [collect].cloud_file_id 有值 → 云端；再否则本地 xlsx。
+      云端模式下判重/写入打在协作文档上，跳过本地锁预检与主图本地下载。
     - base_only=True（默认）：仅采 Temu 基础信息、采购价/重量留空待人工填，【不跑 1688】——
       不开 agent、不连 CDP、不用 LLM，最省。此时 use_pipeline 被忽略。
     - base_only=False：走 1688 自动采价。agent 为空则内部创建并在结束时清理；调用方传入
@@ -980,10 +1141,22 @@ async def run_batch(
     - Excel 被占用 / 清单为空 / CDP 不可用（仅 1688 模式）→ 抛结构化事件并提前返回，不空跑。
     """
     prefs = load_prefs()
+    # 云端目标解析必须在 excel 兜底成默认本地路径【之前】做：显式给的本地路径要能
+    # 压制 prefs/config 里的云端目标（resolve_cloud），否则用户改选本地后这一批仍
+    # 会被写进旧云端文档。
+    cloud = resolve_cloud(excel, cloud_url)
     excel = excel or prefs.get("excel") or DEFAULT_EXCEL
     sheet = sheet or prefs.get("sheet") or DEFAULT_SHEET
     if store is None:
         store = prefs.get("store") or ""
+
+    # 纯 agent 兜底路径（collect_one，非管道）自己 inspect 本地表，云端模式下不适用——
+    # 它本就只是调试兜底，直接中止并提示，别跑到写本地默认表。
+    if cloud is not None and not base_only and not use_pipeline:
+        reason = "纯 agent 模式（--no-pipeline）不支持写入协作文档，请改用确定性管道或基础采集。"
+        await _emit(on_progress, {"type": "aborted", "reason": reason})
+        logger.error(reason)
+        return {"ok": 0, "fail": 0, "batch": 0}
 
     worklist = load_worklist()
     if store:  # 只采选中店铺的商品
@@ -998,7 +1171,8 @@ async def run_batch(
         logger.error(reason)
         return {"ok": 0, "fail": 0, "batch": 0}
 
-    if excel_write_locked(excel):
+    # 锁预检只针对本地 xlsx；协作文档是多人实时协作的，不存在本地占用锁
+    if cloud is None and excel_write_locked(excel):
         msg = (
             f"Excel 正被占用（疑似 WPS/Excel 打开中），无法写入：{excel}。"
             "请先在 WPS/Excel 里关闭该文件，再重跑。"
@@ -1007,19 +1181,54 @@ async def run_batch(
         logger.error("❌ " + msg)
         return {"ok": 0, "fail": 0, "batch": 0}
 
-    # 记住本次选择（工作簿/Sheet/店铺），供下次 UI/CLI 缺省回填；
+    # 记住本次选择（工作簿/Sheet/店铺），供下次 UI/CLI 缺省回填；链接会被拆到 cloud_url。
+    # 云端目标生效时记的是云端目标本身，不能记兜底出的本地 excel——那会把 prefs 里的
+    # cloud_url 冲掉，下一批不带参数就静默退回本地默认表。
     # status 是枚举页签、非本批参数，沿用已存值，避免被空串覆盖丢掉。
-    save_prefs(excel, sheet, store, prefs.get("status") or "")
+    save_prefs(cloud.file_id if cloud is not None else excel,
+               sheet, store, prefs.get("status") or "")
 
-    done = WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
+    # 批次开始就解析一次目标 Sheet 的写入结构（列映射/公式/常量），全批复用——各 Sheet
+    # 列序不同，必须按真实表头写；这份结构一批恒定，不必逐商品重 inspect 大工作簿。
+    # 结构认不出（如缺 SPU 列）→ 直接中止本批，避免逐个商品去撞同一个错误。
+    # 基础模式与管道模式都要按真实表头写，故都先解析（纯 agent 兜底路径自己 inspect，跳过）。
+    # 云端模式提前到这里解析：判重也要用它的表头行号与 SPU 列。
+    pipe_schema = None
+    if cloud is not None:
+        from app.collect.pipeline import resolve_sheet_schema_cloud
+        from app.orders.kdocs_sheet import KdocsSheetError
+
+        try:
+            pipe_schema = await resolve_sheet_schema_cloud(cloud, sheet)
+            if pipe_schema.ok:
+                done = set(cloud.existing_key_values(
+                    sheet, pipe_schema.fields["spu"], pipe_schema.header_row
+                ))
+        except KdocsSheetError as e:
+            reason = f"读取协作文档失败（{e}），已中止本批。"
+            await _emit(on_progress, {"type": "aborted", "reason": reason})
+            logger.error("❌ " + reason)
+            return {"ok": 0, "fail": 0, "batch": 0}
+        if not pipe_schema.ok:
+            await _emit(on_progress, {"type": "aborted", "reason": pipe_schema.error})
+            logger.error(f"❌ 目标表结构不可写，中止本批：{pipe_schema.error}")
+            return {"ok": 0, "fail": 0, "batch": 0}
+        logger.info(
+            f"目标=协作文档；目标表结构已解析：字段列={pipe_schema.fields} "
+            f"公式列={list(pipe_schema.formula_columns)} 常量列={pipe_schema.constant_columns}"
+        )
+    else:
+        done = WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
     todo = [
         it for it in worklist
         if str(it.get("spu", "")).strip() and str(it["spu"]) not in done
     ]
     batch = min(limit, len(todo))
     mode_label = "基础(价/重人工填)" if base_only else ("管道" if use_pipeline else "agent")
+    target_label = (f"协作文档（{cloud.file_id}）" if cloud is not None
+                    else f"工作簿={excel}")
     logger.info(
-        f"=== 采集批次：模式={mode_label} 工作簿={excel} Sheet={sheet} 店铺={store or '全部'}；"
+        f"=== 采集批次：模式={mode_label} {target_label} Sheet={sheet} 店铺={store or '全部'}；"
         f"清单 {len(worklist)} 个，已入库 {len(done)}，待采 {len(todo)}，本批 {batch} 个 ==="
     )
     await _emit(on_progress, {
@@ -1027,12 +1236,7 @@ async def run_batch(
         "done_existing": len(done), "todo": len(todo), "batch": batch,
     })
 
-    # 批次开始就解析一次目标 Sheet 的写入结构（列映射/公式/常量），全批复用——各 Sheet
-    # 列序不同，必须按真实表头写；这份结构一批恒定，不必逐商品重 inspect 大工作簿。
-    # 结构认不出（如缺 SPU 列）→ 直接中止本批，避免逐个商品去撞同一个错误。
-    # 基础模式与管道模式都要按真实表头写，故都先解析（纯 agent 兜底路径自己 inspect，跳过）。
-    pipe_schema = None
-    if base_only or use_pipeline:
+    if cloud is None and (base_only or use_pipeline):
         from app.collect.pipeline import resolve_sheet_schema
 
         pipe_schema = await resolve_sheet_schema(WpsExcelTool(), excel, sheet)
@@ -1057,7 +1261,9 @@ async def run_batch(
                 "type": "product_start", "index": i, "total": batch,
                 "spu": spu, "name": name,
             })
-            outcome = await collect_one_base(item, excel, sheet, schema=pipe_schema)
+            outcome = await collect_one_base(
+                item, excel, sheet, schema=pipe_schema, cloud=cloud
+            )
             await _emit(on_progress, outcome.to_event(i, batch))
             if outcome.ok:
                 ok += 1
@@ -1095,7 +1301,7 @@ async def run_batch(
 
             if use_pipeline:
                 outcome = await collect_one_pipeline(
-                    agent, item, excel, sheet, schema=pipe_schema
+                    agent, item, excel, sheet, schema=pipe_schema, cloud=cloud
                 )
             else:
                 got = await collect_one(agent, item, excel, sheet)

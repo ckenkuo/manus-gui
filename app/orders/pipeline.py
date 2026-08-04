@@ -91,6 +91,24 @@ EXPORT_COLUMNS = [
 # 导出文件里的空值是字符串 `--`，不是空单元格。
 _EMPTY_TOKENS = {"--", "-", "—", "None", "null"}
 
+# ---- 采购汇总 xlsx 的版式参数（2026-07-30 用户定的口径）----------------------
+# 行高单位是磅，1 磅 = 96/72 px：60 磅 ≈ 80px，图缩到 76px 正好留一点边。
+# 为什么带图的表不能也用 25 磅：25 磅只有 33px 高，主图缩到那么小认不出是哪一款，
+# 而「看图确认要采的是这款」正是加图的目的。不带图的明细表就按 25 磅。
+_ROW_H_IMAGE = 60.0
+_ROW_H_PLAIN = 25.0
+_IMG_BOX_PX = 76
+_IMG_COL_PX = 84  # 图片列固定宽度：容得下 76px 图 + 边距，不跟着屏幕宽按比例放大
+
+# 各表列宽权重（相对值，实际像素按屏幕宽度分配，见 _fit_columns）。
+# 取值依据：标题字数 + 该列典型内容长度。长文本列（商品名称/采购清单/订单号）给大权重
+# 让它们吃掉屏幕余量，短列（件数/订单数）压到最小，整表因此能塞进一屏。
+_W_PRODUCT = [84, 62, 52, 300, 105, 48, 58, 290, 150, 48, 52, 64, 92, 190]
+_W_SKU = [84, 62, 62, 105, 105, 150, 260, 150, 58, 48, 52, 64, 92, 170, 170]
+# 明细表末列「订单创建时间」权重比汇总表大：25 磅行高只放得下一行，
+# `2026-07-27 10:16:38` 折成两行第二行就被截掉，必须留够单行宽度（约 140px）。
+_W_DETAIL = [150, 150, 105, 105, 150, 285, 150, 52, 64, 115]
+
 
 @dataclass
 class OrderRow:
@@ -294,7 +312,10 @@ def summarize_purchases(orders: List[OrderRow]) -> List[dict]:
             "order_nos": [],
             "sub_order_nos": [],
             "created_times": [],
+            "image_path": "",
         })
+        if not group["image_path"] and order.image_path:
+            group["image_path"] = order.image_path
         group["total_qty"] += _purchase_quantity(order.qty)
         _append_unique(group["sku_codes"], order.sku_code)
         _append_unique(group["goods_names"], order.goods_name)
@@ -310,6 +331,8 @@ def summarize_purchases(orders: List[OrderRow]) -> List[dict]:
         summary.append({
             "spu_id": group["spu_id"],
             "sku_id": group["sku_id"],
+            # 同一 SKU 的所有子订单主图必然是同一张，取首个下到本地的即可（供 xlsx 嵌图）
+            "image_path": group["image_path"],
             "sku_codes": group["sku_codes"],
             "goods_names": group["goods_names"],
             "attrs": group["attrs"],
@@ -352,8 +375,11 @@ def summarize_products(orders: List[OrderRow]) -> List[dict]:
             "order_nos": [],
             "sub_order_nos": [],
             "created_times": [],
+            "image_path": "",
             "variants": {},
         })
+        if not group["image_path"] and order.image_path:
+            group["image_path"] = order.image_path
         qty = _purchase_quantity(order.qty)
         group["total_qty"] += qty
         _append_unique(group["goods_names"], order.goods_name)
@@ -398,6 +424,8 @@ def summarize_products(orders: List[OrderRow]) -> List[dict]:
         )
         out.append({
             "spu_id": group["spu_id"],
+            # 商品级取该 SPU 下首个下到本地的主图（同款不同码主图基本一致）
+            "image_path": group["image_path"],
             "goods_names": group["goods_names"],
             "sku_codes": group["sku_codes"],
             "sites": group["sites"],
@@ -419,8 +447,139 @@ def summarize_products(orders: List[OrderRow]) -> List[dict]:
     )
 
 
+def screen_client_px(reserve: int = 130) -> int:
+    """当前主屏能放下多少像素的表格列宽，用于把整表压进一屏（只上下滚、不左右滚）。
+
+    reserve 是要让出去的那部分：行号列（约 40px）+ 竖滚动条（约 17px）+ 窗口边框与
+    WPS 侧栏留白。取 130 是 1920 屏实测手调的值——宁可少算几十像素留一点余量，
+    也不要算超导致最后一列被挤到屏幕外，那就白做了。
+
+    best-effort：读不到分辨率（非 Windows、无桌面会话）按 1920 算，只是列宽不贴合，
+    绝不该让整份采购统计因此导不出来。
+    """
+    width = 1920
+    try:
+        import ctypes
+
+        got = int(ctypes.windll.user32.GetSystemMetrics(0))
+        if got > 0:
+            width = got
+    except Exception as e:
+        logger.warning(f"读屏幕分辨率失败，列宽按 {width}px 估算：{e}")
+    return max(width - reserve, 800)
+
+
+def _px_to_width(px: float) -> float:
+    """像素 → openpyxl 列宽单位（Calibri 11 下 px ≈ 7 × 宽度 + 5）。"""
+    return round(max((px - 5) / 7, 1.5), 2)
+
+
+def _fit_columns(
+    worksheet,
+    weights: List[float],
+    avail_px: int,
+    min_px: int = 46,
+    fixed: Optional[Dict[int, float]] = None,
+) -> None:
+    """按权重把 avail_px 分配给各列，保证每列不低于 min_px。
+
+    权重＝该列「希望占多宽」的相对值（标题长度 + 典型内容长度估的），不是内容实测最大值：
+    改动前用的是 `max(len(内容))+2` 逐列取最宽，一个长商品名就能把那列撑到 45 字符、
+    把整表推出屏幕，正是这次要解决的问题。配合自动换行，压窄的列会折行而不是截断。
+
+    fixed={列序号: 像素} 用于图片列：它要的宽度由图框尺寸决定、跟屏幕多宽无关，跟着一起
+    按比例放大只是白占地方（挤掉真正需要宽度的商品名/采购清单）。这些列先按固定值扣掉，
+    余下的宽度才参与权重分配。
+    """
+    if not weights:
+        return
+    fixed = fixed or {}
+    avail_px = max(avail_px - sum(fixed.values()), 200)
+    flex = [0.0 if i in fixed else w for i, w in enumerate(weights, 1)]
+    total = sum(flex) or 1.0
+    raw = [avail_px * w / total for w in flex]
+    # 先垫到 min_px，再把垫出来的超额从「本就宽于 min_px」的列里按比例扣回去
+    got = [max(p, min_px) for p in raw]
+    over = sum(got) - avail_px
+    if over > 0:
+        slack = [max(p - min_px, 0) for p in got]
+        pool = sum(slack) or 1.0
+        got = [p - over * s / pool for p, s in zip(got, slack)]
+    for i, px in enumerate(got, 1):
+        worksheet.column_dimensions[worksheet.cell(row=1, column=i).column_letter].width = (
+            _px_to_width(fixed.get(i, px))
+        )
+
+
+def _style_sheet(worksheet, row_height: float, rows: int, cols: int) -> None:
+    """统一版式：全表自动换行 + 垂直居中，数据行行高 row_height，冻结表头并开筛选。
+
+    为什么整片单元格逐个设而不是只设列样式：openpyxl 的列级 alignment 只作用于【新建】
+    单元格，已 append 的行不受影响，实测表现就是「设了没生效」。
+    """
+    from openpyxl.styles import Alignment
+
+    wrap = Alignment(wrap_text=True, vertical="center", horizontal="left")
+    head = Alignment(wrap_text=True, vertical="center", horizontal="center")
+    for row in worksheet.iter_rows(min_row=1, max_row=rows, max_col=cols):
+        for cell in row:
+            cell.alignment = head if cell.row == 1 else wrap
+    worksheet.row_dimensions[1].height = 30
+    for r in range(2, rows + 1):
+        worksheet.row_dimensions[r].height = row_height
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = (
+        f"A1:{worksheet.cell(row=1, column=cols).column_letter}{max(rows, 1)}"
+    )
+
+
+def _embed_image(worksheet, row: int, path: str, box_px: int) -> bool:
+    """把本地主图等比缩放后嵌进该行 A 列，成功返回 True。
+
+    这里用的是普通浮动图，不是登记表那种 WPS DISPIMG 嵌入图：采购统计是本管线【新建】的
+    文件，没有 DISPIMG 图索引表要维护；而登记表是既有 WPS 文件，动它必须走 zip/XML 直改
+    （见 wps_excel_tool 的说明）。
+
+    锚定刻意用 twoCellAnchor + editAs="twoCell"（「随单元格移动并调整大小」），不用
+    openpyxl 传字符串时默认的 oneCellAnchor：这两张表开着筛选，人一按「是否采购完成」筛，
+    oneCellAnchor 的图不会跟着隐藏，会整片糊在剩下的行上。两个锚点都落在同一个单元格内，
+    靠偏移量圈出 box_px 的方框，所以图不会跨到右边的列去。
+
+    best-effort：单张图坏了/丢了只告警，这一格空着，绝不让整份统计导不出来。
+    """
+    from openpyxl.drawing.image import Image as XlImage
+    from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
+    from openpyxl.utils.units import pixels_to_EMU
+
+    try:
+        if not path or not Path(path).exists():
+            return False
+        img = XlImage(path)
+        scale = min(box_px / max(img.width, 1), box_px / max(img.height, 1), 1.0)
+        w, h = int(img.width * scale), int(img.height * scale)
+        pad = 3
+        img.anchor = TwoCellAnchor(
+            editAs="twoCell",
+            _from=AnchorMarker(col=0, row=row - 1,
+                               colOff=pixels_to_EMU(pad), rowOff=pixels_to_EMU(pad)),
+            to=AnchorMarker(col=0, row=row - 1,
+                            colOff=pixels_to_EMU(pad + w), rowOff=pixels_to_EMU(pad + h)),
+        )
+        worksheet.add_image(img)
+        return True
+    except Exception as e:
+        logger.warning(f"采购统计嵌图失败（该格留空）：{path} → {e}")
+        return False
+
+
 def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) -> dict:
-    """导出本批新增订单的 SPU/SKU 采购汇总和逐条明细。"""
+    """导出本批新增订单的 SPU/SKU 采购汇总和逐条明细。
+
+    版式按「一屏放下、只上下滚」来做（2026-07-30 用户要求）：列宽按运行时屏幕分辨率按权重
+    分配、全表自动换行 + 垂直居中、带图两张表行高 60 磅（图缩到 76px 居中），明细表 25 磅。
+    汇总两张表每行嵌该 SKU/商品的主图，并留一列「是否采购完成」供人工勾。
+    时间只保留一个「创建时间」＝该组最早的下单时间（采购紧急度看它）。
+    """
     import openpyxl
     from openpyxl.styles import Font, PatternFill
 
@@ -436,12 +595,14 @@ def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) ->
     product_sheet = workbook.active
     product_sheet.title = "商品汇总"
     product_sheet.append([
-        "需多规格", "商品名称", "SPU ID", "规格数", "采购总件数", "采购清单",
-        "SKU货号", "订单数", "子订单数", "站点", "最早下单时间", "最晚下单时间",
-        "订单号",
+        "主图", "是否采购完成", "需多规格", "商品名称", "SPU ID", "规格数",
+        "采购总件数", "采购清单", "SKU货号", "订单数", "子订单数", "站点",
+        "创建时间", "订单号",
     ])
-    for p in products:
+    product_images = 0
+    for i, p in enumerate(products, 2):
         product_sheet.append([
+            "", "",
             "是" if p["is_multi"] else "否",
             "；".join(p["goods_names"]), p["spu_id"], p["variant_count"],
             p["total_qty"],
@@ -449,26 +610,29 @@ def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) ->
                 f"{v['attrs'] or '（无属性）'}×{v['qty']}" for v in p["variants"]
             ),
             "；".join(p["sku_codes"]), p["order_count"], p["sub_order_count"],
-            "；".join(p["sites"]), p["first_created_at"], p["last_created_at"],
+            "；".join(p["sites"]), p["first_created_at"],
             "；".join(p["order_nos"]),
         ])
+        product_images += _embed_image(product_sheet, i, p["image_path"], _IMG_BOX_PX)
 
     summary_sheet = workbook.create_sheet("SPU_SKU汇总")
-    summary_headers = [
-        "是否重复采购", "SPU ID", "SKU ID", "SKU货号", "商品名称", "商品属性",
-        "采购总件数", "订单数", "子订单数", "站点", "最早下单时间", "最晚下单时间",
-        "订单号", "子订单号",
-    ]
-    summary_sheet.append(summary_headers)
-    for group in groups:
+    summary_sheet.append([
+        "主图", "是否采购完成", "是否重复采购", "SPU ID", "SKU ID", "SKU货号",
+        "商品名称", "商品属性", "采购总件数", "订单数", "子订单数", "站点",
+        "创建时间", "订单号", "子订单号",
+    ])
+    sku_images = 0
+    for i, group in enumerate(groups, 2):
         summary_sheet.append([
+            "", "",
             "是" if group["is_repeated"] else "否",
             group["spu_id"], group["sku_id"], "；".join(group["sku_codes"]),
             "；".join(group["goods_names"]), "；".join(group["attrs"]),
             group["total_qty"], group["order_count"], group["sub_order_count"],
-            "；".join(group["sites"]), group["first_created_at"], group["last_created_at"],
+            "；".join(group["sites"]), group["first_created_at"],
             "；".join(group["order_nos"]), "；".join(group["sub_order_nos"]),
         ])
+        sku_images += _embed_image(summary_sheet, i, group["image_path"], _IMG_BOX_PX)
 
     detail_sheet = workbook.create_sheet("订单明细")
     detail_headers = [
@@ -489,15 +653,23 @@ def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) ->
         ])
 
     header_fill = PatternFill("solid", fgColor="F4B183")
-    for worksheet in (product_sheet, summary_sheet, detail_sheet):
-        worksheet.freeze_panes = "A2"
-        worksheet.auto_filter.ref = worksheet.dimensions
+    avail = screen_client_px()
+    for worksheet, weights, height, rows, img in (
+        (product_sheet, _W_PRODUCT, _ROW_H_IMAGE, len(products) + 1, True),
+        (summary_sheet, _W_SKU, _ROW_H_IMAGE, len(groups) + 1, True),
+        (detail_sheet, _W_DETAIL, _ROW_H_PLAIN, len(orders) + 1, False),
+    ):
         for cell in worksheet[1]:
             cell.font = Font(bold=True)
             cell.fill = header_fill
-        for column_cells in worksheet.columns:
-            width = min(max(len(str(cell.value or "")) for cell in column_cells) + 2, 45)
-            worksheet.column_dimensions[column_cells[0].column_letter].width = max(width, 10)
+        _fit_columns(worksheet, weights, avail, fixed={1: _IMG_COL_PX} if img else None)
+        _style_sheet(worksheet, height, rows, len(weights))
+
+    # 「是否采购完成」给个是/否下拉：这一列是人工勾的，下拉能防手输「已采」「ok」这类
+    # 五花八门的写法，后续想按它筛未采购才筛得干净。allow_blank=True——留空就是还没处理。
+    for worksheet, rows in ((product_sheet, len(products)), (summary_sheet, len(groups))):
+        if rows:
+            _add_done_dropdown(worksheet, rows)
 
     workbook.save(path)
     workbook.close()
@@ -509,7 +681,22 @@ def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) ->
         "products": len(products),
         "multi_products": sum(1 for p in products if p["is_multi"]),
         "total_qty": sum(group["total_qty"] for group in groups),
+        "product_images": product_images,
+        "sku_images": sku_images,
     }
+
+
+def _add_done_dropdown(worksheet, rows: int) -> None:
+    """给 B 列（是否采购完成）挂「是/否」下拉。best-effort，失败只告警。"""
+    from openpyxl.worksheet.datavalidation import DataValidation
+
+    try:
+        dv = DataValidation(type="list", formula1='"是,否"', allow_blank=True)
+        dv.error = "请选择「是」或「否」"
+        worksheet.add_data_validation(dv)
+        dv.add(f"B2:B{rows + 1}")
+    except Exception as e:
+        logger.warning(f"「是否采购完成」下拉设置失败（该列仍可手输）：{e}")
 
 
 def _md_cell(value: Any) -> str:
@@ -666,6 +853,30 @@ def _section_detail(multi: List[dict], orders: List[OrderRow]) -> List[str]:
     return lines
 
 
+# 数量列的标题写法集合。管线自己插的那一列固定叫「数量」（见 service.ensure_qty_columns），
+# 但用户可能早先手工加过别的写法，一并认下来，免得插出第二列同义列。
+QTY_TITLES = {"数量", "件数", "商品数量", "采购件数", "应履约件数"}
+QTY_TITLE = "数量"          # 管线插列时写入的标题
+QTY_AFTER_TITLE = "尺码"    # 插在这一列右侧（2026-07-30 用户指定）
+
+
+def _qty_number(raw: Any):
+    """把「应履约件数」转成【数字】写进登记表；空值返回空串（不落单元格）。
+
+    必须是数字而不是文本：这一列要能直接求和、筛选大于 1 的多件单。整数就写 int，
+    免得 1 显示成 1.0；解析不出（导出偶发脏值）退回原始文本，宁可留痕给人看，
+    也不要静默写 0 让人以为这单不用发货。
+    """
+    text = _clean(raw)
+    if not text:
+        return ""
+    try:
+        quantity = Decimal(text)
+    except InvalidOperation:
+        return text
+    return int(quantity) if quantity == quantity.to_integral() else float(quantity)
+
+
 # 登记表列标题 → 取值。一个字段可能有多种标题写法（` StoreD` 表用「站点」而非
 # 「站点区分」），故用标题集合匹配。这里【只列管线能填的字段】：国内发出时间/采购日期/
 # 采购费用/Y2头程费用/采购订单号/物流情况/产品图2 是人工后续填的，管线一律留空不碰。
@@ -674,6 +885,7 @@ _FIELD_SOURCES: List[tuple] = [
     ({"站点区分", "站点"}, lambda o, ctx: o.site),
     ({"订单号"}, lambda o, ctx: o.order_no),
     ({"尺码"}, lambda o, ctx: o.attrs),
+    (QTY_TITLES, lambda o, ctx: _qty_number(o.qty)),
     ({"平台物流跟踪号", "平台跟踪号"}, lambda o, ctx: o.tracking_no),
     ({"平台创建时间"}, lambda o, ctx: o.created_at),
     ({"平台成交价"}, lambda o, ctx: o.deal_price),

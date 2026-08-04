@@ -390,10 +390,12 @@ async def collect_enumerate(status: str = Body("", embed=True)):
     商品名等），点页面「查询」原样采集；非空 = 先替你切到该页签再查询。本次选择记入偏好回显。
     """
     tab = status or ""
-    # 记住本次采集范围，保留已存的 excel/sheet/store 不被覆盖
+    # 记住本次采集范围，保留已存的 excel/sheet/store 不被覆盖；
+    # 云端目标存在 cloud_url 键（与 excel 互斥），回传时二选一，避免被空 excel 清掉
     prefs = collect_service.load_prefs()
     collect_service.save_prefs(
-        prefs.get("excel", ""), prefs.get("sheet", ""), prefs.get("store", ""), tab
+        prefs.get("excel") or prefs.get("cloud_url") or "",
+        prefs.get("sheet", ""), prefs.get("store", ""), tab
     )
     count = await collect_service.enumerate_worklist(status_tab=tab)
     return {"count": count, "status": collect_service.get_worklist_status()}
@@ -636,6 +638,10 @@ async def orders_sheet_info(workbook: str, sheet: str):
     cfg = orders_service.load_orders_config()
     return JSONResponse(content=orders_service.inspect_sheet(
         workbook, sheet, list(cfg.get("dedupe_by") or []),
+        cloud=orders_service.cloud_backend(
+            cfg,
+            cloud_url=workbook if orders_service.is_cloud_link(workbook) else "",
+        ),
     ))
 
 

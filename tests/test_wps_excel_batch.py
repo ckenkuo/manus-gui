@@ -610,3 +610,150 @@ def test_shift_data_region_ignores_self_closing_shared_formula():
     assert '<row r="5">' in moved and '<row r="6">' in moved
     assert '<c r="G5"' in moved and '<c r="G6"' in moved
     assert 'ref="G6:G7"' in moved
+
+
+# ---- 插列（订单登记表要在「尺码」右侧加「数量」）---------------------------
+
+
+def test_insert_column_shifts_cells_ranges_and_writes_header(book):
+    """在「尺码」(D) 右侧插列：D 及左侧不动，E 起全部右移，各类区域引用同步平移。"""
+    res = WpsExcelTool.insert_column_after(str(book), "插入表", "尺码", "数量")
+    xml = _s3(book)
+
+    assert res["inserted"] is True and res["column"] == "E"
+    assert Path(res["backup"]).exists(), "改结构前必须留备份"
+    # 表头：D 原样，E 是新列（样式抄左邻表头格 s="1"），原 G/I 右移成 H/J
+    assert '<c r="D1" s="1" t="str"><v>尺码</v></c>' in xml
+    assert '<c r="E1" s="1" t="str"><v>数量</v></c>' in xml
+    assert '<c r="H1" s="1" t="str"><v>产品图片</v></c>' in xml
+    assert '<c r="J1" s="1" t="str"><v>平台创建时间</v></c>' in xml
+    # 数据格随之右移，样式跟着走
+    assert '<c r="H2" s="7" t="str">' in xml and '<c r="G2"' not in xml
+    assert '<c r="D2" s="5" t="str"><v>杏色 / 3-4Y</v></c>' in xml, "尺码列本身不能动"
+    # 共享公式 ref、合并区、筛选区、dimension、spans 全部平移；C 列条件格式不动
+    assert '<f t="shared" ref="H2:H3" si="0">' in xml
+    assert '<mergeCell ref="C2:C3"/><mergeCell ref="G2:G3"/>' in xml
+    assert '<autoFilter ref="B1:I3"/>' in xml
+    assert '<dimension ref="A1:J1048576"/>' in xml
+    assert 'sqref="C1:C2 C4:C1048576"' in xml, "C 在插入位左侧，不该动"
+    assert '<row r="900" customFormat="1" spans="2:10"/>' in xml
+
+
+def test_new_column_cells_inherit_left_neighbor_style(book):
+    """刚插出来的列整表一个单元格都没有，学不到样式 → 取模板行左邻列的（同 Excel 语义）。
+
+    不做的话数量格没有 s=、跟左右邻差一圈边框，肉眼一看就是「补上去的」。
+    """
+    WpsExcelTool.insert_column_after(str(book), "插入表", "尺码", "数量")
+    WpsExcelTool().append_rows(
+        str(book), "插入表",
+        [{"values": {"C": "PO-NEW-1", "D": "红色", "E": 2}}],
+        insert_at_top=True,
+    )
+    xml = _s3(book)
+
+    # 模板行 D 是 s="5"，新列 E 跟着它
+    assert '<c r="E2" s="5"><v>2</v></c>' in xml
+
+
+def test_insert_column_is_idempotent(book):
+    """已经有「数量」列就直接返回，不动文件、不做备份——重跑不能插出第二列。"""
+    WpsExcelTool.insert_column_after(str(book), "插入表", "尺码", "数量")
+    before = _s3(book)
+
+    res = WpsExcelTool.insert_column_after(str(book), "插入表", "尺码", "数量")
+
+    assert res["inserted"] is False and res["column"] == "E"
+    assert res["backup"] is None
+    assert _s3(book) == before
+
+
+def test_insert_column_reads_header_row_two(book):
+    """表头在第 2 行的 Sheet（牛仔裤/童装那种）也要认对表头行。"""
+    res = WpsExcelTool.insert_column_after(
+        str(book), "牛仔裤", "尺码", "数量", header_row=2
+    )
+    xml = _sheet(book, "xl/worksheets/sheet2.xml")
+
+    assert res["inserted"] is True and res["column"] == "D"
+    assert '<c r="D2" s="1" t="str"><v>数量</v></c>' in xml
+    assert '<c r="E2" s="1" t="str"><v>备注</v></c>' in xml, "原备注列右移"
+    assert '<row r="1"><c r="A1" s="1" t="str"><v>2026年牛仔裤订单登记</v></c></row>' in xml
+
+
+def test_insert_column_rejects_missing_anchor(book):
+    """找不到锚点列就抛错：位置猜不得，插错列等于整表错位。"""
+    with pytest.raises(ValueError, match="找不到"):
+        WpsExcelTool.insert_column_after(str(book), "插入表", "不存在的列", "数量")
+
+
+def test_shift_ref_cols_rules():
+    """列平移规则：插入位左侧不动、右侧后移，$ 保留，到底的列号卡在 XFD 不越界。"""
+    assert WpsExcelTool._shift_ref_cols("B1:H3", 5) == "B1:I3"
+    assert WpsExcelTool._shift_ref_cols("C1:C1048576", 5) == "C1:C1048576"
+    assert WpsExcelTool._shift_ref_cols("$D$2:$F$9", 5) == "$D$2:$G$9"
+    assert WpsExcelTool._shift_ref_cols("C1:C9 F1:F9", 5) == "C1:C9 G1:G9"
+    assert WpsExcelTool._shift_ref_cols("XFD1", 5) == "XFD1"
+
+
+def test_shift_head_cols_new_col_inherits_left_range():
+    """左邻列是多列段的末列时，新 <col> 要插在它之后并继承它的样式（<col> 必须升序）。"""
+    head = (
+        '<worksheet><dimension ref="A1:H9"/><cols>'
+        '<col min="1" max="4" width="12" style="55"/>'
+        '<col min="5" max="8" width="20" style="99"/></cols>'
+    )
+    out = WpsExcelTool._shift_head_cols(head, 5, WpsExcelTool._col_style(head, 4), 9.0)
+
+    assert re.findall(r'<col [^>]*/>', out) == [
+        '<col min="1" max="4" width="12" style="55"/>',
+        '<col min="5" max="5" width="9.0" style="55" customWidth="1"/>',
+        '<col min="6" max="9" width="20" style="99"/>',
+    ]
+    assert '<dimension ref="A1:I9"/>' in out
+
+
+def test_shift_head_cols_extends_range_spanning_insert_point():
+    """跨过插入位的段只把 max +1：新列并进这一段，自然继承它的样式与列宽。"""
+    head = '<worksheet><cols><col min="3" max="8" width="20" style="99"/></cols>'
+
+    out = WpsExcelTool._shift_head_cols(head, 5, "99", 9.0)
+
+    assert re.findall(r'<col [^>]*/>', out) == ['<col min="3" max="9" width="20" style="99"/>']
+
+
+def test_shift_head_cols_survives_sheet_without_cols():
+    """没有 <cols> 定义的表（新列拿默认列宽）不该报错——数据平移才是要紧事。"""
+    out = WpsExcelTool._shift_head_cols(
+        '<worksheet><dimension ref="A1:H9"/><sheetViews><sheetView topLeftCell="F2">'
+        '<selection activeCell="F2" sqref="F2"/></sheetView></sheetViews>',
+        5, "", 9.0,
+    )
+
+    assert "<col " not in out
+    assert '<dimension ref="A1:I9"/>' in out
+    assert 'topLeftCell="G2"' in out and 'sqref="G2"' in out, "视口与选区也要跟着移"
+
+
+def test_shift_data_cols_rejects_real_cell_refs_in_formula():
+    """DISPIMG 放行，带真单元格引用的公式一律中止——移了列不改公式就是静默算错。"""
+    ok = (
+        '<row r="2" spans="1:9"><c r="G2" t="str">'
+        '<f>_xlfn.DISPIMG(&quot;ID_8C37B8B84F0292F3A9CB7081234567AB&quot;,1)</f>'
+        "<v>x</v></c></row>"
+    )
+    moved = WpsExcelTool._shift_data_cols(ok, 5)
+    assert '<c r="H2"' in moved and 'spans="1:10"' in moved
+
+    with pytest.raises(ValueError, match="公式引用错位"):
+        WpsExcelTool._shift_data_cols('<row r="2"><c r="G2"><f>SUM(A2:F2)</f></c></row>', 5)
+
+
+def test_insert_column_shifts_only_this_sheets_defined_name(book):
+    """筛选区缓存 definedName 只动本表那条，别的表不能被带着改。"""
+    WpsExcelTool.insert_column_after(str(book), "插入表", "尺码", "数量")
+    with zipfile.ZipFile(book) as zf:
+        wbx = zf.read("xl/workbook.xml").decode("utf-8")
+
+    assert "插入表!$B$1:$I$3" in wbx
+    assert "牛仔裤!$A$1:$D$3" in wbx, "别的表那条原样不动"
