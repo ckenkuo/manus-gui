@@ -299,6 +299,22 @@ def test_existing_key_tuples_combo_key(book):
     }
 
 
+def test_first_data_value_reads_topmost_row(book):
+    """取表头正下方第一个非空值：订单登记表的增量水位就是它（写入是 insert_at_top）。"""
+    assert WpsExcelTool.first_data_value(str(book), "订单表", "C") == "PO-045-1"
+    # 表头在第 2 行的表要显式传 header_row，否则会把表头当数据
+    assert WpsExcelTool.first_data_value(
+        str(book), "牛仔裤", "B", header_row=2
+    ) == "PO-211-9"
+
+
+def test_first_data_value_skips_blank_rows_and_missing_sheet(book):
+    """顶端有空行时往下扫到首个非空；表不存在/该列全空返回空串，绝不抛错。"""
+    # E 列（平台物流跟踪号）在夹具里全空 → 空串，调用方据此退全量
+    assert WpsExcelTool.first_data_value(str(book), "订单表", "E") == ""
+    assert WpsExcelTool.first_data_value(str(book), "不存在的表", "C") == ""
+
+
 # ---- 批量追加 -------------------------------------------------------------
 
 

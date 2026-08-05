@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from app.orders.kdocs_sheet import KdocsSheet
 
 from app.agent.manus import Manus
+from app.cloud_docs import remember as remember_cloud_doc
 from app.config import PROJECT_ROOT, config
 from app.logger import logger
 from app.tool.wps_excel_tool import WpsExcelTool
@@ -181,6 +182,10 @@ def save_prefs(
         data["cloud_url"] = v
     else:
         data["excel"] = excel
+    # 协作文档链接同时进登记簿（app/cloud_docs.py），下次开页可直接从候选里选；
+    # 只登记真正的 http(s) 链接，file_id 形态不进登记簿（没法在 UI 里直接选）
+    if data["cloud_url"] and is_cloud_link(data["cloud_url"]):
+        remember_cloud_doc(data["cloud_url"])
     try:
         COLLECT_PREFS.parent.mkdir(parents=True, exist_ok=True)
         COLLECT_PREFS.write_text(

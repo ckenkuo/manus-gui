@@ -138,13 +138,23 @@
                 <span class="text-body-tertiary">（本地 xlsx 路径，或粘贴协作文档链接）</span>
               </label>
               <!-- input+datalist 而不是 select：允许直接粘贴 kdocs 链接，候选仅作回显 -->
-              <input
-                id="workbookSelect"
-                type="text"
-                class="form-control form-control-sm"
-                list="workbookOptions"
-                placeholder="C:\...\登记表.xlsx 或 https://www.kdocs.cn/l/..."
-              />
+              <div class="input-group input-group-sm">
+                <input
+                  id="workbookSelect"
+                  type="text"
+                  class="form-control form-control-sm"
+                  list="workbookOptions"
+                  placeholder="C:\...\登记表.xlsx 或 https://www.kdocs.cn/l/..."
+                />
+                <button
+                  id="btnSaveCloudDoc"
+                  type="button"
+                  class="btn btn-outline-secondary"
+                  title="把当前协作文档链接登记到本地（可起名字），下次直接从候选里选"
+                >
+                  <i class="bi bi-bookmark-star"></i>
+                </button>
+              </div>
               <datalist id="workbookOptions"></datalist>
             </div>
             <div class="col-12 col-md-5">
@@ -347,10 +357,20 @@
         try {
           const r = await fetch("/orders/worklist" + (qs ? "?" + qs : ""));
           cfg = await r.json();
-          // 工作簿是 input+datalist：datalist 只放候选，当前值直接回填进输入框
-          $("workbookOptions").innerHTML = (cfg.workbooks || [])
-            .map((v) => `<option value="${esc(v)}"></option>`)
-            .join("");
+          // 工作簿是 input+datalist：datalist 只放候选（本地工作簿 + 已登记的
+          // 协作文档链接），当前值直接回填进输入框
+          $("workbookOptions").innerHTML =
+            (cfg.workbooks || [])
+              .map((v) => `<option value="${esc(v)}"></option>`)
+              .join("") +
+            cloudDocs
+              .map(
+                (d) =>
+                  `<option value="${esc(d.url)}"${
+                    d.name ? ` label="${esc(d.name)}"` : ""
+                  }></option>`
+              )
+              .join("");
           $("workbookSelect").value = cfg.workbook || "";
           $("workbookPath").textContent = cfg.cloud
             ? "协作文档（在线表格）"
@@ -823,7 +843,49 @@
 
       $("btnStart").addEventListener("click", startBatch);
 
-      loadWorklist();
+      // ---- 协作文档链接登记簿：候选回填 + 手动命名 --------------------------
+      // 登记过的链接（含名字）合并进工作簿 datalist；「收藏」按钮给当前链接起名
+      // 登记。正常跑批时服务端 save_prefs 也会自动登记，这里主要是补名字。
+      let cloudDocs = [];
+      async function loadCloudDocs() {
+        try {
+          const r = await fetch("/api/cloud_docs");
+          cloudDocs = (await r.json()).docs || [];
+        } catch (e) {
+          cloudDocs = [];
+        }
+      }
+      $("btnSaveCloudDoc").addEventListener("click", async () => {
+        const url = $("workbookSelect").value.trim();
+        if (!/^https?:\/\//i.test(url)) {
+          showToast(
+            "不是协作文档链接",
+            "先在登记表输入框粘贴 https://www.kdocs.cn/l/... 链接，再点登记",
+            "warning"
+          );
+          return;
+        }
+        const existing = cloudDocs.find((d) => d.url === url);
+        const name = prompt(
+          "给这个链接起个名字（留空＝只登记链接）：",
+          existing ? existing.name : ""
+        );
+        if (name === null) return; // 取消
+        try {
+          await fetch("/api/cloud_docs", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url, name: name.trim() }),
+          });
+          await loadCloudDocs();
+          loadWorklist({}); // 重渲 datalist 候选
+          showToast("已登记", name.trim() ? `${name.trim()}：${url}` : url, "success");
+        } catch (e) {
+          showToast("登记失败", String(e), "danger");
+        }
+      });
+
+      loadCloudDocs().then(() => loadWorklist());
     </script>
   </body>
 </html>

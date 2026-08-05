@@ -126,13 +126,23 @@
                 <span class="text-body-tertiary">（本地 xlsx 路径，或粘贴协作文档链接）</span>
               </label>
               <!-- input+datalist 而不是 select：允许直接粘贴 kdocs 链接，候选仅作回显 -->
-              <input
-                id="inputExcel"
-                type="text"
-                class="form-control form-control-sm"
-                list="excelOptions"
-                placeholder="C:\...\核算表.xlsx 或 https://www.kdocs.cn/l/..."
-              />
+              <div class="input-group input-group-sm">
+                <input
+                  id="inputExcel"
+                  type="text"
+                  class="form-control form-control-sm"
+                  list="excelOptions"
+                  placeholder="C:\...\核算表.xlsx 或 https://www.kdocs.cn/l/..."
+                />
+                <button
+                  id="btnSaveCloudDoc"
+                  type="button"
+                  class="btn btn-outline-secondary"
+                  title="把当前协作文档链接登记到本地（可起名字），下次直接从候选里选"
+                >
+                  <i class="bi bi-bookmark-star"></i>
+                </button>
+              </div>
               <datalist id="excelOptions"></datalist>
               <div id="excelHint" class="small text-body-tertiary mt-1"></div>
             </div>
@@ -374,11 +384,20 @@
       }
 
       function fillSelectors(s) {
-        // 工作簿是 input+datalist：datalist 只放扫描到的本地 .xlsx 候选，
-        // 当前值（本地路径或粘贴的协作文档链接）直接回填进输入框
-        $("excelOptions").innerHTML = (s.workbooks || [])
-          .map((p) => `<option value="${p}"></option>`)
-          .join("");
+        // 工作簿是 input+datalist：datalist 放扫描到的本地 .xlsx 候选 + 已登记的
+        // 协作文档链接（带名字），当前值（本地路径或粘贴的链接）直接回填进输入框
+        $("excelOptions").innerHTML =
+          (s.workbooks || [])
+            .map((p) => `<option value="${p}"></option>`)
+            .join("") +
+          cloudDocs
+            .map(
+              (d) =>
+                `<option value="${d.url}"${
+                  d.name ? ` label="${d.name}"` : ""
+                }></option>`
+            )
+            .join("");
         $("inputExcel").value = s.excel || "";
         // 云端目标给个明确标识，避免把链接当成本地路径误解
         $("excelHint").textContent = s.cloud ? "协作文档（在线表格）" : "";
@@ -430,6 +449,7 @@
           const r = await fetch("/collect/worklist?" + qs.toString());
           const s = await r.json();
           items = s.items || [];
+          lastStatus = s; // 缓存，供登记链接后不重拉清单直接重渲候选
           // 用后端回显的生效值同步本地选择（首屏即「上次选择」）
           sel.excel = s.excel || "";
           sel.sheet = s.sheet || "";
@@ -599,7 +619,50 @@
         sel.status = e.target.value;
       });
 
-      loadWorklist();
+      // ---- 协作文档链接登记簿：候选回填 + 手动命名 --------------------------
+      // 登记过的链接（含名字）合并进工作簿 datalist；「收藏」按钮给当前链接起名
+      // 登记。正常跑批时服务端 save_prefs 也会自动登记，这里主要是补名字。
+      let cloudDocs = [];
+      let lastStatus = null;
+      async function loadCloudDocs() {
+        try {
+          const r = await fetch("/api/cloud_docs");
+          cloudDocs = (await r.json()).docs || [];
+        } catch (e) {
+          cloudDocs = [];
+        }
+      }
+      $("btnSaveCloudDoc").addEventListener("click", async () => {
+        const url = $("inputExcel").value.trim();
+        if (!/^https?:\/\//i.test(url)) {
+          showToast(
+            "不是协作文档链接",
+            "先在工作簿输入框粘贴 https://www.kdocs.cn/l/... 链接，再点登记",
+            "warning"
+          );
+          return;
+        }
+        const existing = cloudDocs.find((d) => d.url === url);
+        const name = prompt(
+          "给这个链接起个名字（留空＝只登记链接）：",
+          existing ? existing.name : ""
+        );
+        if (name === null) return; // 取消
+        try {
+          await fetch("/api/cloud_docs", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ url, name: name.trim() }),
+          });
+          await loadCloudDocs();
+          if (lastStatus) fillSelectors(lastStatus); // 重渲 datalist 候选
+          showToast("已登记", name.trim() ? `${name.trim()}：${url}` : url, "success");
+        } catch (e) {
+          showToast("登记失败", String(e), "danger");
+        }
+      });
+
+      loadCloudDocs().then(() => loadWorklist());
     </script>
   </body>
 </html>

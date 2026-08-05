@@ -129,7 +129,8 @@ def _print_summary(s: dict) -> None:
     inc = s.get("incremental") or {}
     if inc.get("enabled"):
         logger.info(
-            f"增量：水位 {inc.get('known')} 个订单号，本批翻 {inc.get('pages_swept')} 页"
+            f"增量：水位 {inc.get('watermark')}（登记表最新一条），"
+            f"本批翻 {inc.get('pages_swept')} 页"
             + ("（追上后早停）" if inc.get("stopped_early") else "（未触发早停，已翻到底）")
         )
     if s.get("no_key_sheets"):

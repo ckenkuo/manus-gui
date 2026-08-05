@@ -336,6 +336,37 @@ async def save_config(config_data: dict = Body(...)):
         return {"status": "error", "message": str(e)}
 
 
+# ==== 协作文档链接登记簿（app/cloud_docs.py）：订单页/采集页共用 ==============
+# 凡是用过的 kdocs 协作链接都会自动登记；这里提供列表（UI 下拉候选）、命名/改名、
+# 删除三个接口，纯本地读写，不碰云端文档本身。
+
+from app import cloud_docs
+
+
+@app.get("/api/cloud_docs")
+async def cloud_docs_list():
+    """登记簿列表 [{name, url, last_used}]，按最近使用倒序，供 UI 下拉候选。"""
+    return JSONResponse(content={"docs": cloud_docs.list_docs()})
+
+
+@app.post("/api/cloud_docs")
+async def cloud_docs_save(
+    url: str = Body(..., embed=True), name: str = Body("", embed=True)
+):
+    """登记/更新一条链接（主要是给链接起名字）；url 为空报 400。"""
+    url = url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="url 不能为空")
+    cloud_docs.remember(url, name=name)
+    return {"status": "success"}
+
+
+@app.delete("/api/cloud_docs")
+async def cloud_docs_delete(url: str):
+    """从登记簿删掉一条链接。"""
+    return {"status": "success" if cloud_docs.remove(url) else "not_found"}
+
+
 # ==== 批量采集（Temu→1688→Excel）：确定性管道，独立于通用 agent 任务 ==========
 # UI 复用 app/collect/service.py 的 run_batch，进度经 on_progress 结构化事件走 SSE。
 # 与 /tasks 的区别：/tasks 是通用 agent 自由循环；采集是确定性批处理作业，事件语义

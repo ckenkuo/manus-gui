@@ -599,6 +599,42 @@ class WpsExcelTool(BaseTool):
         return last
 
     @classmethod
+    def first_data_value(
+        cls, file_path: str, sheet_name: str, col: str, header_row: int = 1
+    ) -> str:
+        """读某列【表头正下方第一个非空值】。读不到返回空串，绝不抛错。
+
+        为什么取「第一个」而不是整列集合：订单登记表的写入是 insert_at_top（新行插到表头
+        正下方，见 append_rows），所以数据区最顶端那一行就是上次登记的最新一条。它单条就是
+        增量水位的完整语义——页面新→旧翻页时遇到它即「追上」。
+
+        不严格要求就是 header_row+1 那一行：表里可能有零星空行（人工插的分隔行），
+        从表头往下扫到首个非空为止。扫描上限 200 行，避免整表几万行全扫。
+        """
+        try:
+            with zipfile.ZipFile(file_path) as zf:
+                part = cls._resolve_sheet_part(zf, sheet_name)
+                if not part:
+                    return ""
+                sheet_xml = zf.read(part).decode("utf-8")
+                shared = cls._shared_strings(zf)
+                row_map = dict(cls._parse_rows(sheet_xml))
+                for rid in range(header_row + 1, header_row + 201):
+                    body = row_map.get(str(rid))
+                    if not body:
+                        continue
+                    m = re.search(
+                        r'<c r="%s%d"[^>]*>.*?</c>' % (col, rid), body, re.S
+                    )
+                    if m:
+                        txt = cls._cell_text(m.group(0), shared).strip()
+                        if txt:
+                            return txt
+                return ""
+        except Exception:
+            return ""
+
+    @classmethod
     def existing_key_values(
         cls, file_path: str, sheet_name: str, col: str = "D", header_row: int = 1
     ) -> set:

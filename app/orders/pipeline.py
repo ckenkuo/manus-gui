@@ -70,6 +70,10 @@ _DISABLE_OVERLAY_JS = r"""
 """
 
 # 「共有 247 条」/「已选订单：40」
+# 订单列表「创建时间新→旧」对应的 sortType 值（2026-07-27 实测，见 docs §2 的 URL）。
+# 增量早停的全部正确性都压在这个排序上，故它是 check_list_sort_url 的唯一合格值。
+_SORT_DESC = "1"
+
 _RE_TOTAL = re.compile(r"共有\s*([\d,]+)\s*条")
 _RE_SELECTED = re.compile(r"已选订单[:：]\s*([\d,]+)")
 
@@ -159,37 +163,89 @@ def should_stop_incremental(
 ) -> tuple:
     """增量早停判据。返回 (要不要停, 原因)——纯集合运算，不碰 page，可离线单测。
 
-    判据：本页订单号【全部】已登记，且本批此前至少见过一条新单。为什么要「见过新单」这个
-    附加条件：首次跑水位是空集，第一页就全是新单，自然不会停；而水位非空却第一页就全已知，
-    等价于「没有新单」，停掉也是对的——这条件真正拦的是水位读错（比如列字母取错取到空列）
-    导致的第一页就误停。
+    判据：本页【出现任意一条】已登记的订单号就停。known 通常只有一个元素——登记表里最新的
+    那条订单号（见 read_known_order_nos：写入走 insert_at_top，数据区顶端行即最新）。页面
+    新→旧，翻到它就说明它之后的都更旧、都是上次登记时已处理过的，不再是本批要采的新单。
 
-    另一半是【交错检测】：新→旧排序下一旦出现已知单，它后面不该再有新单。出现交错说明
-    要么排序变了（页面手点了列头排序、list_url 的 sortType 被改），要么表里有空洞（上批
-    某几条没登记成功）。两种情况都不能早停——排序变了早停会漏单，有空洞更要翻完把洞补上。
-    这条不依赖任何时间字段，纯顺序判断，是主力护栏。
+    判据按集合成员判定而非单值相等：known 是 set 的既有契约不变，多元素时语义自然退化成
+    「遇到其中任意一条即停」，与单条水位一致。
+
+    为什么不是原先的「整页全部已登记才停」：那个判据的粒度是页、水位的粒度是单，两者不匹配。
+    水位少于一页条数（新建 Sheet 只登记过几条）时，任何一页都不可能 20 条全命中，`all()`
+    恒为假，早停出口结构性走不通，必然翻到底——2026-08-04 实机就是这样：`WINTAK8.4+` 表里
+    只有 1 个订单号，它出现在第 4 页，本该停在第 4 页，实际翻了 63 页。表越空增量越失效，
+    与设计意图正好相反。
+
+    同时【去掉了原来的交错检测】（「首个已知单之后不该再有新单，否则退全量」）：它无法区分
+    「排序被改」和「表本来就稀疏」。上面那次实机里，第 4 页那条已登记单前后都是未登记单——
+    前面的更新、后面的更旧，都从没登记过，这是新建表的正常状态，却被判成「排序可能被改或表
+    里有空洞」而退全量。排序异常改由 check_created_desc 用创建时间单调性判断，那个信号才真
+    正指向排序，不会跟水位稀疏混淆。
+
+    已知代价：比表内最新那条【更旧】的空洞（上批某几条因未映射/无价被跳过）不会再被增量补上，
+    因为翻到那条就停了。要补洞请显式走全量（CLI `--no-incremental`）。这是刻意的取舍——
+    原先为了补洞而在稀疏水位下无条件退全量，代价是增量完全不起作用。
+
+    seen_new 只用于区分原因文案：它为假说明本页连一条新单都没有、且此前各页也没有，
+    等价于「本批无新单」；为真则是正常追平。两种都停。
     """
     nos = [str(o.get("order_no") or "").strip() for o in page_orders]
     nos = [n for n in nos if n]
     if not nos:
         return False, "本页读不到订单号"
 
-    flags = [n in known for n in nos]
-    # 首个已知单之后还出现新单 = 交错
-    if True in flags and False in flags[flags.index(True):]:
-        return False, "本页已登记与未登记交错，排序可能被改或表里有空洞，本批退全量"
-    if not all(flags):
+    hit = next((n for n in nos if n in known), "")
+    if not hit:
         return False, ""
     if not seen_new:
-        return True, "本页全部已登记且本批未发现新单，判定为无新单"
-    return True, "本页全部已登记，已追上上次登记位置"
+        return True, f"本页出现已登记订单 {hit} 且本批未发现新单，判定为无新单"
+    return True, f"本页出现已登记订单 {hit}，已追上上次登记位置"
+
+
+def check_list_sort_url(list_url: str) -> str:
+    """校验 list_url 是「创建时间新→旧」排序。不合格返回给操作者看的中止文案，合格返回空串。
+
+    为什么必须有这道【确定性】校验：增量早停的正确性完全建立在「列表是新→旧」之上——翻到
+    水位那条就停，是因为它之后的都更旧。排序若反过来，第一页就是最老的单、里面必然含水位，
+    于是【停在第 1 页】，导出最老的 20 条、全被判重挡掉，汇总显示「待写 0 行、早停」。
+    这跟正常的「本批无新单」长得一模一样，是**静默漏采**：那次可能有上千条新单一条没进表。
+
+    唯一的运行时护栏 check_created_desc 依赖列表页 DOM 里能读到创建时间，而这一点未经实机
+    确认（实机日志里从未出现过它的告警，大概率是压根没匹到时间、静默降级成了无护栏）。
+    所以补这道纯字符串校验：不依赖 DOM 结构、不会静默失效，坏了就中止而不是照跑。
+
+    只认 URL 里的 `sortType`。页面上手点列头改排序【不改 URL】，这道校验拦不住那种，
+    仍由 check_created_desc 兜（能读到时间的话）——两道护栏覆盖不同来源，不互相替代。
+    """
+    if not list_url:
+        return ""  # 缺 list_url 由调用方的必填校验负责，这里不重复报
+    m = re.search(r"[?&]sortType=([^&#]*)", list_url)
+    if not m:
+        return (
+            "list_url 里没有 sortType 参数，无法确认订单列表是「创建时间新→旧」排序。\n"
+            "增量采集要求新单在前（翻到已登记那条就停）；排序不对会静默漏采。\n"
+            f"请在 config/config.toml 的 [orders].list_url 补上 sortType={_SORT_DESC}，"
+            "或加 --no-incremental 走全量采集。"
+        )
+    got = m.group(1).strip()
+    if got != _SORT_DESC:
+        return (
+            f"list_url 的 sortType={got or '(空)'}，不是「创建时间新→旧」"
+            f"（应为 {_SORT_DESC}）。\n"
+            "增量采集靠「翻到已登记那条就停」，排序反了会停在第 1 页、把上千条新单全漏掉，"
+            "而汇总看起来只是「本批无新单」。\n"
+            f"请把 config/config.toml 的 [orders].list_url 改成 sortType={_SORT_DESC}，"
+            "或加 --no-incremental 走全量采集。"
+        )
+    return ""
 
 
 def check_created_desc(prev_created: str, page_orders: List[dict]) -> str:
     """校验创建时间跨页单调不增；违反返回告警文案，正常/读不到返回空串。
 
-    best-effort 补充护栏：列表页 DOM 里有没有创建时间未经实机确认，读不到就只靠
-    should_stop_incremental 的交错检测，不中断也不阻塞早停。
+    这是【唯一】的排序护栏（原先的交错检测已删，理由见 should_stop_incremental）：
+    best-effort，列表页 DOM 里有没有创建时间未经实机确认，读不到就返回空串、静默降级到
+    无护栏，不中断也不阻塞早停。
     """
     times = [str(o.get("created_at") or "").strip() for o in page_orders]
     times = [t for t in times if t]
@@ -572,7 +628,21 @@ def _embed_image(worksheet, row: int, path: str, box_px: int) -> bool:
         return False
 
 
-def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) -> dict:
+def purchase_file_stem(kind: str, store: str, stamp: str) -> str:
+    """拼采购产物的文件名主干：店铺名放最前面，便于在同一日期目录里一眼分辨是哪家店的。
+
+    店铺名前置而不是插在时间戳后面：多店铺时同一天会有好几份，文件管理器按名称排序时
+    前置能把同店的自然聚到一起（2026-08-05 用户要求）。
+    店铺名可能带 Windows 文件名非法字符（页面上的店名是自由文本），统一剔除；剔空或本来
+    就没识别到店铺时退化成原来的「不带店铺名」格式，不留下「_」这种空占位。
+    """
+    safe = "".join(c for c in str(store) if c not in '\\/:*?"<>|').strip()
+    return f"{safe}_{kind}_{stamp}" if safe else f"{kind}_{stamp}"
+
+
+def export_purchase_summary(
+    orders: List[OrderRow], out_dir: str, stamp: str, store: str = ""
+) -> dict:
     """导出本批新增订单的 SPU/SKU 采购汇总和逐条明细。
 
     版式按「一屏放下、只上下滚」来做（2026-07-30 用户要求）：列宽按运行时屏幕分辨率按权重
@@ -587,7 +657,7 @@ def export_purchase_summary(orders: List[OrderRow], out_dir: str, stamp: str) ->
     output_dir.mkdir(parents=True, exist_ok=True)
     groups = summarize_purchases(orders)
     products = summarize_products(orders)
-    path = output_dir / f"新增订单采购汇总_{stamp}.xlsx"
+    path = output_dir / f"{purchase_file_stem('新增订单采购汇总', store, stamp)}.xlsx"
 
     workbook = openpyxl.Workbook()
     # 商品级放第一张：采购是按商品链接下单的，先看「这款要买哪些码各几件」。
@@ -724,7 +794,9 @@ def _fmt_qty(quantity: Decimal) -> Any:
     return int(quantity) if quantity == quantity.to_integral() else float(quantity)
 
 
-def export_purchase_markdown(orders: List[OrderRow], out_dir: str, stamp: str) -> dict:
+def export_purchase_markdown(
+    orders: List[OrderRow], out_dir: str, stamp: str, store: str = ""
+) -> dict:
     """把本批新增订单按 SPU+SKU 的合并采购情况写成 md，每批一个新文件。
 
     为什么在 xlsx 之外再出一份 md：xlsx 适合筛选核对，但采购前真正要看的是「这批里哪几
@@ -740,10 +812,15 @@ def export_purchase_markdown(orders: List[OrderRow], out_dir: str, stamp: str) -
     multi = [p for p in products if p["is_multi"]]
     single = [p for p in products if not p["is_multi"]]
     total_qty = sum(p["total_qty"] for p in products)
-    path = output_dir / f"新增订单采购统计_{stamp}.md"
+    path = output_dir / f"{purchase_file_stem('新增订单采购统计', store, stamp)}.md"
 
     lines: List[str] = [
         "# 本批新增订单采购统计（按商品合并，打开一次链接买齐所有码数）", "",
+    ]
+    # 店铺写进正文抬头：md 常被整段贴进聊天跟供应商对量，脱离文件名后也得看得出是哪家店
+    if str(store).strip():
+        lines.append(f"- 店铺：{store}")
+    lines += [
         f"- 批次标识：{stamp}",
         f"- 本批待登记子订单：{len(orders)} 条",
         f"- 涉及商品（SPU）：{len(products)} 个",
@@ -1322,9 +1399,9 @@ async def sweep_pages(
     导出的也正是这批选中的单。否则只要 max_pages 小于实际页数就必然中止，这个参数等于死的。
     truncated=True 会一路传到汇总，让人一眼看出「这批不是全量」。
 
-    known_order_nos 非空即【增量模式】：翻到「本页订单号全部已登记」就停（判据见
+    known_order_nos 非空即【增量模式】：翻到「本页出现已登记订单号」就停（判据见
     should_stop_incremental），不再翻完全部页。早停同样跳过「已选==总数」校验——本就只
-    选了前几页。判定为全已知的那一页【照样勾选导出】：判重键是订单号+尺码，订单号已登记
+    选了前几页。触发早停的那一页【照样勾选导出】：判重键是订单号+尺码，订单号已登记
     不代表它每个尺码都登记了（同订单新增尺码是真实情况），跳过就漏行；重叠的旧单由判重
     挡掉，代价只是多导出几十行。
     增量早停与 truncated 语义相反（那个是「可能漏」，这个是「故意只取新的、不漏」），
@@ -1361,7 +1438,7 @@ async def sweep_pages(
             page_new = len(page_orders) - page_known
             if page_new:
                 seen_new = True
-            # 护栏 B（best-effort）：读不到创建时间就返回空串，自动降级到只靠交错检测
+            # 排序护栏（best-effort）：读不到创建时间就返回空串，降级到无护栏
             if not desc_broken:
                 broken = check_created_desc(prev_created, page_orders)
                 if broken:
@@ -1372,12 +1449,12 @@ async def sweep_pages(
 
             if not desc_broken:
                 stop, reason = should_stop_incremental(page_orders, known, seen_new)
-                if reason and not stop:
-                    # 交错：不早停，翻完全量把空洞补上（reason 已说明原因）
-                    desc_broken = True
-                    logger.warning(f"{reason}")
-                elif stop:
+                if stop:
                     stopped_early, stop_reason = True, reason
+                elif reason:
+                    # 只剩「本页读不到订单号」一种：本页不参与判断、继续翻下一页即可。
+                    # 绝不因此置 desc_broken——那会让一次瞬时 DOM 读失败毒化整批增量。
+                    logger.warning(f"{reason}（本页不参与增量判断，继续翻页）")
 
         if on_page:
             # 回调可能是协程函数（service 层的 _emit 是 async），返回值是 awaitable 就 await。
@@ -1422,7 +1499,7 @@ async def sweep_pages(
     return {"images": images, "pages": pages, "total": total, "selected": sel,
             "truncated": truncated, "stopped_early": stopped_early,
             "stop_reason": stop_reason,
-            # 排序校验或交错检测触发过 → 本批实际走了全量，汇总里要能看出增量没生效
+            # 排序校验触发过 → 本批实际走了全量，汇总里要能看出增量没生效
             "fell_back": bool(known) and desc_broken}
 
 

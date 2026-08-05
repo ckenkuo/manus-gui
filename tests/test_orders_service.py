@@ -12,6 +12,7 @@ WPS 工作簿（复用 test_wps_excel_batch 的构造思路，走真实 append_r
 import asyncio
 import re
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -209,6 +210,11 @@ def _isolate_output(tmp_path, monkeypatch):
     monkeypatch.setattr(S, "get_output_dir", lambda kind="": out)
 
 
+# 带「创建时间新→旧」排序的列表 URL。增量早停的正确性压在这个排序上，
+# service 会在增量生效前校验它（check_list_sort_url）。
+_SORTED_URL = "https://x/orders.html?queryType=2&sortType=1"
+
+
 def _patch_collect(monkeypatch, orders, store="StoreA"):
     """把 run_orders_batch 的外部依赖全换成假的，并钉死配置。
 
@@ -228,8 +234,10 @@ def _patch_collect(monkeypatch, orders, store="StoreA"):
             "join": {"image": 0, "price": 0, "miss": len(orders)},
         }
 
+    # list_url 必须带 sortType=1：增量模式下 service 会前置校验排序（见
+    # pipeline.check_list_sort_url），不带就整批中止，跟被测行为无关的用例会全红
     monkeypatch.setattr(S, "load_orders_config", lambda: {
-        "list_url": "https://x", "dedupe_by": ["订单号", "尺码"],
+        "list_url": _SORTED_URL, "dedupe_by": ["订单号", "尺码"],
         "sheet_map": SHEET_MAP,
     })
     monkeypatch.setattr(S, "collect_orders", fake_collect)
@@ -258,7 +266,7 @@ def test_dry_run_does_not_touch_workbook(workbook, monkeypatch):
     _patch_collect(monkeypatch, [_order("PO-新A", "32"), _order("PO-新B", "34")])
     before = workbook.read_bytes()
 
-    res = _run(dry_run=True, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert workbook.read_bytes() == before, "dry-run 不得改动登记表一个字节"
     assert res["dry_run"] is True
@@ -271,6 +279,50 @@ def test_dry_run_does_not_touch_workbook(workbook, monkeypatch):
     assert types[0] == "started" and types[-1] == "done"
 
 
+def test_purchase_out_dir_groups_by_date(tmp_path, monkeypatch):
+    """采购汇总按天分目录：日期取 stamp 前 8 位，同一天多批共用一个目录。"""
+    root = tmp_path / "订单采购汇总"
+    monkeypatch.setattr(S, "get_output_dir", lambda kind="": root)
+
+    first = S._purchase_out_dir("20260805_101530")
+    second = S._purchase_out_dir("20260805_193000")
+
+    assert first == root / "20260805" and first.is_dir()
+    assert second == first, "同一天的两批不该拆成两个目录"
+
+
+def test_purchase_out_dir_falls_back_to_today_without_stamp(tmp_path, monkeypatch):
+    """stamp 拿不到（导出文件名异常）时退回当天日期，不能落到分类根目录去。"""
+    root = tmp_path / "订单采购汇总"
+    monkeypatch.setattr(S, "get_output_dir", lambda kind="": root)
+
+    out = S._purchase_out_dir("batch")
+
+    assert out.parent == root and out.name.isdigit() and len(out.name) == 8
+
+
+def test_purchase_files_land_in_date_folder(workbook, monkeypatch, tmp_path):
+    """整批跑完，xlsx 与 md 都在同一个日期子目录里，不再堆在分类根目录。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL)
+
+    xlsx, md = Path(res["purchase"]["file"]), Path(res["purchase"]["md_file"])
+    assert xlsx.parent == md.parent, "同批两份产物必须同目录"
+    assert xlsx.parent.name.isdigit() and len(xlsx.parent.name) == 8
+
+
+def test_purchase_filenames_carry_store(workbook, monkeypatch):
+    """店铺名进文件名：多店铺时同一日期目录下要能一眼分辨是哪家店的采购单。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL)
+
+    assert res["purchase"]["store"] == "StoreA"
+    assert Path(res["purchase"]["file"]).name.startswith("StoreA_")
+    assert Path(res["purchase"]["md_file"]).name.startswith("StoreA_")
+
+
 def test_real_run_writes_rows(workbook, monkeypatch):
     """dry_run=False 才落盘，行数与判重口径一致，且能被再次读出来。"""
     _patch_collect(monkeypatch, [
@@ -279,7 +331,7 @@ def test_real_run_writes_rows(workbook, monkeypatch):
         _order("PO-新B", "34"),
     ])
 
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert res["written_rows"] == 2 and res["dup_skipped"] == 1
     assert res["failed_sheets"] == []
@@ -291,7 +343,7 @@ def test_real_run_writes_rows(workbook, monkeypatch):
     assert ("PO-045-已入库", "杏色 / 3-4Y") in keys
 
     # 重复跑一次：全部判重跳过，不再新增
-    res2 = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res2 = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
     assert res2["written_rows"] == 0 and res2["dup_skipped"] == 3
     assert res2["purchase"]["rows"] == 0
 
@@ -303,7 +355,7 @@ def test_write_mode_inserts_quantity_column_and_fills_it(workbook, monkeypatch):
     """写入模式：先给目标表插「数量」列，再把应履约件数写进去（数字，能求和）。"""
     _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="2")])
 
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert res["written_rows"] == 1
     header = WpsExcelTool.read_header(str(workbook), "StoreA全球1")
@@ -327,11 +379,11 @@ def test_write_mode_inserts_quantity_column_and_fills_it(workbook, monkeypatch):
 def test_quantity_column_insert_is_idempotent_across_batches(workbook, monkeypatch):
     """连跑两批不能插出第二列「数量」，判重也不能因为多了一列而失效。"""
     _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="2")])
-    _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="2"),
                                  _order("PO-新B", "34", qty="1")])
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     header = WpsExcelTool.read_header(str(workbook), "StoreA全球1")
     assert [t for t in header.values() if t == "数量"] == ["数量"]
@@ -344,7 +396,7 @@ def test_dry_run_shows_quantity_without_touching_structure(workbook, monkeypatch
     _patch_collect(monkeypatch, [_order("PO-新A", "32", qty="3")])
     before = workbook.read_bytes()
 
-    res = _run(dry_run=True, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert workbook.read_bytes() == before
     preview = res["sheets"]["StoreA全球1"]["preview"][0]
@@ -385,7 +437,7 @@ def test_write_failure_is_reported_not_swallowed(workbook, monkeypatch):
         raise PermissionError("文件被占用")
 
     monkeypatch.setattr(wet.WpsExcelTool, "append_rows", boom)
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert res["failed_sheets"] == ["StoreA全球1"]
     assert res["written_rows"] == 0
@@ -398,7 +450,7 @@ def test_write_failure_is_reported_not_swallowed(workbook, monkeypatch):
 
 def test_aborts_when_workbook_missing(monkeypatch, tmp_path):
     _patch_collect(monkeypatch, [])
-    res = _run(dry_run=True, workbook=str(tmp_path / "不存在.xlsx"), list_url="https://x")
+    res = _run(dry_run=True, workbook=str(tmp_path / "不存在.xlsx"), list_url=_SORTED_URL)
 
     assert "登记表不存在" in res["aborted"]
     assert res["written_rows"] == 0
@@ -409,12 +461,12 @@ def test_lock_precheck_only_blocks_write_mode(workbook, monkeypatch):
     _patch_collect(monkeypatch, [_order("PO-新A", "32")])
     monkeypatch.setattr(S, "excel_write_locked", lambda p: True)
 
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
     assert "正被占用" in res["aborted"] and res["written_rows"] == 0
     # 中止发生在采集之前：不该有任何采集/解析事件
     assert [e["type"] for e in res["_events"]] == ["aborted"]
 
-    dry = _run(dry_run=True, workbook=str(workbook), list_url="https://x")
+    dry = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL)
     assert dry["aborted"] == "" and dry["pending"] == 1
 
 
@@ -425,7 +477,7 @@ def test_aborts_when_cdp_down(workbook, monkeypatch):
         return False
 
     monkeypatch.setattr(S, "ensure_cdp_alive", dead)
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert "CDP 不可用" in res["aborted"] and res["written_rows"] == 0
 
@@ -439,7 +491,7 @@ def test_aborts_when_collect_fails(workbook, monkeypatch):
     monkeypatch.setattr(S, "collect_orders", boom)
     before = workbook.read_bytes()
 
-    res = _run(dry_run=False, workbook=str(workbook), list_url="https://x")
+    res = _run(dry_run=False, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert "识别不到当前登录店铺名" in res["aborted"]
     assert workbook.read_bytes() == before
@@ -459,7 +511,7 @@ def test_explicit_sheet_overrides_site_routing(workbook, monkeypatch):
         _order("PO-新B", "34", site="另一个怪站点"),
     ])
 
-    res = _run(dry_run=True, workbook=str(workbook), list_url="https://x",
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL,
                store="StoreA", sheet="StoreA全球1")
 
     assert res["pending"] == 2 and res["unmapped_skipped"] == 0
@@ -477,7 +529,7 @@ def test_explicit_sheet_reuses_configured_store_value(workbook, monkeypatch):
     })
     _patch_collect(monkeypatch, [_order("PO-新A", "32")])
 
-    res = _run(dry_run=True, workbook=str(workbook), list_url="https://x",
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL,
                store="StoreA", sheet="StoreA全球1")
 
     assert res["sheets"]["StoreA全球1"]["preview"][0]["订单店铺"] == "StoreA全球"
@@ -487,7 +539,7 @@ def test_explicit_sheet_without_store_aborts(workbook, monkeypatch):
     """指定 Sheet 却不给店铺要中止：店铺名要写进「订单店铺」列，没有就没法合成映射。"""
     _patch_collect(monkeypatch, [_order("PO-新A", "32")])
 
-    res = _run(dry_run=True, workbook=str(workbook), list_url="https://x",
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL,
                sheet="StoreA全球1")
 
     assert "必须同时指定店铺" in res["aborted"]
@@ -701,11 +753,15 @@ def test_empty_deal_price_reaches_workbook(workbook, monkeypatch):
 # ---- 增量采集：水位读取与启用条件 ------------------------------------------
 
 
-def test_read_known_order_nos_reads_registered_orders(workbook):
-    """水位＝该 Sheet「订单号」列已登记的值，按真实表头定位列、不硬编码列字母。"""
+def test_read_known_order_nos_reads_only_topmost_order(workbook):
+    """水位＝表头正下方那一条订单号（写入是 insert_at_top，顶端行即最新）。
+
+    刻意断言 len==1：旧实现读整列集合，配合「整页全已登记才停」的判据在稀疏表上
+    结构性失效（见 docs §16.1）。现在只取顶端一条，不受表内行数影响。
+    """
     known = S.read_known_order_nos(str(workbook), "StoreA全球1")
 
-    assert "PO-045-已入库" in known
+    assert known == {"PO-045-已入库"}, "只取最新一条，不再读整列"
 
 
 def test_read_known_order_nos_returns_empty_on_missing_sheet(workbook):
@@ -714,15 +770,46 @@ def test_read_known_order_nos_returns_empty_on_missing_sheet(workbook):
 
 
 def test_incremental_uses_watermark_in_single_sheet_mode(workbook, monkeypatch):
-    """单表模式：水位传给 collect_orders，汇总里标 enabled。"""
+    """单表模式：水位（顶端那条订单号）传给 collect_orders，汇总里标 enabled。"""
     seen = _patch_collect(monkeypatch, [_order("PO-新A", "32")])
 
     res = _run(store="StoreA", dry_run=True, workbook=str(workbook),
                sheet="StoreA全球1")
 
-    assert "PO-045-已入库" in seen["known"], "单表模式必须把已登记订单号当水位传下去"
+    assert seen["known"] == {"PO-045-已入库"}, "单表模式必须把最新那条订单号当水位传下去"
     assert res["incremental"]["enabled"] is True
-    assert res["incremental"]["known"] >= 1
+    assert res["incremental"]["known"] == 1
+    assert res["incremental"]["watermark"] == "PO-045-已入库", "汇总要报出水位供人工核对"
+
+
+def test_incremental_aborts_on_wrong_sort_order(workbook, monkeypatch):
+    """增量模式 + list_url 排序不对 → 整批中止，一条都不采。
+
+    为什么必须中止而不是降级成全量：排序反了，第一页就是最老的单、必然含水位那条，
+    于是停在第 1 页、导出最老的 20 条并被判重全挡掉，汇总显示「待写 0 行、早停」——
+    跟正常的「本批无新单」一模一样。静默漏采比中止危险得多。
+    """
+    seen = _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(store="StoreA", dry_run=True, workbook=str(workbook),
+               sheet="StoreA全球1",
+               list_url="https://x/orders.html?queryType=2&sortType=2")
+
+    assert "sortType=2" in res["aborted"]
+    assert "known" not in seen, "中止要发生在采集之前，不该白翻几分钟页"
+    assert res["pending"] == 0
+
+
+def test_full_scan_does_not_check_sort_order(workbook, monkeypatch):
+    """关掉增量 → 不校验排序：全量翻完所有页，本来就不依赖顺序，不该拦。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(store="StoreA", dry_run=True, workbook=str(workbook),
+               sheet="StoreA全球1", incremental=False,
+               list_url="https://x/orders.html?queryType=2&sortType=2")
+
+    assert not res["aborted"], "全量模式不依赖排序，排序参数不对也该照跑"
+    assert res["pending"] == 1
 
 
 def test_incremental_disabled_when_sheet_map_routing(workbook, monkeypatch):

@@ -375,6 +375,49 @@ def test_export_purchase_markdown_escapes_pipe(tmp_path):
     assert "连衣裙\\|夏款" in Path(result["md_file"]).read_text(encoding="utf-8")
 
 
+# ---- 文件名带店铺名：多店铺采购时要能一眼分辨 -------------------------------
+
+
+def test_purchase_file_stem_prefixes_store():
+    """店铺名放最前面，同店的文件按名称排序自然聚在一起。"""
+    assert P.purchase_file_stem("新增订单采购汇总", "StoreA", "20260805_101530") == \
+        "StoreA_新增订单采购汇总_20260805_101530"
+
+
+def test_purchase_file_stem_strips_illegal_chars():
+    """店名是页面自由文本，带 Windows 非法字符会让写文件直接失败。"""
+    assert P.purchase_file_stem("汇总", 'A/B:C*?"<>|D', "20260805") == "ABCD_汇总_20260805"
+
+
+def test_purchase_file_stem_without_store_keeps_old_format():
+    """没识别到店铺时退回原格式，不留「_」空占位。"""
+    assert P.purchase_file_stem("汇总", "", "20260805") == "汇总_20260805"
+    assert P.purchase_file_stem("汇总", "  ", "20260805") == "汇总_20260805"
+
+
+def test_export_purchase_files_carry_store_name(tmp_path):
+    """xlsx 与 md 的文件名都带店铺；md 正文抬头也写店铺（会被整段贴去对量）。"""
+    orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
+                     sku_id="SKU-A", qty="1")]
+
+    xlsx = P.export_purchase_summary(orders, str(tmp_path), "20260805", "StoreB")
+    md = P.export_purchase_markdown(orders, str(tmp_path), "20260805", "StoreB")
+
+    assert Path(xlsx["file"]).name == "StoreB_新增订单采购汇总_20260805.xlsx"
+    assert Path(md["md_file"]).name == "StoreB_新增订单采购统计_20260805.md"
+    assert "- 店铺：StoreB" in Path(md["md_file"]).read_text(encoding="utf-8")
+
+
+def test_export_purchase_markdown_omits_store_line_when_unknown(tmp_path):
+    """店铺为空时不留「- 店铺：」空行。"""
+    orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
+                     sku_id="SKU-A", qty="1")]
+
+    md = P.export_purchase_markdown(orders, str(tmp_path), "20260805")
+
+    assert "店铺：" not in Path(md["md_file"]).read_text(encoding="utf-8")
+
+
 # ---- 增量早停判据（纯函数，不需要浏览器）-----------------------------------
 
 
@@ -395,10 +438,10 @@ def test_stop_when_whole_page_known_after_seeing_new():
     assert stop is True and "追上" in reason
 
 
-def test_no_stop_while_page_has_new_orders():
-    """本页还有没登记的单 → 继续翻。"""
+def test_no_stop_while_page_is_all_new():
+    """本页一条已登记的都没有 → 还没追上，继续翻。"""
     stop, reason = P.should_stop_incremental(
-        _page("PO-new", "PO-1"), {"PO-1"}, seen_new=False
+        _page("PO-new1", "PO-new2"), {"PO-1"}, seen_new=False
     )
     assert stop is False and reason == ""
 
@@ -411,15 +454,26 @@ def test_stop_on_first_page_all_known_means_no_new_orders():
     assert stop is True and "未发现新单" in reason
 
 
-def test_interleaved_known_and_new_blocks_early_stop():
-    """已登记与未登记交错 → 不早停：排序可能被改，或表里有空洞，都要翻完全量。
+def test_stop_on_single_known_order_amid_new_ones():
+    """稀疏水位：整页只有 1 条已登记、前后都是新单 → 照样停。
 
-    这是主力护栏，纯顺序判断、不依赖任何时间字段。
+    2026-08-04 实机回归：新建 Sheet 只登记过 1 个订单号，它出现在第 4 页中间，
+    前面的更新、后面的更旧，都没登记过。旧判据要求「整页全已登记」，水位只有 1 条时
+    恒不成立，还会被交错检测判成「排序可能被改」而退全量，实际翻了 63 页。
     """
     stop, reason = P.should_stop_incremental(
-        _page("PO-1", "PO-new", "PO-2"), {"PO-1", "PO-2"}, seen_new=True
+        _page("PO-new1", "PO-new2", "PO-1", "PO-new3", "PO-new4"),
+        {"PO-1"}, seen_new=True,
     )
-    assert stop is False and "交错" in reason
+    assert stop is True and "追上" in reason and "PO-1" in reason
+
+
+def test_stop_when_known_order_is_last_on_page():
+    """已登记单出现在页尾 → 停（它之后的都更旧，不是新单）。"""
+    stop, reason = P.should_stop_incremental(
+        _page("PO-new1", "PO-new2", "PO-1"), {"PO-1"}, seen_new=True
+    )
+    assert stop is True and "追上" in reason
 
 
 def test_empty_page_does_not_stop():
@@ -432,6 +486,36 @@ def test_empty_watermark_never_stops():
     """水位为空（首次登记）→ 全是新单，自然翻到底。"""
     stop, _ = P.should_stop_incremental(_page("PO-1", "PO-2"), set(), seen_new=False)
     assert stop is False
+
+
+def test_check_list_sort_url_accepts_desc():
+    """sortType=1（创建时间新→旧）→ 通过。"""
+    url = "https://x/orders.html?fulfillmentMode=0&queryType=2&sortType=1&timeZone=UTC%2B8"
+    assert P.check_list_sort_url(url) == ""
+
+
+def test_check_list_sort_url_rejects_wrong_sort():
+    """sortType 不是 1 → 返回中止文案，且要指明怎么改、怎么绕。
+
+    这是静默漏采的唯一确定性护栏：排序反了会停在第 1 页，汇总却显示「本批无新单」。
+    """
+    err = P.check_list_sort_url("https://x/orders.html?queryType=2&sortType=2")
+
+    assert "sortType=2" in err
+    assert "config.toml" in err, "要告诉操作者去哪儿改"
+    assert "--no-incremental" in err, "要给出不改配置也能跑的出路"
+
+
+def test_check_list_sort_url_rejects_missing_sort():
+    """URL 里压根没有 sortType → 同样中止：无法确认排序就不能信早停。"""
+    err = P.check_list_sort_url("https://x/orders.html?queryType=2")
+
+    assert "没有 sortType" in err and "config.toml" in err
+
+
+def test_check_list_sort_url_ignores_empty_url():
+    """list_url 为空 → 交给调用方的必填校验报，这里不重复报。"""
+    assert P.check_list_sort_url("") == ""
 
 
 def test_check_created_desc_accepts_descending():
@@ -453,7 +537,7 @@ def test_check_created_desc_flags_newer_than_prev_page():
 
 
 def test_check_created_desc_degrades_without_times():
-    """列表页读不到创建时间 → 返回空串，静默降级到只靠交错检测。"""
+    """列表页读不到创建时间 → 返回空串，静默降级到无排序护栏。"""
     assert P.check_created_desc("2026-07-28 10:00:00", _page("PO-1", "PO-2")) == ""
 
 
@@ -1038,27 +1122,51 @@ def test_sweep_early_stop_skips_total_check(monkeypatch):
     assert res["stopped_early"] is True and res["selected"] < res["total"]
 
 
-def test_sweep_falls_back_to_full_on_interleave(monkeypatch):
-    """页内已登记与未登记交错 → 退全量翻到底，并标 fell_back。
+def test_sweep_stops_on_sparse_watermark(monkeypatch):
+    """稀疏水位回归：水位只有 1 条、它在第 4 页中间 → 停在第 4 页，不翻到底。
 
-    交错意味着排序被改（会漏单）或表里有空洞（要补齐），两种都必须翻完。
+    2026-08-04 实机 bug 的最小复现（原先翻了 63 页）：旧判据要整页全已登记才停，
+    水位 1 条时永不成立；且第 4 页「新单→已登记→新单」的排布会被交错检测判成排序异常
+    而永久退全量。两个缺陷叠加使增量在新建表上完全失效。
     """
     _patch_sweep_incremental(monkeypatch, {
-        1: _page("PO-old1", "PO-new1"),   # 已登记后又出现新单 = 交错
-        2: _page("PO-old2"),
-        3: _page("PO-old3"),
-        4: _page("PO-old4"),
-        5: _page("PO-old5"),
+        1: _page("PO-n1", "PO-n2"),
+        2: _page("PO-n3", "PO-n4"),
+        3: _page("PO-n5", "PO-n6"),
+        4: _page("PO-n7", "PO-old1", "PO-n8"),   # 已登记单夹在新单中间
+        5: _page("PO-n9"),
     })
 
     res = asyncio.run(P.sweep_pages(
-        object(), max_pages=5,
-        known_order_nos={"PO-old1", "PO-old2", "PO-old3", "PO-old4", "PO-old5"},
+        object(), max_pages=5, known_order_nos={"PO-old1"},
     ))
 
-    assert res["stopped_early"] is False
-    assert res["fell_back"] is True, "退全量要能在汇总里看出来"
-    assert res["pages"] == 5
+    assert res["pages"] == 4, "遇到已登记单就停，不该翻到第 5 页"
+    assert res["stopped_early"] is True
+    assert res["fell_back"] is False, "稀疏水位是正常状态，不该报退全量"
+
+
+def test_sweep_unreadable_page_does_not_poison_batch(monkeypatch):
+    """某页读不到订单号 → 只跳过本页，后续页照常判早停，绝不整批退全量。
+
+    read_page_orders 是 best-effort（DOM 瞬时读失败返回空表），它的语义是「本页不参与
+    判断」。改动前调用点把这种情形也置了 desc_broken，一次瞬时失败就让整批增量失效。
+    """
+    _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-n1"),
+        2: [],                    # 读不到
+        3: _page("PO-old1"),
+        4: _page("PO-old2"),
+        5: _page("PO-old3"),
+    })
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5, known_order_nos={"PO-old1", "PO-old2", "PO-old3"},
+    ))
+
+    assert res["pages"] == 3, "第 2 页读不到只跳过本页，第 3 页照样早停"
+    assert res["stopped_early"] is True
+    assert res["fell_back"] is False
 
 
 def test_sweep_without_watermark_keeps_full_behavior(monkeypatch):
@@ -1074,8 +1182,8 @@ def test_sweep_without_watermark_keeps_full_behavior(monkeypatch):
 def test_sweep_reports_new_and_known_counts_per_page(monkeypatch):
     """页进度要带本页新/已登记计数，UI 上才看得出增量在起作用。"""
     _patch_sweep_incremental(monkeypatch, {
-        1: _page("PO-new1", "PO-old1"),
-        2: _page("PO-old1", "PO-old2"),
+        1: _page("PO-new1", "PO-new2"),
+        2: _page("PO-new3", "PO-old1"),
     })
     got = []
 
@@ -1087,4 +1195,5 @@ def test_sweep_reports_new_and_known_counts_per_page(monkeypatch):
         known_order_nos={"PO-old1", "PO-old2"},
     ))
 
-    assert (got[0]["new_on_page"], got[0]["known_on_page"]) == (1, 1)
+    assert (got[0]["new_on_page"], got[0]["known_on_page"]) == (2, 0)
+    assert (got[1]["new_on_page"], got[1]["known_on_page"]) == (1, 1)

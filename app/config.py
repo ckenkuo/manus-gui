@@ -37,6 +37,8 @@ OUTPUT_SUBDIRS = {
     "orders_export": "订单导出",
     # 订单登记管线：按子订单号命名的产品主图（写入登记表前的落地副本）
     "orders_image": "订单商品图片",
+    # 订单登记管线：本批采购汇总 xlsx + md。实际落在其下的 <YYYYMMDD>/ 里按天归档，
+    # 见 app/orders/service.py 的 _purchase_out_dir（一天多批共用一个日期目录）
     "orders_purchase": "订单采购汇总",
     # 订单登记管线 dry-run 的「待写计划」CSV：日志只打 3 行，逐行核对靠这个
     "orders_plan": "订单待写计划",

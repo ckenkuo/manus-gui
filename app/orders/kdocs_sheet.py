@@ -251,6 +251,25 @@ class KdocsSheet:
         header = {index_to_col(ci): t for ci, t in sorted(by_row[best_row].items())}
         return header, best_row + 1
 
+    def first_data_value(self, sheet_name: str, col: str, header_row: int) -> str:
+        """读某列表头正下方第一个非空值，作增量水位。口径同本地同名方法。
+
+        写入是 insert_at_top，所以数据区顶端那行就是上次登记的最新一条。
+        """
+        ci = col_to_index(col)
+        row_from = header_row  # 0-based 的表头下一行
+        row_to = min(
+            int(self.sheets_info()[sheet_name].get("row_to", 0)), row_from + 199
+        )
+        if row_to < row_from:
+            return ""
+        cells = self._get_range(sheet_name, row_from, row_to, ci, ci)
+        for c in sorted(cells, key=lambda x: int(x["rowFrom"])):
+            text = str(c.get("cellText") or "").strip()
+            if text:
+                return text
+        return ""
+
     def existing_key_values(self, sheet_name: str, col: str,
                             header_row: int) -> set:
         """读某列表头以下的所有值（strip 后非空），作增量水位。口径同本地同名方法。"""

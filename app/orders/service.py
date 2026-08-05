@@ -17,6 +17,7 @@ import csv
 import json
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -30,6 +31,7 @@ from app.collect.service import (
     excel_write_locked,
     list_workbooks,
 )
+from app.cloud_docs import remember as remember_cloud_doc
 from app.config import PROJECT_ROOT, config, get_output_dir
 from app.logger import logger
 from app.orders import pipeline
@@ -128,6 +130,9 @@ def save_prefs(store: str = "", workbook: str = "", sheet: str = "") -> None:
         data["cloud_url"] = workbook.strip()
     else:
         data["workbook"] = workbook
+    # 协作文档链接同时进登记簿（app/cloud_docs.py），下次开页可直接从候选里选
+    if data["cloud_url"]:
+        remember_cloud_doc(data["cloud_url"])
     try:
         ORDERS_PREFS.parent.mkdir(parents=True, exist_ok=True)
         ORDERS_PREFS.write_text(
@@ -286,16 +291,24 @@ def get_worklist_status(
 
 def read_known_order_nos(workbook: str, sheet: str,
                          cloud: Optional[KdocsSheet] = None) -> set:
-    """读某 Sheet 已登记的订单号集合，作增量采集的水位。纯读，失败返回空集。
+    """读某 Sheet【最新登记的那一条】订单号，作增量采集的水位。纯读，失败返回空集。
+
+    取的是表头正下方第一个非空订单号（`first_data_value`）。为什么单条就够：写入走的是
+    insert_at_top（新行插到表头正下方）+ 写入前按创建时间倒序排（见 plan_writes），所以
+    数据区顶端那行必然是上次登记的最新一条。页面也是新→旧，翻页遇到它就是「追上」。
+
+    为什么不再读整列集合：整列在稀疏表上反而有害。旧实现配合「整页全已登记才停」的判据，
+    在新建 Sheet（表里只有几条）上早停出口结构性走不通，必然翻到底（2026-08-04 实机
+    `WINTAK8.4+` 翻了 63 页，详见 docs §16.1）。单条水位不受表内行数影响，语义也更直白。
+    顺带省掉一次整列扫描（本地是 zip 解压全表、云端是分页拉几千行）。
 
     为什么只在【单表模式】用（调用方保证）：sheet_map 分流一次 sweep 同时喂 7 张表，各表
-    新旧程度不同（某张上周登记过、另一张停了一个月）。取并集会让落后的表被领先的表掩盖——
-    它的旧单在并集里「已知」，于是早停，那批就永远补不回来。单表模式落点唯一、水位唯一，
-    语义无歧义。
+    新旧程度不同（某张上周登记过、另一张停了一个月）。拿其中一张的水位当停止信号会让落后的
+    表永远补不回来。单表模式落点唯一、水位唯一，语义无歧义。
 
-    返回空集＝调用方退回全量 sweep（订单号列缺失、文件损坏都走这条），不会误早停：
-    should_stop_incremental 在水位为空时第一页就全是新单，自然翻到底。
-    cloud 非空时从协作文档读，口径相同。
+    返回值仍是 set（0 或 1 个元素），保持与 sweep_pages / should_stop_incremental 的既有
+    契约不变。空集＝调用方退回全量 sweep（订单号列缺失、空表、文件损坏都走这条），不会误
+    早停：水位为空时判据永远命不中，自然翻到底。cloud 非空时从协作文档读，口径相同。
     """
     try:
         header, header_row, _ = _sheet_schema(workbook, sheet, cloud=cloud)
@@ -307,13 +320,16 @@ def read_known_order_nos(workbook: str, sheet: str,
         logger.warning(f"Sheet「{sheet}」没有「订单号」列，本批退全量采集")
         return set()
     if cloud is not None:
-        known = cloud.existing_key_values(sheet, col=col, header_row=header_row)
+        latest = cloud.first_data_value(sheet, col=col, header_row=header_row)
     else:
-        known = WpsExcelTool.existing_key_values(
+        latest = WpsExcelTool.first_data_value(
             workbook, sheet, col=col, header_row=header_row
         )
-    logger.info(f"Sheet「{sheet}」已登记 {len(known)} 个订单号（增量水位）")
-    return known
+    if not latest:
+        logger.warning(f"Sheet「{sheet}」数据区顶端读不到订单号（空表？），本批退全量采集")
+        return set()
+    logger.info(f"Sheet「{sheet}」最新登记订单号 {latest}（增量水位，翻到它即停）")
+    return {latest}
 
 
 def _sheet_schema(workbook: str, sheet: str,
@@ -722,6 +738,13 @@ async def run_orders_batch(
     elif not sheet:
         inc_reason = "未指定目标 Sheet（按 sheet_map 分站点分流），水位有歧义，本批全量采集"
     else:
+        # 排序前置校验：增量早停靠「翻到已登记那条就停」，排序反了会停在第 1 页并把新单
+        # 全漏掉，且汇总看起来只是「本批无新单」——静默漏采，所以这里【中止】而不是降级。
+        # 只在增量真要生效时校验：全量模式不依赖排序，不该拦（见 check_list_sort_url）。
+        sort_err = pipeline.check_list_sort_url(list_url)
+        if sort_err:
+            await _emit(on_progress, {"type": "aborted", "reason": sort_err})
+            return _summary(dry_run, aborted=sort_err)
         known = read_known_order_nos(workbook, sheet, cloud=cloud)
         if not known:
             inc_reason = "该 Sheet 读不到已登记订单号（首次登记或缺订单号列），本批全量采集"
@@ -768,6 +791,9 @@ async def run_orders_batch(
     purchase = _export_purchase(
         pending_orders,
         Path(got.get("export_file") or "").stem.replace("订单导出_", "") or "batch",
+        # 店铺名进文件名：多店铺时同一日期目录下要能一眼分辨。用 got["store"]（采集时
+        # 实际识别/指定的那家）而不是入参 store——后者可能为空、由 detect_store 补上
+        got.get("store", ""),
     )
     if purchase.get("file") or purchase.get("md_file"):
         await _emit(on_progress, {"type": "purchase_summary", **purchase})
@@ -802,6 +828,8 @@ async def run_orders_batch(
         unpriced=unpriced, purchase=purchase,
         incremental={
             "enabled": bool(known), "known": len(known), "reason": inc_reason,
+            # 水位就是登记表最新那条订单号，报出来便于人工核对停在了哪儿
+            "watermark": next(iter(known), ""),
             "stopped_early": bool(got.get("stopped_early")),
             "stop_reason": got.get("stop_reason", ""),
             "fell_back": bool(got.get("fell_back")),
@@ -812,7 +840,29 @@ async def run_orders_batch(
     return summary
 
 
-def _export_purchase(pending_orders: List[pipeline.OrderRow], stamp: str) -> dict:
+def _purchase_out_dir(stamp: str) -> Path:
+    """采购汇总落到「订单采购汇总/<日期>/」下，按天分文件夹。
+
+    为什么不按批次一批一个目录：一天里往往要跑好几批（补单、换店铺），一批一个目录会把
+    父目录撑成几十个只装两个文件的空壳；而采购是按天推进的活儿，同一天的几批要一起看。
+    日期取自 stamp 前缀（stamp 来自导出文件名 订单导出_YYYYMMDD_HHMMSS），拿不到就用
+    当天日期——同一批的 xlsx 和 md 共用这一次结果，不会被跨零点跑批拆到两个目录里。
+    """
+    date = stamp[:8] if stamp[:8].isdigit() else datetime.now().strftime("%Y%m%d")
+    root = get_output_dir("orders_purchase")
+    target = root / date
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        return target
+    except Exception as e:
+        # 建子目录失败（如目录名被同名文件占了）不该让整份统计导不出来，退回分类根目录
+        logger.warning(f"创建采购汇总日期目录失败，落回 {root}：{e}")
+        return root
+
+
+def _export_purchase(
+    pending_orders: List[pipeline.OrderRow], stamp: str, store: str = ""
+) -> dict:
     """出本批的采购统计：xlsx（筛选核对用）+ md（合并下单速览用），各批一份新文件。
 
     两份各自独立 try：它们是两个用途不同的产物，一个写失败不该连坐另一个。整段都是
@@ -822,7 +872,7 @@ def _export_purchase(pending_orders: List[pipeline.OrderRow], stamp: str) -> dic
     给统计就晚了。
     """
     purchase = {
-        "file": "", "md_file": "", "rows": len(pending_orders),
+        "file": "", "md_file": "", "store": store, "rows": len(pending_orders),
         "groups": 0, "repeated_groups": 0, "total_qty": 0,
         # 商品级：products=涉及几个 SPU，multi_products=要一次买多规格的有几个
         "products": 0, "multi_products": 0, "variants": 0,
@@ -832,13 +882,17 @@ def _export_purchase(pending_orders: List[pipeline.OrderRow], stamp: str) -> dic
     if not pending_orders:
         return purchase
 
-    out_dir = str(get_output_dir("orders_purchase"))
+    out_dir = str(_purchase_out_dir(stamp))
     try:
-        purchase.update(pipeline.export_purchase_summary(pending_orders, out_dir, stamp))
+        purchase.update(
+            pipeline.export_purchase_summary(pending_orders, out_dir, stamp, store)
+        )
     except Exception as e:
         logger.warning(f"导出新增订单采购汇总 xlsx 失败（不影响登记表写入）：{e}")
     try:
-        purchase.update(pipeline.export_purchase_markdown(pending_orders, out_dir, stamp))
+        purchase.update(
+            pipeline.export_purchase_markdown(pending_orders, out_dir, stamp, store)
+        )
     except Exception as e:
         logger.warning(f"导出新增订单采购统计 md 失败（不影响登记表写入）：{e}")
     return purchase
