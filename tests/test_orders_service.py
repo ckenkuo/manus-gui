@@ -605,7 +605,7 @@ def test_prefs_roundtrip(tmp_path, monkeypatch):
 
     assert S.load_prefs() == {
         "store": "StoreB", "workbook": "D:/wb.xlsx", "sheet": "StoreB欧区",
-        "cloud_url": "",
+        "cloud_url": "", "doc_mode": "auto",
     }
 
 
@@ -616,10 +616,26 @@ def test_prefs_cloud_link_goes_to_cloud_url(tmp_path, monkeypatch):
                  sheet="Pawly全球1")
     assert S.load_prefs() == {
         "store": "Pawly", "workbook": "", "sheet": "Pawly全球1",
-        "cloud_url": "https://www.kdocs.cn/l/abc123",
+        "cloud_url": "https://www.kdocs.cn/l/abc123", "doc_mode": "auto",
     }
     S.save_prefs(store="Pawly", workbook="D:/wb.xlsx", sheet="")
     assert S.load_prefs()["cloud_url"] == ""
+
+
+def test_prefs_explicit_mode_keeps_both_targets(tmp_path, monkeypatch):
+    """显式切模式时两侧目标互不覆盖：来回切不用重填对面那个路径。"""
+    monkeypatch.setattr(S, "ORDERS_PREFS", tmp_path / "orders_prefs.json")
+    S.save_prefs(workbook="https://www.kdocs.cn/l/abc", doc_mode="cloud")
+    S.save_prefs(workbook="D:/wb.xlsx", doc_mode="local")
+
+    prefs = S.load_prefs()
+    assert prefs["workbook"] == "D:/wb.xlsx"
+    assert prefs["cloud_url"] == "https://www.kdocs.cn/l/abc", "切本地不该抹掉线上目标"
+    assert prefs["doc_mode"] == "local"
+
+    # 切回线上：本地路径也还在
+    S.save_prefs(workbook="https://www.kdocs.cn/l/abc", doc_mode="cloud")
+    assert S.load_prefs()["workbook"] == "D:/wb.xlsx"
 
 
 def test_worklist_explicit_cloud_link(monkeypatch):
@@ -652,8 +668,164 @@ def test_worklist_explicit_cloud_link(monkeypatch):
         classmethod(lambda cls, p: ["Sheet1"]),
     )
     st = S.get_worklist_status(workbook="D:/local.xlsx")
-    assert "cloud" not in st
+    assert st["cloud"] is False and st["doc_mode"] == "local"
     assert st["sheets"] == ["Sheet1"]
+
+
+# ---- 本地/线上文档模式切换（kdocs 限额时要能立刻切回本地）--------------------
+
+
+def test_doc_mode_local_ignores_config_cloud(monkeypatch, workbook):
+    """选了本地模式，config 配了 cloud_file_id 也不许走云端。"""
+    monkeypatch.setattr(S, "cloud_backend",
+                        lambda cfg, cloud_url="": pytest.fail("本地模式不该构造云端后端"))
+    cfg = {"cloud_file_id": "abc", "workbook": str(workbook)}
+
+    cloud, wb, mode = S.resolve_doc_target(cfg, "", "local", prefs={})
+
+    assert cloud is None and wb == str(workbook) and mode == "local"
+
+
+def test_doc_mode_local_ignores_pasted_cloud_link(monkeypatch, workbook):
+    """本地模式下输入框里残留的 kdocs 链接不能当本地路径用（拿它当文件名必然失败）。"""
+    monkeypatch.setattr(S, "cloud_backend",
+                        lambda cfg, cloud_url="": pytest.fail("本地模式不该构造云端后端"))
+
+    cloud, wb, mode = S.resolve_doc_target(
+        {"workbook": str(workbook)}, "https://www.kdocs.cn/l/abc", "local", prefs={})
+
+    assert cloud is None and wb == str(workbook) and mode == "local"
+
+
+def test_doc_mode_local_returns_empty_when_nothing_known(monkeypatch):
+    """本地模式下没有任何有效路径时回传空串，交给 UI 让用户自己选——不猜。
+
+    登记表选错就是把订单写进别人家的表，这种不可逆落点不该由代码按文件名关键词猜。
+    """
+    cloud, wb, mode = S.resolve_doc_target({}, "", "local", prefs={})
+
+    assert cloud is None and wb == "" and mode == "local"
+
+
+def test_doc_mode_local_skips_stale_config_path():
+    """config/prefs 记的路径已失效（表被改名）时回传空串让用户重选。
+
+    实测过的场景：config 指向 wintop订单登记表7.24.xlsx，实际文件已改名带「（缓存）」。
+    """
+    cloud, wb, _ = S.resolve_doc_target(
+        {"workbook": "D:/已经被改名了.xlsx"}, "", "local",
+        prefs={"workbook": "D:/也不在了.xlsx"})
+
+    assert wb == "", "失效路径不能直接抛给 UI 报「登记表不存在」"
+
+
+def test_doc_mode_local_prefers_existing_pref_path(workbook):
+    """prefs 里的路径文件还在就用它，不必每次都要用户重选。"""
+    cloud, wb, _ = S.resolve_doc_target({}, "", "local",
+                                        prefs={"workbook": str(workbook)})
+
+    assert wb == str(workbook)
+
+
+def test_doc_mode_local_keeps_explicit_path_even_if_missing():
+    """用户这次显式填的路径照用，不做存在性判断——填错了该让他看见报错。"""
+    cloud, wb, _ = S.resolve_doc_target({}, "D:/我就要这个.xlsx", "local", prefs={})
+
+    assert wb == "D:/我就要这个.xlsx"
+
+
+def test_batch_aborts_with_actionable_hint_without_local_workbook(monkeypatch):
+    """本地模式没选表：中止信息要告诉人去哪儿选，不能只报「配置不完整」。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+    monkeypatch.setattr(S, "load_orders_config", lambda: {
+        "list_url": _SORTED_URL, "dedupe_by": ["订单号", "尺码"],
+        "sheet_map": SHEET_MAP,
+    })
+
+    res = _run(dry_run=True, workbook="", doc_mode="local", list_url=_SORTED_URL)
+
+    assert "未选择本地登记表" in res["aborted"]
+    assert res["written_rows"] == 0
+
+
+def test_doc_mode_cloud_uses_pref_url_when_nothing_pasted(monkeypatch):
+    """线上模式没粘链接时用上次那个，不要退回本地。"""
+    seen = {}
+
+    def fake_backend(cfg, cloud_url=""):
+        seen["url"] = cloud_url
+        return object()
+
+    monkeypatch.setattr(S, "cloud_backend", fake_backend)
+
+    cloud, wb, mode = S.resolve_doc_target(
+        {}, "", "cloud", prefs={"cloud_url": "https://www.kdocs.cn/l/old"})
+
+    assert cloud is not None and wb == "" and mode == "cloud"
+    assert seen["url"] == "https://www.kdocs.cn/l/old"
+
+
+def test_doc_mode_auto_explicit_local_path_beats_config_cloud(monkeypatch):
+    """既有 bug 的回归：auto 下显式本地路径必须压制 config 的 cloud_file_id。
+
+    原先这里会去读 config.cloud_file_id 走云端，于是 UI 显示本地、实际写进协作文档，
+    而同名 Sheet 存在时不报任何错——静默落错文档。
+    """
+    monkeypatch.setattr(S, "cloud_backend",
+                        lambda cfg, cloud_url="": pytest.fail("显式本地路径不该走云端"))
+
+    cloud, wb, mode = S.resolve_doc_target(
+        {"cloud_file_id": "abc"}, "D:/local.xlsx", "auto", prefs={})
+
+    assert cloud is None and wb == "D:/local.xlsx" and mode == "local"
+
+
+def test_normalize_doc_mode_tolerates_unknown():
+    """老 prefs 文件里没有这个键，不认识的值一律当 auto，不能让页面打不开。"""
+    assert S.normalize_doc_mode(None) == "auto"
+    assert S.normalize_doc_mode("") == "auto"
+    assert S.normalize_doc_mode("胡写") == "auto"
+    assert S.normalize_doc_mode("CLOUD") == "cloud"
+
+
+def test_worklist_local_lists_desktop_candidates(monkeypatch):
+    """本地模式没选到表：workbook 为空但 workbooks 候选要给全，用户才点得出来。"""
+    monkeypatch.setattr(S, "load_orders_config", lambda: {"dedupe_by": ["订单号"]})
+    monkeypatch.setattr(S, "load_prefs", lambda: {})
+    monkeypatch.setattr(S, "list_workbooks",
+                        lambda: ["C:/Desktop/甲.xlsx", "C:/Desktop/乙.xlsx"])
+
+    st = S.get_worklist_status(doc_mode="local")
+
+    assert st["workbook"] == "" and st["doc_mode"] == "local"
+    assert st["workbooks"] == ["C:/Desktop/甲.xlsx", "C:/Desktop/乙.xlsx"]
+    assert st["sheets"] == [] and st["sheet_info"] == {}
+
+
+def test_batch_aborts_when_cloud_mode_has_no_target(workbook, monkeypatch):
+    """显式选线上却没有可用文档：必须中止，不能静默退回本地表。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+    monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": None)
+
+    res = _run(dry_run=True, workbook="", doc_mode="cloud", list_url=_SORTED_URL)
+
+    assert "线上文档" in res["aborted"] and res["written_rows"] == 0
+
+
+def test_batch_local_mode_ignores_config_cloud(workbook, monkeypatch):
+    """本地模式整批跑通，且全程不碰云端后端（kdocs 限额时的救命路径）。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+    monkeypatch.setattr(S, "load_orders_config", lambda: {
+        "list_url": _SORTED_URL, "dedupe_by": ["订单号", "尺码"],
+        "sheet_map": SHEET_MAP, "cloud_file_id": "should-be-ignored",
+    })
+    monkeypatch.setattr(S, "cloud_backend",
+                        lambda cfg, cloud_url="": pytest.fail("本地模式不该构造云端后端"))
+
+    res = _run(dry_run=False, workbook=str(workbook), doc_mode="local",
+               list_url=_SORTED_URL)
+
+    assert res["written_rows"] == 1 and res["doc_mode"] == "local"
 
 
 def test_load_prefs_tolerates_garbage(tmp_path, monkeypatch):

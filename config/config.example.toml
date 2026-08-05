@@ -167,6 +167,8 @@ price_strategy = "discount_ceiling"
 
 # 商品采集管线（Temu 商品 → 1688 比价 → 成本核算表）的云端协作表格（金山文档）。
 # 填了 cloud_file_id 后，采集默认写入云端而非本地 xlsx；UI/CLI 显式粘贴的链接优先于此。
+# 注意这只是【默认值】：页面上的「本地文档 / 线上文档」开关（或 CLI 的 --doc-mode local）
+# 会压制它——kdocs 有配额，用满了要能不改配置就切回本地表继续干活。
 [collect]
 cloud_file_id = ""
 cloud_link = ""   # 人类可读的分享链接，仅用于 UI 回显
@@ -180,6 +182,9 @@ workbook = "C:\\Users\\<用户名>\\Desktop\\订单登记表.xlsx"
 # 协作文档模式（可选）：cloud_file_id 非空时，订单登记的水位/判重/写入全部打在金山
 # 协作表格上（本地 workbook 不再参与；采购汇总仍落本地）。file_id 用 kdocs-cli 上传
 # 本地表后获得。留空则走本地 xlsx 路径。
+# 同上，这只是【默认值】：页面的「本地文档 / 线上文档」开关（或 --doc-mode local）会压制
+# 它。切本地时若上面的 workbook 也没配（或文件已改名失效），页面会让你从桌面候选里自己
+# 选一张表——登记表选错就是写进别人家的表，代码不替你猜。
 cloud_file_id = ""
 cloud_link = ""
 # 待发货订单页 URL（含筛选参数；管线不切店铺，用当前 CDP 里已登录的那个店）。

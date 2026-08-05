@@ -665,3 +665,44 @@ DISPIMG 数量、`cellimages.xml`、`sharedStrings.xml`、`WpsReserved_CellImgLi
   - 无文件锁预检（云端无占用概念），dry-run 同样需要网络与 kdocs-cli 已认证。
 - 认证：`kdocs-cli auth login`（token 存系统密钥链）；skill 文档见
   `~/.kimi-code/skills/kdocs/SKILL.md`。
+
+### 19.1 本地/线上双轨并存：页面上一键切（2026-08-05）
+
+kdocs 有配额（实测会返 `429001` 限频、更严重时熔断），所以**老的本地路径必须一直可用，
+且要能不改配置就切回去**。为此把「写本地表还是协作文档」从隐式推断改成显式三态
+`doc_mode`：
+
+| 值 | 含义 |
+|----|------|
+| `local` | 只写本地 xlsx。config 配了 `cloud_file_id` 也不理；输入框里残留的 kdocs 链接不当本地路径用；表由用户从候选里选，挑不出就**中止**并提示去选（不猜、不兜底默认表） |
+| `cloud` | 只写协作文档。没粘链接就退 `prefs.cloud_url` > `config.cloud_file_id`；都没有则**中止**，不静默退回本地（否则会写错文档） |
+| `auto` | 历史行为：链接→云端；否则 config 配了云端就云端。老版本 UI/CLI 与旧 prefs 落到这里 |
+
+- 入口：两个页面顶部的「本地文档 / 线上文档」按钮组；CLI 是 `--doc-mode`
+  （[orders_collect.py](../orders_collect.py)、[batch_collect.py](../batch_collect.py)）。
+  接口层 `/orders/worklist`、`/orders/sheet_info`、`/orders/batch`、`/collect/worklist`、
+  `/collect/batch` 全部透传。
+- 解析集中在 [app/orders/service.py](../app/orders/service.py) 的 `resolve_doc_target()`
+  和 [app/collect/service.py](../app/collect/service.py) 的 `resolve_cloud()`，两侧同一套
+  取值。`started` / `batch_start` 事件与汇总都带 `doc_mode`，切错模式能一眼看出来。
+- **本地模式下的表由用户自己选，代码不猜**（2026-08-05 用户明确要求）：曾短暂实现过按
+  文件名关键词自动挑桌面候选，随即去掉——登记表选错就是把订单写进别人家的表，这种不可逆
+  落点不能由启发式决定。现在的口径是 `prefs > config`，两者都失效就回传**空**
+  `workbook`/`excel`，由 UI 让用户从候选下拉里点一个（`list_workbooks()` 已按修改时间
+  倒序扫了桌面与输出目录，候选一直是全的）。见 `_pick_local_workbook()` /
+  `_pick_local_excel()`。
+- **失效路径要跳过**：prefs/config 里记的路径若文件已不在（表被改名很常见），当作没选、
+  回传空串让用户重选，而不是把死路径抛给 UI 报「登记表不存在」。2026-08-05 实测就踩到：
+  config 指向 `wintop订单登记表7.24.xlsx`，实际已改名为 `wintop订单登记表（缓存）.xlsx`。
+  用户**本次显式填的**路径例外，照用不做存在性判断——填错了该让他看见报错。
+- 没选到表时的提示要可操作：service 中止信息是「未选择本地登记表：请在页面的…选一个」而
+  不是笼统的「配置不完整：缺 workbook」；采集侧同样**不再兜底到 `DEFAULT_EXCEL`**（那是
+  写死的备份文件路径，静默落进去比报错更糟）。UI 侧输入框下方给灰字提示、开始按钮置灰，
+  且不弹「路径不存在」红条（还没选不算配置坏了）。
+- prefs 两侧目标互不覆盖（`doc_mode` 显式时）：本地模式只更新 `workbook`、保留
+  `cloud_url`，反之亦然。来回切不用重填对面那个路径。`auto` 时保持原互斥语义，否则残留的
+  旧链接会把用户后来选的本地表盖掉。
+- 顺带修一个既有 bug：`auto` 分支里显式传本地路径时，原先仍会去读 `config.cloud_file_id`
+  走云端——UI 显示本地、实际写进协作文档，且同名 Sheet 存在时不报任何错。collect 侧的
+  `resolve_cloud` 早就防了这个，orders 侧漏了，现已对齐（回归用例
+  `test_doc_mode_auto_explicit_local_path_beats_config_cloud`）。

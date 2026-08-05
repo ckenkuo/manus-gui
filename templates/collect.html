@@ -120,6 +120,41 @@
       <div class="card mb-3">
         <div class="card-body">
           <div class="row g-2 align-items-end">
+            <div class="col-12">
+              <!-- 本地/线上切换：kdocs 有配额，用满了要能立刻切回本地表继续干活。
+                   两侧各记一份目标，来回切不用重填对面那个路径 -->
+              <label class="form-label small text-muted mb-1">文档模式</label>
+              <div class="btn-group btn-group-sm w-100 mb-2" role="group">
+                <input
+                  type="radio"
+                  class="btn-check"
+                  name="docMode"
+                  id="docModeLocal"
+                  value="local"
+                  autocomplete="off"
+                />
+                <label class="btn btn-outline-primary" for="docModeLocal">
+                  <i class="bi bi-hdd"></i> 本地文档
+                  <span class="d-none d-md-inline text-body-tertiary small">
+                    （自动搜桌面表格）
+                  </span>
+                </label>
+                <input
+                  type="radio"
+                  class="btn-check"
+                  name="docMode"
+                  id="docModeCloud"
+                  value="cloud"
+                  autocomplete="off"
+                />
+                <label class="btn btn-outline-primary" for="docModeCloud">
+                  <i class="bi bi-cloud"></i> 线上文档
+                  <span class="d-none d-md-inline text-body-tertiary small">
+                    （金山协作表格）
+                  </span>
+                </label>
+              </div>
+            </div>
             <div class="col-12 col-md-5">
               <label class="form-label small text-muted mb-1">
                 目标工作簿
@@ -399,8 +434,13 @@
             )
             .join("");
         $("inputExcel").value = s.excel || "";
-        // 云端目标给个明确标识，避免把链接当成本地路径误解
-        $("excelHint").textContent = s.cloud ? "协作文档（在线表格）" : "";
+        // 云端目标给个明确标识，避免把链接当成本地路径误解；本地模式没选到表时提示去选
+        // （后端刻意不猜——写错表要人工回滚）
+        $("excelHint").textContent = s.cloud
+          ? "协作文档（在线表格）"
+          : s.excel
+          ? ""
+          : "请从下拉候选里选一个本地工作簿（桌面上的 xlsx 已列出）";
 
         // Sheet 下拉：选中工作簿的所有表；首项为「请选择」
         const sheetSel = $("selSheet");
@@ -439,12 +479,19 @@
             .join("");
       }
 
+      // 当前选中的文档模式；首屏未渲染时返回空串＝让后端按上次选择决定
+      function docMode() {
+        return document.querySelector('input[name="docMode"]:checked')?.value || "";
+      }
+
       async function loadWorklist() {
         try {
           const qs = new URLSearchParams({
             excel: sel.excel,
             sheet: sel.sheet,
             store: sel.store,
+            // 每次都带上：否则切过模式后再切 Sheet，后端会按 prefs 里的旧模式解析
+            doc_mode: docMode(),
           });
           const r = await fetch("/collect/worklist?" + qs.toString());
           const s = await r.json();
@@ -455,6 +502,8 @@
           sel.sheet = s.sheet || "";
           sel.store = s.store || "";
           sel.status = s.status || "";
+          // 回显后端实际生效的模式（本地模式下 excel 可能是自动挑的桌面候选）
+          $(s.doc_mode === "cloud" ? "docModeCloud" : "docModeLocal").checked = true;
           fillSelectors(s);
           renderStats(s);
           renderTable();
@@ -546,6 +595,7 @@
               excel: sel.excel,
               sheet: sel.sheet,
               store: sel.store,
+              doc_mode: docMode(),
             }),
           });
           const { job_id } = await r.json();
@@ -609,6 +659,16 @@
       $("selSheet").addEventListener("change", (e) => {
         sel.sheet = e.target.value;
         loadWorklist(); // 重算该 Sheet 下的 done/todo
+      });
+      // 切本地/线上：目标表整个换了，excel 清空交给后端按该模式重新解析（本地模式会自动
+      // 挑桌面候选），Sheet 一并清掉——新文档里旧 Sheet 未必存在
+      ["docModeLocal", "docModeCloud"].forEach((id) => {
+        $(id).addEventListener("change", (e) => {
+          if (!e.target.checked) return;
+          sel.excel = "";
+          sel.sheet = "";
+          loadWorklist();
+        });
       });
       $("selStore").addEventListener("change", (e) => {
         sel.store = e.target.value;

@@ -64,6 +64,91 @@ def cloud_backend(cfg: dict, cloud_url: str = "") -> Optional[KdocsSheet]:
     return KdocsSheet(target)
 
 
+# 文档模式：UI 上的「本地文档 / 线上文档」开关值。auto 是历史行为（按链接形态和
+# config 自动判定），local/cloud 是用户显式钉死。
+DOC_MODE_AUTO = "auto"
+DOC_MODE_LOCAL = "local"
+DOC_MODE_CLOUD = "cloud"
+_DOC_MODES = (DOC_MODE_AUTO, DOC_MODE_LOCAL, DOC_MODE_CLOUD)
+
+
+def normalize_doc_mode(value: Optional[str]) -> str:
+    """把外部传进来的模式值收敛到三个合法值之一；不认识的一律当 auto。
+
+    不认识就退 auto 而不是报错：这个值来自 UI/CLI/prefs 三处，其中 prefs 是历史文件
+    （老版本存的 JSON 里根本没有这个键），报错会让开过旧版的人一开页就红。
+    """
+    v = str(value or "").strip().lower()
+    return v if v in _DOC_MODES else DOC_MODE_AUTO
+
+
+def resolve_doc_target(
+    cfg: dict, workbook: str = "", doc_mode: str = DOC_MODE_AUTO,
+    prefs: Optional[dict] = None,
+) -> tuple:
+    """解析本批到底写本地表还是协作文档，返回 (cloud, workbook, mode)。
+
+    cloud 为 None＝本地模式，此时 workbook 是本地 xlsx 路径；cloud 非空＝云端模式，
+    workbook 返回空串（本地路径不参与读写）。mode 是实际生效的模式，回给 UI 回显。
+
+    为什么要显式三态而不是继续「看链接形态自动判」：kdocs 有配额，用满了要能立刻切回
+    本地表继续干活（2026-08-05 用户要求）。auto 模式下只要 config 配了 cloud_file_id
+    就永远走云端，用户没有不改配置就切回本地的办法。
+
+    - local：只认本地路径。即便 workbook 传进来是个 kdocs 链接也不用它（链接不是本地
+      路径，拿它当文件名必然失败），改用 prefs/config 里的本地表，再兜底桌面自动挑。
+    - cloud：只认协作文档。workbook 是链接就用它，否则退 prefs.cloud_url > config。
+    - auto：保持改动前的行为（链接→云端；否则 config 配了云端就云端）。
+
+    顺带修一个既有 bug：auto 分支里显式传本地路径时原先仍会去读 config.cloud_file_id，
+    于是用户在 UI 选了本地表、实际却写进云端文档（同名 Sheet 存在时不报任何错）。
+    collect 侧的 resolve_cloud 早就防了这个，orders 侧漏了，这里对齐。
+    """
+    mode = normalize_doc_mode(doc_mode)
+    wb = (workbook or "").strip()
+    prefs = prefs if prefs is not None else load_prefs()
+
+    if mode == DOC_MODE_LOCAL:
+        if wb and not is_cloud_link(wb):
+            return None, wb, mode   # 用户这次显式选的，照用不做存在性判断
+        # 挑不出就返回空串：由 UI 让用户从候选里选，不猜（见 _pick_local_workbook）
+        return None, _pick_local_workbook(cfg, prefs), mode
+
+    if mode == DOC_MODE_CLOUD:
+        url = wb if is_cloud_link(wb) else str(prefs.get("cloud_url") or "").strip()
+        return cloud_backend(cfg, cloud_url=url), "", mode
+
+    if is_cloud_link(wb):
+        return cloud_backend(cfg, cloud_url=wb), "", DOC_MODE_CLOUD
+    if wb:
+        # 显式本地路径压制 config 的云端目标（对齐 collect.resolve_cloud）
+        return None, wb, DOC_MODE_LOCAL
+    pref_url = str(prefs.get("cloud_url") or "").strip()
+    if pref_url or str(cfg.get("cloud_file_id") or "").strip():
+        return cloud_backend(cfg, cloud_url=pref_url), "", DOC_MODE_CLOUD
+    local = str(prefs.get("workbook") or "").strip() \
+        or str(cfg.get("workbook") or "").strip()
+    return None, local, DOC_MODE_LOCAL
+
+
+def _pick_local_workbook(cfg: dict, prefs: dict) -> str:
+    """本地模式下没有本次显式选择时的登记表：prefs > config，两者都失效则返回空串。
+
+    **刻意不猜**（2026-08-05 用户要求）：登记表选错就是把订单写进别人家的表，这种不可逆
+    的落点不该由代码按文件名关键词猜。返回空串时 UI 的工作簿下拉里已经有桌面候选
+    （list_workbooks 按修改时间倒序扫桌面与输出目录），让用户自己点一个。
+
+    路径要先确认**文件还在**：登记表常被改名（如加日期后缀、加「（缓存）」），config 里那条
+    就成了死路径。失效时返回空串让用户重选，而不是把死路径抛给 UI 报「登记表不存在」
+    （2026-08-05 实测 config 指向 wintop订单登记表7.24.xlsx，实际已改名为「（缓存）」）。
+    """
+    for path in (str(prefs.get("workbook") or "").strip(),
+                 str(cfg.get("workbook") or "").strip()):
+        if path and Path(path).exists():
+            return path
+    return ""
+
+
 @dataclass
 class SheetPlan:
     """一个目标 Sheet 的写入计划（dry-run 展示与实写共用同一份数据）。"""
@@ -118,20 +203,36 @@ def load_prefs() -> dict:
         return {}
 
 
-def save_prefs(store: str = "", workbook: str = "", sheet: str = "") -> None:
+def save_prefs(store: str = "", workbook: str = "", sheet: str = "",
+               doc_mode: str = "") -> None:
     """记住本次选择，供下次 UI 缺省回填。写失败只告警、不阻断本批。
 
     workbook 是协作文档链接时存到 cloud_url（与本地路径分开）：下次首屏按
     「prefs.cloud_url > config.cloud_file_id」回填，而显式选过本地路径则清掉
     cloud_url，避免旧链接盖掉用户后来的选择。
+
+    doc_mode 显式给 local/cloud 时，**两种路径互不覆盖**：本地模式只更新 workbook、保留
+    原来的 cloud_url，云端模式反之。否则用户在两个模式间来回切时，切过去就把另一边记的
+    目标清了，切回来又要重填一次（kdocs 配额用满时切本地、次日切回云端是常规操作）。
+    能这么留是因为模式本身已经把歧义消掉了，不必再靠「哪边有值」来猜。
+
+    doc_mode 为 auto（没传，即老版本 UI/CLI）时保持原来的互斥语义：显式选本地就清掉
+    cloud_url。auto 的目标解析仍靠「cloud_url 有值就走云端」，留着旧链接会把用户后来选的
+    本地表盖掉。
     """
-    data = {"store": store, "sheet": sheet, "workbook": "", "cloud_url": ""}
+    mode = normalize_doc_mode(doc_mode)
+    old = load_prefs() if mode != DOC_MODE_AUTO else {}
+    data = {"store": store, "sheet": sheet, "workbook": "", "cloud_url": "",
+            "doc_mode": mode}
     if is_cloud_link(workbook):
         data["cloud_url"] = workbook.strip()
+        data["workbook"] = str(old.get("workbook") or "")
     else:
         data["workbook"] = workbook
-    # 协作文档链接同时进登记簿（app/cloud_docs.py），下次开页可直接从候选里选
-    if data["cloud_url"]:
+        data["cloud_url"] = str(old.get("cloud_url") or "")
+    # 协作文档链接同时进登记簿（app/cloud_docs.py），下次开页可直接从候选里选。
+    # 只登记本次真正传进来的链接，沿用上面继承的旧值不必再登记一遍
+    if is_cloud_link(workbook):
         remember_cloud_doc(data["cloud_url"])
     try:
         ORDERS_PREFS.parent.mkdir(parents=True, exist_ok=True)
@@ -177,24 +278,33 @@ def inspect_sheet(workbook: str, sheet: str, dedupe_by: Optional[List[str]] = No
 def _cloud_worklist(
     cfg: dict, prefs: dict, cloud_url: str, store: Optional[str],
     sheet: Optional[str], dedupe_by: List[str], store_options: List[str],
+    cloud: Optional[KdocsSheet] = None,
 ) -> dict:
     """云端模式的 worklist：Sheet 列表与可写性都查协作文档，本地枚举不参与。
 
     cloud_url 为空＝用 config 的 cloud_file_id（展示用 cloud_link 回显）。
     读失败（未认证/网络/链接无效）不抛错：返回空列表 + cloud_error，由 UI 红条展示。
+    cloud 已由调用方（resolve_doc_target）解析好时直接复用，避免重复构造。
     """
-    cloud = cloud_backend(cfg, cloud_url=cloud_url)
+    if cloud is None:
+        cloud = cloud_backend(cfg, cloud_url=cloud_url)
     display = cloud_url or str(cfg.get("cloud_link") or cfg.get("cloud_file_id") or "")
     if store is None:
         store = prefs.get("store") or ""
     if sheet is None:
         sheet = prefs.get("sheet") or ""
     cloud_err = ""
-    try:
-        sheets = cloud.sheet_names()
-    except Exception as e:
-        logger.warning(f"读协作文档工作表列表失败：{e}")
-        sheets, cloud_err = [], str(e)
+    sheets: List[str] = []
+    if cloud is None:
+        # 用户显式切到线上模式但压根没有可用目标（config 没配、也没粘过链接）。
+        # 当成「读失败」走同一条 UI 红条通道，提示补链接，别在这里抛错
+        cloud_err = "未指定协作文档：请在上方粘贴 kdocs 链接，或在 config.toml 配 cloud_file_id"
+    else:
+        try:
+            sheets = cloud.sheet_names()
+        except Exception as e:
+            logger.warning(f"读协作文档工作表列表失败：{e}")
+            sheets, cloud_err = [], str(e)
     sheet = sheet if sheet in sheets else ""
     # datalist 候选：当前目标 + 上次用过的 + config 配过的链接，去重保序
     suggestions: List[str] = []
@@ -213,6 +323,7 @@ def _cloud_worklist(
         "dedupe_by": dedupe_by,
         "store_options": store_options,
         "cloud": True,
+        "doc_mode": DOC_MODE_CLOUD,
         "cloud_error": cloud_err,
         "sheet_info": (
             inspect_sheet("", sheet, dedupe_by, cloud=cloud)
@@ -225,12 +336,16 @@ def get_worklist_status(
     store: Optional[str] = None,
     workbook: Optional[str] = None,
     sheet: Optional[str] = None,
+    doc_mode: Optional[str] = None,
 ) -> dict:
     """订单页首屏：可选工作簿/Sheet 列表 + 上次选择回显 + 选中 Sheet 的可写性。
 
-    目标优先级：显式传入（本地路径或粘贴的协作文档链接）> 上次使用的协作链接
-    （prefs.cloud_url）> config 的 cloud_file_id > 本地工作簿（prefs > config）。
-    显式传入本地路径时走本地模式，即使 config 配了云端——用户的选择永远优先。
+    doc_mode 显式给 local/cloud 时钉死走哪条路（UI 上的「本地文档/线上文档」开关）；
+    不给（None）则沿用上次选的模式，再退 auto——auto 的优先级是：显式传入（本地路径或
+    粘贴的协作文档链接）> 上次使用的协作链接（prefs.cloud_url）> config 的
+    cloud_file_id > 本地工作簿（prefs > config）。
+    本地模式下已知路径都失效（表被改名等）时回传空 workbook，由用户从 workbooks 候选里
+    自己选一个——登记表选错就是写进别人家的表，不由代码猜（见 _pick_local_workbook）。
     纯读、不触发任何采集或写入。
     """
     cfg = load_orders_config()
@@ -242,18 +357,16 @@ def get_worklist_status(
     )
 
     wb = (workbook or "").strip()
-    if wb and is_cloud_link(wb):
-        return _cloud_worklist(cfg, prefs, wb, store, sheet, dedupe_by, store_options)
-    if not wb:
-        pref_url = str(prefs.get("cloud_url") or "").strip()
-        if pref_url:
-            return _cloud_worklist(cfg, prefs, pref_url, store, sheet,
-                                   dedupe_by, store_options)
-        if str(cfg.get("cloud_file_id") or "").strip():
-            return _cloud_worklist(cfg, prefs, "", store, sheet,
-                                   dedupe_by, store_options)
+    mode = normalize_doc_mode(
+        doc_mode if doc_mode is not None else prefs.get("doc_mode")
+    )
+    cloud, local_wb, mode = resolve_doc_target(cfg, wb, mode, prefs=prefs)
+    if mode == DOC_MODE_CLOUD:
+        url = wb if is_cloud_link(wb) else str(prefs.get("cloud_url") or "").strip()
+        return _cloud_worklist(cfg, prefs, url, store, sheet, dedupe_by,
+                               store_options, cloud=cloud)
 
-    workbook = wb or prefs.get("workbook") or str(cfg.get("workbook") or "")
+    workbook = local_wb
     if store is None:
         store = prefs.get("store") or ""
     if sheet is None:
@@ -279,10 +392,10 @@ def get_worklist_status(
         "sheets": sheets,
         "dedupe_by": dedupe_by,
         # 店铺候选：sheet_map 里配过的店铺名，供下拉，仍允许手填
-        "store_options": sorted(
-            {str(m.get("store", "")).strip() for m in (cfg.get("sheet_map") or [])
-             if str(m.get("store", "")).strip()}
-        ),
+        "store_options": store_options,
+        "cloud": False,
+        "doc_mode": DOC_MODE_LOCAL,
+        "cloud_error": "",
         "sheet_info": (
             inspect_sheet(workbook, sheet, dedupe_by) if exists and sheet else {}
         ),
@@ -659,6 +772,7 @@ async def run_orders_batch(
     sheet: str = "",
     require_price: bool = False,
     incremental: bool = True,
+    doc_mode: str = "",
 ) -> dict:
     """整批入口：预检 →（读水位）→ 采集 → 计划 →（dry_run 则止步）→ 批量写入 → 汇总。
 
@@ -676,14 +790,10 @@ async def run_orders_batch(
     有歧义（见 read_known_order_nos），一律退全量 sweep 靠判重兜底，行为与改动前一致。
     """
     cfg = load_orders_config()
-    # workbook 参数是协作文档链接时，本批目标就是它（覆盖 config 的 cloud_file_id）；
-    # 是本地路径/空时按原逻辑：config 开了云端走云端，否则本地 xlsx
-    if is_cloud_link(workbook):
-        cloud = cloud_backend(cfg, cloud_url=workbook)
-        workbook = ""
-    else:
-        cloud = cloud_backend(cfg)
-        workbook = workbook or str(cfg.get("workbook") or "")
+    # 本批写本地表还是协作文档：doc_mode 显式给 local/cloud 就钉死，不给则按链接形态和
+    # config 自动判（见 resolve_doc_target）。本地模式下挑不出登记表则 workbook 为空，
+    # 走下面的「缺 workbook」中止，让用户回 UI 自己选一个——不猜。
+    cloud, workbook, doc_mode = resolve_doc_target(cfg, workbook, doc_mode)
     list_url = list_url or str(cfg.get("list_url") or "")
     dedupe_by = list(cfg.get("dedupe_by") or _DEFAULT_DEDUPE_BY)
     sheet = (sheet or "").strip()
@@ -696,10 +806,20 @@ async def run_orders_batch(
     else:
         sheet_map = list(cfg.get("sheet_map") or [])
 
+    # 显式切到线上模式但没有可用目标：直接中止，别静默退回本地表（会写错文档）
+    if cloud is None and doc_mode == DOC_MODE_CLOUD:
+        reason = ("已选「线上文档」但未指定协作文档：请粘贴 kdocs 链接，"
+                  "或在 config.toml 的 [orders] 配 cloud_file_id")
+        await _emit(on_progress, {"type": "aborted", "reason": reason})
+        return _summary(dry_run, aborted=reason)
+    # 本地模式没选到登记表：给可操作的提示，别只报「配置不完整」让人去猜哪儿没配
+    if cloud is None and not workbook:
+        reason = ("未选择本地登记表：请在页面的「订单登记表」里从候选中选一个（或填路径），"
+                  "也可在 config.toml 的 [orders].workbook 配默认值")
+        await _emit(on_progress, {"type": "aborted", "reason": reason})
+        return _summary(dry_run, aborted=reason)
     # 云端模式不需要本地登记表：workbook 缺失/被占用都不再是中止条件
     missing = [n for n, v in (("list_url", list_url),) if not v]
-    if cloud is None and not workbook:
-        missing.append("workbook")
     if missing or not sheet_map:
         reason = f"[orders] 配置不完整：缺 {missing or ['sheet_map']}"
         await _emit(on_progress, {"type": "aborted", "reason": reason})
@@ -727,7 +847,7 @@ async def run_orders_batch(
         "type": "started", "dry_run": dry_run, "workbook": workbook,
         # sheet 非空表示本批不按站点分流，全部进这张表——务必让用户在日志里看见
         "sheet": sheet, "store": store, "incremental": incremental,
-        "cloud": bool(cloud),
+        "cloud": bool(cloud), "doc_mode": doc_mode,
     })
 
     # 水位：采集之前读，纯读操作，dry-run 下同样生效（试跑就是要看有哪些新单）
@@ -825,7 +945,7 @@ async def run_orders_batch(
     summary = _summary(
         dry_run, orders=orders, plans=plans, unmapped=unmapped,
         written=written, got=got, img_stat=img_stat, plan_files=plan_files,
-        unpriced=unpriced, purchase=purchase,
+        unpriced=unpriced, purchase=purchase, doc_mode=doc_mode,
         incremental={
             "enabled": bool(known), "known": len(known), "reason": inc_reason,
             # 水位就是登记表最新那条订单号，报出来便于人工核对停在了哪儿
@@ -989,6 +1109,7 @@ def _summary(
     unpriced: Optional[List[dict]] = None,
     purchase: Optional[dict] = None,
     incremental: Optional[dict] = None,
+    doc_mode: str = "",
 ) -> dict:
     """汇总本批结果。字段对 UI/CLI 都是稳定契约，别随手改名。"""
     plans = plans or {}
@@ -996,6 +1117,8 @@ def _summary(
     return {
         "dry_run": dry_run,
         "aborted": aborted,
+        # 本批实际写的是本地表还是协作文档（local/cloud），供 UI/CLI 收尾时明示落点
+        "doc_mode": doc_mode,
         # 增量采集：enabled/known/stopped_early/fell_back/pages_swept/reason。
         # 与 truncated 分开看：truncated=可能漏，stopped_early=故意只取新单、不漏。
         "incremental": incremental or {"enabled": False, "known": 0, "reason": ""},

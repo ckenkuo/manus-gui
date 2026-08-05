@@ -112,17 +112,64 @@ def cloud_backend(cfg: dict, cloud_url: str = "") -> Optional["KdocsSheet"]:
     return KdocsSheet(target)
 
 
+# 文档模式：UI 上的「本地文档 / 线上文档」开关值，与 orders 侧同一套取值。
+# auto 是历史行为（按链接形态和 config 自动判），local/cloud 是用户显式钉死。
+DOC_MODE_AUTO = "auto"
+DOC_MODE_LOCAL = "local"
+DOC_MODE_CLOUD = "cloud"
+_DOC_MODES = (DOC_MODE_AUTO, DOC_MODE_LOCAL, DOC_MODE_CLOUD)
+
+
+def normalize_doc_mode(value: Optional[str]) -> str:
+    """把外部传进来的模式值收敛到三个合法值之一；不认识的一律当 auto。
+
+    不认识就退 auto 而不是报错：这个值来自 UI/CLI/prefs 三处，其中 prefs 是历史文件
+    （老版本存的 JSON 里没有这个键），报错会让开过旧版的人一开页就红。
+    """
+    v = str(value or "").strip().lower()
+    return v if v in _DOC_MODES else DOC_MODE_AUTO
+
+
+def _pick_local_excel(prefs: dict) -> str:
+    """本地模式下没有本次显式选择时的工作簿：prefs 里那条（文件还在才算），否则空串。
+
+    **刻意不猜**（2026-08-05 用户要求）：写错表要人工回滚，这种落点不该由代码按文件名
+    关键词猜。返回空串时 UI 的工作簿下拉里已经有桌面候选（list_workbooks 按修改时间倒序
+    扫桌面与输出目录），让用户自己点一个。
+
+    路径要先确认文件还在：核算表常被改名（加日期后缀之类），失效时返回空串让用户重选，
+    而不是把死路径抛给 UI 报「表不存在」。
+    """
+    path = str(prefs.get("excel") or "").strip()
+    return path if path and os.path.exists(path) else ""
+
+
 def resolve_cloud(excel: Optional[str] = None,
-                  cloud_url: Optional[str] = None) -> Optional["KdocsSheet"]:
+                  cloud_url: Optional[str] = None,
+                  doc_mode: str = DOC_MODE_AUTO) -> Optional["KdocsSheet"]:
     """按调用方参数解析本批云端目标；返回 None 表示走本地 xlsx。
 
-    优先级：显式给的协作文档链接 → 云端；【显式给的本地路径 → 本地】——必须压制
-    prefs/config 里的云端目标，否则用户改选本地后，这一批仍会被写进旧云端文档
-    （同名 Sheet 存在时不报任何错，直接落错文档）；未显式指定（空/None）→
-    cloud_url 参数 > prefs.cloud_url > [collect].cloud_file_id。
+    doc_mode 显式给 local/cloud 时钉死走哪条路：kdocs 有配额，用满了要能立刻切回本地表
+    继续干活（2026-08-05 用户要求）。auto 模式下只要 config 配了 cloud_file_id 就永远
+    走云端，用户没有不改配置就切回本地的办法。
+      - local：一律返回 None（本地），即便传进来的 excel 是个 kdocs 链接。
+      - cloud：excel 是链接就用它，否则退 cloud_url 参数 > prefs.cloud_url > config。
+      - auto（默认，行为不变）：显式给的协作文档链接 → 云端；【显式给的本地路径 →
+        本地】——必须压制 prefs/config 里的云端目标，否则用户改选本地后，这一批仍会被
+        写进旧云端文档（同名 Sheet 存在时不报任何错，直接落错文档）；未显式指定
+        （空/None）→ cloud_url 参数 > prefs.cloud_url > [collect].cloud_file_id。
     """
+    mode = normalize_doc_mode(doc_mode)
     explicit = (excel or "").strip()
     cfg = load_collect_config()
+    if mode == DOC_MODE_LOCAL:
+        return None
+    if mode == DOC_MODE_CLOUD:
+        url = explicit if is_cloud_link(explicit) else (
+            (cloud_url or "").strip()
+            or str(load_prefs().get("cloud_url") or "").strip()
+        )
+        return cloud_backend(cfg, cloud_url=url)
     if is_cloud_link(explicit):
         return cloud_backend(cfg, cloud_url=explicit)
     if explicit:
@@ -166,7 +213,8 @@ def _looks_like_local_path(value: str) -> bool:
 
 
 def save_prefs(
-    excel: str = "", sheet: str = "", store: str = "", status: str = ""
+    excel: str = "", sheet: str = "", store: str = "", status: str = "",
+    doc_mode: str = "",
 ) -> None:
     """记住本次选择（含采集页签 status），供下次 UI/CLI 缺省回填。写失败只告警、不阻断采集。
 
@@ -174,18 +222,28 @@ def save_prefs(
     （对齐 orders 的 prefs 拆分）：下次首屏按「显式链接 > prefs.cloud_url >
     config.cloud_file_id」解析云端目标；显式选过本地路径则清掉 cloud_url，
     避免旧链接盖掉用户后来的选择。
+
+    doc_mode 显式给 local/cloud 时两侧目标互不覆盖（本地模式保留原 cloud_url，反之亦然），
+    这样在两个模式间来回切不用重填对面那个路径——kdocs 配额用满时切本地、次日切回云端是
+    常规操作。auto（没传，即老版本 UI/CLI）时保持原来的互斥语义：auto 的目标解析仍靠
+    「cloud_url 有值就走云端」，留着旧链接会把用户后来选的本地表盖掉。
     """
+    mode = normalize_doc_mode(doc_mode)
+    old = load_prefs() if mode != DOC_MODE_AUTO else {}
     data = {"excel": "", "cloud_url": "", "sheet": sheet, "store": store,
-            "status": status}
+            "status": status, "doc_mode": mode}
     v = (excel or "").strip()
     if is_cloud_link(v) or (v and not _looks_like_local_path(v)):
         data["cloud_url"] = v
+        data["excel"] = str(old.get("excel") or "")
     else:
         data["excel"] = excel
+        data["cloud_url"] = str(old.get("cloud_url") or "")
     # 协作文档链接同时进登记簿（app/cloud_docs.py），下次开页可直接从候选里选；
-    # 只登记真正的 http(s) 链接，file_id 形态不进登记簿（没法在 UI 里直接选）
-    if data["cloud_url"] and is_cloud_link(data["cloud_url"]):
-        remember_cloud_doc(data["cloud_url"])
+    # 只登记真正的 http(s) 链接，file_id 形态不进登记簿（没法在 UI 里直接选）。
+    # 只登记本次真正传进来的，上面继承的旧值不必再登记一遍
+    if is_cloud_link(v):
+        remember_cloud_doc(v)
     try:
         COLLECT_PREFS.parent.mkdir(parents=True, exist_ok=True)
         COLLECT_PREFS.write_text(
@@ -604,14 +662,18 @@ def get_worklist_status(
     excel: Optional[str] = None,
     sheet: Optional[str] = None,
     store: Optional[str] = None,
+    doc_mode: Optional[str] = None,
 ) -> dict:
     """UI 展示用：返回清单总量 / 已入库 / 待采、可选工作簿/Sheet/店铺列表及每条状态。
 
     不触发任何采集，纯读 worklist.json + 已入库 SPU 集合，供 UI 渲染。
     - excel/sheet/store 均缺省回填「上次选择」偏好，再兜底出厂默认。
+    - doc_mode 显式给 local/cloud 时钉死走哪条路；不给（None）则沿用上次选的模式，
+      再退 auto。本地模式下上次的路径已失效时回传空 excel，由用户从 workbooks 候选里
+      自己选——写错表要人工回滚，不由代码猜（见 _pick_local_excel）。
     - 传了 store → items 过滤到该店；有有效 sheet → done 按该工作簿/Sheet 判重，
       否则 done=None（跨店对单 sheet 判重无意义）。
-    - 回传当前生效的 excel/sheet/store 供 UI 回显选中态。
+    - 回传当前生效的 excel/sheet/store/doc_mode 供 UI 回显选中态。
     - 云端分支：excel 是协作文档链接、或无显式本地目标但 prefs/config 配了云端时，
       Sheet 列表与判重都查协作文档（KdocsSheet）；返回带 cloud=True，读失败不抛错、
       带 cloud_error 由 UI 红条展示（对齐订单页的展示契约）。云端模式不返回
@@ -620,11 +682,32 @@ def get_worklist_status(
     """
     prefs = load_prefs()
     cfg = load_collect_config()
-    # 目标解析（与 run_batch 同一优先级）：显式链接 → 云端；无显式目标时
-    # prefs.cloud_url > config.cloud_file_id → 云端；否则本地（行为不变）。
+    # 目标解析（与 run_batch 同一优先级）：doc_mode 显式钉死 > 显式链接 → 云端；
+    # 无显式目标时 prefs.cloud_url > config.cloud_file_id → 云端；否则本地。
     explicit = (excel or "").strip()
+    mode = normalize_doc_mode(
+        doc_mode if doc_mode is not None else prefs.get("doc_mode")
+    )
     cloud = None
-    if is_cloud_link(explicit):
+    cloud_missing = ""
+    if mode == DOC_MODE_LOCAL:
+        # 输入框里残留的链接不能当本地路径用（拿它当文件名必然失败）
+        excel = (explicit if explicit and not is_cloud_link(explicit) else "") \
+            or _pick_local_excel(prefs)
+    elif mode == DOC_MODE_CLOUD:
+        url = explicit if is_cloud_link(explicit) else (
+            str(prefs.get("cloud_url") or "").strip()
+            or str(cfg.get("cloud_file_id") or "").strip()
+        )
+        if url:
+            cloud = cloud_backend(cfg, cloud_url=url)
+            excel = url
+        else:
+            # 显式选线上但没有可用目标：走同一条 cloud_error 红条通道提示补链接
+            excel = ""
+            cloud_missing = ("未指定协作文档：请在上方粘贴 kdocs 链接，"
+                             "或在 config.toml 配 cloud_file_id")
+    elif is_cloud_link(explicit):
         cloud = cloud_backend(cfg, cloud_url=explicit)
         excel = explicit
     elif not explicit:
@@ -645,8 +728,11 @@ def get_worklist_status(
     worklist = load_worklist()
     stores = summarize_stores(worklist)
     workbooks = list_workbooks()
-    cloud_err = ""
-    if cloud is not None:
+    cloud_err = cloud_missing
+    if cloud_missing:
+        # 线上模式但无目标：没有可读的 Sheet 列表，判重一律空集，等用户补链接
+        sheets, sheet_valid, done = [], False, set()
+    elif cloud is not None:
         try:
             sheets = cloud.sheet_names()
         except Exception as e:
@@ -710,8 +796,11 @@ def get_worklist_status(
         "status_tabs": STATUS_TABS,
         "status": prefs.get("status") or "",
         "items": items,
+        # 实际生效的文档模式，供 UI 回显开关（本地模式恒为 local，即便 config 配了云端）
+        "doc_mode": (DOC_MODE_CLOUD if (cloud is not None or cloud_missing)
+                     else DOC_MODE_LOCAL),
     }
-    if cloud is not None:
+    if cloud is not None or cloud_missing:
         result["cloud"] = True
         result["cloud_error"] = cloud_err
     else:
@@ -1129,11 +1218,15 @@ async def run_batch(
     store: Optional[str] = None,
     base_only: bool = True,
     cloud_url: Optional[str] = None,
+    doc_mode: str = "",
 ) -> dict:
     """跑一批未入库商品的采集，进度经 on_progress 抛出。返回汇总 {ok, fail, batch}。
 
     - excel/sheet 缺省回填「上次选择」偏好、再兜底出厂默认；store 非空则只采该店商品。
       本次组合成功启动后 save_prefs 记住，供下次缺省回填。
+    - doc_mode 显式给 local/cloud 时钉死走本地表还是协作文档（kdocs 有配额，用满要能
+      立刻切回本地）；不给则按 auto 的历史优先级判（见 resolve_cloud）。本地模式下
+      挑不出工作簿则中止并提示回 UI 选，不兜底到 DEFAULT_EXCEL、也不猜。
     - 云端目标（resolve_cloud）：excel 是协作文档链接 → 云端；显式给的本地路径 →
       本地（压制 prefs/config 的云端目标）；未显式指定 → cloud_url 参数 >
       prefs.cloud_url > [collect].cloud_file_id 有值 → 云端；再否则本地 xlsx。
@@ -1146,10 +1239,31 @@ async def run_batch(
     - Excel 被占用 / 清单为空 / CDP 不可用（仅 1688 模式）→ 抛结构化事件并提前返回，不空跑。
     """
     prefs = load_prefs()
+    doc_mode = normalize_doc_mode(doc_mode)
     # 云端目标解析必须在 excel 兜底成默认本地路径【之前】做：显式给的本地路径要能
     # 压制 prefs/config 里的云端目标（resolve_cloud），否则用户改选本地后这一批仍
     # 会被写进旧云端文档。
-    cloud = resolve_cloud(excel, cloud_url)
+    cloud = resolve_cloud(excel, cloud_url, doc_mode)
+    # 显式选线上却没有可用文档：中止而不是静默退回本地表（会写错文档）
+    if cloud is None and doc_mode == DOC_MODE_CLOUD:
+        reason = ("已选「线上文档」但未指定协作文档：请粘贴 kdocs 链接，"
+                  "或在 config.toml 的 [collect] 配 cloud_file_id")
+        await _emit(on_progress, {"type": "aborted", "reason": reason})
+        logger.error(reason)
+        return {"ok": 0, "fail": 0, "batch": 0}
+    # 本地模式下输入框里残留的链接不能当本地路径用（拿它当文件名必然失败）
+    if doc_mode == DOC_MODE_LOCAL and excel and is_cloud_link(excel):
+        excel = ""
+    if doc_mode == DOC_MODE_LOCAL:
+        # 不兜底到 DEFAULT_EXCEL：那是写死的备份文件路径，多半不是用户此刻要写的表，
+        # 静默落进去比报错更糟。挑不出就让用户回 UI 从候选里选一个——不猜。
+        excel = excel or _pick_local_excel(prefs)
+        if not excel:
+            reason = ("未选择本地工作簿：请在页面的「目标工作簿」里从候选中选一个"
+                      "（或填路径）")
+            await _emit(on_progress, {"type": "aborted", "reason": reason})
+            logger.error(reason)
+            return {"ok": 0, "fail": 0, "batch": 0}
     excel = excel or prefs.get("excel") or DEFAULT_EXCEL
     sheet = sheet or prefs.get("sheet") or DEFAULT_SHEET
     if store is None:
@@ -1191,7 +1305,7 @@ async def run_batch(
     # cloud_url 冲掉，下一批不带参数就静默退回本地默认表。
     # status 是枚举页签、非本批参数，沿用已存值，避免被空串覆盖丢掉。
     save_prefs(cloud.file_id if cloud is not None else excel,
-               sheet, store, prefs.get("status") or "")
+               sheet, store, prefs.get("status") or "", doc_mode)
 
     # 批次开始就解析一次目标 Sheet 的写入结构（列映射/公式/常量），全批复用——各 Sheet
     # 列序不同，必须按真实表头写；这份结构一批恒定，不必逐商品重 inspect 大工作簿。
@@ -1239,6 +1353,10 @@ async def run_batch(
     await _emit(on_progress, {
         "type": "batch_start", "total": len(worklist),
         "done_existing": len(done), "todo": len(todo), "batch": batch,
+        # 本批落点：本地表还是协作文档，供 UI/CLI 明示（切错模式要能一眼看出来）
+        "cloud": cloud is not None,
+        "doc_mode": DOC_MODE_CLOUD if cloud is not None else DOC_MODE_LOCAL,
+        "target": target_label,
     })
 
     if cloud is None and (base_only or use_pipeline):

@@ -87,6 +87,12 @@ async def main():
     )
     parser.add_argument("--sheet", default=None, help="目标 Sheet 名（缺省=上次选择/出厂默认）")
     parser.add_argument("--store", default=None, help="只采该店铺（mallid 或店名；缺省=全部）")
+    parser.add_argument(
+        "--doc-mode", choices=["auto", "local", "cloud"], default="auto",
+        help="写本地工作簿还是协作文档。local=只写本地 xlsx（kdocs 配额用满时切这个；"
+             "未给 --excel 则用上次选过的那个，没有就报错让你显式指定）；"
+             "cloud=只写协作文档；auto（默认）=按 --excel 形态与 config 自动判",
+    )
     args = parser.parse_args()
 
     if args.refresh or args.enumerate_only or not service.WORKLIST.exists():
@@ -100,7 +106,8 @@ async def main():
     # 采集前预检：Excel 被占用就别启动 agent（省去浏览器/MCP 初始化与 LLM 开销）。
     # 走协作文档（显式链接，或未显式指定但 prefs/config 配了云端目标）时没有本地
     # 占用锁，跳过预检——否则默认本地表恰好被 WPS 打开会误拦本要走云端的批次。
-    if service.resolve_cloud(args.excel) is None and service.excel_write_locked(excel):
+    if (service.resolve_cloud(args.excel, doc_mode=args.doc_mode) is None
+            and service.excel_write_locked(excel)):
         logger.error(
             f"❌ Excel 正被占用（疑似 WPS/Excel 打开中），无法写入：{excel}\n"
             "   请先在 WPS/Excel 里【关闭该文件】，再重新运行。"
@@ -115,6 +122,7 @@ async def main():
         excel=args.excel,
         sheet=args.sheet,
         store=args.store,
+        doc_mode=args.doc_mode,
     )
 
 

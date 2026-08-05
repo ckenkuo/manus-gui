@@ -402,14 +402,16 @@ collect_jobs: dict = {}
 
 @app.get("/collect/worklist")
 async def collect_worklist(
-    excel: str = "", sheet: str = "", store: str = "",
+    excel: str = "", sheet: str = "", store: str = "", doc_mode: str = "",
 ):
     """UI 首屏：清单总量/已入库/待采 + 每条状态（不触发采集）。
 
     可选 excel/sheet/store 过滤：缺省回填上次选择。响应含 workbooks/sheets/stores 供下拉。
+    doc_mode（local/cloud）钉死本地表还是协作文档；不传则沿用上次选的模式。
     """
     return JSONResponse(content=collect_service.get_worklist_status(
         excel=excel or None, sheet=sheet or None, store=store or None,
+        doc_mode=doc_mode or None,
     ))
 
 
@@ -440,11 +442,14 @@ async def collect_batch(
     excel: str = Body("", embed=True),
     sheet: str = Body("", embed=True),
     store: str = Body("", embed=True),
+    doc_mode: str = Body("", embed=True),
 ):
     """启动一批采集作业，返回 job_id；进度经 /collect/batch/{job_id}/events (SSE) 消费。
 
     base_only=True（默认）只采 Temu 基础信息、采购价/重量留空待人工填；False 走 1688 自动采价。
     excel/sheet/store 指定目标工作簿/Sheet/店铺（缺省回填上次选择）。
+    doc_mode（local/cloud）钉死写本地表还是协作文档：kdocs 有配额，用满了要能立刻切回
+    本地继续干活。不传则按链接形态与 config 自动判（历史行为）。
     """
     job_id = str(uuid.uuid4())
     job = CollectJob(job_id, limit, use_pipeline, excel, sheet, store, base_only)
@@ -459,6 +464,7 @@ async def collect_batch(
                 limit=limit, use_pipeline=use_pipeline, base_only=base_only,
                 on_progress=_on_progress,
                 excel=excel or None, sheet=sheet or None, store=store or None,
+                doc_mode=doc_mode,
             )
         except Exception as e:
             await job.push({"type": "aborted", "reason": f"采集异常：{e}"})
@@ -647,32 +653,35 @@ orders_jobs: dict = {}
 
 
 @app.get("/orders/worklist")
-async def orders_worklist(store: str = "", workbook: str = "", sheet: str = ""):
+async def orders_worklist(store: str = "", workbook: str = "", sheet: str = "",
+                          doc_mode: str = ""):
     """订单页首屏/切换：可选工作簿与 Sheet 列表、上次选择回显、选中 Sheet 的可写性。
 
     query 参数缺省（不传）时回填「上次选择」，再兜底 config 的 [orders].workbook。
     注意 store/sheet 用空串表示「本次不覆盖」，与 service 的 None 语义对齐：显式传空串
     是「清空选择」，不传则沿用偏好。纯读，不触发采集或写入。
+    doc_mode（local/cloud）钉死本地登记表还是协作文档；不传则沿用上次选的模式。
     """
     return JSONResponse(content=orders_service.get_worklist_status(
         store=store or None, workbook=workbook or None, sheet=sheet or None,
+        doc_mode=doc_mode or None,
     ))
 
 
 @app.get("/orders/sheet_info")
-async def orders_sheet_info(workbook: str, sheet: str):
+async def orders_sheet_info(workbook: str, sheet: str, doc_mode: str = ""):
     """单独探测某 Sheet 的可写性（判重列是否齐、图片列、表头行）。
 
     独立成一个接口是因为登记表 102MB，切 Sheet 时只该解析这一张表的表头，不必把整个
     worklist（含工作簿枚举）重算一遍。
+
+    doc_mode 与 worklist 同一套语义：选了本地就只探本地表，不去碰协作文档（否则本地模式
+    下这里仍会按 config 的 cloud_file_id 去读云端，探出来的表头根本不是要写的那张）。
     """
     cfg = orders_service.load_orders_config()
+    cloud, local_wb, _ = orders_service.resolve_doc_target(cfg, workbook, doc_mode)
     return JSONResponse(content=orders_service.inspect_sheet(
-        workbook, sheet, list(cfg.get("dedupe_by") or []),
-        cloud=orders_service.cloud_backend(
-            cfg,
-            cloud_url=workbook if orders_service.is_cloud_link(workbook) else "",
-        ),
+        local_wb or workbook, sheet, list(cfg.get("dedupe_by") or []), cloud=cloud,
     ))
 
 
@@ -685,6 +694,7 @@ async def orders_batch(
     sheet: str = Body("", embed=True),
     allow_no_price: bool = Body(True, embed=True),
     incremental: bool = Body(True, embed=True),
+    doc_mode: str = Body("", embed=True),
 ):
     """启动一批订单登记作业，返回 job_id；进度经 /orders/batch/{job_id}/events (SSE) 消费。
 
@@ -698,12 +708,16 @@ async def orders_batch(
 
     incremental 默认 True，但只在显式指定了 sheet 时真正生效：采集前读该 Sheet 已登记的
     订单号当水位，翻页追上就停。按 sheet_map 分流时水位有歧义，自动退全量。
+
+    doc_mode（local/cloud）钉死写本地登记表还是协作文档：kdocs 有配额，用满了要能立刻
+    切回本地继续干活。不传则按链接形态与 config 自动判（历史行为）。
     """
     job_id = str(uuid.uuid4())
     job = OrdersJob(job_id, store, dry_run)
     orders_jobs[job_id] = job
     # 记住本次选择，下次开页直接回填（写失败不影响本批）
-    orders_service.save_prefs(store=store, workbook=workbook, sheet=sheet)
+    orders_service.save_prefs(store=store, workbook=workbook, sheet=sheet,
+                              doc_mode=doc_mode)
 
     async def _on_progress(event: dict):
         await job.push(event)
@@ -716,6 +730,7 @@ async def orders_batch(
                 on_progress=_on_progress,
                 require_price=not allow_no_price,
                 incremental=incremental,
+                doc_mode=doc_mode,
             )
         except Exception as e:
             await job.push({"type": "aborted", "reason": f"订单登记异常：{e}"})

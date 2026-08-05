@@ -190,6 +190,12 @@ async def main() -> None:
              "默认不开——允许成交价为空，订单照常登记（插件回填约一天延迟，等价会积压"
              "当天全部订单；代价是那一格后续需人工补填，重跑不会补）",
     )
+    parser.add_argument(
+        "--doc-mode", choices=["auto", "local", "cloud"], default="auto",
+        help="写本地登记表还是协作文档。local=只写本地 xlsx（kdocs 配额用满时切这个；"
+             "未给 --workbook 则用上次选过的、再退 [orders].workbook，都没有就报错）；"
+             "cloud=只写协作文档；auto（默认）=按 --workbook 形态与 config 自动判",
+    )
     args = parser.parse_args()
 
     await service.run_orders_batch(
@@ -202,6 +208,7 @@ async def main() -> None:
         max_pages=args.max_pages,
         require_price=args.require_price,
         incremental=not args.no_incremental,
+        doc_mode=args.doc_mode,
     )
 
 

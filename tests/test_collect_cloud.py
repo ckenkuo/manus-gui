@@ -480,6 +480,107 @@ def test_resolve_cloud_priority(monkeypatch, tmp_path):
     assert made[-1] == "CFG_FILE", "无 prefs 链接时落到 config 的 cloud_file_id"
 
 
+# ---- 本地/线上文档模式切换（kdocs 限额时要能立刻切回本地）----------------------
+
+
+def test_resolve_cloud_local_mode_never_goes_cloud(monkeypatch, tmp_path):
+    """选了 local：即便 config 配了云端、连输入框里是 kdocs 链接，也一律走本地。"""
+    monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
+    monkeypatch.setattr(S, "load_collect_config",
+                        lambda: {"cloud_file_id": "CFG_FILE"})
+    monkeypatch.setattr(S, "cloud_backend",
+                        lambda cfg, cloud_url="": pytest.fail("本地模式不该构造云端后端"))
+
+    assert S.resolve_cloud(None, None, "local") is None
+    assert S.resolve_cloud("https://www.kdocs.cn/l/abc", None, "local") is None
+
+
+def test_resolve_cloud_cloud_mode_uses_prefs_then_config(monkeypatch, tmp_path):
+    """选了 cloud 但没粘链接：退 prefs.cloud_url，再退 config，不该回本地。"""
+    monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
+    monkeypatch.setattr(S, "load_collect_config",
+                        lambda: {"cloud_file_id": "CFG_FILE"})
+    made = []
+
+    def fake_backend(cfg, cloud_url=""):
+        made.append(cloud_url or cfg.get("cloud_file_id"))
+        return object()
+
+    monkeypatch.setattr(S, "cloud_backend", fake_backend)
+
+    S.save_prefs(excel="https://www.kdocs.cn/l/old", sheet="S", doc_mode="cloud")
+    assert S.resolve_cloud(None, None, "cloud") is not None
+    assert made[-1] == "https://www.kdocs.cn/l/old"
+
+    # 本地路径不该把 cloud 模式拽回本地（用户已经明确选了线上）
+    assert S.resolve_cloud("D:/wb.xlsx", None, "cloud") is not None
+
+
+def test_run_batch_local_mode_ignores_config_cloud(monkeypatch, tmp_path):
+    """整批：选了 local 就写本地表，config 的 cloud_file_id 一概不理。"""
+    _patch_common(monkeypatch, tmp_path, FakeCloud())
+    monkeypatch.setattr(S, "load_collect_config",
+                        lambda: {"cloud_file_id": "CFG_FILE"})
+    monkeypatch.setattr(S, "cloud_backend",
+                        lambda cfg, cloud_url="": pytest.fail("本地模式不该构造云端后端"))
+    events: list = []
+
+    asyncio.run(S.run_batch(
+        limit=1, base_only=True, on_progress=lambda e: events.append(e),
+        excel=str(tmp_path / "wb.xlsx"), sheet="pawly全球", doc_mode="local",
+    ))
+
+    start = next(e for e in events if e["type"] == "batch_start")
+    assert start["cloud"] is False and start["doc_mode"] == "local"
+
+
+def test_run_batch_cloud_mode_without_target_aborts(monkeypatch, tmp_path):
+    """选了 cloud 却没有可用文档：中止，不能静默退回本地表（会写错文档）。"""
+    _patch_common(monkeypatch, tmp_path, FakeCloud())
+    monkeypatch.setattr(S, "load_collect_config", lambda: {})
+    monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": None)
+    events: list = []
+
+    res = asyncio.run(S.run_batch(
+        limit=1, base_only=True, on_progress=lambda e: events.append(e),
+        excel="", sheet="pawly全球", doc_mode="cloud",
+    ))
+
+    assert res == {"ok": 0, "fail": 0, "batch": 0}
+    aborted = next(e for e in events if e["type"] == "aborted")
+    assert "线上文档" in aborted["reason"]
+
+
+def test_pick_local_excel_skips_stale_pref():
+    """prefs 记的表被改名了就回传空串让用户重选，别把死路径抛给 UI 报「表不存在」。"""
+    assert S._pick_local_excel({"excel": "D:/已经改名了.xlsx"}) == ""
+
+
+def test_pick_local_excel_keeps_existing_pref(tmp_path):
+    """prefs 路径文件还在就用它，不必每次都要用户重选。"""
+    wb = tmp_path / "核算.xlsx"
+    wb.write_bytes(b"x")
+
+    assert S._pick_local_excel({"excel": str(wb)}) == str(wb)
+
+
+def test_run_batch_local_without_excel_aborts(monkeypatch, tmp_path):
+    """本地模式没选表：中止并提示回 UI 选，不能静默写进出厂默认的 DEFAULT_EXCEL。"""
+    _patch_common(monkeypatch, tmp_path, FakeCloud())
+    monkeypatch.setattr(S, "load_collect_config", lambda: {})
+    monkeypatch.setattr(S, "load_prefs", lambda: {})
+    events: list = []
+
+    res = asyncio.run(S.run_batch(
+        limit=1, base_only=True, on_progress=lambda e: events.append(e),
+        excel="", sheet="pawly全球", doc_mode="local",
+    ))
+
+    assert res == {"ok": 0, "fail": 0, "batch": 0}
+    aborted = next(e for e in events if e["type"] == "aborted")
+    assert "未选择本地工作簿" in aborted["reason"]
+
+
 # ---- get_worklist_status 云端分支 ----------------------------------------------
 
 

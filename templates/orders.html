@@ -132,6 +132,41 @@
       <div class="card mb-3">
         <div class="card-body">
           <div class="row g-2 align-items-end">
+            <div class="col-12">
+              <!-- 本地/线上切换：kdocs 有配额，用满了要能立刻切回本地表继续干活。
+                   两侧各记一份目标，来回切不用重填对面那个路径 -->
+              <label class="form-label small text-muted mb-1">文档模式</label>
+              <div class="btn-group btn-group-sm w-100 mb-2" role="group">
+                <input
+                  type="radio"
+                  class="btn-check"
+                  name="docMode"
+                  id="docModeLocal"
+                  value="local"
+                  autocomplete="off"
+                />
+                <label class="btn btn-outline-primary" for="docModeLocal">
+                  <i class="bi bi-hdd"></i> 本地文档
+                  <span class="d-none d-md-inline text-body-tertiary small">
+                    （自动搜桌面表格）
+                  </span>
+                </label>
+                <input
+                  type="radio"
+                  class="btn-check"
+                  name="docMode"
+                  id="docModeCloud"
+                  value="cloud"
+                  autocomplete="off"
+                />
+                <label class="btn btn-outline-primary" for="docModeCloud">
+                  <i class="bi bi-cloud"></i> 线上文档
+                  <span class="d-none d-md-inline text-body-tertiary small">
+                    （金山协作表格）
+                  </span>
+                </label>
+              </div>
+            </div>
             <div class="col-12 col-md-7">
               <label class="form-label small text-muted mb-1">
                 订单登记表
@@ -350,9 +385,19 @@
         return $("switchWrite").checked;
       }
 
+      // 当前选中的文档模式；首屏未渲染时返回空串＝让后端按上次选择决定
+      function docMode() {
+        return document.querySelector('input[name="docMode"]:checked')?.value || "";
+      }
+
       // ---- 首屏 / 切换工作簿 ----
-      // params 为空＝首屏（回填上次选择）；传了就是用户切换了某一项
+      // params 为空＝首屏（回填上次选择）；传了就是用户切换了某一项。
+      // doc_mode 每次都带上：否则切过模式后再切 Sheet，后端会按 prefs 里的旧模式解析
       async function loadWorklist(params = {}) {
+        if (!("doc_mode" in params)) {
+          const m = docMode();
+          if (m) params.doc_mode = m;
+        }
         const qs = new URLSearchParams(params).toString();
         try {
           const r = await fetch("/orders/worklist" + (qs ? "?" + qs : ""));
@@ -372,9 +417,14 @@
               )
               .join("");
           $("workbookSelect").value = cfg.workbook || "";
+          // 本地模式下没选到表（首次用/上次那张被改名了）：明确提示去下拉里选，
+          // 后端刻意不猜——登记表选错就是把订单写进别人家的表
           $("workbookPath").textContent = cfg.cloud
             ? "协作文档（在线表格）"
-            : cfg.workbook || "";
+            : cfg.workbook || "请从下拉候选里选一个本地登记表（桌面上的 xlsx 已列出）";
+          // 回显后端实际生效的模式（首屏来自上次选择）
+          const mode = cfg.doc_mode === "cloud" ? "cloud" : "local";
+          $(mode === "cloud" ? "docModeCloud" : "docModeLocal").checked = true;
           fillSelect(
             $("sheetSelect"),
             cfg.sheets || [],
@@ -386,13 +436,18 @@
             .join("");
           if (cfg.store && !$("storeInput").value) $("storeInput").value = cfg.store;
           $("lockAlert").classList.toggle("d-none", !cfg.workbook_locked);
-          $("missAlert").classList.toggle("d-none", !!cfg.workbook_exists);
+          // 本地模式还没选表不算错（上面的灰字已在提示去选），别弹红条误导成配置坏了
+          const pendingPick = !cfg.cloud && !cfg.workbook;
+          $("missAlert").classList.toggle(
+            "d-none",
+            !!cfg.workbook_exists || pendingPick
+          );
           // 云端模式下「不存在」的真实原因多半在 cloud_error（kdocs-cli 没装上/未认证/
           // 网络不通），直接显示出来，别误导人去查本地路径
-          if (!cfg.workbook_exists) {
+          if (!cfg.workbook_exists && !pendingPick) {
             $("missAlertText").textContent = cfg.cloud && cfg.cloud_error
               ? `协作文档读取失败：${cfg.cloud_error}`
-              : "配置里的登记表路径不存在，请检查 config.toml 的 [orders].workbook。";
+              : "选中的登记表路径不存在（表可能被改名/移动），请从下拉候选里重选一个。";
           }
           renderSheetInfo(cfg.sheet_info || {});
           updateStartEnabled();
@@ -458,7 +513,11 @@
         const blockWrite = isWrite() && cfg.workbook_locked;
         $("btnStart").disabled = miss || blockWrite || unwritable;
         $("btnStart").title = miss
-          ? (cfg.cloud && cfg.cloud_error ? "协作文档读取失败" : "登记表路径不存在")
+          ? cfg.cloud && cfg.cloud_error
+            ? "协作文档读取失败"
+            : !cfg.workbook
+            ? "请先选一个本地登记表"
+            : "登记表路径不存在"
           : unwritable
           ? "选中的 Sheet 缺判重列，写不进去"
           : blockWrite
@@ -733,9 +792,11 @@
         const sheet = $("sheetSelect").value;
         // 正式写入是不可逆操作，二次确认时把落点写清楚（本地表有自动备份，云端没有）
         const target = sheet ? `目标表：${sheet}（本批全部写这张）` : "按站点映射自动分表";
-        const how = cfg.cloud
-          ? "正式写入会把订单行写进协作文档（图片按 URL 嵌入，无本地备份）。\n\n"
-          : "正式写入会把订单行连同 DISPIMG 主图写进登记表（写前自动备份）。\n\n";
+        // 按当前开关而不是 cfg.cloud 判：用户可能切了模式还没等 worklist 回来
+        const how =
+          docMode() === "cloud"
+            ? "正式写入会把订单行写进【线上协作文档】（图片按 URL 嵌入，无本地备份）。\n\n"
+            : "正式写入会把订单行连同 DISPIMG 主图写进【本地登记表】（写前自动备份）。\n\n";
         if (
           write &&
           !confirm(
@@ -764,6 +825,7 @@
               workbook: $("workbookSelect").value,
               sheet: $("sheetSelect").value, // 空＝按 sheet_map 分流
               incremental: $("switchIncremental").checked,
+              doc_mode: docMode(),
             }),
           });
           const { job_id } = await r.json();
@@ -819,6 +881,17 @@
         loadWorklist({ workbook: e.target.value, sheet: "" });
       });
 
+      // 切本地/线上：目标表整个换了，workbook 交给后端按该模式重新解析（本地模式会自动
+      // 挑桌面候选），所以这里刻意不带 workbook，只把模式传过去
+      ["docModeLocal", "docModeCloud"].forEach((id) => {
+        $(id).addEventListener("change", (e) => {
+          if (!e.target.checked) return;
+          $("sheetSelect").innerHTML = '<option value="">读取中…</option>';
+          $("sheetInfo").textContent = "";
+          loadWorklist({ doc_mode: e.target.value, sheet: "" });
+        });
+      });
+
       // 换 Sheet：只探测这一张表，不重算整个 worklist（登记表 102MB）
       $("sheetSelect").addEventListener("change", async (e) => {
         const sheet = e.target.value;
@@ -832,7 +905,12 @@
         $("sheetInfo").innerHTML =
           '<span class="text-muted"><span class="spinner-border spinner-border-sm"></span> 探测表头…</span>';
         try {
-          const qs = new URLSearchParams({ workbook: cfg.workbook, sheet });
+          // 带上模式：否则本地模式下后端仍会按 config 的 cloud_file_id 去探云端表头
+          const qs = new URLSearchParams({
+            workbook: cfg.workbook,
+            sheet,
+            doc_mode: docMode(),
+          });
           cfg.sheet_info = await (await fetch("/orders/sheet_info?" + qs)).json();
         } catch (err) {
           cfg.sheet_info = { sheet, writable: false, reason: String(err) };
