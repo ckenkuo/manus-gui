@@ -835,6 +835,246 @@ def test_select_all_disables_overlay_before_clicking():
     assert page.calls == ["evaluate", "click"], "顺序反了等于没修"
 
 
+# ---- 导出弹窗的「收货信息」复选框（2026-08-06 实机卡在这里整批中止）------------
+
+
+class _DialogPage:
+    """导出弹窗的页面替身，记录每次 locator 用的选择器。
+
+    beast-core 的真实结构是
+    `<label data-testid=beast-core-checkbox><input 隐形><span>文案</span></label>`：
+    点里面的 input 会超时报 not visible，可点的是 label 本身。这里让点 input 直接抛错。
+    """
+
+    def __init__(self, checked=True):
+        self.checked = checked
+        self.selectors: list = []
+        self.clicked: list = []
+
+    def locator(self, sel):
+        page = self
+        page.selectors.append(sel)
+        is_input = "input" in sel
+
+        class _Loc:
+            first = property(lambda s: s)
+
+            async def count(s):
+                return 1
+
+            async def is_checked(s):
+                return page.checked
+
+            def locator(s, inner):
+                return page.locator(inner)
+
+            async def click(s, timeout=None):
+                if is_input:
+                    raise AssertionError(
+                        "点了隐形 input——0×0 opacity:0，实机必超时"
+                    )
+                assert timeout and timeout <= 5000, "这一步可跳过，别用默认 30s 干等"
+                page.clicked.append(sel)
+                page.checked = False
+
+        return _Loc()
+
+    async def wait_for_timeout(self, ms):
+        return None
+
+
+def test_export_checkbox_locator_is_scoped_to_its_own_label():
+    """复选框必须按「自身带该文案的 checkbox label」定位，不能在外层后代里取 .first。
+
+    2026-08-06 回归：上一版用 label:has-text(...) 匹配到包着整组的外层节点，再在其后代取
+    第一个 checkbox，点到的是【导出范围】开关——于是增量早停只勾 20 单却导出了整页 182 单，
+    日志全绿、导出内容全错。这条钉住选择器把文案和 data-testid 绑在同一个 label 上。
+    """
+    page = _DialogPage()
+
+    label, cb = P._export_checkbox(page, "收货信息")
+
+    sel = page.selectors[0]
+    assert "beast-core-checkbox" in sel and "收货信息" in sel, \
+        "文案与 data-testid 必须在同一个选择器里，避免匹配到外层分组节点"
+
+
+def test_export_checkbox_clicks_label_not_hidden_input():
+    """取消「收货信息」点的是 label：点隐形 input 会超时把整批拖挂。"""
+    page = _DialogPage(checked=True)
+    label, cb = P._export_checkbox(page, "收货信息")
+
+    asyncio.run(P._click_checkbox_label(page, label))
+
+    assert page.checked is False
+    assert page.clicked and "beast-core-checkbox" in page.clicked[0]
+
+
+class _ExportPage:
+    """trigger_export 的页面替身：只实现导出弹窗这条链路。
+
+    cb_boom=True 模拟「取消收货信息」那一步点击超时——这一步失败绝不能让整批白跑
+    （2026-08-06 实机就是这样中止的，前面翻页勾选全部作废）。
+    """
+
+    def __init__(self, cb_boom=False):
+        self.cb_boom = cb_boom
+        self.confirmed = False
+        self.selectors: list = []
+
+    async def evaluate(self, js, *a):
+        return 0
+
+    async def wait_for_timeout(self, ms):
+        return None
+
+    def locator(self, sel):
+        page = self
+        page.selectors.append(sel)
+
+        class _Loc:
+            first = property(lambda s: s)
+
+            async def count(s):
+                # 「全部」范围开关：本替身不提供，模拟弹窗里没有这个控件
+                return 0 if "全部" in sel else 1
+
+            async def get_attribute(s, name):
+                return ""
+
+            async def is_disabled(s):
+                return False
+
+            async def is_checked(s):
+                return True
+
+            def locator(s, inner):
+                return page.locator(inner)
+
+            async def click(s, timeout=None):
+                if "收货信息" in sel:
+                    if page.cb_boom:
+                        raise RuntimeError("Timeout 5000ms exceeded: not visible")
+                    return None
+                if "确认导出" in sel:
+                    page.confirmed = True
+
+        return _Loc()
+
+    def expect_download(self, timeout=None):
+        page = self
+
+        class _Ctx:
+            async def __aenter__(s):
+                return s
+
+            async def __aexit__(s, *a):
+                return False
+
+            @property
+            def value(s):
+                async def _dl():
+                    class _D:
+                        async def save_as(self, dst):
+                            with open(dst, "wb") as f:
+                                f.write(b"x" * 2048)
+
+                    return _D()
+
+                return _dl()
+
+        return _Ctx()
+
+
+def test_trigger_export_survives_checkbox_failure(tmp_path, caplog):
+    """取消勾选那步点不动时照样把导出走完——不能让翻完页勾好单的一批白跑。"""
+    page = _ExportPage(cb_boom=True)
+
+    path = asyncio.run(P.trigger_export(page, str(tmp_path)))
+
+    assert page.confirmed is True, "必须继续点「确认导出」"
+    assert Path(path).exists()
+
+
+class _ScopeTrackingPage(_ExportPage):
+    """在 _ExportPage 之上记录「实际点了哪些选择器」，用来钉住没点到范围开关。"""
+
+    def __init__(self):
+        super().__init__()
+        self.clicked: list = []
+
+    def locator(self, sel):
+        page = self
+        inner_loc = super().locator(sel)
+
+        class _Loc:
+            first = property(lambda s: s)
+
+            async def count(s):
+                return await inner_loc.count()
+
+            async def get_attribute(s, name):
+                return ""
+
+            async def is_disabled(s):
+                return False
+
+            async def is_checked(s):
+                return True
+
+            def locator(s, inner):
+                return page.locator(inner)
+
+            async def click(s, timeout=None):
+                page.clicked.append(sel)
+                if "确认导出" in sel:
+                    page.confirmed = True
+
+        return _Loc()
+
+
+def test_trigger_export_never_clicks_scope_switch(tmp_path):
+    """整条导出链路不许点到「全部/已选」范围开关：点错就把增量批变成整页导出。
+
+    2026-08-06 回归的直接后果就是这个——只勾了 20 单，导出却是整页 182 单。
+    """
+    page = _ScopeTrackingPage()
+
+    asyncio.run(P.trigger_export(page, str(tmp_path)))
+
+    assert page.confirmed is True
+    assert not [s for s in page.clicked if "全部" in s], \
+        f"点到了导出范围开关：{page.clicked}"
+    # 点击目标只该是「收货信息」那个 checkbox 和「确认导出」按钮
+    assert all("收货信息" in s or "确认导出" in s or "导出订单" in s
+               for s in page.clicked), page.clicked
+
+
+def test_warn_if_export_scope_is_all_flags_wrong_scope(caplog):
+    """范围开关选中「全部」时要大声告警——静默导出整页最难查。"""
+    page = _DialogPage(checked=True)
+
+    hit = asyncio.run(P._warn_if_export_scope_is_all(page))
+
+    assert hit is True
+
+
+def test_warn_if_export_scope_tolerates_missing_control():
+    """查不到这个控件（DOM 未实测确认）就当没事，绝不误拦正常批次。"""
+
+    class _NoScope:
+        def locator(self, sel):
+            class _L:
+                first = property(lambda s: s)
+
+                async def count(s):
+                    return 0
+
+            return _L()
+
+    assert asyncio.run(P._warn_if_export_scope_is_all(_NoScope())) is False
+
+
 # ---- 悬浮层遮挡（商家助手插件注入，2026-07-29 实机复现）----------------------
 
 
@@ -1018,11 +1258,22 @@ def _patch_sweep(monkeypatch, total=100, page_size=20):
     async def fake_count(page):
         return page_size * picked["pages"]
 
+    # 早停页走的是按行勾选（只勾水位之前那些更新的单），记下每次要勾的订单号供断言
+    row_picks: list = []
+
+    async def fake_select_rows(page, order_nos):
+        row_picks.append(list(order_nos))
+        picked["pages"] += 1
+        return len(order_nos)
+
     monkeypatch.setattr(P, "read_pagination", fake_read)
     monkeypatch.setattr(P, "grab_page_images", fake_grab)
     monkeypatch.setattr(P, "select_all_on_page", fake_select)
+    monkeypatch.setattr(P, "select_rows_by_order_no", fake_select_rows)
     monkeypatch.setattr(P, "selected_count", fake_count)
     monkeypatch.setattr(P, "goto_next_page", fake_next)
+    cur["row_picks"] = row_picks
+    return cur
 
 
 async def _none():
@@ -1083,10 +1334,11 @@ def _patch_sweep_incremental(monkeypatch, page_orders_by_page: dict, total=100,
     async def fake_read_orders(page):
         return page_orders_by_page.get(cur["page"], [])
 
-    _patch_sweep(monkeypatch, total=total, page_size=page_size)
+    base = _patch_sweep(monkeypatch, total=total, page_size=page_size)
     monkeypatch.setattr(P, "read_pagination", fake_read)
     monkeypatch.setattr(P, "goto_next_page", fake_next)
     monkeypatch.setattr(P, "read_page_orders", fake_read_orders)
+    cur["row_picks"] = base["row_picks"]
     return cur
 
 
@@ -1144,6 +1396,98 @@ def test_sweep_stops_on_sparse_watermark(monkeypatch):
     assert res["pages"] == 4, "遇到已登记单就停，不该翻到第 5 页"
     assert res["stopped_early"] is True
     assert res["fell_back"] is False, "稀疏水位是正常状态，不该报退全量"
+
+
+def test_select_rows_by_order_no_passes_wanted_and_disables_overlay(monkeypatch):
+    """按行勾选：要先屏蔽悬浮层，再把订单号原样传给页面脚本，返回勾中行数。"""
+    calls: list = []
+
+    class _P:
+        async def evaluate(self, js, *a):
+            calls.append(("evaluate", a[0] if a else None))
+            return {"hit": 2, "missed": []}
+
+        async def wait_for_timeout(self, ms):
+            return None
+
+    monkeypatch.setattr(P, "disable_pointer_overlays",
+                        lambda page: calls.append(("overlay", None)) or _none())
+
+    hit = asyncio.run(P.select_rows_by_order_no(_P(), ["PO-a", "PO-b"]))
+
+    assert hit == 2
+    assert [c[0] for c in calls] == ["overlay", "evaluate"], "顺序反了会被悬浮球拦住"
+    assert calls[1][1] == ["PO-a", "PO-b"]
+
+
+def test_select_rows_by_order_no_skips_when_nothing_wanted():
+    """没有要勾的订单就直接返回 0，不碰页面。"""
+    assert asyncio.run(P.select_rows_by_order_no(object(), [])) == 0
+
+
+def test_orders_before_watermark_cuts_at_first_known():
+    """水位之前（更新）的才要采；水位自身和之后更旧的都不要。"""
+    page = _page("PO-n1", "PO-n2", "PO-old1", "PO-n3")
+
+    got = P._orders_before_watermark(page, {"PO-old1"})
+
+    assert got == ["PO-n1", "PO-n2"], "水位之后那条更旧的单不能带上"
+
+
+def test_orders_before_watermark_empty_when_watermark_first():
+    """水位就在第一行＝本批没有新单，一行都不该勾。"""
+    page = _page("PO-old1", "PO-n1")
+
+    assert P._orders_before_watermark(page, {"PO-old1"}) == []
+
+
+def test_sweep_early_stop_page_selects_only_newer_rows(monkeypatch):
+    """早停页只勾水位之前的行，不再整页全选。
+
+    2026-08-06 实机 bug 的最小复现：水位是 PO-045-0821…（2026-08-05 21:15），它之后同页
+    还有 14 条更旧的子订单，原先整页全选把它们一并导出了。用户明确只要水位之后（更新）的单。
+    """
+    cur = _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-new1", "PO-new2", "PO-wm", "PO-older1", "PO-older2"),
+    })
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5, known_order_nos={"PO-wm"},
+    ))
+
+    assert res["stopped_early"] is True and res["pages"] == 1
+    assert cur["row_picks"] == [["PO-new1", "PO-new2"]], \
+        "只该勾水位之前那两条，水位及更旧的三条都不能勾"
+
+
+def test_sweep_early_stop_selects_nothing_when_no_new(monkeypatch):
+    """本批无新单（水位在首行）：不勾任何行，也不退回整页全选。"""
+    cur = _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-wm", "PO-older1"),
+    })
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5, known_order_nos={"PO-wm"},
+    ))
+
+    assert res["stopped_early"] is True
+    assert cur["row_picks"] == [], "一条新单都没有，不该勾任何行"
+
+
+def test_sweep_non_stop_pages_still_select_all(monkeypatch):
+    """没触发早停的页照旧整页全选——那些页本来全是新单，逐行勾是白费。"""
+    cur = _patch_sweep_incremental(monkeypatch, {
+        1: _page("PO-n1", "PO-n2"),
+        2: _page("PO-n3", "PO-wm"),
+    })
+
+    res = asyncio.run(P.sweep_pages(
+        object(), max_pages=5, known_order_nos={"PO-wm"},
+    ))
+
+    assert res["pages"] == 2
+    # 第 1 页整页选（不进 row_picks），第 2 页是早停页只勾 PO-n3
+    assert cur["row_picks"] == [["PO-n3"]]
 
 
 def test_sweep_unreadable_page_does_not_poison_batch(monkeypatch):

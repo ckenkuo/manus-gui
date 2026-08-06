@@ -83,6 +83,11 @@ _RE_SELECTED = re.compile(r"已选订单[:：]\s*([\d,]+)")
 # （姓名/电话/邮箱/身份证号/税号/地址），不该落到本地表。该设置会被后台记住，所以每次
 # 都要先读当前状态再决定点不点（幂等）。
 _EXPORT_GROUP_EXCLUDE = "收货信息"
+# 弹窗里的复选框和表头全选框是同一套 beast-core 组件：真实 <input> 是 0×0 + opacity:0 的
+# 隐形元素，**点它必然 30s 超时报「element is not visible」**（2026-08-06 实机踩到：增量
+# 早停后走到导出，卡在这里整批中止）。上面 _HEAD_CHECKBOX 已记过同一个坑，这里漏了同一套
+# 处理。所以【状态读 input、点击点 label】：label 才是可见可点的那层。
+_EXPORT_CB_LABEL = 'label[data-testid="beast-core-checkbox"]'
 
 # 导出文件的 19 个列名（表头第 1 行，sheet 名 `sheet1`）。
 EXPORT_COLUMNS = [
@@ -200,6 +205,26 @@ def should_stop_incremental(
     if not seen_new:
         return True, f"本页出现已登记订单 {hit} 且本批未发现新单，判定为无新单"
     return True, f"本页出现已登记订单 {hit}，已追上上次登记位置"
+
+
+def _orders_before_watermark(page_orders: List[dict], known: set) -> List[str]:
+    """取本页里位于水位【之前】（更新）的订单号，按页面顺序。纯函数，可离线单测。
+
+    列表是创建时间新→旧，所以第一个命中 known 的位置就是水位，它**之前**的都比它新＝本批
+    真正要采的新单；它自身和之后的都更旧、上次已处理过。
+    2026-08-06 之前早停页走整页全选，把水位之后更旧的单也导出了（实机 5 条新单带出 14 条
+    旧子订单）；改成只勾这里返回的这些。
+
+    水位恰好在第一行（本批无新单）时返回空表，调用方据此不勾任何行。
+    """
+    out: List[str] = []
+    for o in page_orders:
+        no = str(o.get("order_no") or "").strip()
+        if no in known:
+            break
+        if no:
+            out.append(no)
+    return out
 
 
 def check_list_sort_url(list_url: str) -> str:
@@ -961,6 +986,12 @@ _FIELD_SOURCES: List[tuple] = [
     ({"订单店铺", "店铺"}, lambda o, ctx: ctx.get("store_value", "")),
     ({"站点区分", "站点"}, lambda o, ctx: o.site),
     ({"订单号"}, lambda o, ctx: o.order_no),
+    # 子订单号：表里本来没有这列，2026-08-06 起支持（有就写、没有就自然跳过，见本函数说明）。
+    # 它是唯一能区分同一订单多行的字段，所以判重键可以升级成「订单号+子订单号」。
+    # 为什么它比尺码可靠：尺码取自导出的「商品属性」，该值不保证唯一——实测某 SKU 的属性
+    # 恒为字符串 `Variant`（Temu 那边就没有规格名），同一订单里两个该商品的子订单会生成
+    # 完全相同的键，第二行被判成重复丢掉＝少买一件。子订单号一单一号，不存在这个问题。
+    ({"子订单号"}, lambda o, ctx: o.sub_order_no),
     ({"尺码"}, lambda o, ctx: o.attrs),
     (QTY_TITLES, lambda o, ctx: _qty_number(o.qty)),
     ({"平台物流跟踪号", "平台跟踪号"}, lambda o, ctx: o.tracking_no),
@@ -1219,6 +1250,56 @@ async def select_all_on_page(page) -> None:
         raise RuntimeError("点了全选框但状态没变成已勾选，页面可能改版")
 
 
+# 按订单号勾选单行：定位到含该订单号的 tr，点它的行首 checkbox 的可见 label。
+# 与表头全选同一套 beast-core 结构（隐形 input + 可点 label），所以同样【点 label】。
+# 返回实际点中的行数，供调用方校验「想勾几行就勾中几行」。
+_SELECT_ROWS_JS = r"""
+(wanted) => {
+  const want = new Set(wanted);
+  let hit = 0, missed = [];
+  const trs = Array.from(document.querySelectorAll('table tbody tr'));
+  for (const tr of trs) {
+    const m = (tr.innerText || '').match(/PO-[\d-]+/);
+    if (!m || !want.has(m[0])) continue;
+    const box = tr.querySelector('input[type="checkbox"]');
+    if (!box) { missed.push(m[0]); continue; }
+    if (box.checked) { hit++; continue; }
+    // 点可见的 label：行首 input 同样是 0×0+opacity:0，直接 .click() 到 input 上
+    // 在真实浏览器里不会触发 React 的 onChange，所以走 label
+    const label = box.closest('label[data-testid="beast-core-checkbox"]')
+                  || box.closest('label');
+    (label || box).click();
+    hit++;
+  }
+  return {hit, missed};
+}
+"""
+
+
+async def select_rows_by_order_no(page, order_nos) -> int:
+    """只勾选本页中订单号在 order_nos 里的行；返回勾中的行数。
+
+    为什么需要它：增量早停那一页原先走整页全选，于是水位之后那些**更旧的**订单也被导出
+    （2026-08-06 实机：只想要 5 条新单，导出却带上 14 条旧子订单）。旧行虽能被判重挡住，
+    但前提是判重键足够细——而实测键不够细时（只配订单号、或属性恒为 `Variant`）就会写进去。
+    所以正确做法是源头上只勾新单，别把「导出集合」的正确性外包给判重。
+
+    一个订单可能占多行（多子订单），这里按订单号匹配，命中的行全勾——同一订单的兄弟行
+    本来就该一起采。返回值由调用方与期望行数比对，不一致就说明页面结构变了。
+    """
+    wanted = [str(n).strip() for n in (order_nos or []) if str(n).strip()]
+    if not wanted:
+        return 0
+    await disable_pointer_overlays(page)
+    res = await page.evaluate(_SELECT_ROWS_JS, wanted)
+    hit = int((res or {}).get("hit") or 0)
+    missed = (res or {}).get("missed") or []
+    if missed:
+        logger.warning(f"有 {len(missed)} 行找不到行首复选框（未勾选）：{missed[:3]}")
+    await page.wait_for_timeout(400)
+    return hit
+
+
 async def goto_next_page(page, timeout_ms: int = 20000) -> bool:
     """点「下一页」并等页码真的变了。已在尾页返回 False。"""
     ul = page.locator(_PAGINATION).first
@@ -1401,9 +1482,15 @@ async def sweep_pages(
 
     known_order_nos 非空即【增量模式】：翻到「本页出现已登记订单号」就停（判据见
     should_stop_incremental），不再翻完全部页。早停同样跳过「已选==总数」校验——本就只
-    选了前几页。触发早停的那一页【照样勾选导出】：判重键是订单号+尺码，订单号已登记
-    不代表它每个尺码都登记了（同订单新增尺码是真实情况），跳过就漏行；重叠的旧单由判重
-    挡掉，代价只是多导出几十行。
+    选了前几页。
+
+    触发早停的那一页【只勾水位之前那些更新的行】（`_orders_before_watermark` +
+    `select_rows_by_order_no`），不再整页全选。2026-08-06 改：原先整页勾的理由是「订单号
+    已登记不代表每个尺码都登记了，重叠旧单交给判重挡」，但实机发现这个理由站不住——判重键
+    不够细时（只配订单号、或商品属性恒为 `Variant`）旧行会直接写进表里，用户看到的就是
+    「只想采 5 条新单，却多出 14 条旧子订单」。导出集合的正确性不该外包给判重，源头只勾
+    新单才对；同订单新增尺码那种情况由「按订单号勾整行」覆盖（命中的订单其所有子订单行
+    一起勾）。
     增量早停与 truncated 语义相反（那个是「可能漏」，这个是「故意只取新的、不漏」），
     故用独立的 stopped_early 字段上报，绝不复用 truncated。
     """
@@ -1428,12 +1515,14 @@ async def sweep_pages(
         cur = await read_pagination(page)
         page_imgs = await grab_page_images(page)
         images.update(page_imgs)
-        await select_all_on_page(page)
-        sel = await selected_count(page)
 
+        # 增量模式下先读本页订单号再决定怎么勾：若本页含水位（即将早停），只勾水位【之前】
+        # 那些更新的行，不再整页全选。原先整页勾的后果是把水位之后更旧的单一并导出
+        # （2026-08-06 实机：想要 5 条新单，却带上 14 条旧子订单），旧行能否被拦全看判重键
+        # 够不够细——不该把导出集合的正确性外包给判重，源头只勾新单才对。
+        page_orders = await read_page_orders(page) if known else []
         page_new = page_known = 0
         if known:
-            page_orders = await read_page_orders(page)
             page_known = sum(1 for o in page_orders if o["order_no"] in known)
             page_new = len(page_orders) - page_known
             if page_new:
@@ -1455,6 +1544,21 @@ async def sweep_pages(
                     # 只剩「本页读不到订单号」一种：本页不参与判断、继续翻下一页即可。
                     # 绝不因此置 desc_broken——那会让一次瞬时 DOM 读失败毒化整批增量。
                     logger.warning(f"{reason}（本页不参与增量判断，继续翻页）")
+
+        # 早停页只勾水位之前那些更新的行；其余页照旧整页全选（本就全是新单）
+        if stopped_early:
+            fresh = _orders_before_watermark(page_orders, known)
+            if fresh:
+                hit = await select_rows_by_order_no(page, fresh)
+                logger.info(
+                    f"早停页只勾水位之前的 {len(fresh)} 个订单（实际勾中 {hit} 行），"
+                    "水位及更旧的行不导出"
+                )
+            else:
+                logger.info("早停页没有比水位更新的订单，本页不勾选")
+        else:
+            await select_all_on_page(page)
+        sel = await selected_count(page)
 
         if on_page:
             # 回调可能是协程函数（service 层的 _emit 是 async），返回值是 awaitable 就 await。
@@ -1503,6 +1607,55 @@ async def sweep_pages(
             "fell_back": bool(known) and desc_broken}
 
 
+def _export_checkbox(page, text: str):
+    """定位导出弹窗里某个分组的复选框，返回 (可点的 label, 读状态的 input)。
+
+    **必须用「自身带该文案的 checkbox label」，绝不能在外层节点的后代里取 .first**：
+    `label:has-text("收货信息")` 会连包着整组的外层 label 一起匹配上，在它后代里取第一个
+    checkbox 未必是想点的那个，可能点到弹窗里别的开关——那属于静默错误（日志一切正常、
+    导出内容却不对），比超时报错难查得多。
+    beast-core 的结构是 `<label data-testid=beast-core-checkbox><input 隐形><span>文案</span></label>`，
+    所以文案和 data-testid 本就在同一个 label 上，精确定位不需要任何猜测。
+    """
+    box = page.locator(f'{_EXPORT_CB_LABEL}:has-text("{text}")').first
+    return box, box.locator('input[type="checkbox"]').first
+
+
+async def _warn_if_export_scope_is_all(page) -> bool:
+    """导出弹窗里若有「全部/已选」范围开关且选中了「全部」，告警。返回是否检出异常。
+
+    只告警不抛错：这个开关的真实 DOM 未实测确认（本项目规矩是选择器必须实测，没实测的
+    不硬编码成判据），万一文案不同就会误拦本来正常的批次。所以这里做「能查到就查，查到
+    明显不对就大声喊」，把决定权留给人——比静默导出整页好，也比误中止安全。
+    真要收紧成硬判据，得先在实机把这个控件的结构记进 docs（照 1688 选择器那套来）。
+    """
+    try:
+        checked = page.locator(
+            f'{_EXPORT_CB_LABEL}:has-text("全部"), label:has-text("导出全部")'
+        ).first
+        if await checked.count() == 0:
+            return False
+        cb = checked.locator('input[type="checkbox"], input[type="radio"]').first
+        if await cb.count() and await cb.is_checked():
+            logger.warning(
+                "导出弹窗的范围似乎选中了「全部」而不是「已选订单」——本批可能导出整页而非"
+                "勾选的那些单。请到页面确认导出范围（增量批次尤其要留意）。"
+            )
+            return True
+    except Exception as e:
+        logger.warning(f"检查导出范围时出错（忽略，不影响导出）：{e}")
+    return False
+
+
+async def _click_checkbox_label(page, label, timeout_ms: int = 5000) -> None:
+    """点 beast-core 复选框的可见 label（隐形 input 点不动，见 _EXPORT_CB_LABEL）。
+
+    timeout 压到 5s（Playwright 默认 30s）：这一步是可跳过的隐私收敛，点不动就该赶紧
+    放弃继续导出，而不是让整批在这儿干等半分钟。
+    """
+    await label.click(timeout=timeout_ms)
+
+
 async def trigger_export(page, out_dir: str, timeout_ms: int = 180000) -> str:
     """点「导出订单」→ 弹窗取消勾「收货信息」→ 「确认导出」→ 接住下载，返回落地路径。
 
@@ -1526,19 +1679,33 @@ async def trigger_export(page, out_dir: str, timeout_ms: int = 180000) -> str:
     await page.wait_for_timeout(1200)
 
     # 弹窗里取消「收货信息」（买家 PII）。后台会记住上次设置，故先读状态再决定点不点。
+    # 点击务必打在 label 上：input 是 0×0+opacity:0 的隐形元素（见 _EXPORT_CB_LABEL）。
+    #
+    # 整段 best-effort：取消勾选是隐私收敛，它失败不该让【已经翻完页、勾好单】的一批白跑。
+    # 2026-08-06 实机就是这样挂的——点隐形 input 超时 30s，异常一路抛到 service，整批中止，
+    # 前面的翻页与勾选全部作废。下面的 warning 本来就说明这一步是「确认不了就提醒人核对」，
+    # 但异常会绕过它，所以必须显式吞掉。
     excluded = False
-    label = page.locator(f'label:has-text("{_EXPORT_GROUP_EXCLUDE}")').first
-    if await label.count():
-        cb = label.locator('input[type="checkbox"]').first
-        if await cb.count() and await cb.is_checked():
-            await cb.click()
-            await page.wait_for_timeout(300)
-        excluded = await cb.count() > 0 and not await cb.is_checked()
+    try:
+        label, cb = _export_checkbox(page, _EXPORT_GROUP_EXCLUDE)
+        if await label.count() and await cb.count():
+            if await cb.is_checked():
+                await _click_checkbox_label(page, label)
+                await page.wait_for_timeout(300)
+            excluded = not await cb.is_checked()
+    except Exception as e:
+        logger.warning(f"取消「{_EXPORT_GROUP_EXCLUDE}」勾选时出错（继续导出）：{e}")
     if not excluded:
         logger.warning(
             f"没能确认「{_EXPORT_GROUP_EXCLUDE}」已取消勾选——导出文件可能含买家隐私字段，"
             "落表前请人工核对导出列"
         )
+
+    # 导出范围护栏：确认弹窗仍停在「已选订单」而不是「全部」。
+    # 为什么要专门守这一条：上面那个 checkbox 一旦点错对象（见 _export_checkbox 的说明），
+    # 最坏情况是把导出范围从「已选」翻成「全部」，于是勾了几单却导出整页——日志全绿、
+    # 导出内容全错。这种静默错误代价很大（白跑几分钟且掩盖真因），宁可在这儿多查一道。
+    await _warn_if_export_scope_is_all(page)
 
     confirm = page.locator('button:has-text("确认导出"), [class*="BTN_"]:has-text("确认导出")').first
     if await confirm.count() == 0:

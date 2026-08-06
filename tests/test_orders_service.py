@@ -126,10 +126,81 @@ def test_load_orders_config_falls_back_to_example():
     cfg = S.load_orders_config()
 
     assert cfg.get("workbook") and cfg.get("list_url")
-    assert cfg.get("dedupe_by") == ["订单号", "尺码"]
+    # 同上，不钉字面值：本机 config.toml 可能配成 ["订单号"] 或加了「子订单号」。
+    # 只钉「订单号」必须在键里——它是判重的根，缺了就是全表重写。
+    dedupe_by = cfg.get("dedupe_by")
+    assert isinstance(dedupe_by, list) and "订单号" in dedupe_by
     assert isinstance(cfg.get("sheet_map"), list) and cfg["sheet_map"]
     first = cfg["sheet_map"][0]
     assert first.get("store") and first.get("sheet") and first.get("sites")
+
+
+# ---- 判重键的选取：同订单多行绝不能互相压制 --------------------------------
+
+
+def test_preferred_dedupe_by_upgrades_single_column_key():
+    """只配了订单号：表里有尺码列就自动补上，避免同订单多行被判成重复而少买。"""
+    header = {"C": "订单号", "D": "尺码"}
+
+    assert S._preferred_dedupe_by(header, ["订单号"]) == ["订单号", "尺码"]
+
+
+def test_preferred_dedupe_by_prefers_sub_order_no():
+    """子订单号一单一号，比尺码可靠（尺码有 `Variant` 这种恒定值），优先用它。"""
+    header = {"C": "订单号", "D": "尺码", "E": "子订单号"}
+
+    assert S._preferred_dedupe_by(header, ["订单号"]) == ["订单号", "子订单号"]
+
+
+def test_preferred_dedupe_by_respects_explicit_config():
+    """用户已经指定了区分位就不动——配置优先，别自作聪明再加一列。"""
+    header = {"C": "订单号", "D": "尺码", "E": "子订单号"}
+
+    assert S._preferred_dedupe_by(header, ["订单号", "尺码"]) == ["订单号", "尺码"]
+
+
+def test_preferred_dedupe_by_keeps_key_when_no_candidate():
+    """表里既没子订单号也没尺码：维持原样，由 collided 计数暴露风险，不臆造列。"""
+    header = {"C": "订单号", "D": "站点区分"}
+
+    assert S._preferred_dedupe_by(header, ["订单号"]) == ["订单号"]
+
+
+def test_plan_writes_reports_same_batch_collision(workbook, monkeypatch):
+    """同批内撞键的行要单独报（collided），不能混进 dup 静默掉——那是少买。
+
+    2026-08-06 实机背景：config 配了 dedupe_by=["订单号"]，而同一订单含两个子订单，
+    第二行被判成重复丢掉。这类行从没写过，跟「表里已有」完全是两种事。
+    """
+    orders = [
+        _order("PO-045-新1", "Variant"),
+        _order("PO-045-新1", "【黄色】一件装"),   # 同订单第二个子订单
+    ]
+
+    # 关掉自动补列，让单列键真的生效（模拟本机那份 config + 表里没有可补的列）
+    monkeypatch.setattr(S, "_ROW_DISCRIMINATORS", [])
+    plans, _, _ = S.plan_writes(orders, str(workbook), "StoreA", SHEET_MAP,
+                                dedupe_by=["订单号"])
+    plan = plans["StoreA全球1"]
+
+    assert plan.dedupe_by == ["订单号"]
+
+    assert len(plan.rows) == 1 and plan.dup == 1
+    assert len(plan.collided) == 1, "被吃掉的兄弟行必须报出来"
+    assert plan.collided[0]["order_no"] == "PO-045-新1"
+
+
+def test_plan_writes_no_collision_when_key_distinguishes(workbook):
+    """键够细时同订单两行都要写，且 collided 为空。"""
+    orders = [
+        _order("PO-045-新1", "Variant"),
+        _order("PO-045-新1", "【黄色】一件装"),
+    ]
+
+    plans, _, _ = S.plan_writes(orders, str(workbook), "StoreA", SHEET_MAP)
+    plan = plans["StoreA全球1"]
+
+    assert len(plan.rows) == 2 and plan.collided == []
 
 
 # ---- 计划与判重 ------------------------------------------------------------

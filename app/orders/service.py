@@ -40,8 +40,17 @@ from app.tool.wps_excel_tool import WpsExcelTool
 
 # 整批护栏：翻完 N 页 + 导出 + 下 N 张图，247 条实测约 3~5 分钟，给足余量。
 ORDERS_BATCH_TIMEOUT = 1800
-# 判重键的默认列标题（登记表没有子订单号列，见 docs/orders-pipeline-plan.md §5）。
+# 判重键的默认列标题（见 docs/orders-pipeline-plan.md §5）。
+# 保持「订单号+尺码」不动：各表是否已加「子订单号」列参差不齐（2026-08-06 实测云端 4 张表
+# 都还没有），把它设成默认会让缺列的表 no_key 整表跳过、一行都写不进。
+# 真正的升级路径是 _preferred_dedupe_by：**按目标表实际有的列自适应**——有子订单号列就用它
+# （更精确），没有就退回尺码。
+# **绝不要只配 ["订单号"]**：同订单的其余子订单会被当成重复丢掉（实测：单列键下同批内两行
+# 撞键，第二行静默不写＝少买一件）。
 _DEFAULT_DEDUPE_BY = ["订单号", "尺码"]
+# 判重键里「区分同订单多行」那一位的候选，按精确度从高到低。子订单号一单一号最可靠；
+# 尺码取自导出「商品属性」，实测有 SKU 恒为 `Variant`（Temu 无规格名），会撞键。
+_ROW_DISCRIMINATORS = ["子订单号", "尺码"]
 # 订单页「上次选择」（店铺/工作簿/Sheet）。与采集页的 collect_prefs.json 分开存。
 ORDERS_PREFS = config.workspace_root / "orders_prefs.json"
 
@@ -162,6 +171,10 @@ class SheetPlan:
     orders: List[pipeline.OrderRow] = field(default_factory=list)
     preview: List[dict] = field(default_factory=list)  # 人工核对用：{列标题: 值}
     dup: int = 0
+    # 本批内撞键被丢掉的行（不是「表里已有」，是判重键不够细导致的少买），见 _stage_order
+    collided: List[dict] = field(default_factory=list)
+    # 这张表实际用的判重列（按表内有哪些列自适应，见 _preferred_dedupe_by）
+    dedupe_by: List[str] = field(default_factory=list)
     no_key: bool = False
 
 
@@ -544,6 +557,7 @@ def plan_writes(
     unmapped: List[dict] = []
     unpriced: List[dict] = []
     seen: Dict[str, set] = {}  # sheet → 已排入本批的键，防同批内重复
+    existing: Dict[str, set] = {}  # sheet → 进本批前表里已有的键（seen 的快照）
 
     # 本批按创建时间倒序：登记表要求「时间越新的越在上面」，而写入走的是插到表头下方，
     # 所以排在前面的落在更上面。Temu 页面本来就是新→旧，但那是页面顺序、不是契约，
@@ -579,13 +593,44 @@ def plan_writes(
                 header=header, header_row=header_row, image_col=image_col,
             )
             plans[sheet] = plan
-            seen[sheet] = _existing_keys(workbook, plan, titles, cloud=cloud)
+            # 判重键按【这张表】实际有的列定：各表加「子订单号」列的进度不同，
+            # 所以逐表解析而不是全批共用一份（见 _preferred_dedupe_by）
+            plan.dedupe_by = _preferred_dedupe_by(header, titles)
+            seen[sheet] = _existing_keys(workbook, plan, plan.dedupe_by, cloud=cloud)
+            # 存一份「进本批前表里已有的键」：seen 会被本批新排的行污染，靠它区分
+            # 「表里已有」和「同批撞键」两种 dup（后者是少买，必须报出来）
+            existing[sheet] = set(seen[sheet])
             if not header:
                 logger.warning(f"Sheet「{sheet}」读不到表头，本批跳过它")
 
-        _stage_order(o, plan, titles, seen[sheet])
+        _stage_order(o, plan, plan.dedupe_by, seen[sheet], existing[sheet])
 
     return plans, unmapped, unpriced
+
+
+def _preferred_dedupe_by(header: Dict[str, str], titles: List[str]) -> List[str]:
+    """按目标表实际有的列，把判重键升级到能区分同订单多行的那一位。
+
+    为什么要自适应而不是让用户配死：各表加「子订单号」列的进度不一样（2026-08-06 云端 4 张
+    表都还没加，本地表刚加了一张），配死任一种都会有表踩坑——配子订单号则缺列的表 no_key
+    整表不写，配尺码则无规格商品（属性恒为 `Variant`）在同订单里撞键少买。
+
+    规则：配置里已经指定了区分位（子订单号/尺码之一）就尊重配置，不动；
+    只配了订单号这类单列键时，看表里有没有更精确的列，有就自动补上——单列键会把同订单的
+    其余子订单全判成重复丢掉，这是静默少买，值得替用户兜一下。
+    补的时候优先子订单号，其次尺码；两者都没有就只能维持原样（后续由 collided 计数暴露）。
+    """
+    if any(t.strip() in _ROW_DISCRIMINATORS for t in titles):
+        return list(titles)
+    for cand in _ROW_DISCRIMINATORS:
+        if pipeline.resolve_title_column(header, cand):
+            upgraded = list(titles) + [cand]
+            logger.info(
+                f"判重键 {titles} 只有订单号一位，按表内实际列自动补上「{cand}」→ {upgraded}"
+                "（避免同订单多个子订单被判成重复而少买）"
+            )
+            return upgraded
+    return list(titles)
 
 
 def _existing_keys(workbook: str, plan: SheetPlan, titles: List[str],
@@ -613,9 +658,17 @@ def _existing_keys(workbook: str, plan: SheetPlan, titles: List[str],
 
 
 def _stage_order(
-    o: pipeline.OrderRow, plan: SheetPlan, titles: List[str], seen: set
+    o: pipeline.OrderRow, plan: SheetPlan, titles: List[str], seen: set,
+    existing: Optional[set] = None,
 ) -> None:
-    """把一条订单排进某 Sheet 的写入计划；已入库或本批内重复的只计数不排。"""
+    """把一条订单排进某 Sheet 的写入计划；已入库或本批内重复的只计数不排。
+
+    existing 是「进本批之前表里已有的键」。传了它就能把两种 dup 分开：
+      - 表里已有 → 正常判重，本来就不该再写
+      - **本批内两行撞了同一个键** → 这行从没写过就被丢了，等于少买，属于判重键选得不够细
+        （典型：dedupe_by 只配了订单号，或尺码取到恒为 `Variant` 的无规格商品）。
+        这种必须报出来，不能跟上面那种混在一个数字里静默掉。
+    """
     if plan.no_key or not plan.header:
         return
     key = pipeline.dedupe_key(o, plan.header, titles, plan.store_value)
@@ -624,6 +677,12 @@ def _stage_order(
         return
     if key in seen:
         plan.dup += 1
+        # 不在「原有键」里却已在 seen 里 → 是本批前面某行占的位，同批撞键
+        if existing is not None and key not in existing:
+            plan.collided.append({
+                "order_no": o.order_no, "sub_order_no": o.sub_order_no,
+                "attrs": o.attrs, "key": list(key),
+            })
         return
     seen.add(key)
 
@@ -796,6 +855,13 @@ async def run_orders_batch(
     cloud, workbook, doc_mode = resolve_doc_target(cfg, workbook, doc_mode)
     list_url = list_url or str(cfg.get("list_url") or "")
     dedupe_by = list(cfg.get("dedupe_by") or _DEFAULT_DEDUPE_BY)
+    # 只按订单号判重会把同订单的其余子订单当成重复丢掉（少买），且是静默的。
+    # 不中止：这是用户的配置选择，但必须让他在日志里看见。
+    if [t.strip() for t in dedupe_by] == ["订单号"]:
+        logger.warning(
+            "dedupe_by 只配了「订单号」：一个订单含多个子订单时，除第一行外都会被判成重复"
+            "丢掉（＝少买）。建议改成 [\"订单号\", \"子订单号\"]（表里需有子订单号列）。"
+        )
     sheet = (sheet or "").strip()
     if sheet:
         if not store:
@@ -921,8 +987,19 @@ async def run_orders_batch(
         await _emit(on_progress, {
             "type": "plan", "sheet": plan.sheet, "pending": len(plan.rows),
             "dup": plan.dup, "no_key": plan.no_key,
+            # 这张表实际用的判重列，报出来便于核对（各表可能不同）
+            "dedupe_by": plan.dedupe_by,
+            # 同批撞键＝这些行从没写过就被丢了（少买），与 dup 语义不同，单独报
+            "collided": len(plan.collided),
+            "collided_samples": plan.collided[:5],
             "with_image": sum(1 for r in plan.rows if r.get("image_path")),
         })
+        if plan.collided:
+            logger.warning(
+                f"Sheet「{plan.sheet}」有 {len(plan.collided)} 行在本批内撞了同一个判重键"
+                f"被丢弃（＝少买）：判重键 {plan.dedupe_by} 区分不了这些行。"
+                f"建议在该表加「子订单号」列（一单一号，不会撞）。样例：{plan.collided[:3]}"
+            )
     if unmapped:
         await _emit(on_progress, {
             "type": "unmapped", "count": len(unmapped), "samples": unmapped[:5],
@@ -1134,6 +1211,9 @@ def _summary(
         "purchase": purchase or {},
         "pending": sum(len(p.rows) for p in plans.values()),
         "dup_skipped": sum(p.dup for p in plans.values()),
+        # dup_skipped 的子集：本批内撞键被丢的行数（＝少买，判重键不够细），单独报出来
+        "collided_skipped": sum(len(p.collided) for p in plans.values()),
+        "collided_samples": [c for p in plans.values() for c in p.collided][:5],
         "unmapped_skipped": len(unmapped or []),
         # 页面暂无成交单价、留到下批的订单（与 unmapped 语义不同：这个明天自己就好了）
         "unpriced_skipped": len(unpriced or []),
@@ -1145,7 +1225,8 @@ def _summary(
         ),
         "failed_sheets": [s for s, r in written.items() if r.get("error")],
         "sheets": {
-            s: {"pending": len(p.rows), "dup": p.dup, "preview": p.preview[:3]}
+            s: {"pending": len(p.rows), "dup": p.dup,
+                "collided": len(p.collided), "preview": p.preview[:3]}
             for s, p in plans.items()
         },
     }
