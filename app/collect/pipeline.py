@@ -1084,16 +1084,45 @@ async def resolve_sheet_schema_cloud(cloud, sheet: str) -> SheetSchema:
     )
 
 
+def _cloud_first_row(cloud, sheet: str, schema: SheetSchema,
+                     insert_at_top: bool, at_row: Optional[int] = None,
+                     up_count: int = 0) -> int:
+    """本批新行的起始行号（1-based，用于公式模板的 {r}）。
+
+    公式必须在写入【之前】按真实落点渲染，所以这里要先把落点算出来——与
+    KdocsSheet.write_rows 内部同一套口径。两处口径若漂移，公式会指向错行、算出别人家的值。
+
+    - at_row 为 None：插顶端=表头正下方；追加=数据区末行之后（空表退回表头正下方）。
+    - at_row 有值：就用它（「从第 R 行向下插」）。
+    - up_count>0：「向上插」——新行要落在 at_row 之前，故起点 = at_row - n，
+      但不得越过表头（挤到表头上会写坏标题行），越界则从表头下一行开始。
+    """
+    if at_row is not None:
+        if up_count > 0:
+            return max(at_row - up_count, schema.header_row + 1)
+        return at_row
+    if insert_at_top:
+        return schema.header_row + 1
+    end = cloud.data_end_row(sheet)  # 0-based
+    return max(end + 2, schema.header_row + 1)  # 0-based 末行 +1 行 → 1-based 再 +1
+
+
 async def write_product_row_cloud(
     cloud,
     sheet: str,
     item: dict,
     res: CollectResult,
     schema: SheetSchema,
+    insert_at_top: bool = False,
+    at_row: Optional[int] = None,
+    up_count: int = 0,
 ) -> tuple[bool, str]:
-    """云端协作文档版 write_product_row：单行写入（插到表头正下方），值+公式同批，
+    """云端协作文档版 write_product_row：单行写入，值+公式同批，
     主图走 item["image"] 的在线 URL 嵌入（不经本地下载，KdocsSheet.write_rows 内部
     已做 avif→jpeg 转换）。
+
+    落点：at_row 有值则钉死在那一行（采集页「从第 R 行插」，up_count>0 表示向上插）；
+    否则 insert_at_top=True 插到表头正下方、False 追加到数据区末尾（默认）。
 
     KdocsSheetError → 返回 (False, msg)，单商品失败不连坐（与本地「写入失败」同口径）。
     """
@@ -1101,18 +1130,112 @@ async def write_product_row_cloud(
 
     if not schema.ok:
         return False, schema.error
+    try:
+        first_row = await asyncio.to_thread(
+            _cloud_first_row, cloud, sheet, schema, insert_at_top, at_row, up_count
+        )
+        row = _cloud_row(item, res, schema, 0, first_row)
+        await asyncio.to_thread(
+            cloud.write_rows, sheet, [row], schema.header_row, insert_at_top,
+            first_row if at_row is not None else None,
+        )
+    except KdocsSheetError as e:
+        return False, f"写入失败：{e}"
+    return True, "已写入"
+
+
+def _cloud_row(item: dict, res: CollectResult, schema: SheetSchema,
+               offset: int, first_row: int) -> dict:
+    """组装 write_rows 需要的一行。
+
+    offset = 该行在本批里的序号（0 起）；first_row = 本批第一行的 1-based 行号。
+    公式行号必须按 offset 递增：一批 n 行占 first_row .. first_row+n-1，若全用
+    first_row，n 行公式会齐刷刷指向第一行、算出同一个值。
+    """
     values = _build_column_values(item, res, schema)
     # 公式放最后：write_rows 的读回校验取 values 里第一个非空值比对 cellText，
     # 公式格的 cellText 是计算值而非公式串，放前面必误判「写入验证失败」。
     for col, tpl in schema.formula_columns.items():
-        values[col] = tpl.format(r=schema.header_row + 1)
-    row = {
+        values[col] = tpl.format(r=first_row + offset)
+    return {
         "values": values,
         "image_column": schema.fields.get("image"),
         "image_url": item.get("image"),
     }
+
+
+async def write_product_rows_cloud(
+    cloud,
+    sheet: str,
+    items: list,
+    schema: SheetSchema,
+    insert_at_top: bool = False,
+    at_row: Optional[int] = None,
+    up_count: int = 0,
+) -> tuple[bool, str, list]:
+    """把整批商品【一次】写进协作文档，返回 (整批是否成功, 说明, 确认落表的 SPU 列表)。
+
+    为什么要批量：逐商品写一行要 5~6 次 kdocs 调用（插行/文本/图片/读回校验/确认），
+    而 write_rows 本身支持多行——内部把文本攒到 500 格一批、图片 10 张一批，写 20 行
+    也就 6 次。实测 20 个商品从 124 次降到 10 次。kdocs 有配额（429001 限频要等 20s、
+    429002 直接熔断），这个量级的差距决定了整批能不能一次跑完。
+
+    【原子性是刻意的「一坏全坏」】一批里任一行文本写失败/读回校验不过，整批算失败并
+    落日志，不做「挑出坏的再写剩下的」——那样表里会留下半批数据，而判重键已落表，
+    重跑时这半批被当成已入库跳过，人工很难看出哪几行是残缺的。整批失败则一行不落，
+    重跑即可，语义干净。图片失败仍只告警不连坐（沿用 write_rows 的既定取舍：
+    文本已登记就算这行成立，图片格留空可人工补，见 kdocs_sheet.write_rows）。
+
+    insert_at_top 决定落点：True 插到表头正下方，False 追加到数据区末尾。
+
+    确认口径：只读新行区那 n 格（read_new_rows_column），不再拉整列。
+    """
+    from app.orders.kdocs_sheet import KdocsSheetError
+
+    if not schema.ok:
+        return False, schema.error, []
+    if not items:
+        return True, "本批无商品", []
+
+    spu_col = schema.fields.get("spu")
+    if not spu_col:
+        return False, "schema 缺 SPU 列，无法确认写入", []
+
     try:
-        await asyncio.to_thread(cloud.write_rows, sheet, [row], schema.header_row)
+        # 落点要在渲染公式【之前】定下来（追加模式下依赖当前末行），并复用给写后确认——
+        # 若确认时重新算一次，写入已让 row_to 增长，会读到本批之后的空白区。
+        first_row = await asyncio.to_thread(
+            _cloud_first_row, cloud, sheet, schema, insert_at_top, at_row, up_count
+        )
+        rows = [
+            _cloud_row(
+                item,
+                CollectResult(spu=str(item.get("spu", "")), ok=True,
+                              note="采购价/重量待人工填"),
+                schema, offset, first_row,
+            )
+            for offset, item in enumerate(items)
+        ]
+        await asyncio.to_thread(
+            cloud.write_rows, sheet, rows, schema.header_row, insert_at_top,
+            first_row if at_row is not None else None,
+        )
     except KdocsSheetError as e:
-        return False, f"写入失败：{e}"
-    return True, "已写入"
+        return False, f"整批写入失败（一行不落，可直接重跑）：{e}", []
+
+    # 写后确认：读新行区的 SPU 列，与本批 SPU 逐行比对（顺序与写入同序）
+    try:
+        got = await asyncio.to_thread(
+            cloud.read_new_rows_column, sheet, spu_col, first_row, len(rows)
+        )
+    except KdocsSheetError as e:
+        return False, f"整批写后确认失败：{e}", []
+
+    expect = [str(it.get("spu", "")).strip() for it in items]
+    missing = [s for s, g in zip(expect, got) if s != g]
+    if missing:
+        return False, (
+            f"整批写后确认不一致：{len(missing)} 行 SPU 与预期不符"
+            f"（期望 {expect[:3]}… 实际 {got[:3]}…）"
+        ), []
+    return True, f"整批已写入 {len(rows)} 行", expect

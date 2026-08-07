@@ -88,6 +88,11 @@ async def main():
     parser.add_argument("--sheet", default=None, help="目标 Sheet 名（缺省=上次选择/出厂默认）")
     parser.add_argument("--store", default=None, help="只采该店铺（mallid 或店名；缺省=全部）")
     parser.add_argument(
+        "--region", default="",
+        help="目标区域（顶栏「全球 / 美国 / 欧区」）。以此为准：浏览器停在别的区域会先"
+             "替你切过去再采；缺省=跟随浏览器当前区域",
+    )
+    parser.add_argument(
         "--doc-mode", choices=["auto", "local", "cloud"], default="auto",
         help="写本地工作簿还是协作文档。local=只写本地 xlsx（kdocs 配额用满时切这个；"
              "未给 --excel 则用上次选过的那个，没有就报错让你显式指定）；"
@@ -96,7 +101,13 @@ async def main():
     args = parser.parse_args()
 
     if args.refresh or args.enumerate_only or not service.WORKLIST.exists():
-        await service.enumerate_worklist()
+        # 区域未确认是要人去浏览器里处理的事（选定区域 / 只留一个区域的列表页），
+        # 打清楚提示直接退出，不带 traceback 也不继续往下跑空批。
+        try:
+            await service.enumerate_worklist(region_label=args.region)
+        except service.RegionNotConfirmed as e:
+            logger.error(f"❌ {e}")
+            return
     if args.enumerate_only:
         return
 

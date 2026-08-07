@@ -36,6 +36,11 @@ from app.config import PROJECT_ROOT, config, get_output_dir
 from app.logger import logger
 from app.orders import pipeline
 from app.orders.kdocs_sheet import KdocsSheet
+from app.temu_region import (
+    confirm_region_from_context,
+    read_region,
+    region_conflict,
+)
 from app.tool.wps_excel_tool import WpsExcelTool
 
 # 整批护栏：翻完 N 页 + 导出 + 下 N 张图，247 条实测约 3~5 分钟，给足余量。
@@ -217,7 +222,8 @@ def load_prefs() -> dict:
 
 
 def save_prefs(store: str = "", workbook: str = "", sheet: str = "",
-               doc_mode: str = "") -> None:
+               doc_mode: str = "",
+               region_label: Optional[str] = None) -> None:
     """记住本次选择，供下次 UI 缺省回填。写失败只告警、不阻断本批。
 
     workbook 是协作文档链接时存到 cloud_url（与本地路径分开）：下次首屏按
@@ -235,8 +241,14 @@ def save_prefs(store: str = "", workbook: str = "", sheet: str = "",
     """
     mode = normalize_doc_mode(doc_mode)
     old = load_prefs() if mode != DOC_MODE_AUTO else {}
+    # 区域：None = 本次没传，沿用上次记的（老版本 UI/CLI 不带这个参数，别被空串重置掉）；
+    # 空串 = 显式选「跟随浏览器当前区域」。故这里必须读完整旧偏好，不能借用上面按模式取的 old。
+    region_val = (
+        load_prefs().get("region_label") or "" if region_label is None
+        else str(region_label).strip()
+    )
     data = {"store": store, "sheet": sheet, "workbook": "", "cloud_url": "",
-            "doc_mode": mode}
+            "doc_mode": mode, "region_label": region_val}
     if is_cloud_link(workbook):
         data["cloud_url"] = workbook.strip()
         data["workbook"] = str(old.get("workbook") or "")
@@ -343,6 +355,32 @@ def _cloud_worklist(
             if sheet and not cloud_err else {}
         ),
     }
+
+
+async def peek_current_region() -> dict:
+    """只读探当前浏览器里选定的区域，供订单页首屏展示。{label, host, labels, error}。
+
+    为什么只展示、不做选择器：区域的真值在【浏览器里】——它是操作者在 Temu 顶栏点选的，
+    切换会换域名。UI 上再放一个区域下拉就有了两处真值，选了却和浏览器不一致时反而更危险。
+    所以这里把浏览器的实际区域显示出来，让操作者在点「开始」前对一眼，落表仍由店铺+Sheet 决定。
+
+    best-effort：连不上 CDP、没开后台页、区域读不到都只回 error 字符串，绝不抛——首屏
+    不该因为浏览器没开就打不开（对齐本项目辅助路径吞异常的取向）。
+    """
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(CDP_URL)
+            try:
+                if not browser.contexts:
+                    return {"error": "CDP 浏览器没有可用 context"}
+                region = await confirm_region_from_context(browser.contexts[0])
+                return {"label": region.label, "host": region.host,
+                         "labels": list(region.labels), "error": ""}
+            finally:
+                await browser.close()
+    except Exception as e:
+        logger.warning(f"读当前区域失败（首屏仅提示，忽略）：{e}")
+        return {"error": str(e)}
 
 
 def get_worklist_status(
@@ -716,17 +754,47 @@ def _preview_row(
     return row | {"_图片": "有" if item.get("image_path") else "无"}
 
 
+def _retarget_url_host(url: str, host: str) -> str:
+    """把 URL 的域名换成 host，**其余部分（路径/query/fragment）原样保留**。
+
+    为什么不用 url_in_region 重建：list_url 是操作者自己配的，query 里带着订单列表的筛选
+    与排序参数（sortType 等，check_list_sort_url 还要校验它）。按路径重建会把这些参数丢掉，
+    等于悄悄改掉本批的采集范围。所以只动 netloc。
+
+    host 为空或与原域相同则原样返回。url 解析不出域名（相对路径等）也原样返回，交由调用方
+    的既有校验处理。
+    """
+    from urllib.parse import urlsplit, urlunsplit
+
+    if not host:
+        return url
+    try:
+        parts = urlsplit(str(url or ""))
+        if not parts.netloc or parts.netloc.lower() == host.lower():
+            return url
+        switched = urlunsplit(parts._replace(netloc=host))
+        logger.info(f"list_url 域名按区域改写：{parts.netloc} → {host}")
+        return switched
+    except Exception as e:
+        logger.warning(f"改写 list_url 域名失败（沿用原链接）：{e}")
+        return url
+
+
 async def collect_orders(
     list_url: str,
     store: str = "",
     on_progress: ProgressCB = None,
     max_pages: int = 200,
     known_order_nos: Optional[set] = None,
+    region_label: str = "",
 ) -> dict:
     """连 CDP、开专用页签、翻页勾选抓图、触发导出、解析。返回 {orders, store, stat...}。
 
     专用页签模式同活动管线：绝不复用用户正在操作的页签——它的筛选条件、弹窗和生命周期
     都不受管线控制，用户随手一关就把整批打断。用完即关，不碰用户原有页签。
+
+    region_label：UI 上选定的区域，**以它为准**——浏览器停在别的区域会先切过去再采
+    （区域切换换域名，决定这批能看到哪些订单）。空串＝跟随浏览器当前区域。
     """
     pw = await async_playwright().start()
     browser = None
@@ -736,6 +804,18 @@ async def collect_orders(
         if not browser.contexts:
             raise RuntimeError("CDP 浏览器没有可用 context")
         ctx = browser.contexts[0]
+
+        # 区域前置动作：顶栏「全球 / 美国 / 欧区」切换换的是【域名】（全球
+        # agentseller.temu.com、美国 agentseller-us.temu.com，2026-08-07 实测），选中的
+        # 区域决定页面能看到哪批订单。
+        #
+        # 以 UI 选定的区域为准：浏览器停在别的区域就切过去（confirm_region_from_context
+        # 内部完成），随后把 list_url 的域名换成该区域的域名——**只换 host，路径与
+        # query 原样保留**，因为那里带着操作者配的筛选与排序参数（sortType 等），
+        # 重建 URL 会丢掉它们。域名不改则会拿全球域链接去导美国区的单，整批落错表。
+        region = await confirm_region_from_context(ctx, region_label)
+        list_url = _retarget_url_host(list_url, region.host)
+
         page = await ctx.new_page()
         await page.goto(list_url, wait_until="domcontentloaded", timeout=60000)
         try:
@@ -746,13 +826,27 @@ async def collect_orders(
             logger.warning(f"关弹窗失败（继续）：{e}")
         await page.wait_for_selector("table tbody tr", timeout=60000)
 
+        # 新开的页签也复核一次：goto 后页面可能被平台重定向到别的区域域名
+        drift = region_conflict(region, await read_region(page))
+        if drift:
+            raise RuntimeError(
+                f"订单列表页签{drift}。已中止，避免把别的区域的订单登记进本批。"
+            )
+
         detected = store or await pipeline.detect_store(page)
         if not detected:
             raise RuntimeError(
                 "识别不到当前登录店铺名，已中止：店铺决定订单写进哪张表，"
                 "猜错会把订单写进别人家的 Sheet。请在界面/CLI 显式指定店铺。"
             )
-        await _emit(on_progress, {"type": "store", "store": detected})
+        # 区域随 store 事件一并抛出：店铺名本身不含区域（同一账号在全球/美国区读到的是
+        # 同一个名字），落表靠的是店铺+站点。把区域摆到进度里，操作者 dry-run 复核时能
+        # 一眼确认「这批是哪个区域的单」，而不是等写完才发现区域选错。
+        await _emit(on_progress, {
+            "type": "store", "store": detected,
+            "region": region.key, "region_label": region.label,
+        })
+        logger.info(f"本批区域={region.describe()} 店铺={detected}")
 
         async def _on_page(info: dict) -> None:
             await _emit(on_progress, {"type": "page", **info})
@@ -782,6 +876,9 @@ async def collect_orders(
         })
         return {
             "orders": orders, "store": detected, "export_file": xlsx,
+            # 实际生效的区域（可能是 UI 选定后切过去的）：进采购汇总文件名，
+            # 同账号跨区域店名相同，只带店名分不清是哪个区域的单
+            "region": region.label, "region_host": region.host,
             "total": swept["total"], "pages": swept["pages"], "join": join_stat,
             # 被 max_pages 截断＝本批不是全量，一路传到汇总，别让人误读成「全跑完了」
             "truncated": swept.get("truncated", False),
@@ -832,6 +929,7 @@ async def run_orders_batch(
     require_price: bool = False,
     incremental: bool = True,
     doc_mode: str = "",
+    region_label: str = "",
 ) -> dict:
     """整批入口：预检 →（读水位）→ 采集 → 计划 →（dry_run 则止步）→ 批量写入 → 汇总。
 
@@ -944,7 +1042,8 @@ async def run_orders_batch(
     try:
         got = await asyncio.wait_for(
             collect_orders(list_url, store=store, on_progress=on_progress,
-                           max_pages=max_pages, known_order_nos=known),
+                           max_pages=max_pages, known_order_nos=known,
+                           region_label=region_label),
             timeout=ORDERS_BATCH_TIMEOUT,
         )
     except asyncio.TimeoutError:
@@ -980,6 +1079,9 @@ async def run_orders_batch(
         # 店铺名进文件名：多店铺时同一日期目录下要能一眼分辨。用 got["store"]（采集时
         # 实际识别/指定的那家）而不是入参 store——后者可能为空、由 detect_store 补上
         got.get("store", ""),
+        # 区域同理用 got["region"]（实际生效的那个，可能是按 UI 选择切过去的），
+        # 而不是入参 region_label——后者为空时表示「跟随浏览器当前」，文件名里要写实际值
+        got.get("region", ""),
     )
     if purchase.get("file") or purchase.get("md_file"):
         await _emit(on_progress, {"type": "purchase_summary", **purchase})
@@ -1058,7 +1160,8 @@ def _purchase_out_dir(stamp: str) -> Path:
 
 
 def _export_purchase(
-    pending_orders: List[pipeline.OrderRow], stamp: str, store: str = ""
+    pending_orders: List[pipeline.OrderRow], stamp: str, store: str = "",
+    region: str = "",
 ) -> dict:
     """出本批的采购统计：xlsx（筛选核对用）+ md（合并下单速览用），各批一份新文件。
 
@@ -1069,7 +1172,8 @@ def _export_purchase(
     给统计就晚了。
     """
     purchase = {
-        "file": "", "md_file": "", "store": store, "rows": len(pending_orders),
+        "file": "", "md_file": "", "store": store, "region": region,
+        "rows": len(pending_orders),
         "groups": 0, "repeated_groups": 0, "total_qty": 0,
         # 商品级：products=涉及几个 SPU，multi_products=要一次买多规格的有几个
         "products": 0, "multi_products": 0, "variants": 0,
@@ -1082,13 +1186,15 @@ def _export_purchase(
     out_dir = str(_purchase_out_dir(stamp))
     try:
         purchase.update(
-            pipeline.export_purchase_summary(pending_orders, out_dir, stamp, store)
+            pipeline.export_purchase_summary(
+                pending_orders, out_dir, stamp, store, region)
         )
     except Exception as e:
         logger.warning(f"导出新增订单采购汇总 xlsx 失败（不影响登记表写入）：{e}")
     try:
         purchase.update(
-            pipeline.export_purchase_markdown(pending_orders, out_dir, stamp, store)
+            pipeline.export_purchase_markdown(
+                pending_orders, out_dir, stamp, store, region)
         )
     except Exception as e:
         logger.warning(f"导出新增订单采购统计 md 失败（不影响登记表写入）：{e}")

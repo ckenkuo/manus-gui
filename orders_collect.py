@@ -176,6 +176,11 @@ async def main() -> None:
     )
     parser.add_argument("--list-url", default="", help="待发货订单页 URL（缺省=配置）")
     parser.add_argument(
+        "--region", default="",
+        help="目标区域（顶栏「全球 / 美国 / 欧区」）。以此为准：浏览器停在别的区域会先切"
+             "过去，list_url 的域名也按该区域改写；缺省=跟随浏览器当前区域",
+    )
+    parser.add_argument(
         "--max-pages", type=int, default=200, help="最多翻几页（冒烟用，缺省 200）"
     )
     parser.add_argument(
@@ -209,6 +214,7 @@ async def main() -> None:
         require_price=args.require_price,
         incremental=not args.no_incremental,
         doc_mode=args.doc_mode,
+        region_label=args.region,
     )
 
 

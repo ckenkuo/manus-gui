@@ -173,6 +173,15 @@ price_strategy = "discount_ceiling"
 cloud_file_id = ""
 cloud_link = ""   # 人类可读的分享链接，仅用于 UI 回显
 
+# 新行写入位置（UI 的「写入位置」下拉同源，这里只是出厂默认；用户在页面选过就以 prefs 为准）：
+#   bottom    追加到数据区末尾（默认）
+#   top       插到表头正下方，已有数据下移
+#   row_down  从 append_row 行开始向下插（原该行及以下下移）
+#   row_up    插在 append_row 行之前（该行内容不变、行号变大）
+# append_row 仅 row_down / row_up 用；缺失或落在表头及以上时自动退回 bottom 并告警。
+append_mode = "bottom"
+append_row = 0
+
 # 订单登记管线（Temu 待发货订单 → 本地订单登记表）。
 # 走页面自带「导出订单」拿官方 xlsx，产品主图从 DOM 抓（导出文件里没有图）。
 [orders]

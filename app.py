@@ -408,29 +408,47 @@ async def collect_worklist(
 
     可选 excel/sheet/store 过滤：缺省回填上次选择。响应含 workbooks/sheets/stores 供下拉。
     doc_mode（local/cloud）钉死本地表还是协作文档；不传则沿用上次选的模式。
+    附带回传区域状态（当前区域 + 该账号可选区域，供下拉渲染；best-effort，读不到只带 error）。
     """
-    return JSONResponse(content=collect_service.get_worklist_status(
+    status = collect_service.get_worklist_status(
         excel=excel or None, sheet=sheet or None, store=store or None,
         doc_mode=doc_mode or None,
-    ))
+    )
+    status["region"] = await collect_service.peek_regions()
+    status["region_label"] = collect_service.load_prefs().get("region_label") or ""
+    return JSONResponse(content=status)
 
 
 @app.post("/collect/enumerate")
-async def collect_enumerate(status: str = Body("", embed=True)):
+async def collect_enumerate(status: str = Body("", embed=True),
+                            region: str = Body("", embed=True)):
     """重新枚举所有已打开店铺标签的清单，写 worklist.json，返回条数。
 
     status：采集范围。空串（默认）= 跟随各店 Temu 页面当前的页签 + 所有筛选（类目/站点/
     商品名等），点页面「查询」原样采集；非空 = 先替你切到该页签再查询。本次选择记入偏好回显。
+    region：目标区域（顶栏「全球 / 美国 / 欧区」）。**以这里选的为准**——浏览器停在别的
+    区域会先替你切过去再采；空串 = 跟随浏览器当前区域。
     """
     tab = status or ""
-    # 记住本次采集范围，保留已存的 excel/sheet/store 不被覆盖；
+    # 记住本次采集范围与区域，保留已存的 excel/sheet/store 不被覆盖；
     # 云端目标存在 cloud_url 键（与 excel 互斥），回传时二选一，避免被空 excel 清掉
     prefs = collect_service.load_prefs()
     collect_service.save_prefs(
         prefs.get("excel") or prefs.get("cloud_url") or "",
-        prefs.get("sheet", ""), prefs.get("store", ""), tab
+        prefs.get("sheet", ""), prefs.get("store", ""), tab,
+        region_label=region or "",
     )
-    count = await collect_service.enumerate_worklist(status_tab=tab)
+    # 区域问题（读不到 / 目标区域不存在 / 切过去后复核失败）是可操作的用户侧问题，
+    # 不是服务异常：回 409 + 明确文案，让前端红条提示，而不是抛 500 堆栈。
+    try:
+        count = await collect_service.enumerate_worklist(
+            status_tab=tab, region_label=region or "")
+    except collect_service.RegionNotConfirmed as e:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "region_not_confirmed", "reason": str(e),
+                     "status": collect_service.get_worklist_status()},
+        )
     return {"count": count, "status": collect_service.get_worklist_status()}
 
 
@@ -443,6 +461,8 @@ async def collect_batch(
     sheet: str = Body("", embed=True),
     store: str = Body("", embed=True),
     doc_mode: str = Body("", embed=True),
+    append_mode: str = Body("", embed=True),
+    append_row: Optional[int] = Body(None, embed=True),
 ):
     """启动一批采集作业，返回 job_id；进度经 /collect/batch/{job_id}/events (SSE) 消费。
 
@@ -450,6 +470,8 @@ async def collect_batch(
     excel/sheet/store 指定目标工作簿/Sheet/店铺（缺省回填上次选择）。
     doc_mode（local/cloud）钉死写本地表还是协作文档：kdocs 有配额，用满了要能立刻切回
     本地继续干活。不传则按链接形态与 config 自动判（历史行为）。
+    append_mode 选新行落点：bottom（默认，追加末尾）/ top（表头下）/ row_down / row_up
+    （后两者配 append_row 指定起始行）。不传沿用上次选择。
     """
     job_id = str(uuid.uuid4())
     job = CollectJob(job_id, limit, use_pipeline, excel, sheet, store, base_only)
@@ -465,6 +487,7 @@ async def collect_batch(
                 on_progress=_on_progress,
                 excel=excel or None, sheet=sheet or None, store=store or None,
                 doc_mode=doc_mode,
+                append_mode=append_mode, append_row=append_row,
             )
         except Exception as e:
             await job.push({"type": "aborted", "reason": f"采集异常：{e}"})
@@ -661,11 +684,16 @@ async def orders_worklist(store: str = "", workbook: str = "", sheet: str = "",
     注意 store/sheet 用空串表示「本次不覆盖」，与 service 的 None 语义对齐：显式传空串
     是「清空选择」，不传则沿用偏好。纯读，不触发采集或写入。
     doc_mode（local/cloud）钉死本地登记表还是协作文档；不传则沿用上次选的模式。
+    附带回传当前浏览器选定的区域（只读展示，best-effort，读不到只带 error）——区域决定
+    这批能看到哪些订单，操作者点「开始」前要能对一眼。
     """
-    return JSONResponse(content=orders_service.get_worklist_status(
+    status = orders_service.get_worklist_status(
         store=store or None, workbook=workbook or None, sheet=sheet or None,
         doc_mode=doc_mode or None,
-    ))
+    )
+    status["region"] = await orders_service.peek_current_region()
+    status["region_label"] = orders_service.load_prefs().get("region_label") or ""
+    return JSONResponse(content=status)
 
 
 @app.get("/orders/sheet_info")
@@ -695,6 +723,7 @@ async def orders_batch(
     allow_no_price: bool = Body(True, embed=True),
     incremental: bool = Body(True, embed=True),
     doc_mode: str = Body("", embed=True),
+    region: str = Body("", embed=True),
 ):
     """启动一批订单登记作业，返回 job_id；进度经 /orders/batch/{job_id}/events (SSE) 消费。
 
@@ -711,13 +740,17 @@ async def orders_batch(
 
     doc_mode（local/cloud）钉死写本地登记表还是协作文档：kdocs 有配额，用满了要能立刻
     切回本地继续干活。不传则按链接形态与 config 自动判（历史行为）。
+
+    region：目标区域（顶栏「全球 / 美国 / 欧区」），**以这里选的为准**——浏览器停在别的
+    区域会先切过去，list_url 的域名也按该区域改写（只换域名，筛选与排序参数原样保留）。
+    空串＝跟随浏览器当前区域。
     """
     job_id = str(uuid.uuid4())
     job = OrdersJob(job_id, store, dry_run)
     orders_jobs[job_id] = job
     # 记住本次选择，下次开页直接回填（写失败不影响本批）
     orders_service.save_prefs(store=store, workbook=workbook, sheet=sheet,
-                              doc_mode=doc_mode)
+                              doc_mode=doc_mode, region_label=region or "")
 
     async def _on_progress(event: dict):
         await job.push(event)
@@ -731,6 +764,7 @@ async def orders_batch(
                 require_price=not allow_no_price,
                 incremental=incremental,
                 doc_mode=doc_mode,
+                region_label=region or "",
             )
         except Exception as e:
             await job.push({"type": "aborted", "reason": f"订单登记异常：{e}"})

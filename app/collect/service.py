@@ -37,17 +37,25 @@ from playwright.async_api import async_playwright
 if TYPE_CHECKING:
     from app.collect.pipeline import SheetSchema
     from app.orders.kdocs_sheet import KdocsSheet
+    from app.temu_region import Region
 
 from app.agent.manus import Manus
 from app.cloud_docs import remember as remember_cloud_doc
 from app.config import PROJECT_ROOT, config
 from app.logger import logger
+
+# 区域未确认异常与活动/订单侧共用同一个类型，三条管线的 UI/CLI 可用同一套 except 转成
+# 「去浏览器里选好区域」的提示。沿用采集侧原有名字，调用方无需改名。
+from app.temu_region import RegionUnconfirmed as RegionNotConfirmed
 from app.tool.wps_excel_tool import WpsExcelTool
 
 # 采集目标出厂默认（偏好文件缺失时兜底；工作簿/Sheet 现已可在 UI/CLI 选择）
 DEFAULT_EXCEL = r"C:\Users\Administrator\Desktop\商品成本核算_原始备份.xlsx"
 DEFAULT_SHEET = "pawly全球"
-TEMU_URL = "https://agentseller.temu.com/newon/product-select"
+# 商品列表页【路径】。刻意不留完整 URL：域名随区域变（全球 agentseller.temu.com、
+# 美国 agentseller-us.temu.com），留个全球域常量，早晚有代码拿它 goto，把操作者选定的
+# 区域悄悄换回全球。采集侧现在只复用用户已打开的列表页签（区域由他自己选定），不新开。
+PRODUCT_SELECT_PATH = "/newon/product-select"
 LIST_API = "searchForSemiSupplier"
 # 采集范围「跟随当前页签」：不再写死 secondarySelectStatusList=[12]（已发布到站点），
 # 而是让代码去点选中的页签、抓页面此刻真正发出的列表请求 body 原样复用（见 _enumerate_one_store）。
@@ -118,6 +126,68 @@ DOC_MODE_AUTO = "auto"
 DOC_MODE_LOCAL = "local"
 DOC_MODE_CLOUD = "cloud"
 _DOC_MODES = (DOC_MODE_AUTO, DOC_MODE_LOCAL, DOC_MODE_CLOUD)
+
+# 新行落点，四种：
+#   bottom     追加到数据区末尾（默认，采集表习惯新品接在旧品之后）
+#   top        插到表头正下方（订单登记表那套「新的在最上面」）
+#   row_down   从指定行开始【向下插入】：该行及其以下整体下移，新行占据它原来的位置
+#   row_up     从指定行开始【向上插入】：新行插在该行【之前】，即落在 row-n .. row-1
+# 采集默认 bottom——2026-08-06 用户明确要求；云端此前一直沿用订单的 insert_at_top，
+# 与本地 xlsx 的追加行为相反，两条路径就此对齐。
+# row_down / row_up 都要配 append_row（1-based）；它们的差别只在「指定行本身要不要被推走」：
+# row_down 从该行开始占位（该行下移），row_up 填到该行上面（该行仍是原内容、只是行号变大）。
+APPEND_BOTTOM = "bottom"
+APPEND_TOP = "top"
+APPEND_ROW_DOWN = "row_down"
+APPEND_ROW_UP = "row_up"
+_APPEND_MODES = (APPEND_BOTTOM, APPEND_TOP, APPEND_ROW_DOWN, APPEND_ROW_UP)
+_APPEND_ROW_MODES = (APPEND_ROW_DOWN, APPEND_ROW_UP)  # 需要 append_row 的两种
+DEFAULT_APPEND_MODE = APPEND_BOTTOM
+
+APPEND_MODE_LABELS = {
+    APPEND_BOTTOM: "追加到末尾",
+    APPEND_TOP: "插到表头下",
+    APPEND_ROW_DOWN: "从指定行向下插",
+    APPEND_ROW_UP: "从指定行向上插",
+}
+
+
+def normalize_append_mode(value: Optional[str]) -> str:
+    """把外部传进来的落点值收敛到四个合法值之一；不认识的退默认（同 normalize_doc_mode 的
+    理由：这个值来自 UI/CLI/prefs/config 四处，prefs 是历史文件、老版本没有这个键）。"""
+    v = str(value or "").strip().lower()
+    return v if v in _APPEND_MODES else DEFAULT_APPEND_MODE
+
+
+def resolve_append_target(mode: str, append_row: Optional[int],
+                         header_row: int) -> tuple[bool, Optional[int], str]:
+    """把（落点模式, 指定行）解析成写入层要的 (insert_at_top, 起始行 1-based, 人读标签)。
+
+    返回的起始行为 None 表示「由写入层自己算」（bottom 要读数据区末行、top 就是表头下一行）。
+    row_down/row_up 返回具体行号，两者的差别在这里就地消化掉，写入层只认「插到第几行」：
+      - row_down=R  → 新行占 R .. R+n-1（原 R 行及以下整体下移）
+      - row_up=R    → 新行占 R-n .. R-1（插在 R 之前）
+    行号非法（缺失/非数字/落到表头及以上）时【退回默认 bottom 并告警】而不是抛错：落点是
+    辅助选项，写错了应当照常入库到安全位置，不该让整批停摆。row_up 的 n 由调用方在拿到
+    起始行后自行减（见 _append_first_row）。
+    """
+    mode = normalize_append_mode(mode)
+    if mode == APPEND_TOP:
+        return True, header_row + 1, APPEND_MODE_LABELS[APPEND_TOP]
+    if mode == APPEND_BOTTOM:
+        return False, None, APPEND_MODE_LABELS[APPEND_BOTTOM]
+
+    try:
+        r = int(str(append_row).strip())
+    except (TypeError, ValueError):
+        r = 0
+    if r <= header_row:
+        logger.warning(
+            f"落点「{APPEND_MODE_LABELS[mode]}」的行号（{append_row}）无效或落在表头"
+            f"（第 {header_row} 行）及以上，本批退回「追加到末尾」。"
+        )
+        return False, None, APPEND_MODE_LABELS[APPEND_BOTTOM]
+    return True, r, f"{APPEND_MODE_LABELS[mode]}（第 {r} 行）"
 
 
 def normalize_doc_mode(value: Optional[str]) -> str:
@@ -214,7 +284,8 @@ def _looks_like_local_path(value: str) -> bool:
 
 def save_prefs(
     excel: str = "", sheet: str = "", store: str = "", status: str = "",
-    doc_mode: str = "",
+    doc_mode: str = "", append_mode: str = "", append_row: Optional[int] = None,
+    region_label: Optional[str] = None,
 ) -> None:
     """记住本次选择（含采集页签 status），供下次 UI/CLI 缺省回填。写失败只告警、不阻断采集。
 
@@ -229,9 +300,26 @@ def save_prefs(
     「cloud_url 有值就走云端」，留着旧链接会把用户后来选的本地表盖掉。
     """
     mode = normalize_doc_mode(doc_mode)
+    # 落点偏好与目标解析无关，故【总是】读旧值兜底（上面的 old 在 auto 模式下是空的，
+    # 不能借用）：不传就沿用上次选的，避免旧版 UI/CLI 不带这个参数时被悄悄重置成默认。
+    _prev = load_prefs()
+    prev_append, prev_row = _prev.get("append_mode"), _prev.get("append_row")
     old = load_prefs() if mode != DOC_MODE_AUTO else {}
+    row_val = append_row if append_row is not None else prev_row
+    try:
+        row_val = int(str(row_val).strip()) if row_val not in (None, "") else None
+    except (TypeError, ValueError):
+        row_val = None
+    # 区域选择：None = 本次没传，沿用上次记的（别被空串重置掉，老版本 UI/CLI 不带这个参数）；
+    # 空串 = 显式选「跟随浏览器当前区域」。
+    region_val = (
+        _prev.get("region_label") or "" if region_label is None
+        else str(region_label).strip()
+    )
     data = {"excel": "", "cloud_url": "", "sheet": sheet, "store": store,
-            "status": status, "doc_mode": mode}
+            "status": status, "doc_mode": mode,
+            "append_mode": normalize_append_mode(append_mode or prev_append),
+            "append_row": row_val, "region_label": region_val}
     v = (excel or "").strip()
     if is_cloud_link(v) or (v and not _looks_like_local_path(v)):
         data["cloud_url"] = v
@@ -354,23 +442,68 @@ async ({mallid, url, body}) => {
 """
 
 
-# best-effort 读店铺名。Temu 卖家中心（agentseller.temu.com）类名全哈希化，语义类名
-# （storeName/mallName…）一个都命不中；实测店名是【顶栏最右侧】的短文本（如 x≈1965 的
-# 「VibeMakers」）。故策略：取顶栏（top<60）所有叶子短文本，按 x 从右往左，跳过已知功能
-# 按钮词（消息/客服/设置/Beta/纯数字/99+ 等），取最右侧的第一个即店名。
-# 先试语义类名（别的卖家中心可能有），命中就用；否则退顶栏最右启发式；全失败返回 ''
-# （调用方退回 mallid）。启发式易随改版失效，需要时对真实页重验微调，勿过拟合。
+# best-effort 读店铺名，四级降级：__USER_INFO__ → rawData → 语义类名 → 顶栏最右启发式。
+#
+# 【为什么不能靠顶栏启发式】它反复误命中：先是「查看使用帮助」「打开商家助手」，2026-08-06
+# 又是「查看使用教程」——这些帮助入口渲染得比店名还靠右，文案随版本改名，靠排除词表永远
+# 追不上（每修一个又冒一个）。所以必须优先读页面自己注入的状态数据。
+#
+# 【2026-08-07 实测修正：rawData 在本版后台压根不存在】product-select 页
+# `window.rawData` 为 undefined（`has_rawData: false`），于是原来的「rawData 优先」形同
+# 虚设，实际一路掉到最末的启发式——那次恰好挑对（Pawly）纯粹因为新文案「查看使用教程」
+# 已被 badKw 拦住，再冒一个词就会误命中。订单侧 _STORE_JS 同样实测返回空串。
+#
+# 真正稳的挂载点是 `window.__USER_INFO__.shopList[].malInfoList[]`，实测结构：
+#   {mallId: 634418228070796（**数字**）, mallName: "Pawly", managedType: 1, mallMode: 1, ...}
+# 注意平台把 mall 拼成了 `mal`（malInfoList），别照 mallList 写。mallId 是数字类型，
+# 与 mallid cookie/请求头的字符串比对前必须 String() 归一，否则 === 永远不等。
+# rawData 那级予以保留：别的后台版本/页面可能有它，删掉等于自断一条路（见项目「保留原有
+# 正确逻辑」的增量修改约定）。
+#
+# 【用 mallid 精确定位】采集侧此时已从网络请求头嗅到该标签的 mallid，多店账号也能精确挑出
+# 【当前这个店】；匹配不上再退「列表只有一个」的单店情形。全失败返回 ''（调用方退回 mallid）。
 _READ_STORE_NAME_JS = r"""
-() => {
+(mallid) => {
+  const ok = (t) => t && t.length >= 1 && t.length <= 40 ? t : '';
+  // 从「mall 对象数组」里挑店名：先按 mallid 精确匹配，其次单店直接取。
+  // mallId 实测是数字，故两边都 String() 归一再比。
+  const pickFrom = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return '';
+    if (mallid) {
+      const hit = arr.find(m => String(m?.mallId ?? m?.mallid ?? '') === String(mallid));
+      if (hit) { const t = ok(String(hit.mallName || '').trim()); if (t) return t; }
+    }
+    if (arr.length === 1) return ok(String(arr[0]?.mallName || '').trim());
+    return '';
+  };
+
+  // ① __USER_INFO__.shopList[].malInfoList[]（2026-08-07 实测存在且带 mallId+mallName）
+  try {
+    for (const shop of (window.__USER_INFO__?.shopList || [])) {
+      const t = pickFrom(shop?.malInfoList);
+      if (t) return t;
+    }
+  } catch (e) { /* 结构变了就往下降级 */ }
+
+  // ② rawData.store.authUser.mallList（本版后台不存在，保留兼容别的版本）
+  try {
+    const t = pickFrom(window.rawData?.store?.authUser?.mallList);
+    if (t) return t;
+  } catch (e) { /* 同上 */ }
+
   const clean = (el) => el ? (el.textContent || '').replace(/\s+/g, ' ').trim() : '';
+  // ③ 语义类名（类名全 hash 化时命不中，但别的卖家中心版本可能有）
   for (const sel of ['[class*="storeName"]','[class*="store-name"]',
                      '[class*="mallName"]','[class*="mall-name"]',
                      '[class*="shopName"]','[class*="shop-name"]']) {
-    const t = clean(document.querySelector(sel));
-    if (t && t.length <= 40) return t;
+    const t = ok(clean(document.querySelector(sel)));
+    if (t) return t;
   }
-  // 顶栏最右侧短文本启发式
+  // ④ 顶栏最右侧短文本启发式（最不可靠，仅兜底）
+  // bad 分两类：① 精确匹配已知功能按钮词；② 含帮助/教程/助手类字样的一律排除——
+  // 这些入口常比店名更靠右，精确词表跟不上改名，故按关键字通配。店名基本不含这些字。
   const bad = /^(Beta|\d+|99\+|学习|自营对接|经理助手|消息|客服|设置|市场|履约管理|首页|通知)$/;
+  const badKw = /(教程|帮助|指引|指南|使用说明|新手|助手|客服|反馈|下载|登出|退出|切换)/;
   const items = [];
   for (const el of document.querySelectorAll('body *')) {
     const r = el.getBoundingClientRect();
@@ -381,7 +514,7 @@ _READ_STORE_NAME_JS = r"""
     items.push({ x: Math.round(r.left), t });
   }
   items.sort((a, b) => b.x - a.x);
-  const pick = items.find(o => !bad.test(o.t));
+  const pick = items.find(o => !bad.test(o.t) && !badKw.test(o.t));
   return pick ? pick.t : '';
 }
 """
@@ -420,11 +553,15 @@ _CLICK_TAB_JS = r"""
 
 
 async def _enumerate_one_store(
-    ctx, page, status_tab: str = "", allow_cookie_fallback: bool = False
+    ctx, page, status_tab: str = "", allow_cookie_fallback: bool = False,
+    region: Optional["Region"] = None,
 ) -> tuple:
     """在单个 product-select 店铺标签内嗅 mallid + 抓该店当前筛选下的全部商品 + 读店名。
 
-    返回 (mallid, store_label, items)。items 每条打上该店 mallid/store 标签。
+    返回 (mallid, store_label, items)。items 每条打上该店 mallid/store/region 标签。
+
+    region：调用方已确认的基准区域（见 confirm_active_region）。传入时每条商品都打上它，
+    使「同 mallid 跨区域」的数据在清单里可区分。
     单店内任一步失败只告警、返回已拿到的部分（best-effort），不阻断其它店。
 
     触发方式：点页面自带的「查询」按钮，用表单里当前所有筛选（页签 + 类目/站点/商品名/时间…）
@@ -521,11 +658,16 @@ async def _enumerate_one_store(
             "请确认该店列表页已打开、可见「查询」按钮后重试。"
         )
 
-    # 店铺标签：best-effort 读店名，读不到退回 mallid
+    # 店铺标签：best-effort 读店名，读不到退回 mallid。
+    # 传 mallid 进去让它在 rawData.mallList 里精确挑出当前店（多店账号也不会串），
+    # 故这段必须排在上面的 mallid 嗅探之后。
     store_label = ""
     try:
-        store_label = (await page.evaluate(_READ_STORE_NAME_JS) or "").strip()
-    except Exception:
+        store_label = (
+            await page.evaluate(_READ_STORE_NAME_JS, mallid["v"] or "") or ""
+        ).strip()
+    except Exception as e:
+        logger.warning(f"读店名失败（退回 mallid 当标签）：{e}")
         store_label = ""
     if not store_label:
         store_label = mallid["v"] or ""
@@ -548,10 +690,112 @@ async def _enumerate_one_store(
     for it in items:
         it["mallid"] = mallid["v"] or ""
         it["store"] = store_label
+        # 区域随每条商品落库：同一 mallid 在不同区域（全球/美国…）是不同的数据范围、
+        # 通常也落不同 Sheet，缺了这个维度就会被判成同一个店（见 app/temu_region.py）。
+        if region is not None:
+            it["region"] = region.key
+            it["region_label"] = region.label
     return mallid["v"], store_label, items
 
 
-async def enumerate_worklist(status_tab: str = "") -> int:
+async def peek_regions() -> dict:
+    """只读探当前浏览器的区域状态，供 UI 渲染区域下拉。
+
+    返回 {current, host, options, error}：current 是浏览器此刻所在区域，options 是该账号
+    顶栏可见的全部区域（下拉候选）。区域候选只能从页面读——账号能看到哪些区域随权限变，
+    代码里写死一份映射就是在猜（见 app/temu_region.py 的设计取向）。
+
+    best-effort：连不上 CDP / 没开后台页 / 读不到都只回 error 字符串，绝不抛——首屏不该
+    因为浏览器没开就打不开。
+    """
+    from app.temu_region import is_seller_page, read_region
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(CDP_URL)
+            try:
+                if not browser.contexts:
+                    return {"error": "CDP 浏览器没有可用 context", "options": []}
+                pages = [p for p in browser.contexts[0].pages
+                         if is_seller_page(p.url or "")]
+                if not pages:
+                    return {"error": "没有打开 Temu 后台页面", "options": []}
+                r = await read_region(pages[0])
+                return {"current": r.label, "host": r.host,
+                        "options": list(r.labels), "error": ""}
+            finally:
+                await browser.close()
+    except Exception as e:
+        logger.warning(f"读区域候选失败（首屏仅提示，忽略）：{e}")
+        return {"error": str(e), "options": []}
+
+
+async def confirm_active_region(pages: list, want_label: str = "") -> "Region":
+    """采集前确认基准区域：所有 product-select 页签必须在【同一个区域】。
+
+    为什么必须先确认再采：区域是页面级过滤器，选了区域后商品数据自动限定在该区域。
+    代码这边什么都不用重建，但必须知道【是哪个区域】——否则同 mallid 跨区域的商品会
+    被归成同一个店、落进同一张 Sheet（本机 worklist 实测已出现全球/美国混装）。
+
+    want_label（UI 上选定的区域）非空时【以 UI 为准】：浏览器停在别的区域就替操作者切过去
+    并复核，省掉「去浏览器点一下再回来点开始」这一趟。为空则沿用浏览器当前区域，读不到
+    就抛 RegionNotConfirmed（不猜——猜错等于把别的区域的商品写进这张表）。
+
+    返回第一个页签的 Region 作为基准；后续每进一个新页签都要再比对一次（见 _check_region）。
+    """
+    from app.temu_region import read_region, region_conflict, switch_region
+
+    if not pages:
+        raise RegionNotConfirmed(
+            "没有打开任何 Temu 商品列表页（product-select）。请先在调试 Chrome 里打开"
+            "商品列表页，再开始采集。"
+        )
+
+    want = str(want_label or "").strip()
+    if want:
+        base = await switch_region(pages[0], want)
+    else:
+        base = await read_region(pages[0])
+        if not base.ok:
+            known = "、".join(base.labels) if base.labels else "未读到"
+            raise RegionNotConfirmed(
+                f"读不到当前区域（{base.describe()}；顶栏区域标签：{known}）。"
+                "请确认页面已加载完成、顶栏能看到区域标签（全球 / 美国 / 欧区），再重试。"
+            )
+
+    for page in pages[1:]:
+        conflict = region_conflict(base, await read_region(page))
+        if conflict:
+            # UI 指定了区域 → 把落后的页签也切过去，把环境对齐到 UI 的选择
+            if want:
+                await switch_region(page, want)
+                continue
+            raise RegionNotConfirmed(
+                f"{conflict}。多个商品列表页签处在不同区域时无法判断本批该采哪个区域，"
+                "请只保留你要采的那个区域的列表页，或把它们都切到同一区域后重试。"
+            )
+    logger.info(
+        f"已确认采集区域：{base.describe()}"
+        + (f"（该账号可见区域：{'、'.join(base.labels)}）" if base.labels else "")
+    )
+    return base
+
+
+async def _check_region(page, base: "Region", what: str) -> None:
+    """进入新页签/新页面后复核它仍在基准区域，不一致就抛 RegionNotConfirmed。
+
+    为什么每次都要复核：区域切换是换域名的整页跳转，采集过程里任何一次导航（或用户手动
+    点了顶栏）都可能把页签带到另一个区域，此后抓到的数据就不属于本批确认的范围了。
+    """
+    from app.temu_region import read_region, region_conflict
+
+    cur = await read_region(page)
+    conflict = region_conflict(base, cur)
+    if conflict:
+        raise RegionNotConfirmed(f"{what}：{conflict}。已中止，避免把别的区域的数据混入本批。")
+
+
+async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> int:
     """确定性枚举：遍历调试 Chrome 里所有已打开的 product-select 店铺标签，逐店点「查询」
     抓其当前筛选下的真实列表请求、翻页取全部商品，合并写 worklist.json，返回条数。
 
@@ -561,7 +805,10 @@ async def enumerate_worklist(status_tab: str = "") -> int:
 
     多店关键：mallid cookie 是 context 级、跨标签共享、只反映当前激活店，故【不能】靠
     cookie 区分店铺——必须逐标签从各自的网络请求头嗅 mallid（见 _enumerate_one_store）。
-    一个店标签都没打开时，退回新开一个（等价旧单店行为）。
+
+    region_label：UI 上选定的区域，**以它为准**——浏览器停在别的区域就先切过去再采
+    （区域切换换域名，见 app/temu_region.py）。为空则沿用浏览器当前区域。确认到的区域会
+    打进每条商品，使同 mallid 跨区域的数据可区分。
     """
     cdp = CDP_URL
     all_items: list = []
@@ -569,39 +816,37 @@ async def enumerate_worklist(status_tab: str = "") -> int:
     async with async_playwright() as pw:
         browser = await pw.chromium.connect_over_cdp(cdp)
         ctx = browser.contexts[0]
+        try:
+            # 所有已打开的列表标签（每个 = 一个已登录店铺在某区域下的视图）
+            store_pages = [
+                p for p in ctx.pages if PRODUCT_SELECT_PATH in (p.url or "")
+            ]
+            # 采集前置动作：确认区域（UI 选了就切过去；读不到/切不动则抛，由 UI/CLI 提示）
+            region = await confirm_active_region(store_pages, region_label)
 
-        # 所有已打开的列表标签（每个 = 一个已登录店铺）；一个都没有再新开一个兜底。
-        store_pages = [p for p in ctx.pages if "product-select" in (p.url or "")]
-        created_page = None
-        if not store_pages:
-            created_page = await ctx.new_page()
-            try:  # commit 只等导航提交、不等整页加载，够跑 fetch 了
-                await created_page.goto(TEMU_URL, wait_until="commit", timeout=60000)
-            except Exception as e:
-                logger.warning(f"打开列表页超时（忽略，继续）：{e}")
-            store_pages = [created_page]
+            for idx, page in enumerate(store_pages, 1):
+                # 逐页签复核：多店场景下每个页签都要确认还在基准区域，别串区域
+                await _check_region(page, region, f"第 {idx} 个商品列表页签")
+                mid, label, items = await _enumerate_one_store(
+                    ctx, page, status_tab=status_tab,
+                    allow_cookie_fallback=len(store_pages) == 1, region=region,
+                )
+                store_count += 1
+                logger.info(
+                    f"[店 {idx}/{len(store_pages)}] 区域={region.describe()} "
+                    f"mallid={mid or '无'} 店名={label or '(未读到)'} 商品={len(items)}"
+                )
+                all_items.extend(items)
+        finally:
+            await browser.close()
 
-        single_tab = len(store_pages) == 1
-        for idx, page in enumerate(store_pages, 1):
-            mid, label, items = await _enumerate_one_store(
-                ctx, page, status_tab=status_tab, allow_cookie_fallback=single_tab
-            )
-            store_count += 1
-            logger.info(
-                f"[店 {idx}/{len(store_pages)}] mallid={mid or '无'} "
-                f"店名={label or '(未读到)'} 商品={len(items)}"
-            )
-            all_items.extend(items)
-
-        if created_page is not None:
-            await created_page.close()  # 只关自己开的
-        await browser.close()
-
-    # 合并去重：同一 spu 可能出现在不同店 → 按 (mallid, spu) 去重，各留一份（可落不同 Sheet）
+    # 合并去重：同一 spu 可能出现在不同店/不同区域 → 按 (店铺+区域, spu) 去重，各留一份
+    # （可落不同 Sheet）。键必须含区域：同一 SPU 在全球区和美国区各有一条时，只按 mallid
+    # 去重会误删掉其中一条（mallid 跨区域不变，见 _store_key）。
     seen, uniq = set(), []
     for it in all_items:
         spu = it.get("spu")
-        key = (it.get("mallid") or "", spu)
+        key = (_store_key(it), spu)
         if spu and key not in seen:
             seen.add(key)
             uniq.append(it)
@@ -639,20 +884,43 @@ def load_worklist() -> list:
 
 
 def _store_key(it: dict) -> str:
-    """某条商品的店铺标识：优先 mallid，缺失退回 store 标签。用于筛选/分组的稳定键。"""
-    return str(it.get("mallid") or it.get("store") or "").strip()
+    """某条商品的「店铺+区域」标识：mallid@region。用于筛选/分组的稳定键。
+
+    【为什么带区域】同一账号在不同区域（全球/美国/欧区）看到的是不同的数据范围，而
+    mallid 在切区域后【完全不变】（2026-08-07 实测，见 app/temu_region.py）。只用 mallid
+    当键，全球和美国的商品会被归成同一个店、落进同一张 Sheet。
+
+    老清单没有 region 字段 → 退回纯 mallid，与旧行为一致（不带 @ 后缀），故历史偏好里
+    存的 store 值仍能匹配上，不会因为升级就整批失配。
+    """
+    base = str(it.get("mallid") or it.get("store") or "").strip()
+    region = str(it.get("region") or "").strip()
+    return f"{base}@{region}" if base and region else base
 
 
 def summarize_stores(worklist: list) -> list:
-    """从 worklist 汇总去重店铺列表：[{key, label, mallid, count}]（按商品数倒序）。"""
+    """从 worklist 汇总去重店铺列表：[{key, label, mallid, region, count}]（按商品数倒序）。
+
+    label 带区域后缀（如 `Pawly · 美国`）：同一账号跨区域时店名完全相同，不带区域的话
+    UI 下拉会并排两个一模一样的选项，用户没法选对。
+    """
     agg: dict = {}
     for it in worklist:
         key = _store_key(it)
         if not key:
             continue
+        name = str(it.get("store") or it.get("mallid") or key)
+        region_label = str(it.get("region_label") or "").strip()
         e = agg.setdefault(
             key,
-            {"key": key, "label": str(it.get("store") or key), "mallid": it.get("mallid") or "", "count": 0},
+            {
+                "key": key,
+                "label": f"{name} · {region_label}" if region_label else name,
+                "mallid": it.get("mallid") or "",
+                "region": it.get("region") or "",
+                "region_label": region_label,
+                "count": 0,
+            },
         )
         e["count"] += 1
     return sorted(agg.values(), key=lambda e: e["count"], reverse=True)
@@ -775,6 +1043,8 @@ def get_worklist_status(
                 "name": it.get("name", ""),
                 "site": it.get("site", ""),
                 "store": it.get("store", ""),
+                "region": it.get("region", ""),
+                "region_label": it.get("region_label", ""),
                 "mallid": it.get("mallid", ""),
                 "category": it.get("category", ""),
                 "price": it.get("price", ""),
@@ -796,6 +1066,12 @@ def get_worklist_status(
         "status_tabs": STATUS_TABS,
         "status": prefs.get("status") or "",
         "items": items,
+        # 新行落点：模式 + 指定行 + 可选项清单，供 UI 渲染下拉与回显上次选择
+        "append_mode": normalize_append_mode(
+            prefs.get("append_mode") or cfg.get("append_mode")
+        ),
+        "append_row": prefs.get("append_row") or cfg.get("append_row") or "",
+        "append_modes": [{"key": k, "label": v} for k, v in APPEND_MODE_LABELS.items()],
         # 实际生效的文档模式，供 UI 回显开关（本地模式恒为 local，即便 config 配了云端）
         "doc_mode": (DOC_MODE_CLOUD if (cloud is not None or cloud_missing)
                      else DOC_MODE_LOCAL),
@@ -956,6 +1232,8 @@ async def collect_one_pipeline(
     sheet: str = DEFAULT_SHEET,
     schema: Optional["SheetSchema"] = None,
     cloud=None,
+    append_mode: str = DEFAULT_APPEND_MODE,
+    append_row: Optional[int] = None,
 ) -> "CollectOutcome":
     """确定性管道采集单商品（阶段二），失败退回 agent 兜底。
 
@@ -965,6 +1243,7 @@ async def collect_one_pipeline(
     返回 CollectOutcome（携带落库结果与来源），供上层生成结构化进度事件。
     """
     from app.collect.pipeline import (
+        _cloud_first_row,
         archive_unmatched_image,
         collect_one_product,
         judge_price,
@@ -978,19 +1257,35 @@ async def collect_one_pipeline(
     excel_tool = WpsExcelTool()
     img_path = os.path.join(str(config.output_dir("image")), f"{spu}.jpeg")
 
+    # 云端落点与写后确认共用同一个行号：写入会让数据区增长，确认时重算会读到空白区。
+    # 逐商品写，故每商品各算一次（写前）。
+    cloud_first_row = {"v": None}
+
     async def _write_row(res) -> tuple[bool, str]:
         """按当前后端（云端/本地）写一行，口径与本地一致。"""
         if cloud is not None:
-            return await write_product_row_cloud(cloud, sheet, item, res, schema)
+            # 逐商品写：row_up 与 row_down 等价（每次插一行），故 up_count=0，见 collect_one_base
+            at_top, at_row, _label = resolve_append_target(
+                append_mode, append_row, schema.header_row
+            )
+            cloud_first_row["v"] = await asyncio.to_thread(
+                _cloud_first_row, cloud, sheet, schema, at_top, at_row, 0
+            )
+            return await write_product_row_cloud(
+                cloud, sheet, item, res, schema, insert_at_top=at_top, at_row=at_row
+            )
         return await write_product_row(
             excel_tool, excel, sheet, item, res, img_path, schema=schema
         )
 
     def _written_confirmed() -> bool:
-        """写后判重确认：云端读协作文档的 SPU 列，本地读 xlsx。"""
+        """写后判重确认：云端读协作文档的 SPU 列，本地读 xlsx。
+
+        云端优化：只读新行那一格（落点由 _write_row 写前算好），不读整列。
+        """
         if cloud is not None:
-            return spu in cloud.existing_key_values(
-                sheet, schema.fields["spu"], schema.header_row
+            return spu in cloud.read_new_rows_column(
+                sheet, schema.fields["spu"], cloud_first_row["v"], 1
             )
         return spu in WpsExcelTool.existing_key_values(
             excel, sheet, spu_col_of(excel, sheet)
@@ -1154,6 +1449,8 @@ async def collect_one_base(
     sheet: str = DEFAULT_SHEET,
     schema: Optional["SheetSchema"] = None,
     cloud=None,
+    append_mode: str = DEFAULT_APPEND_MODE,
+    append_row: Optional[int] = None,
 ) -> "CollectOutcome":
     """基础采集单商品：只写 Temu 基础行（站点/类目/SPU/销售价/主图），采购价(J)/重量(K)
     留空待人工填。【不跑 1688 图搜/判同款/读价】，故不用浏览器/CDP/LLM，纯下图 + 写 Excel。
@@ -1166,6 +1463,7 @@ async def collect_one_base(
     """
     from app.collect.pipeline import (
         CollectResult,
+        _cloud_first_row,
         _download_main_image,
         resolve_sheet_schema_cloud,
         write_product_row,
@@ -1188,9 +1486,26 @@ async def collect_one_base(
 
     res = CollectResult(spu=spu, ok=True, note="采购价/重量待人工填")
     if cloud is not None:
-        wrote, msg = await write_product_row_cloud(cloud, sheet, item, res, schema)
-        confirmed = wrote and spu in cloud.existing_key_values(
-            sheet, schema.fields["spu"], schema.header_row
+        # 逐商品写时 row_up 与 row_down 等价：每次只插一行，插在 R 就把原 R 行推到 R+1，
+        # 下一个商品又插在 R……最终顺序是「后采的在上面」。要「先采的在上面」请用整批写
+        # （基础模式云端默认走 write_product_rows_cloud，见 run_batch）。故这里 up_count=0。
+        at_top, at_row, _label = resolve_append_target(
+            append_mode, append_row, schema.header_row
+        )
+        # 落点要在写入前算好并复用给确认：写入会让数据区增长，事后重算会读到本批之后的空白区
+        first_row = await asyncio.to_thread(
+            _cloud_first_row, cloud, sheet, schema, at_top, at_row, 0
+        )
+        wrote, msg = await write_product_row_cloud(
+            cloud, sheet, item, res, schema, insert_at_top=at_top, at_row=at_row
+        )
+        # 写后确认优化：只读新行那一格（落点已知），不读整列（500 行的表就是
+        # 500 格冗余传输，payload 浪费两个数量级）。次数一样、只省 payload。
+        confirmed = wrote and (
+            spu in await asyncio.to_thread(
+                cloud.read_new_rows_column, sheet, schema.fields["spu"],
+                first_row, 1
+            )
         )
     else:
         wrote, msg = await write_product_row(
@@ -1219,11 +1534,18 @@ async def run_batch(
     base_only: bool = True,
     cloud_url: Optional[str] = None,
     doc_mode: str = "",
+    append_mode: str = "",
+    append_row: Optional[int] = None,
 ) -> dict:
     """跑一批未入库商品的采集，进度经 on_progress 抛出。返回汇总 {ok, fail, batch}。
 
     - excel/sheet 缺省回填「上次选择」偏好、再兜底出厂默认；store 非空则只采该店商品。
       本次组合成功启动后 save_prefs 记住，供下次缺省回填。
+    - append_mode 决定新行落点，四选一：bottom（默认，追加到数据区末尾）、top（插到表头
+      正下方）、row_down / row_up（配 append_row，从指定行向下 / 向上插）。优先级同其它
+      偏好：显式传入 > prefs > [collect] 配置 > bottom。指定行非法（缺失/落在表头及以上）
+      时退回 bottom 并告警——落点是辅助选项，不该让整批停摆（见 resolve_append_target）。
+      云端此前只能插顶端、与本地 xlsx 的追加行为相反，现已统一由这个开关决定。
     - doc_mode 显式给 local/cloud 时钉死走本地表还是协作文档（kdocs 有配额，用满要能
       立刻切回本地）；不给则按 auto 的历史优先级判（见 resolve_cloud）。本地模式下
       挑不出工作簿则中止并提示回 UI 选，不兜底到 DEFAULT_EXCEL、也不猜。
@@ -1240,6 +1562,15 @@ async def run_batch(
     """
     prefs = load_prefs()
     doc_mode = normalize_doc_mode(doc_mode)
+    # 落点：显式 > prefs > config > 默认（bottom）。与 doc_mode 同一套「四处来源」取向。
+    _cfg_for_append = load_collect_config()
+    append_mode = normalize_append_mode(
+        append_mode
+        or prefs.get("append_mode")
+        or _cfg_for_append.get("append_mode")
+    )
+    if append_row is None:
+        append_row = prefs.get("append_row") or _cfg_for_append.get("append_row")
     # 云端目标解析必须在 excel 兜底成默认本地路径【之前】做：显式给的本地路径要能
     # 压制 prefs/config 里的云端目标（resolve_cloud），否则用户改选本地后这一批仍
     # 会被写进旧云端文档。
@@ -1266,6 +1597,9 @@ async def run_batch(
             return {"ok": 0, "fail": 0, "batch": 0}
     excel = excel or prefs.get("excel") or DEFAULT_EXCEL
     sheet = sheet or prefs.get("sheet") or DEFAULT_SHEET
+    # store 的两种来源语义不同，护栏也不同（见下方 store 失配处理）：
+    # None = 调用方没指定、由 prefs 回填；空串 = 调用方显式要「全部店铺」，不许回填。
+    store_from_prefs = store is None
     if store is None:
         store = prefs.get("store") or ""
 
@@ -1278,6 +1612,25 @@ async def run_batch(
         return {"ok": 0, "fail": 0, "batch": 0}
 
     worklist = load_worklist()
+    # store 失配护栏（口径对齐 get_worklist_status 的 store_valid）：prefs 里记的店可能
+    # 已不在当前清单里（重新枚举时只开了另一家店的标签），此时【回填来的】store 降级成
+    # 「全部」并告警，不是报错——UI 那边失配就回显空 store、下拉显示「全部店铺」，若这里
+    # 仍按失效 mallid 硬过滤，就会出现「页面写着全部、后端却过滤到 0 条」的静默不一致
+    # （2026-08-06 实机：prefs 存着上一家的 mallid，本次枚举换了店，直接报「清单里没有商品」）。
+    # 显式传入的 store 不降级：那是调用方明确的意图，失配要如实报错，别悄悄改成全量采。
+    if store and not any(s["key"] == store for s in summarize_stores(worklist)):
+        if store_from_prefs:
+            logger.warning(
+                f"上次选的店铺（{store}）不在当前清单里（清单可能已重新枚举），"
+                f"本批按「全部店铺」采集。"
+            )
+            store = ""
+        else:
+            reason = (f"指定的店铺（{store}）不在当前清单里。"
+                      f"请重新枚举（--refresh）或改选清单里已有的店铺。")
+            await _emit(on_progress, {"type": "aborted", "reason": reason})
+            logger.error(reason)
+            return {"ok": 0, "fail": 0, "batch": 0}
     if store:  # 只采选中店铺的商品
         worklist = [it for it in worklist if _store_key(it) == store]
     if not worklist:
@@ -1305,7 +1658,8 @@ async def run_batch(
     # cloud_url 冲掉，下一批不带参数就静默退回本地默认表。
     # status 是枚举页签、非本批参数，沿用已存值，避免被空串覆盖丢掉。
     save_prefs(cloud.file_id if cloud is not None else excel,
-               sheet, store, prefs.get("status") or "", doc_mode)
+               sheet, store, prefs.get("status") or "", doc_mode,
+               append_mode, append_row)
 
     # 批次开始就解析一次目标 Sheet 的写入结构（列映射/公式/常量），全批复用——各 Sheet
     # 列序不同，必须按真实表头写；这份结构一批恒定，不必逐商品重 inspect 大工作簿。
@@ -1346,8 +1700,16 @@ async def run_batch(
     mode_label = "基础(价/重人工填)" if base_only else ("管道" if use_pipeline else "agent")
     target_label = (f"协作文档（{cloud.file_id}）" if cloud is not None
                     else f"工作簿={excel}")
+    # 落点解析放在 schema 解析之后：row_down/row_up 的合法性要对着真实表头行号判。
+    # 返回的 at_row 为 None 表示「由写入层自己算」（bottom 读末行、top 取表头下一行）。
+    at_top, at_row, append_label = resolve_append_target(
+        append_mode, append_row,
+        pipe_schema.header_row if pipe_schema is not None else 1,
+    )
+    up_count = batch if append_mode == APPEND_ROW_UP and at_row is not None else 0
     logger.info(
-        f"=== 采集批次：模式={mode_label} {target_label} Sheet={sheet} 店铺={store or '全部'}；"
+        f"=== 采集批次：模式={mode_label} {target_label} Sheet={sheet} 店铺={store or '全部'} "
+        f"落点={append_label}；"
         f"清单 {len(worklist)} 个，已入库 {len(done)}，待采 {len(todo)}，本批 {batch} 个 ==="
     )
     await _emit(on_progress, {
@@ -1357,6 +1719,7 @@ async def run_batch(
         "cloud": cloud is not None,
         "doc_mode": DOC_MODE_CLOUD if cloud is not None else DOC_MODE_LOCAL,
         "target": target_label,
+        "append_mode": append_mode,
     })
 
     if cloud is None and (base_only or use_pipeline):
@@ -1375,6 +1738,45 @@ async def run_batch(
     ok = fail = 0
 
     # 基础模式：只写 Temu 基础行、价/重留空待人工填。不开 agent、不连 CDP、不用 LLM。
+    # 云端目标额外走【整批一次写】：基础模式的数据全来自 worklist（不需要浏览器/LLM 逐个采），
+    # 故可攒批。逐商品写一行要 5~6 次 kdocs 调用，整批 20 行只要 6 次（实测 124 → 10）。
+    # kdocs 有配额（429001 限频等 20s、429002 熔断），这个差距决定整批能否一次跑完。
+    # 本地 xlsx 不走这条：没有配额压力，且逐行写的失败隔离更细，保持原样不动。
+    if base_only and cloud is not None:
+        from app.collect.pipeline import write_product_rows_cloud
+
+        items = todo[:limit]
+        for i, item in enumerate(items, 1):
+            await _emit(on_progress, {
+                "type": "product_start", "index": i, "total": batch,
+                "spu": item.get("spu"), "name": item.get("name", ""),
+            })
+        logger.info(f"--- 整批写入协作文档：{len(items)} 行（基础模式） ---")
+        wrote, msg, written_spus = await write_product_rows_cloud(
+            cloud, sheet, items, pipe_schema,
+            insert_at_top=at_top, at_row=at_row, up_count=up_count,
+        )
+        if wrote:
+            ok = len(written_spus)
+            logger.info(f"⬜ {msg}（采购价/重量留空待人工填）")
+            for i, item in enumerate(items, 1):
+                await _emit(on_progress, CollectOutcome(
+                    spu=str(item.get("spu", "")), ok=True, status="base",
+                    via="base", note="采购价/重量待人工填",
+                ).to_event(i, batch))
+        else:
+            # 一坏全坏：整批一行不落，逐个报失败，日志给出原因供排查后重跑
+            fail = len(items)
+            logger.error(f"❌ 整批未入库：{msg}")
+            for i, item in enumerate(items, 1):
+                await _emit(on_progress, CollectOutcome(
+                    spu=str(item.get("spu", "")), ok=False, status="fail",
+                    via="base", note=msg,
+                ).to_event(i, batch))
+        logger.info(f"=== 本批完成：成功 {ok}，失败 {fail} ===")
+        await _emit(on_progress, {"type": "batch_done", "ok": ok, "fail": fail})
+        return {"ok": ok, "fail": fail, "batch": batch}
+
     if base_only:
         for i, item in enumerate(todo[:limit], 1):
             spu = item.get("spu")
@@ -1385,7 +1787,8 @@ async def run_batch(
                 "spu": spu, "name": name,
             })
             outcome = await collect_one_base(
-                item, excel, sheet, schema=pipe_schema, cloud=cloud
+                item, excel, sheet, schema=pipe_schema, cloud=cloud,
+                append_mode=append_mode, append_row=append_row,
             )
             await _emit(on_progress, outcome.to_event(i, batch))
             if outcome.ok:
@@ -1424,7 +1827,8 @@ async def run_batch(
 
             if use_pipeline:
                 outcome = await collect_one_pipeline(
-                    agent, item, excel, sheet, schema=pipe_schema, cloud=cloud
+                    agent, item, excel, sheet, schema=pipe_schema, cloud=cloud,
+                    append_mode=append_mode, append_row=append_row,
                 )
             else:
                 got = await collect_one(agent, item, excel, sheet)

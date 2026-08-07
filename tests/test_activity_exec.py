@@ -48,7 +48,11 @@ def test_activity_page_visualizes_accel_close_and_open_flow():
 
 
 def test_activity_log_search_waits_for_repaint_and_uses_editable_field():
-    """报名记录页切全球后可能重绘；搜索 marker 必须按可编辑 placeholder 重试。"""
+    """报名记录页首屏加载后可能重绘；搜索 marker 必须按可编辑 placeholder 重试。
+
+    （原先这里会先点顶栏「全球」再查询，那是区域切换器、点了会跨域跳转，已移除；
+    重绘等待仍要保留——页面首屏本身就有重绘。）
+    """
     script = pipeline._MARK_ACTIVITY_LOG_SPU_JS
 
     assert "多个|空格|逗号" in script
@@ -71,15 +75,31 @@ def test_site_notification_panel_closer_is_scoped_to_all_messages():
     assert "trigger(close)" in script
 
 
+# 测试用的区域域名：全球是实测的 agentseller.temu.com，改动后 URL 由「区域 host + 路径」
+# 运行时拼出，故测试也按这个口径构造期望值，不再引用已删除的 *_URL 常量。
+GLOBAL_HOST = "agentseller.temu.com"
+US_HOST = "agentseller-us.temu.com"
+
+
+def _region_tabs(active="全球"):
+    """_ACTIVE_REGION_JS 的返回形状：顶栏区域标签 + 当前激活的那个。"""
+    return {"labels": ["全球", "美国", "欧区"], "active": active, "ambiguous": []}
+
+
 class FakeConnectedPage(FakePage):
-    def __init__(self, url="about:blank"):
+    def __init__(self, url="about:blank", region_active="全球"):
         super().__init__(url)
         self.url = url
         self.goto_calls = []
+        self._region_active = region_active
 
     async def goto(self, url, wait_until=None, timeout=None):
         self.goto_calls.append((url, wait_until, timeout))
         self.url = url
+
+    async def evaluate(self, _js, *args):
+        # 区域读取是 _connect_pages 的前置步骤；其它 evaluate 在这些用例里用不到
+        return _region_tabs(self._region_active)
 
 
 class FakeContext:
@@ -127,9 +147,21 @@ def _patch_cdp(monkeypatch, pages):
     return context, browser, playwright
 
 
+def _expected_urls(host):
+    return [
+        f"https://{host}{service.pipeline.FLUX_PATH}",
+        f"https://{host}{service.pipeline.ACTIVITY_PATH}",
+        f"https://{host}{service.pipeline.GOODS_LIST_PATH}",
+    ]
+
+
 def test_connect_pages_opens_all_missing_tabs(monkeypatch):
-    """流量/活动/商品页都缺失时自动打开，并全部标为本批 owned 页签。"""
-    context, browser, playwright = _patch_cdp(monkeypatch, [])
+    """流量/活动/商品页都缺失时自动打开，并全部标为本批 owned 页签。
+
+    context 里必须有一个用户页签供确认区域——_connect_pages 现在会先确认区域再开页面。
+    """
+    context, browser, playwright = _patch_cdp(
+        monkeypatch, [FakeConnectedPage(f"https://{GLOBAL_HOST}/")])
     dismissed = []
 
     async def fake_dismiss(page):
@@ -141,33 +173,64 @@ def test_connect_pages_opens_all_missing_tabs(monkeypatch):
     pw, got_browser, flux, activity, goods, owned = result
 
     assert pw is playwright and got_browser is browser
-    assert [page.url for page in owned] == [
-        service.pipeline.FLUX_URL,
-        service.pipeline.ACTIVITY_URL,
-        service.pipeline.GOODS_LIST_URL,
-    ]
+    assert [page.url for page in owned] == _expected_urls(GLOBAL_HOST)
     assert (flux, activity, goods) == tuple(owned)
     assert dismissed == [page.url for page in owned]
-    assert len(context.pages) == 3
+
+
+def test_connect_pages_opens_tabs_in_user_selected_region(monkeypatch):
+    """核心：用户选的是美国区，本批三个页面就必须开在美国域，不能回落到全球域。
+
+    区域切换换域名（全球 agentseller.temu.com / 美国 agentseller-us.temu.com），旧代码
+    的写死全球域 URL 会把操作者选定的美国区悄悄换掉，报名/开加速器打在错误的一批商品上。
+    """
+    context, _, _ = _patch_cdp(monkeypatch, [
+        FakeConnectedPage(f"https://{US_HOST}/", region_active="美国")])
+
+    async def fake_dismiss(_page):
+        return True
+
+    monkeypatch.setattr(service.pipeline, "dismiss_all_page_popups", fake_dismiss)
+    _, _, _, _, _, owned = asyncio.run(
+        service._connect_pages("http://localhost:9222"))
+
+    assert [page.url for page in owned] == _expected_urls(US_HOST)
+    assert all(GLOBAL_HOST not in page.url for page in owned)
+
+
+def test_connect_pages_aborts_when_region_pages_disagree(monkeypatch):
+    """两个用户页签处在不同区域 → 中止，绝不擅自挑一个区域作业。"""
+    from app.temu_region import RegionUnconfirmed
+
+    _patch_cdp(monkeypatch, [
+        FakeConnectedPage(f"https://{GLOBAL_HOST}/", region_active="全球"),
+        FakeConnectedPage(f"https://{US_HOST}/", region_active="美国"),
+    ])
+    with pytest.raises(RegionUnconfirmed):
+        asyncio.run(service._connect_pages("http://localhost:9222"))
+
+
+def test_connect_pages_aborts_when_no_seller_page_open(monkeypatch):
+    """没有任何后台页签 → 无从确认区域，中止而不是默认全球域。"""
+    from app.temu_region import RegionUnconfirmed
+
+    _patch_cdp(monkeypatch, [])
+    with pytest.raises(RegionUnconfirmed):
+        asyncio.run(service._connect_pages("http://localhost:9222"))
 
 
 def test_connect_pages_ignores_existing_tabs_and_opens_owned_tabs(monkeypatch):
-    """已有页签状态不受管线控制；任务必须忽略它们并新建三个专用页签。"""
-    existing = [
-        FakeConnectedPage(service.pipeline.FLUX_URL),
-        FakeConnectedPage(service.pipeline.ACTIVITY_URL),
-        FakeConnectedPage(service.pipeline.GOODS_LIST_URL),
-    ]
+    """已有页签状态不受管线控制；任务必须忽略它们并新建三个专用页签。
+
+    「忽略」的唯一例外是只读一次区域（不 goto、不点击、不关闭），断言里仍校验这一点。
+    """
+    existing = [FakeConnectedPage(u) for u in _expected_urls(GLOBAL_HOST)]
     context, _, _ = _patch_cdp(monkeypatch, existing)
     result = asyncio.run(service._connect_pages("http://localhost:9222"))
     _, _, flux, activity, goods, owned = result
 
     assert (flux, activity, goods) == tuple(owned)
-    assert [page.url for page in owned] == [
-        service.pipeline.FLUX_URL,
-        service.pipeline.ACTIVITY_URL,
-        service.pipeline.GOODS_LIST_URL,
-    ]
+    assert [page.url for page in owned] == _expected_urls(GLOBAL_HOST)
     assert all(page not in existing for page in owned)
     assert all(page.goto_calls == [] for page in existing)
     assert all(page.closed is False for page in existing)
@@ -1316,7 +1379,7 @@ def test_open_enroll_page_waits_out_rule_popup_loading(monkeypatch):
 
     class FakeActivityPage:
         def __init__(self, context):
-            self.url = pipeline.ACTIVITY_URL
+            self.url = f"https://{GLOBAL_HOST}{pipeline.ACTIVITY_PATH}"
             self.context = context
             self.created = None
             self.mark_calls = 0
@@ -1563,7 +1626,7 @@ def test_open_enroll_page_preserves_preexisting_manual_detail_tab(monkeypatch):
 
     class FakeActivityPage:
         def __init__(self, context):
-            self.url = pipeline.ACTIVITY_URL
+            self.url = f"https://{GLOBAL_HOST}{pipeline.ACTIVITY_PATH}"
             self.context = context
             self.created = None
 

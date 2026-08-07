@@ -653,20 +653,31 @@ def _embed_image(worksheet, row: int, path: str, box_px: int) -> bool:
         return False
 
 
-def purchase_file_stem(kind: str, store: str, stamp: str) -> str:
-    """拼采购产物的文件名主干：店铺名放最前面，便于在同一日期目录里一眼分辨是哪家店的。
+def purchase_file_stem(kind: str, store: str, stamp: str, region: str = "") -> str:
+    """拼采购产物的文件名主干：`店铺-区域_类型_时间戳`。
 
     店铺名前置而不是插在时间戳后面：多店铺时同一天会有好几份，文件管理器按名称排序时
     前置能把同店的自然聚到一起（2026-08-05 用户要求）。
-    店铺名可能带 Windows 文件名非法字符（页面上的店名是自由文本），统一剔除；剔空或本来
-    就没识别到店铺时退化成原来的「不带店铺名」格式，不留下「_」这种空占位。
+
+    区域紧跟店铺名（`Pawly-美国_...`）：同一账号在不同区域（全球/美国/欧区）店名**完全
+    相同**，只带店铺名的话同一天两个区域的汇总在目录里长得一模一样，只能靠时间戳猜是哪个
+    区域的单，采购时拿错就是照着别的区域下单。用连字符而非下划线连接，是为了让「店铺-区域」
+    在按 `_` 切分的文件名结构里仍是同一段。
+
+    店铺名与区域名都可能带 Windows 文件名非法字符（页面上是自由文本），统一剔除；剔空或
+    本来就没识别到时逐级退化（有店无区域 → `店铺_类型_时间戳`；都没有 → `类型_时间戳`），
+    不留下「_」「-」这种空占位。
     """
-    safe = "".join(c for c in str(store) if c not in '\\/:*?"<>|').strip()
-    return f"{safe}_{kind}_{stamp}" if safe else f"{kind}_{stamp}"
+    def _safe(v: str) -> str:
+        return "".join(c for c in str(v) if c not in '\\/:*?"<>|').strip()
+
+    parts = [p for p in (_safe(store), _safe(region)) if p]
+    return f"{'-'.join(parts)}_{kind}_{stamp}" if parts else f"{kind}_{stamp}"
 
 
 def export_purchase_summary(
-    orders: List[OrderRow], out_dir: str, stamp: str, store: str = ""
+    orders: List[OrderRow], out_dir: str, stamp: str, store: str = "",
+    region: str = "",
 ) -> dict:
     """导出本批新增订单的 SPU/SKU 采购汇总和逐条明细。
 
@@ -682,7 +693,9 @@ def export_purchase_summary(
     output_dir.mkdir(parents=True, exist_ok=True)
     groups = summarize_purchases(orders)
     products = summarize_products(orders)
-    path = output_dir / f"{purchase_file_stem('新增订单采购汇总', store, stamp)}.xlsx"
+    path = output_dir / (
+        f"{purchase_file_stem('新增订单采购汇总', store, stamp, region)}.xlsx"
+    )
 
     workbook = openpyxl.Workbook()
     # 商品级放第一张：采购是按商品链接下单的，先看「这款要买哪些码各几件」。
@@ -820,7 +833,8 @@ def _fmt_qty(quantity: Decimal) -> Any:
 
 
 def export_purchase_markdown(
-    orders: List[OrderRow], out_dir: str, stamp: str, store: str = ""
+    orders: List[OrderRow], out_dir: str, stamp: str, store: str = "",
+    region: str = "",
 ) -> dict:
     """把本批新增订单按 SPU+SKU 的合并采购情况写成 md，每批一个新文件。
 
@@ -837,14 +851,20 @@ def export_purchase_markdown(
     multi = [p for p in products if p["is_multi"]]
     single = [p for p in products if not p["is_multi"]]
     total_qty = sum(p["total_qty"] for p in products)
-    path = output_dir / f"{purchase_file_stem('新增订单采购统计', store, stamp)}.md"
+    path = output_dir / (
+        f"{purchase_file_stem('新增订单采购统计', store, stamp, region)}.md"
+    )
 
     lines: List[str] = [
         "# 本批新增订单采购统计（按商品合并，打开一次链接买齐所有码数）", "",
     ]
-    # 店铺写进正文抬头：md 常被整段贴进聊天跟供应商对量，脱离文件名后也得看得出是哪家店
+    # 店铺+区域写进正文抬头：md 常被整段贴进聊天跟供应商对量，脱离文件名后也得看得出是
+    # 哪家店哪个区域的单（同账号跨区域店名完全相同，只写店名分不清）
     if str(store).strip():
-        lines.append(f"- 店铺：{store}")
+        rg = str(region).strip()
+        lines.append(f"- 店铺：{store}" + (f"（{rg}）" if rg else ""))
+    elif str(region).strip():
+        lines.append(f"- 区域：{region}")
     lines += [
         f"- 批次标识：{stamp}",
         f"- 本批待登记子订单：{len(orders)} 条",
@@ -1115,15 +1135,32 @@ _STORE_SELECTORS = [
 ]
 
 
-# 页面自身的状态数据：window.rawData.store.authUser.mallList[].mallName。
-# 优先于 DOM 选择器——实测店铺名挂在构建期 hash 类名（如 `_Wrz4-O9w`）上，改版即失效，
-# 而这份 rawData 是商家后台自己渲染时注入的，跟着接口字段走，稳得多。
+# 页面自身注入的状态数据，优先于 DOM 选择器——店铺名挂在构建期 hash 类名（如 `_Wrz4-O9w`）
+# 上，改版即失效；状态数据跟着接口字段走，稳得多。
+#
+# 【2026-08-07 实测修正】原先只读 `window.rawData.store.authUser.mallList`，但本版后台
+# **压根没有 window.rawData**（实测该 JS 返回空串，detect_store 一直在靠 DOM 兜底）。
+# 真正存在的是 `window.__USER_INFO__.shopList[].malInfoList[]`：
+#   {mallId: 634418228070796（**数字**）, mallName: "Pawly", managedType: 1, ...}
+# 注意平台把 mall 拼成了 `mal`（malInfoList）。rawData 那条保留，别的后台版本可能有。
+#
+# 仍坚持「只有一个店才认」：订单侧没有 mallid 可用来精确定位（采集侧是从列表请求头嗅到的），
+# 多店账号无法从列表判断「当前是哪个」，那种情况交给 DOM，DOM 也读不到就返回空串让调用方
+# 显式指定——店铺决定订单落哪张表，猜错要人工回滚。
 _STORE_JS = """
 () => {
+  const one = (arr) => {
+    if (!Array.isArray(arr) || arr.length !== 1) return '';
+    return String(arr[0]?.mallName || '');
+  };
   try {
-    const list = window.rawData?.store?.authUser?.mallList;
-    if (!Array.isArray(list) || list.length !== 1) return '';
-    return String(list[0]?.mallName || '');
+    for (const shop of (window.__USER_INFO__?.shopList || [])) {
+      const t = one(shop?.malInfoList);
+      if (t) return t;
+    }
+  } catch (e) { /* 结构变了就往下降级 */ }
+  try {
+    return one(window.rawData?.store?.authUser?.mallList);
   } catch (e) { return ''; }
 }
 """

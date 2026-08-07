@@ -395,6 +395,35 @@ def test_purchase_file_stem_without_store_keeps_old_format():
     assert P.purchase_file_stem("汇总", "  ", "20260805") == "汇总_20260805"
 
 
+def test_purchase_file_stem_carries_region():
+    """区域必须进文件名：同账号跨区域店名完全相同，只带店名分不清是哪个区域的单，
+    采购时拿错就是照着别的区域下单。
+    """
+    assert P.purchase_file_stem("汇总", "Pawly", "20260807", "美国") == \
+        "Pawly-美国_汇总_20260807"
+    assert P.purchase_file_stem("汇总", "Pawly", "20260807", "全球") == \
+        "Pawly-全球_汇总_20260807"
+    # 同店同日不同区域必须是两个不同文件名
+    a = P.purchase_file_stem("汇总", "Pawly", "20260807_101530", "全球")
+    b = P.purchase_file_stem("汇总", "Pawly", "20260807_101530", "美国")
+    assert a != b
+
+
+def test_purchase_file_stem_region_degrades_gracefully():
+    """区域读不到时逐级退化，不留「-」「_」空占位。"""
+    assert P.purchase_file_stem("汇总", "Pawly", "20260807", "") == "Pawly_汇总_20260807"
+    assert P.purchase_file_stem("汇总", "Pawly", "20260807", "  ") == "Pawly_汇总_20260807"
+    # 有区域没店铺（店名读取失败）时也别丢区域信息
+    assert P.purchase_file_stem("汇总", "", "20260807", "美国") == "美国_汇总_20260807"
+    assert P.purchase_file_stem("汇总", "", "20260807", "") == "汇总_20260807"
+
+
+def test_purchase_file_stem_strips_illegal_chars_in_region():
+    """区域名同样来自页面文本，非法字符会让写文件直接失败。"""
+    assert P.purchase_file_stem("汇总", "A", "20260807", 'US/:*?"<>|') == \
+        "A-US_汇总_20260807"
+
+
 def test_export_purchase_files_carry_store_name(tmp_path):
     """xlsx 与 md 的文件名都带店铺；md 正文抬头也写店铺（会被整段贴去对量）。"""
     orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
@@ -416,6 +445,31 @@ def test_export_purchase_markdown_omits_store_line_when_unknown(tmp_path):
     md = P.export_purchase_markdown(orders, str(tmp_path), "20260805")
 
     assert "店铺：" not in Path(md["md_file"]).read_text(encoding="utf-8")
+
+
+def test_export_purchase_files_carry_region(tmp_path):
+    """xlsx/md 文件名带区域；md 正文抬头也带（脱离文件名贴给供应商时仍分得清）。"""
+    orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
+                     sku_id="SKU-A", qty="1")]
+
+    xlsx = P.export_purchase_summary(orders, str(tmp_path), "20260807", "Pawly", "美国")
+    md = P.export_purchase_markdown(orders, str(tmp_path), "20260807", "Pawly", "美国")
+
+    assert Path(xlsx["file"]).name == "Pawly-美国_新增订单采购汇总_20260807.xlsx"
+    assert Path(md["md_file"]).name == "Pawly-美国_新增订单采购统计_20260807.md"
+    assert "- 店铺：Pawly（美国）" in Path(md["md_file"]).read_text(encoding="utf-8")
+
+
+def test_export_purchase_same_store_two_regions_do_not_collide(tmp_path):
+    """同店同批次两个区域不能写成同一个文件——那会互相覆盖，采购拿到的是错区域的单。"""
+    orders = [_order(order_no="PO-1", sub_order_no="045-1", spu_id="SPU-A",
+                     sku_id="SKU-A", qty="1")]
+
+    a = P.export_purchase_summary(orders, str(tmp_path), "20260807", "Pawly", "全球")
+    b = P.export_purchase_summary(orders, str(tmp_path), "20260807", "Pawly", "美国")
+
+    assert a["file"] != b["file"]
+    assert Path(a["file"]).exists() and Path(b["file"]).exists()
 
 
 # ---- 增量早停判据（纯函数，不需要浏览器）-----------------------------------

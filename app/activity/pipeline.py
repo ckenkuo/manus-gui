@@ -33,12 +33,16 @@ from app.llm import LLM
 from app.logger import logger
 from app.schema import Message
 
-# ---- 页面 URL 常量（Wave3 web 层会依赖）------------------------------------
-FLUX_URL = "https://agentseller.temu.com/main/flux-analysis"
-ACTIVITY_URL = "https://agentseller.temu.com/activity/marketing-activity"
-ACTIVITY_LOG_URL = "https://agentseller.temu.com/activity/marketing-activity/log"
-# 商品列表页 + 库存查询接口关键字（库存不在 DOM，在此接口响应里，见 read_stock）。
-GOODS_LIST_URL = "https://agentseller.temu.com/goods/list"
+# ---- 页面路径（域名在运行时按当前区域拼，见下）--------------------------------
+# 【为什么只留路径、不留完整 URL】区域切换（顶栏「全球 / 美国 / 欧区」）换的是【域名】：
+# 全球 agentseller.temu.com、美国 agentseller-us.temu.com（2026-08-07 实测）。本管线自己
+# 新开页面干活，若拿写死的全球域 URL 去 goto，就会把操作者选定的美国区悄悄换回全球区，
+# 采到/改到的都不是他要的那批数据。故域名必须运行时取（app/temu_region.url_in_region）。
+FLUX_PATH = "/main/flux-analysis"
+ACTIVITY_PATH = "/activity/marketing-activity"
+ACTIVITY_LOG_PATH = "/activity/marketing-activity/log"
+GOODS_LIST_PATH = "/goods/list"
+# 库存查询接口关键字（库存不在 DOM，在此接口响应里，见 read_stock）。
 _STOCK_API_KEY = "skc/pageQuery"
 
 # ---- 已探测确认的活动主题名（用于从行文本里认出是哪个活动）--------------------
@@ -662,15 +666,25 @@ async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
     }
 
 
-async def read_activity_log_records(context, spus) -> dict:
-    """只读打开报名记录页，逐 SPU 查询并返回平台报名记录接口结果。"""
+async def read_activity_log_records(context, spus, region=None) -> dict:
+    """只读打开报名记录页，逐 SPU 查询并返回平台报名记录接口结果。
+
+    region：调用方已确认的作业区域（app/temu_region.Region）。报名记录页开在该区域的
+    域名下——区域切换换域名，写死全球域会读到另一个区域的报名记录。未传则就地从 context
+    里的用户页签确认一次（读不到就抛，不默认全球域）。
+    """
+    from app.temu_region import confirm_region_from_context, url_in_region
+
+    if region is None:
+        region = await confirm_region_from_context(context)
     targets = list(dict.fromkeys(str(spu).strip() for spu in spus if str(spu).strip()))
     page = await context.new_page()
     records = []
     queries = []
     complete = True
     try:
-        await page.goto(ACTIVITY_LOG_URL, wait_until="domcontentloaded", timeout=30000)
+        await page.goto(url_in_region(ACTIVITY_LOG_PATH, region),
+                        wait_until="domcontentloaded", timeout=30000)
         await page.bring_to_front()
         await dismiss_all_page_popups(page)
         for _ in range(30):
@@ -681,13 +695,10 @@ async def read_activity_log_records(context, spus) -> dict:
                 continue
             if "报名记录" in body and "SPU ID" in body:
                 break
-        global_tab = page.get_by_text("全球", exact=True).last
-        if await global_tab.count():
-            try:
-                await global_tab.click(timeout=5000)
-                await asyncio.sleep(2)
-            except Exception:
-                pass
+        # 【曾在这里硬点顶栏「全球」，已移除】那排标签是区域切换器，点它会【跨域跳转】
+        # （全球 agentseller.temu.com ↔ 美国 agentseller-us.temu.com，2026-08-07 实测），
+        # 等于把操作者选定的区域悄悄换掉、读到别的区域的报名记录。区域现由上面的 goto
+        # 用已确认区域的域名钉住，页面自己会把数据限定在该区域，不需要也不该再点标签。
 
         query_button = page.get_by_role("button", name="查询", exact=True).last
         for spu in targets:
@@ -795,7 +806,14 @@ async def read_stock(page, product_ids=None) -> dict:
     page.on("response", on_resp)
     try:
         if "goods/list" not in (page.url or ""):
-            await page.goto(GOODS_LIST_URL, wait_until="domcontentloaded", timeout=60000)
+            # 用【本页当前所在域】拼商品列表 URL：这个 page 是本批在已确认区域下新开的，
+            # 它的 host 就是那个区域。写死全球域会把页面跳到另一个区域、读到别家库存。
+            from app.temu_region import Region, host_of, url_in_region
+
+            await page.goto(
+                url_in_region(GOODS_LIST_PATH, Region(host=host_of(page.url or ""))),
+                wait_until="domcontentloaded", timeout=60000,
+            )
         else:
             await page.reload(wait_until="domcontentloaded", timeout=60000)
         await dismiss_site_notification_panel(page)

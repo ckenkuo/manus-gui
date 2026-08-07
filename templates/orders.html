@@ -227,6 +227,20 @@
               />
               <datalist id="storeOptions"></datalist>
             </div>
+            <!-- 区域以这里选的为准：浏览器停在别的区域会先替你切过去，list_url 的域名
+                 也按该区域改写（只换域名，筛选与排序参数原样保留）。 -->
+            <div class="col-6 col-md-4">
+              <label class="form-label small text-muted mb-1">
+                区域
+                <span class="text-body-tertiary">（决定这批能看到哪些订单）</span>
+              </label>
+              <select
+                id="regionSelect"
+                class="form-select form-select-sm"
+                title="以这里选的区域为准：浏览器停在别的区域会先替你切过去再采"
+              ></select>
+              <div id="regionNote" class="form-text small mt-1"></div>
+            </div>
             <div class="col-6 col-md-3">
               <label class="form-label small text-muted mb-1">最多翻页</label>
               <input
@@ -435,6 +449,7 @@
             .map((s) => `<option value="${esc(s)}"></option>`)
             .join("");
           if (cfg.store && !$("storeInput").value) $("storeInput").value = cfg.store;
+          renderRegion(cfg.region, cfg.region_label);
           $("lockAlert").classList.toggle("d-none", !cfg.workbook_locked);
           // 本地模式还没选表不算错（上面的灰字已在提示去选），别弹红条误导成配置坏了
           const pendingPick = !cfg.cloud && !cfg.workbook;
@@ -453,6 +468,43 @@
           updateStartEnabled();
         } catch (e) {
           showToast("加载工作簿列表失败", String(e), "danger");
+        }
+      }
+
+      // 区域下拉 + 当前状态提示。
+      // 候选只能从页面读——账号能看到哪些区域随权限变，代码里写死一份映射就是在猜。
+      // 「商家中心」不是业务区域（没有订单列表），从候选里剔掉。
+      function renderRegion(r, want) {
+        const sel = $("regionSelect");
+        const note = $("regionNote");
+        if (!sel) return;
+        const info = r || {};
+        const opts = (info.labels || []).filter((x) => x !== "商家中心");
+        const curTip = info.label
+          ? `跟随浏览器当前（${info.label}）`
+          : "跟随浏览器当前";
+        const cur = want || "";
+        sel.innerHTML =
+          `<option value=""${cur === "" ? " selected" : ""}>${esc(curTip)}</option>` +
+          opts
+            .map(
+              (t) =>
+                `<option value="${esc(t)}"${t === cur ? " selected" : ""}>${esc(t)}</option>`
+            )
+            .join("");
+        if (!note) return;
+        // 读不到区域时给可操作提示（最常见原因是没开后台页/没登录），不是干巴巴的错误码
+        if (info.error) {
+          note.innerHTML =
+            '<span class="text-warning">读不到浏览器当前区域</span>' +
+            '<span class="text-body-tertiary">：请在调试 Chrome 里打开 Temu 后台页面。' +
+            "选定具体区域后，管线会自动切过去</span>";
+        } else {
+          note.innerHTML = `<span class="text-body-tertiary">浏览器当前：${esc(
+            info.label
+          )}（${esc(info.host)}）${
+            cur && cur !== info.label ? "，本批开始时会切到「" + esc(cur) + "」" : ""
+          }</span>`;
         }
       }
 
@@ -596,7 +648,13 @@
             );
             break;
           case "store":
-            logLine(`当前店铺：${d.store}`, "text-info");
+            // 区域一起打进日志：店铺名本身不含区域（同账号跨区域同名），出问题时
+            // 光看「当前店铺 Pawly」分不清这批是全球还是美国的单
+            logLine(
+              `当前店铺：${d.store}` +
+                (d.region_label ? `（区域 ${d.region_label}）` : ""),
+              "text-info"
+            );
             break;
           case "watermark":
             if (d.enabled) {
@@ -797,10 +855,18 @@
           docMode() === "cloud"
             ? "正式写入会把订单行写进【线上协作文档】（图片按 URL 嵌入，无本地备份）。\n\n"
             : "正式写入会把订单行连同 DISPIMG 主图写进【本地登记表】（写前自动备份）。\n\n";
+        // 区域进二次确认：区域决定这批是哪些订单，搞错就是整批登记到错的区域上
+        const rgSel = $("regionSelect");
+        const rgText =
+          rgSel && rgSel.value
+            ? `区域：${rgSel.value}（本批开始时会切过去）`
+            : `区域：${
+                rgSel?.selectedOptions?.[0]?.textContent?.trim() || "跟随浏览器当前"
+              }`;
         if (
           write &&
           !confirm(
-            how + `${$("workbookSelect").value}\n${target}\n\n确认继续？`
+            how + `${$("workbookSelect").value}\n${target}\n${rgText}\n\n确认继续？`
           )
         ) {
           return;
@@ -826,6 +892,7 @@
               sheet: $("sheetSelect").value, // 空＝按 sheet_map 分流
               incremental: $("switchIncremental").checked,
               doc_mode: docMode(),
+              region: $("regionSelect").value, // 空＝跟随浏览器当前区域
             }),
           });
           const { job_id } = await r.json();

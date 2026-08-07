@@ -71,6 +71,8 @@ pytest tests/test_experience_*.py -v             # 经验库单测（离线，�
 - **主图下载必须带浏览器头 + 重试**：裸 `requests` 会被 CDN 拦（连接重置/403）。
 - **按 Sheet 真实表头写入/判重**：各 Sheet 列序不同，批次开始解析一次 `SheetSchema` 全批复用，**绝不硬编码列号**。
 - **1688 选择器已实测**：结果卡片 `.search-offer-wrapper`（连字符）、详情价 `.module-od-main-price`、运费 `.module-od-shipping-services`、重量 `.module-od-product-pack-info`；改前先确认页面结构没变。
+- **Temu「区域」≠ 店铺，区域就是域名**：顶栏「全球/美国/欧区」切换换的是**域名**（全球 `agentseller.temu.com`、美国 `agentseller-us.temu.com`），`mallid` 与 `region` cookie 跨区域**完全不变**（`region=211` 只是碰巧与美国站订单前缀同码）。故店铺键必须带区域（`mallid@host`），页面 URL 一律运行时拼域名、**不留写死全球域的 URL 常量**。切区域**不能点顶栏标签**（业务页上非当前区域全带 `disabled` 类，合成与真实点击都不跳），只能换域名导航 + 等顶栏渲染后复核。只有全球/美国域名经实测，其它区域不许臆造。详见 [app/temu_region.py](app/temu_region.py)。
+- **店名读 `window.__USER_INFO__`，不是 `rawData`**：本版后台**没有** `window.rawData`（原先「rawData 优先」形同虚设，一路掉到顶栏启发式，靠排除词表挡「查看使用教程」这类按钮，文案一改就误命中）。可靠挂载点是 `window.__USER_INFO__.shopList[].malInfoList[]`（`{mallId: 数字, mallName}`）——注意平台把 mall 拼成 **`mal`**，且 `mallId` 是**数字**，与 mallid 字符串比对前必须 `String()` 归一。
 - **视觉模型 `qwen3.7-plus` 是多模态**（能看图），坐标按 `css = px / dpr` 换算，截图前先 `remove_highlights()`。
 - 生成物（Excel 备份、图片、截图）统一落到桌面 `manus输出/` 分类目录，不要堆在桌面根。
 

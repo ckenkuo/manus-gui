@@ -184,6 +184,7 @@ def _schema() -> P.SheetSchema:
 
 
 def test_write_row_cloud_sequence_and_payload(monkeypatch):
+    """插顶端（insert_at_top=True）：插行 → 文本 → 图片 → 读回，公式行号 = 表头下一行。"""
     verify = {"rangeData": [{"rowFrom": 1, "colFrom": 0, "cellText": "美国"}]}
     routes = {
         ("sheet", "get_sheets_info"): SHEETS_INFO,
@@ -197,7 +198,8 @@ def test_write_row_cloud_sequence_and_payload(monkeypatch):
     res = P.CollectResult(spu="SPU-9", ok=True, purchase_price=3.2, shipping=0.8,
                           weight_g=300)
 
-    ok, msg = asyncio.run(P.write_product_row_cloud(cli, "pawly全球", item, res, _schema()))
+    ok, msg = asyncio.run(P.write_product_row_cloud(
+        cli, "pawly全球", item, res, _schema(), insert_at_top=True))
     assert ok, msg
 
     kinds = [a for _, a, _ in cli._fake.calls if a != "get_sheets_info"]
@@ -225,6 +227,40 @@ def test_write_row_cloud_sequence_and_payload(monkeypatch):
     assert [o["op_type"] for o in pic_ops] == ["cell_operation_type_picture"]
     assert K.index_to_col(pic_ops[0]["col_from"]) == "D"  # 图片列
     assert "format/jpeg" in pic_ops[0]["cell_pic_info"]["pic_content"]  # avif→jpeg
+
+
+def test_write_row_cloud_append_bottom_skips_insert(monkeypatch):
+    """默认追加到末尾：不发 insert_rows_cols（省一次调用），落点 = 数据区末行之后。
+
+    SHEETS_INFO 的 rowTo=5（0-based）→ 新行落 0-based 第 6 行、公式行号 1-based = 7。
+    """
+    verify = {"rangeData": [{"rowFrom": 6, "colFrom": 0, "cellText": "美国"}]}
+    routes = {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "range_data_batch_update"): {"code": 0},
+        ("sheet", "get_range_data"): verify,
+    }
+    cli = _make(monkeypatch, routes)
+    item = {"spu": "SPU-9", "site": "美国", "category": "玩具", "price": "¥12.50",
+            "image": "https://img.kwcdn.com/a.jpg"}
+    res = P.CollectResult(spu="SPU-9", ok=True, purchase_price=3.2, shipping=0.8,
+                          weight_g=300)
+
+    ok, msg = asyncio.run(
+        P.write_product_row_cloud(cli, "pawly全球", item, res, _schema())
+    )
+    assert ok, msg
+
+    kinds = [a for _, a, _ in cli._fake.calls if a != "get_sheets_info"]
+    assert "insert_rows_cols" not in kinds, "追加不该插行"
+    assert kinds == ["range_data_batch_update", "range_data_batch_update",
+                     "get_range_data"]
+
+    calls = [c for c in cli._fake.calls if c[1] != "get_sheets_info"]
+    ops = calls[0][2]["range_data"]
+    assert all(o["row_from"] == 6 for o in ops), "0-based 落在末行(5)之后"
+    by_col = {K.index_to_col(o["col_from"]): o["formula"] for o in ops}
+    assert by_col["K"] == "=G7+J7+H7*80", "公式行号跟随实际落点(1-based 7)"
 
 
 def test_write_row_cloud_error_is_per_product(monkeypatch):
@@ -260,12 +296,15 @@ def test_write_row_cloud_aborts_on_bad_schema(monkeypatch):
 
 
 class FakeCloud:
-    """run_batch 云端分支用的假后端：记录判重读，sheet_names/read_header 供首屏用。"""
+    """run_batch 云端分支用的假后端：记录判重读与批量写，sheet_names/read_header 供首屏用。"""
 
     def __init__(self, sheets=("pawly全球",), file_id="https://www.kdocs.cn/l/abc123"):
         self._sheets = list(sheets)
         self.file_id = file_id  # run_batch 记 prefs/打日志都取它（对齐 KdocsSheet）
         self.key_reads = []  # [(sheet, col, header_row)]
+        self.writes = []  # [(sheet, rows, header_row, insert_at_top)]，基础模式走整批写
+        self.new_row_reads = []  # [(sheet, col, first_row, n)]，写后确认只读新行区
+        self.row_to = 5  # 0-based 数据区末行，追加落点靠它算；write_rows 后增长
 
     def sheet_names(self):
         return self._sheets
@@ -277,6 +316,26 @@ class FakeCloud:
         self.key_reads.append((sheet, col, header_row))
         return set()
 
+    def data_end_row(self, sheet):
+        """数据区末行（0-based）。默认 5 行历史数据，供追加落点计算。"""
+        return self.row_to
+
+    def write_rows(self, sheet, rows, header_row, insert_at_top=True,
+                   first_row=None):
+        self.writes.append((sheet, list(rows), header_row, insert_at_top, first_row))
+        self.row_to += len(rows)  # 与真实实现一致：写后数据区增长
+        return {"written": len(rows), "images": 0, "images_failed": 0,
+                "first_row": header_row if insert_at_top else self.row_to}
+
+    def read_new_rows_column(self, sheet, col, first_row, n):
+        """按写入顺序回放 SPU，模拟服务端已落值（供写后确认比对）。"""
+        self.new_row_reads.append((sheet, col, first_row, n))
+        out = []
+        for _s, rows, _hr, _top, _fr in self.writes:
+            for r in rows:
+                out.append(str(r["values"].get(col, "")))
+        return out[:n]
+
 
 def _patch_common(monkeypatch, tmp_path, cloud):
     """把 run_batch 的外部依赖全换成假的（清单/prefs/结构解析/单商品写入）。"""
@@ -287,9 +346,11 @@ def _patch_common(monkeypatch, tmp_path, cloud):
     monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": cloud)
     seen = {}
 
-    async def fake_base(item, excel, sheet, schema=None, cloud=None):
+    async def fake_base(item, excel, sheet, schema=None, cloud=None,
+                        append_mode="bottom", append_row=None):
         seen["cloud"] = cloud
         seen["schema"] = schema
+        seen["append_mode"] = append_mode
         return S.CollectOutcome(spu=str(item["spu"]), ok=True, status="base", via="base")
 
     monkeypatch.setattr(S, "collect_one_base", fake_base)
@@ -319,7 +380,14 @@ def test_run_batch_cloud_branch(monkeypatch, tmp_path):
 
     assert res == {"ok": 1, "fail": 0, "batch": 1}
     assert cloud.key_reads == [("pawly全球", "C", 1)], "判重要读云端的 SPU 列"
-    assert seen["cloud"] is cloud, "单商品写入要走云端后端"
+    # 基础模式云端走【整批一次写】，不再逐商品调 collect_one_base
+    assert len(cloud.writes) == 1, "整批只该发一次 write_rows"
+    assert cloud.writes[0][0] == "pawly全球"
+    assert [r["values"]["C"] for r in cloud.writes[0][1]] == ["S1"]
+    # 写后确认只读新行区那 n 格，不再拉整列（key_reads 只有批次开始那一次判重）。
+    # 默认落点是 bottom：FakeCloud 的 row_to=5（0-based）→ 新行 1-based 第 7 行。
+    assert cloud.new_row_reads == [("pawly全球", "C", 7, 1)]
+    assert cloud.writes[0][3] is False, "默认 bottom → insert_at_top=False"
     # 链接被拆到 cloud_url 键（对齐 orders 的 prefs 拆分）
     assert S.load_prefs()["cloud_url"] == "https://www.kdocs.cn/l/abc123"
 
@@ -425,7 +493,7 @@ def test_run_batch_cloud_from_prefs_keeps_link(monkeypatch, tmp_path):
 
     assert res == {"ok": 1, "fail": 0, "batch": 1}
     assert cloud.key_reads == [("pawly全球", "C", 1)]
-    assert seen["cloud"] is cloud
+    assert len(cloud.writes) == 1, "基础模式云端走整批写"
     assert S.load_prefs()["cloud_url"] == cloud.file_id, "云端批次不能冲掉 prefs 链接"
 
 
@@ -668,3 +736,326 @@ def test_kdocs_sheet_link_scheme_case_insensitive():
     assert K.KdocsSheet("HTTPS://WWW.KDOCS.CN/L/ABC")._id_param == "url"
     assert K.KdocsSheet("VsdfG0001234567")._id_param == "file_id"
     assert not S.is_cloud_link(None)
+
+
+def _patch_local_batch(monkeypatch, tmp_path, worklist):
+    """本地基础模式跑 run_batch 的最小 patch 集，供 store 失配护栏用例复用。"""
+    monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
+    monkeypatch.setattr(S, "load_worklist", lambda: worklist)
+    monkeypatch.setattr(S, "load_collect_config", lambda: {})
+    monkeypatch.setattr(S, "excel_write_locked", lambda _p: False)
+    monkeypatch.setattr(S, "spu_col_of", lambda e, s: "C")
+    monkeypatch.setattr(
+        S.WpsExcelTool, "existing_key_values",
+        classmethod(lambda cls, e, s, c: set()),
+    )
+
+    async def fake_schema(tool, excel, sheet):
+        return P.SheetSchema(sheet=sheet, fields={"spu": "C"}, ok=True)
+
+    monkeypatch.setattr(P, "resolve_sheet_schema", fake_schema)
+    done = []
+
+    async def fake_base(item, excel, sheet, schema=None, cloud=None,
+                        append_mode="bottom", append_row=None):
+        done.append(str(item["spu"]))
+        return S.CollectOutcome(spu=str(item["spu"]), ok=True, status="base", via="base")
+
+    monkeypatch.setattr(S, "collect_one_base", fake_base)
+    return done
+
+
+def test_run_batch_stale_prefs_store_falls_back_to_all(monkeypatch, tmp_path):
+    """prefs 里的店已不在清单里（清单被重新枚举成另一家店）→ 降级「全部店铺」并照常采。
+
+    UI 侧 get_worklist_status 失配时回显空 store、下拉显示「全部店铺」，这里若仍按失效
+    mallid 硬过滤，就会「页面写着全部、后端过滤到 0 条」，报「清单里没有商品」。
+    """
+    done = _patch_local_batch(
+        monkeypatch, tmp_path,
+        [{"spu": "S1", "name": "n", "mallid": "NEW", "store": "新店"}],
+    )
+    S.save_prefs(excel="D:/wb.xlsx", sheet="pawly全球", store="OLD")
+
+    res = asyncio.run(S.run_batch(
+        limit=5, base_only=True, excel="D:/wb.xlsx", sheet="pawly全球",
+    ))
+
+    assert res == {"ok": 1, "fail": 0, "batch": 1}
+    assert done == ["S1"], "降级后应采全部店铺的商品，而不是过滤到空"
+    assert S.load_prefs()["store"] == "", "失效 store 要被清掉，别继续污染下一批"
+
+
+def test_run_batch_explicit_unknown_store_aborts(monkeypatch, tmp_path):
+    """显式指定的店不在清单里 → 如实报错，绝不悄悄降级成全量采（那是改写调用方意图）。"""
+    done = _patch_local_batch(
+        monkeypatch, tmp_path,
+        [{"spu": "S1", "name": "n", "mallid": "NEW", "store": "新店"}],
+    )
+    events = []
+
+    res = asyncio.run(S.run_batch(
+        limit=5, base_only=True, excel="D:/wb.xlsx", sheet="pawly全球",
+        store="OLD", on_progress=lambda e: events.append(e),
+    ))
+
+    assert res == {"ok": 0, "fail": 0, "batch": 0}
+    assert done == []
+    assert events and events[0]["type"] == "aborted"
+    assert "OLD" in events[0]["reason"]
+
+
+def test_run_batch_explicit_store_still_filters(monkeypatch, tmp_path):
+    """回归：显式指定清单里存在的店，仍只采该店（护栏不能把正常过滤放行掉）。"""
+    done = _patch_local_batch(
+        monkeypatch, tmp_path,
+        [
+            {"spu": "S1", "name": "n", "mallid": "A", "store": "店A"},
+            {"spu": "S2", "name": "n", "mallid": "B", "store": "店B"},
+        ],
+    )
+
+    res = asyncio.run(S.run_batch(
+        limit=5, base_only=True, excel="D:/wb.xlsx", sheet="pawly全球", store="B",
+    ))
+
+    assert res == {"ok": 1, "fail": 0, "batch": 1}
+    assert done == ["S2"]
+
+
+# ---- 云端批量写（基础模式）----------------------------------------------------
+
+
+def test_write_rows_cloud_formula_row_numbers_increment():
+    """一批 n 行的公式行号必须逐行递增：全用同一个行号会让 n 行公式指向同一行。
+
+    两种落点都要验：追加时起点是数据区末行之后，插顶端时是表头正下方。
+    """
+    schema = P.SheetSchema(
+        sheet="S", fields={"spu": "C"}, ok=True, header_row=1,
+        formula_columns={"H": "=E{r}*2"},
+    )
+    items = [{"spu": f"S{i}"} for i in range(3)]
+
+    # 默认 bottom：FakeCloud.row_to=5（0-based）→ 新行 1-based 从第 7 行起
+    bottom = FakeCloud()
+    ok, msg, wrote = asyncio.run(P.write_product_rows_cloud(bottom, "S", items, schema))
+    assert ok, msg
+    assert wrote == ["S0", "S1", "S2"]
+    assert bottom.writes[0][3] is False
+    assert [r["values"]["H"] for r in bottom.writes[0][1]] == [
+        "=E7*2", "=E8*2", "=E9*2",
+    ]
+
+    # 插顶端：header_row=1 → 新行占 1-based 的 2/3/4 行
+    top = FakeCloud()
+    ok, msg, _ = asyncio.run(
+        P.write_product_rows_cloud(top, "S", items, schema, insert_at_top=True)
+    )
+    assert ok, msg
+    assert top.writes[0][3] is True
+    assert [r["values"]["H"] for r in top.writes[0][1]] == [
+        "=E2*2", "=E3*2", "=E4*2",
+    ]
+
+
+def test_write_rows_cloud_single_call_for_whole_batch():
+    """整批只发一次 write_rows + 一次写后确认（配额敏感：逐行写是 5~6 次/行）。"""
+    cloud = FakeCloud()
+    schema = P.SheetSchema(sheet="S", fields={"spu": "C"}, ok=True, header_row=1)
+    items = [{"spu": f"S{i}"} for i in range(20)]
+
+    ok, _msg, wrote = asyncio.run(
+        P.write_product_rows_cloud(cloud, "S", items, schema, insert_at_top=True)
+    )
+
+    assert ok and len(wrote) == 20
+    assert len(cloud.writes) == 1, "20 行只该发一次 write_rows"
+    # 插顶端：落点 = header_row+1 = 2
+    assert cloud.new_row_reads == [("S", "C", 2, 20)], "确认只读新行区，不拉整列"
+    assert cloud.key_reads == [], "批量写路径不该再逐行读整列判重"
+
+
+def test_write_rows_cloud_all_or_nothing_on_write_error():
+    """写失败 → 整批算失败、返回空已写列表（一坏全坏，重跑即可，不留半批）。"""
+    from app.orders.kdocs_sheet import KdocsSheetError
+
+    class BoomCloud(FakeCloud):
+        def write_rows(self, sheet, rows, header_row, insert_at_top=True,
+                       first_row=None):
+            raise KdocsSheetError("429002 熔断")
+
+    schema = P.SheetSchema(sheet="S", fields={"spu": "C"}, ok=True, header_row=1)
+    items = [{"spu": "A"}, {"spu": "B"}]
+
+    ok, msg, wrote = asyncio.run(
+        P.write_product_rows_cloud(BoomCloud(), "S", items, schema)
+    )
+
+    assert not ok
+    assert wrote == []
+    assert "429002" in msg and "一行不落" in msg
+
+
+def test_write_rows_cloud_detects_confirm_mismatch():
+    """写后确认读回的 SPU 与预期不符 → 整批判失败，绝不谎报成功。"""
+    class SkewCloud(FakeCloud):
+        def read_new_rows_column(self, sheet, col, first_row, n):
+            return ["WRONG"] * n
+
+    schema = P.SheetSchema(sheet="S", fields={"spu": "C"}, ok=True, header_row=1)
+    ok, msg, wrote = asyncio.run(
+        P.write_product_rows_cloud(SkewCloud(), "S", [{"spu": "A"}], schema)
+    )
+
+    assert not ok and wrote == []
+    assert "确认不一致" in msg
+
+
+def test_run_batch_cloud_batch_write_failure_reports_all_failed(monkeypatch, tmp_path):
+    """整批写失败时 run_batch 要把本批全部计为失败，并逐个发 aborted/fail 事件。"""
+    from app.orders.kdocs_sheet import KdocsSheetError
+
+    class BoomCloud(FakeCloud):
+        def write_rows(self, sheet, rows, header_row, insert_at_top=True,
+                       first_row=None):
+            raise KdocsSheetError("429002 熔断")
+
+    cloud = BoomCloud()
+    monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
+    monkeypatch.setattr(S, "load_worklist", lambda: [
+        {"spu": "S1", "name": "n", "mallid": "m"},
+        {"spu": "S2", "name": "n", "mallid": "m"},
+    ])
+    monkeypatch.setattr(S, "load_collect_config", lambda: {})
+    monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": cloud)
+
+    async def fake_schema_cloud(c, sheet):
+        return P.SheetSchema(sheet=sheet, fields={"spu": "C"}, ok=True, header_row=1)
+
+    monkeypatch.setattr(P, "resolve_sheet_schema_cloud", fake_schema_cloud)
+    events = []
+
+    res = asyncio.run(S.run_batch(
+        limit=5, base_only=True, excel="https://www.kdocs.cn/l/abc123",
+        sheet="pawly全球", on_progress=lambda e: events.append(e),
+    ))
+
+    assert res == {"ok": 0, "fail": 2, "batch": 2}
+    fails = [e for e in events if e.get("status") == "fail"]
+    assert len(fails) == 2, "两个商品都要报失败，不能静默"
+    assert any("429002" in str(e.get("note", "")) for e in fails)
+
+
+# ---- 落点四模式 --------------------------------------------------------------
+
+
+def test_resolve_append_target_four_modes():
+    """四种落点解析成 (insert_at_top, 起始行, 标签)：起始行 None = 交给写入层自己算。"""
+    assert S.resolve_append_target(S.APPEND_BOTTOM, None, 1)[:2] == (False, None)
+    assert S.resolve_append_target(S.APPEND_TOP, None, 1)[:2] == (True, 2)
+    # 表头在第 2 行时，top 落到第 3 行
+    assert S.resolve_append_target(S.APPEND_TOP, None, 2)[:2] == (True, 3)
+    # 指定行两种：解析阶段都返回该行本身，向上插的减法在 _cloud_first_row 里做
+    assert S.resolve_append_target(S.APPEND_ROW_DOWN, 10, 1)[:2] == (True, 10)
+    assert S.resolve_append_target(S.APPEND_ROW_UP, 10, 1)[:2] == (True, 10)
+    # 标签带上行号，供日志/UI 明示落点
+    assert "10" in S.resolve_append_target(S.APPEND_ROW_DOWN, 10, 1)[2]
+
+
+def test_resolve_append_target_bad_row_falls_back_to_bottom():
+    """行号缺失/非数字/落在表头及以上 → 退回 bottom，不抛错（落点是辅助选项，别让整批停摆）。"""
+    for bad in (None, "", "abc", 0, -5, 1):  # header_row=1 时第 1 行就是表头
+        at_top, at_row, label = S.resolve_append_target(S.APPEND_ROW_DOWN, bad, 1)
+        assert (at_top, at_row) == (False, None), bad
+        assert label == S.APPEND_MODE_LABELS[S.APPEND_BOTTOM]
+    # 表头在第 2 行时，第 2 行也非法（就是表头本身）
+    assert S.resolve_append_target(S.APPEND_ROW_UP, 2, 2)[:2] == (False, None)
+
+
+def test_normalize_append_mode_unknown_falls_back():
+    """不认识的值退默认 bottom：这个值来自 UI/CLI/prefs/config，老 prefs 里没有这个键。"""
+    assert S.normalize_append_mode(None) == S.APPEND_BOTTOM
+    assert S.normalize_append_mode("") == S.APPEND_BOTTOM
+    assert S.normalize_append_mode("nonsense") == S.APPEND_BOTTOM
+    assert S.normalize_append_mode(" TOP ") == S.APPEND_TOP  # 大小写/空格不敏感
+    assert S.normalize_append_mode("row_up") == S.APPEND_ROW_UP
+
+
+def test_cloud_first_row_row_up_subtracts_batch_size():
+    """向上插：n 行要落在指定行【之前】，故起点 = R - n；越过表头则从表头下一行开始。"""
+    cloud = FakeCloud()
+    schema = P.SheetSchema(sheet="S", fields={"spu": "C"}, ok=True, header_row=1)
+
+    # 从第 10 行向上插 3 行 → 占 7/8/9
+    assert P._cloud_first_row(cloud, "S", schema, True, 10, 3) == 7
+    # 向下插不减
+    assert P._cloud_first_row(cloud, "S", schema, True, 10, 0) == 10
+    # 挤到表头之上时钳到表头下一行（header_row=1 → 2）
+    assert P._cloud_first_row(cloud, "S", schema, True, 3, 10) == 2
+
+
+def test_write_rows_cloud_row_up_lands_before_target():
+    """整批向上插：公式行号与落点都在指定行之前，且插行请求打在算出的起点上。"""
+    cloud = FakeCloud()
+    schema = P.SheetSchema(
+        sheet="S", fields={"spu": "C"}, ok=True, header_row=1,
+        formula_columns={"H": "=E{r}*2"},
+    )
+    items = [{"spu": f"S{i}"} for i in range(3)]
+
+    ok, msg, wrote = asyncio.run(P.write_product_rows_cloud(
+        cloud, "S", items, schema, insert_at_top=True, at_row=20, up_count=3))
+
+    assert ok, msg
+    assert wrote == ["S0", "S1", "S2"]
+    # 起点 = 20 - 3 = 17 → 占 17/18/19，正好排在第 20 行之前
+    assert [r["values"]["H"] for r in cloud.writes[0][1]] == [
+        "=E17*2", "=E18*2", "=E19*2",
+    ]
+    assert cloud.writes[0][4] == 17, "显式落点要透传给 write_rows"
+    assert cloud.new_row_reads == [("S", "C", 17, 3)]
+
+
+def test_write_rows_cloud_row_down_starts_at_target():
+    """整批向下插：从指定行开始占位（原该行及以下被推走）。"""
+    cloud = FakeCloud()
+    schema = P.SheetSchema(
+        sheet="S", fields={"spu": "C"}, ok=True, header_row=1,
+        formula_columns={"H": "=E{r}*2"},
+    )
+    items = [{"spu": f"S{i}"} for i in range(2)]
+
+    ok, msg, _ = asyncio.run(P.write_product_rows_cloud(
+        cloud, "S", items, schema, insert_at_top=True, at_row=8, up_count=0))
+
+    assert ok, msg
+    assert [r["values"]["H"] for r in cloud.writes[0][1]] == ["=E8*2", "=E9*2"]
+    assert cloud.writes[0][4] == 8
+
+
+def test_write_row_cloud_at_row_insert_payload(monkeypatch):
+    """从指定行插入：insert_rows_cols 的 0-based 行号 = 指定行 - 1，文本也落在那一行。"""
+    verify = {"rangeData": [{"rowFrom": 9, "colFrom": 0, "cellText": "美国"}]}
+    routes = {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "insert_rows_cols"): {"code": 0},
+        ("sheet", "range_data_batch_update"): {"code": 0},
+        ("sheet", "get_range_data"): verify,
+    }
+    cli = _make(monkeypatch, routes)
+    item = {"spu": "SPU-9", "site": "美国", "category": "玩具", "price": "¥12.50"}
+    res = P.CollectResult(spu="SPU-9", ok=True, purchase_price=3.2, shipping=0.8)
+
+    # 1-based 第 10 行 → 0-based 9
+    ok, msg = asyncio.run(P.write_product_row_cloud(
+        cli, "pawly全球", item, res, _schema(), insert_at_top=True, at_row=10))
+    assert ok, msg
+
+    calls = [c for c in cli._fake.calls if c[1] != "get_sheets_info"]
+    insert = calls[0][2]
+    assert (insert["row_from"], insert["row_to"]) == (9, 9)
+    ops = calls[1][2]["range_data"]
+    assert all(o["row_from"] == 9 for o in ops)
+    by_col = {K.index_to_col(o["col_from"]): o["formula"] for o in ops}
+    assert by_col["K"] == "=G10+J10+H10*80", "公式行号用 1-based 的 10"

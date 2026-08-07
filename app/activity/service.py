@@ -166,13 +166,22 @@ def _read_cost(excel: str, sheet: str, spu: str) -> dict:
     )
 
 
-async def _connect_pages(cdp_url: str):
-    """连 CDP 并新建本批专用的流量、活动、商品页。
+async def _connect_pages(cdp_url: str, region_label: str = ""):
+    """连 CDP、确认作业区域，并在【该区域的域名下】新建本批专用的流量、活动、商品页。
 
     不复用已有页签：其筛选条件、弹窗、局部状态和生命周期都不受管线控制，甚至可能正被
     操作者关闭。三个页面均由本批创建并加入 owned_pages，调用方负责及时关闭；用户原本打开
-    的页签不读取、不修改、也不关闭。
+    的页签只【读一次区域】，不修改、不点击、也不关闭。
+
+    区域为什么必须先确认：顶栏区域切换换的是域名（全球 agentseller.temu.com / 美国
+    agentseller-us.temu.com）。本管线自己新开页面，若用写死的全球域，就会把操作者选定的
+    美国区悄悄换回全球区——报名/开加速器这类写操作会打在错误的一批商品上。
+
+    region_label：UI 上选定的区域，**以它为准**——浏览器停在别的区域会先切过去再开工作页。
+    为空则沿用浏览器当前区域；读不到区域抛 RegionUnconfirmed，绝不默认全球域。
     """
+    from app.temu_region import confirm_region_from_context, url_in_region
+
     pw = await async_playwright().start()
     browser = None
     owned_pages = []
@@ -181,8 +190,10 @@ async def _connect_pages(cdp_url: str):
         if not browser.contexts:
             raise RuntimeError("CDP 浏览器没有可用 context")
         ctx = browser.contexts[0]
+        region = await confirm_region_from_context(ctx, region_label)
 
-        async def open_owned_page(label, url):
+        async def open_owned_page(label, path):
+            url = url_in_region(path, region)
             page = await ctx.new_page()
             owned_pages.append(page)
             try:
@@ -198,9 +209,9 @@ async def _connect_pages(cdp_url: str):
                 owned_pages.remove(page)
                 raise RuntimeError(f"自动打开{label}失败：{exc}") from exc
 
-        flux_page = await open_owned_page("流量页", pipeline.FLUX_URL)
-        activity_page = await open_owned_page("活动页", pipeline.ACTIVITY_URL)
-        goods_page = await open_owned_page("商品页", pipeline.GOODS_LIST_URL)
+        flux_page = await open_owned_page("流量页", pipeline.FLUX_PATH)
+        activity_page = await open_owned_page("活动页", pipeline.ACTIVITY_PATH)
+        goods_page = await open_owned_page("商品页", pipeline.GOODS_LIST_PATH)
         return pw, browser, flux_page, activity_page, goods_page, owned_pages
     except Exception:
         for page in reversed(owned_pages):
@@ -917,6 +928,7 @@ async def run_activity_batch(
     stock_map=None,
     live: bool = False,
     activity_allow=None,
+    region_label: str = "",
 ) -> dict:
     """跑一批 SPU 的活动管理编排（关流量→报名→开流量），进度经 on_progress 抛出。
 
@@ -972,7 +984,7 @@ async def run_activity_batch(
             return {"done": 0, "skip": 0, "fail": 0, "results": []}
         try:
             (pw, browser, flux_page, activity_page, goods_page,
-             owned_pages) = await _connect_pages(CDP_URL)
+             owned_pages) = await _connect_pages(CDP_URL, region_label)
         except Exception as e:
             await _emit(on_progress, {"type": "aborted", "reason": f"连接 CDP 失败：{e}"})
             logger.error(f"活动批次：连接 CDP 失败：{e}")

@@ -189,7 +189,27 @@
               <label class="form-label small text-muted mb-1">店铺</label>
               <select id="selStore" class="form-select form-select-sm"></select>
             </div>
+            <div class="col-6 col-md-3">
+              <label class="form-label small text-muted mb-1">写入位置</label>
+              <select
+                id="selAppend"
+                class="form-select form-select-sm"
+                title="新行写到哪里：追加到末尾（默认）/ 插到表头下 / 从指定行向下插 / 从指定行向上插"
+              ></select>
+            </div>
+            <div class="col-6 col-md-2 d-none" id="wrapAppendRow">
+              <label class="form-label small text-muted mb-1">起始行</label>
+              <input
+                type="number"
+                id="inputAppendRow"
+                class="form-control form-control-sm"
+                min="2"
+                placeholder="如 10"
+                title="向下插：新行从该行开始，原内容下移。向上插：新行排在该行之前"
+              />
+            </div>
           </div>
+          <div id="appendHint" class="small text-body-tertiary mt-2"></div>
         </div>
       </div>
 
@@ -202,6 +222,16 @@
               id="selStatus"
               class="form-select"
               title="默认「跟随页面当前」：页签+类目/站点/商品名等筛选都在 Temu 页面设好，枚举时点页面「查询」原样采集。选具体页签则先替你切该页签（可能重置详细筛选）"
+            ></select>
+          </div>
+          <!-- 区域以这里选的为准：枚举时若浏览器停在别的区域，会先替你切过去再采
+               （区域切换是换域名的整页跳转，见 app/temu_region.py） -->
+          <div class="input-group input-group-sm" style="width: 240px">
+            <span class="input-group-text">区域</span>
+            <select
+              id="selRegion"
+              class="form-select"
+              title="以这里选的区域为准：枚举时浏览器若停在别的区域，会先替你切过去再采。选「跟随浏览器当前」则用浏览器此刻所在的区域"
             ></select>
           </div>
           <button id="btnRefresh" class="btn btn-outline-secondary btn-sm">
@@ -324,8 +354,51 @@
       let items = []; // 当前清单（含每条 done 状态）
       let priced = {}; // spu -> {status, purchase_price, shipping}（本批实时结果覆盖）
       let evtSource = null;
-      // 三级选择当前值（后端回显「上次选择」作初值）
-      let sel = { excel: "", sheet: "", store: "", status: "" };
+      // 三级选择当前值（后端回显「上次选择」作初值）+ 新行落点
+      let sel = {
+        excel: "",
+        sheet: "",
+        store: "",
+        status: "",
+        region: "", // 目标区域；空串＝跟随浏览器当前区域
+        append_mode: "bottom",
+        append_row: "",
+      };
+
+      // 区域名等文本进 HTML 前转义（区域名来自页面读取，不是常量）
+      function esc(s) {
+        return String(s == null ? "" : s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c]
+        );
+      }
+
+      // 起始行输入框只在「从指定行」两种模式下出现；顺带给出一句人读的落点说明，
+      // 避免用户把「向下插」和「向上插」记反（差别只在指定行本身要不要被推走）。
+      function syncAppendUI() {
+        const needRow =
+          sel.append_mode === "row_down" || sel.append_mode === "row_up";
+        $("wrapAppendRow").classList.toggle("d-none", !needRow);
+        const r = String(sel.append_row || "").trim() || "R";
+        const hints = {
+          bottom: "新行追加到数据区末尾（现有内容不动）。",
+          top: "新行插到表头正下方，已有数据整体下移。",
+          row_down: `新行从第 ${r} 行开始占位，原第 ${r} 行及以下整体下移。`,
+          row_up: `新行排在第 ${r} 行之前（该行内容不变、行号变大）。`,
+        };
+        let msg = hints[sel.append_mode] || "";
+        if (needRow && !String(sel.append_row || "").trim()) {
+          msg += " 未填起始行时本批会退回「追加到末尾」。";
+        }
+        $("appendHint").textContent = msg;
+      }
 
       function showToast(title, body, kind = "primary") {
         $("toastTitle").textContent = title;
@@ -392,7 +465,12 @@
             const img = it.image
               ? `<img class="thumb" src="${it.image}" loading="lazy" />`
               : '<div class="thumb"></div>';
-            const store = it.store || it.mallid || "";
+            // 店铺列带上区域：同一账号在全球/美国区店名完全相同，不标区域就分不清
+            // 这一行是哪个区域采来的
+            const storeName = it.store || it.mallid || "";
+            const store = it.region_label
+              ? `${storeName} · ${it.region_label}`
+              : storeName;
             return `<tr data-spu="${it.spu}">
               <td>${img}</td>
               <td class="small text-muted">${it.spu}</td>
@@ -466,6 +544,20 @@
             )
             .join("");
 
+        // 写入位置下拉：选项由后端给（与 APPEND_MODE_LABELS 同源，勿在前端重复维护）
+        sel.append_mode = s.append_mode || "bottom";
+        sel.append_row = s.append_row || "";
+        $("selAppend").innerHTML = (s.append_modes || [])
+          .map(
+            (m) =>
+              `<option value="${m.key}"${
+                m.key === sel.append_mode ? " selected" : ""
+              }>${m.label}</option>`
+          )
+          .join("");
+        $("inputAppendRow").value = sel.append_row;
+        syncAppendUI();
+
         // 采集范围下拉：首项「跟随页面当前」(value="") 为默认，其后是可选覆盖页签
         const statusSel = $("selStatus");
         const cur = s.status || "";
@@ -477,6 +569,33 @@
                 `<option value="${t}"${t === cur ? " selected" : ""}>切到「${t}」</option>`
             )
             .join("");
+
+        renderRegionSelect(s);
+      }
+
+      // 区域下拉：候选只能从页面读（账号能看到哪些区域随权限变，代码里写死就是猜）。
+      // 首项 value="" ＝跟随浏览器当前区域；其余是顶栏实际可见的区域。
+      // 「商家中心」不是业务区域（没有商品列表），从候选里剔掉，免得选了采不到东西。
+      function renderRegionSelect(s) {
+        const box = $("selRegion");
+        if (!box) return;
+        const r = s.region || {};
+        const want = s.region_label || "";
+        const opts = (r.options || []).filter((x) => x !== "商家中心");
+        const curTip = r.current ? `跟随浏览器当前（${r.current}）` : "跟随浏览器当前";
+        box.innerHTML =
+          `<option value=""${want === "" ? " selected" : ""}>${esc(curTip)}</option>` +
+          opts
+            .map(
+              (t) =>
+                `<option value="${esc(t)}"${t === want ? " selected" : ""}>${esc(t)}</option>`
+            )
+            .join("");
+        // 读不到区域时把原因挂在 title 上，不弹红条——浏览器没开是常态，
+        // 真正需要区域时（点枚举）后端会回 409 带可操作文案
+        box.title = r.error
+          ? `读不到区域：${r.error}。请在调试 Chrome 里打开 Temu 后台页面`
+          : "以这里选的区域为准：枚举时浏览器若停在别的区域，会先替你切过去再采";
       }
 
       // 当前选中的文档模式；首屏未渲染时返回空串＝让后端按上次选择决定
@@ -502,6 +621,7 @@
           sel.sheet = s.sheet || "";
           sel.store = s.store || "";
           sel.status = s.status || "";
+          sel.region = s.region_label || "";
           // 回显后端实际生效的模式（本地模式下 excel 可能是自动挑的桌面候选）
           $(s.doc_mode === "cloud" ? "docModeCloud" : "docModeLocal").checked = true;
           fillSelectors(s);
@@ -526,8 +646,15 @@
           $("statBatch").textContent = data.batch;
           $("progressLabel").textContent = `0 / ${data.batch}`;
           $("progressBar").style.width = "0%";
+          const posLabel = {
+            bottom: "追加到末尾",
+            top: "插到表头下",
+            row_down: "从指定行向下插",
+            row_up: "从指定行向上插",
+          }[data.append_mode] || "";
           logLine(
-            `批次开始：清单 ${data.total}，已入库 ${data.done_existing}，待采 ${data.todo}，本批 ${data.batch}`,
+            `批次开始：清单 ${data.total}，已入库 ${data.done_existing}，待采 ${data.todo}，本批 ${data.batch}` +
+              (posLabel ? `，写入位置=${posLabel}` : ""),
             "text-info"
           );
         } else if (type === "product_start") {
@@ -596,6 +723,9 @@
               sheet: sel.sheet,
               store: sel.store,
               doc_mode: docMode(),
+              append_mode: sel.append_mode,
+              // 空串要送 null：后端 append_row 是 Optional[int]，空串会 422
+              append_row: sel.append_row === "" ? null : Number(sel.append_row),
             }),
           });
           const { job_id } = await r.json();
@@ -622,11 +752,18 @@
           const r = await fetch("/collect/enumerate", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ status: sel.status }),
+            body: JSON.stringify({ status: sel.status, region: sel.region }),
           });
-          const { count } = await r.json();
+          const data = await r.json();
+          // 409 = 区域问题（没开列表页 / 目标区域不存在 / 切过去后复核失败）。这是要去
+          // 浏览器里处理的事，reason 已经是可操作文案，原样展示，别裹成「枚举失败」
+          if (r.status === 409) {
+            showToast("区域未就绪", data.reason || "区域未确认", "warning");
+            return;
+          }
           const scope = sel.status ? `切到「${sel.status}」` : "跟随页面当前";
-          showToast("枚举完成", `${scope}，共 ${count} 个商品`, "success");
+          const rg = sel.region ? `区域「${sel.region}」，` : "";
+          showToast("枚举完成", `${rg}${scope}，共 ${data.count} 个商品`, "success");
           await loadWorklist();
         } catch (e) {
           showToast("枚举失败", String(e), "danger");
@@ -660,6 +797,15 @@
         sel.sheet = e.target.value;
         loadWorklist(); // 重算该 Sheet 下的 done/todo
       });
+      // 落点只影响写入位置，不影响 done/todo，故不必重新拉清单（省一次请求）
+      $("selAppend").addEventListener("change", (e) => {
+        sel.append_mode = e.target.value;
+        syncAppendUI();
+      });
+      $("inputAppendRow").addEventListener("input", (e) => {
+        sel.append_row = e.target.value.trim();
+        syncAppendUI();
+      });
       // 切本地/线上：目标表整个换了，excel 清空交给后端按该模式重新解析（本地模式会自动
       // 挑桌面候选），Sheet 一并清掉——新文档里旧 Sheet 未必存在
       ["docModeLocal", "docModeCloud"].forEach((id) => {
@@ -677,6 +823,10 @@
       // 采集页签只在「重新枚举」时生效，改选不重拉清单，仅记住选择
       $("selStatus").addEventListener("change", (e) => {
         sel.status = e.target.value;
+      });
+      // 区域同理：只在「重新枚举」时生效（切区域是整页跳转，不该在改下拉时就触发）
+      $("selRegion").addEventListener("change", (e) => {
+        sel.region = e.target.value;
       });
 
       // ---- 协作文档链接登记簿：候选回填 + 手动命名 --------------------------

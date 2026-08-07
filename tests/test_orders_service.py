@@ -296,11 +296,14 @@ def _patch_collect(monkeypatch, orders, store="StoreA"):
     seen_watermark: dict = {}
 
     async def fake_collect(list_url, store="", on_progress=None, max_pages=200,
-                           known_order_nos=None):
+                           known_order_nos=None, region_label=""):
         # 记下 service 算出来的水位，供增量用例断言（单表模式才该非空）
         seen_watermark["known"] = set(known_order_nos or ())
+        seen_watermark["region_label"] = region_label
         return {
             "orders": orders, "store": store or "StoreA",
+            # 真实 collect_orders 回传实际生效的区域（可能是按 UI 选择切过去的）
+            "region": region_label or "全球",
             "export_file": "X.xlsx", "total": len(orders), "pages": 1,
             "join": {"image": 0, "price": 0, "miss": len(orders)},
         }
@@ -384,14 +387,26 @@ def test_purchase_files_land_in_date_folder(workbook, monkeypatch, tmp_path):
 
 
 def test_purchase_filenames_carry_store(workbook, monkeypatch):
-    """店铺名进文件名：多店铺时同一日期目录下要能一眼分辨是哪家店的采购单。"""
+    """店铺名+区域进文件名：同一日期目录下要能一眼分辨是哪家店哪个区域的采购单。"""
     _patch_collect(monkeypatch, [_order("PO-新A", "32")])
 
     res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL)
 
     assert res["purchase"]["store"] == "StoreA"
-    assert Path(res["purchase"]["file"]).name.startswith("StoreA_")
-    assert Path(res["purchase"]["md_file"]).name.startswith("StoreA_")
+    assert res["purchase"]["region"] == "全球"
+    assert Path(res["purchase"]["file"]).name.startswith("StoreA-全球_")
+    assert Path(res["purchase"]["md_file"]).name.startswith("StoreA-全球_")
+
+
+def test_purchase_filenames_use_actual_region_not_input(workbook, monkeypatch):
+    """文件名用【实际生效】的区域：UI 选了美国就写美国，而不是入参的空串。"""
+    _patch_collect(monkeypatch, [_order("PO-新A", "32")])
+
+    res = _run(dry_run=True, workbook=str(workbook), list_url=_SORTED_URL,
+               region_label="美国")
+
+    assert res["purchase"]["region"] == "美国"
+    assert Path(res["purchase"]["file"]).name.startswith("StoreA-美国_")
 
 
 def test_real_run_writes_rows(workbook, monkeypatch):
@@ -676,7 +691,7 @@ def test_prefs_roundtrip(tmp_path, monkeypatch):
 
     assert S.load_prefs() == {
         "store": "StoreB", "workbook": "D:/wb.xlsx", "sheet": "StoreB欧区",
-        "cloud_url": "", "doc_mode": "auto",
+        "cloud_url": "", "doc_mode": "auto", "region_label": "",
     }
 
 
@@ -688,9 +703,23 @@ def test_prefs_cloud_link_goes_to_cloud_url(tmp_path, monkeypatch):
     assert S.load_prefs() == {
         "store": "Pawly", "workbook": "", "sheet": "Pawly全球1",
         "cloud_url": "https://www.kdocs.cn/l/abc123", "doc_mode": "auto",
+        "region_label": "",
     }
     S.save_prefs(store="Pawly", workbook="D:/wb.xlsx", sheet="")
     assert S.load_prefs()["cloud_url"] == ""
+
+
+def test_prefs_region_is_remembered_and_not_reset_by_omission(tmp_path, monkeypatch):
+    """区域选择要记住；老版本 UI/CLI 不带这个参数时不能把它悄悄重置掉。"""
+    monkeypatch.setattr(S, "ORDERS_PREFS", tmp_path / "orders_prefs.json")
+    S.save_prefs(store="Pawly", workbook="D:/wb.xlsx", region_label="美国")
+    assert S.load_prefs()["region_label"] == "美国"
+    # 不传 region_label（None）＝沿用上次
+    S.save_prefs(store="Pawly", workbook="D:/wb.xlsx")
+    assert S.load_prefs()["region_label"] == "美国"
+    # 显式空串＝改回「跟随浏览器当前区域」
+    S.save_prefs(store="Pawly", workbook="D:/wb.xlsx", region_label="")
+    assert S.load_prefs()["region_label"] == ""
 
 
 def test_prefs_explicit_mode_keeps_both_targets(tmp_path, monkeypatch):

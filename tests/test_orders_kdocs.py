@@ -79,6 +79,29 @@ def test_col_index_roundtrip():
         assert K.index_to_col(K.col_to_index(col)) == col
 
 
+def test_force_text_input():
+    """22 位物流跟踪号等长数字串加单引号前缀强制按文本录入，短串/带字母/金额原样。"""
+    # 长数字串（订单号/子订单号/物流跟踪号/SKUID 等）加 `'` 前缀
+    assert K.force_text_input("9200190419690851234567") == "'9200190419690851234567"  # 22位
+    assert K.force_text_input("211031661904287936") == "'211031661904287936"          # 18位
+    assert K.force_text_input("920019041969") == "'920019041969"                     # 12位（阈值）
+    # 前导零：哪怕很短也必须按文本（否则前导零会被抹掉）
+    assert K.force_text_input("007") == "'007"
+    assert K.force_text_input("01234") == "'01234"
+    # 短数字串留成数值，让表格可以求和/筛选大于1（数量、金额）
+    assert K.force_text_input("12.34") == "12.34"       # 金额，含小数点不是纯数字
+    assert K.force_text_input("12") == "12"             # 价格整数部分，未达阈值
+    assert K.force_text_input("3") == "3"               # 件数
+    assert K.force_text_input(3) == "3"                 # int 原样转字符串，让表格按数值解析
+    assert K.force_text_input(12.34) == "12.34"         # float
+    # 带字母/连字符的本就不会被强转成数值，无需干预
+    assert K.force_text_input("PO-211-03166038385273625") == "PO-211-03166038385273625"
+    assert K.force_text_input("GFUS01029661553153") == "GFUS01029661553153"
+    # 已有前缀的不重复加（防调用方二次处理）
+    assert K.force_text_input("'920019041969") == "'920019041969"
+    assert K.force_text_input("'12") == "'12"
+
+
 def test_read_header_picks_fullest_row(monkeypatch):
     # 第 1 行只有一个跨列大标题，第 2 行才是真表头（与本地 detect_header_row 同口径）
     routes = {
@@ -135,7 +158,9 @@ def test_write_rows_sequence_and_payload(monkeypatch):
         "image_url": "https://img.kwcdn.com/a.jpg?imageView2/2/w/800/q/70/format/avif",
     }]
     res = cli.write_rows("StoreA全球1", rows, header_row=2)
-    assert res == {"written": 1, "images": 1, "images_failed": 0}
+    # first_row 是新增的返回字段（0-based 落点）：订单默认 insert_at_top，落在表头
+    # （第 2 行）正下方 = 0-based 2，行为与采集加落点开关之前一致。
+    assert res == {"written": 1, "images": 1, "images_failed": 0, "first_row": 2}
 
     kinds = [a for _, a, _ in cli._fake.calls if a != "get_sheets_info"]
     # 插行 → 写文本 → 写图片（先文后图）→ 读回验证
@@ -151,6 +176,7 @@ def test_write_rows_sequence_and_payload(monkeypatch):
     formulas = [o for o in ops if o["op_type"] == "cell_operation_type_formula"]
     pics = [o for o in ops if o["op_type"] == "cell_operation_type_picture"]
     assert pics == []  # 文本包不带图
+    # 数量字段（int/short str）不加前缀，让表格保持数值语义可求和
     assert {(o["col_from"], o["formula"]) for o in formulas} == {
         (2, "PO-9"), (3, "黑色 / 5Y"), (4, "2")}
     assert all(o["row_from"] == 2 for o in ops)
@@ -161,6 +187,36 @@ def test_write_rows_sequence_and_payload(monkeypatch):
     assert pic_ops[0]["cell_pic_info"]["tag"] == "sheet_pic_type_url"
     assert "format/jpeg" in pic_ops[0]["cell_pic_info"]["pic_content"]
     assert pic_ops[0]["col_from"] == 6  # G 列
+
+
+def test_write_rows_forces_text_for_long_digits(monkeypatch):
+    """22 位物流跟踪号等长数字串加 `'` 前缀，防科学计数法丢精度（实机验证 2026-08-07）。"""
+    verify = {"rangeData": [{"rowFrom": 2, "colFrom": 2, "cellText": "211031661904287936"}]}
+    routes = {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "insert_rows_cols"): {"code": 0},
+        ("sheet", "range_data_batch_update"): {"code": 0},
+        ("sheet", "get_range_data"): verify,
+    }
+    cli = _make(monkeypatch, routes)
+    rows = [{
+        "values": {
+            "C": "211031661904287936",  # 18 位子订单号 → 加前缀
+            "D": "9200190419690851234567",  # 22 位跟踪号 → 加前缀
+            "E": "12.34",  # 金额 → 原样（含小数点，不是纯数字）
+            "F": 3,  # 件数 int → 原样转字符串
+        },
+    }]
+    cli.write_rows("StoreA全球1", rows, header_row=2)
+    calls = [c for c in cli._fake.calls if c[1] == "range_data_batch_update"]
+    text_ops = calls[0][2]["range_data"]
+    formulas = {o["col_from"]: o["formula"] for o in text_ops}
+    # 长数字串带前缀 `'`（kdocs 读回的 cellText 不含前缀，验证用原始值 → 能过）
+    assert formulas[2] == "'211031661904287936"
+    assert formulas[3] == "'9200190419690851234567"
+    # 金额/数量不加（保持数值语义，能求和）
+    assert formulas[4] == "12.34"
+    assert formulas[5] == "3"
 
 
 def test_write_rows_verify_mismatch_raises(monkeypatch):

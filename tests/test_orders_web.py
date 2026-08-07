@@ -88,11 +88,11 @@ def _fake_runner(seen: dict):
 
     async def _run(store="", dry_run=True, workbook="", list_url="",
                    on_progress=None, max_pages=200, sheet="", require_price=False,
-                   incremental=True, doc_mode=""):
+                   incremental=True, doc_mode="", region_label=""):
         seen.update({"store": store, "dry_run": dry_run, "max_pages": max_pages,
                      "workbook": workbook, "sheet": sheet,
                      "require_price": require_price, "incremental": incremental,
-                     "doc_mode": doc_mode})
+                     "doc_mode": doc_mode, "region_label": region_label})
         await on_progress({"type": "started", "dry_run": dry_run, "workbook": "W"})
         await on_progress({"type": "plan", "sheet": "S", "pending": 2, "dup": 1,
                            "no_key": False, "with_image": 2})
@@ -140,7 +140,17 @@ def test_batch_passes_selection(client, monkeypatch, webapp, no_prefs):
         "store": "StoreA", "dry_run": False, "max_pages": 3,
         "workbook": "D:/wb.xlsx", "sheet": "StoreA全球1",
         "require_price": False, "incremental": True, "doc_mode": "",
+        "region_label": "",   # 没选＝跟随浏览器当前区域
     }
+
+
+def test_batch_passes_region(client, monkeypatch, webapp, no_prefs):
+    """UI 上选的区域必须原样传到 service：区域决定这批能看到哪些订单，传丢了会整批登记错。"""
+    seen: dict = {}
+    monkeypatch.setattr(webapp.orders_service, "run_orders_batch", _fake_runner(seen))
+    r = client.post("/orders/batch", json={"region": "美国"})
+    client.get(f"/orders/batch/{r.json()['job_id']}/events")
+    assert seen["region_label"] == "美国"
 
 
 def test_batch_passes_doc_mode(client, monkeypatch, webapp, no_prefs):
@@ -185,7 +195,8 @@ def test_batch_remembers_selection(client, monkeypatch, webapp):
     })
     client.get(f"/orders/batch/{r.json()['job_id']}/events")
     assert saved == {"store": "StoreB", "workbook": "D:/wb.xlsx",
-                     "sheet": "StoreB欧区", "doc_mode": "local"}
+                     "sheet": "StoreB欧区", "doc_mode": "local",
+                     "region_label": ""}
 
 
 def test_batch_exception_surfaces_as_aborted(client, monkeypatch, webapp, no_prefs):

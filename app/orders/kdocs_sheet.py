@@ -41,6 +41,10 @@ _RATE_LIMIT_WAIT = 20
 # 嵌图尺寸：-1 = 自适应单元格（2026-08-04 实机对照实验，用户确认自适应观感最好；
 # 固定 76px 在云文档里渲染得过小）。
 _IMAGE_PX = -1
+# 纯数字串达到这个长度就强制按文本录入（见 force_text_input）。取 12 是因为：
+# 表格数值只有 15 位有效数字，12 位已经进了「显示成科学计数法」的区间；而管线会写的
+# 数值字段（成交价、件数）不可能有 12 位，故这个阈值不会误伤需要求和的列。
+_TEXT_DIGITS_MIN = 12
 
 
 def _resolve_cli(cli: str) -> str:
@@ -81,6 +85,40 @@ def index_to_col(idx: int) -> str:
     while idx > 0:
         idx, r = divmod(idx - 1, 26)
         s = chr(ord("A") + r) + s
+    return s
+
+
+def force_text_input(value: Any) -> str:
+    """把「本该按文本落表」的纯数字串加上 `'` 前缀强制文本录入，其余原样返回。
+
+    为什么需要：range_data_batch_update 的 formula 参数是【常规录入】语义，等同于人在
+    单元格里敲字符——长数字串会被表格当数值解析。22 位的平台物流跟踪号
+    `9200190419690851234567` 落表后显示成 `9.20019041969085E+21`，且表格数值只有 15 位
+    有效数字，尾数被永久抹平、原值再也读不回来（2026-08-07 实机 get_typed_value 实测：
+    裸写得到 type=double，加 `'` 前缀得到 type=string 且值完整）。
+
+    为什么按【值】判定而不是按列标题：本函数同时服务订单登记与商品采集两条管线，
+    write_rows 拿到的是 {列字母: 值}、不带标题语义；而纯数字长串这个特征本身就足以
+    区分标识符和金额。
+
+    命中条件是「纯数字」且「长度 >= _TEXT_DIGITS_MIN 或有前导零」，刻意不含这两类：
+      - 金额（平台成交价）和数量必须留成数值才能求和、筛选大于 1 的多件单，而它们
+        不可能有 12 位；含小数点的 `12.34` 本就不是纯数字串，天然不命中。
+      - 带字母/连字符的订单号（`PO-211-…`）表格本来就存成文本，无需干预。
+    前导零单独判：`0012` 这种无论多短，落成数值都会被抹成 12。
+
+    `'` 前缀只作用于录入阶段，读回的 cellText 不含它，所以判重、水位、写入校验的
+    口径完全不变（本模块所有读路径都走 cellText）。
+    """
+    s = str(value)
+    # 已带前缀的原样返回，避免调用方重复处理时叠成 `''123`
+    if s.startswith("'"):
+        return s
+    # isdigit 对全角数字/上标也为真，叠加 isascii 收窄到半角 0-9
+    if not (s.isascii() and s.isdigit()):
+        return s
+    if len(s) >= _TEXT_DIGITS_MIN or (len(s) > 1 and s.startswith("0")):
+        return "'" + s
     return s
 
 
@@ -270,6 +308,27 @@ class KdocsSheet:
                 return text
         return ""
 
+    def read_new_rows_column(self, sheet_name: str, col: str,
+                             first_row: int, n: int) -> List[str]:
+        """读【刚写入的 n 行】某列的值（自上而下），供写后确认用。
+
+        first_row 是本批第一行的 1-based 行号（插顶端时 = header_row+1，追加时是末行之后），
+        由调用方在写入前算好并复用——写入会让数据区增长，事后重算会读到本批之后的空白区。
+
+        为什么单独开一个方法而不复用 existing_key_values：新行占据连续的 n 行、位置完全
+        已知，只需读这 n 格。而 existing_key_values 会拉整列——采集管线逐商品写、每商品
+        确认一次，500 行的表就是每商品传 500 格，一批 20 个白传一万格。次数一样、payload
+        差两个数量级，而且表越大越亏。返回的 list 与写入顺序同序，缺失格补空串。
+        """
+        if n <= 0:
+            return []
+        ci = col_to_index(col)
+        row_from = first_row - 1  # 1-based → 0-based
+        cells = self._get_range(sheet_name, row_from, row_from + n - 1, ci, ci)
+        by_row = {int(c["rowFrom"]): str(c.get("cellText") or "").strip()
+                  for c in cells}
+        return [by_row.get(row_from + i, "") for i in range(n)]
+
     def existing_key_values(self, sheet_name: str, col: str,
                             header_row: int) -> set:
         """读某列表头以下的所有值（strip 后非空），作增量水位。口径同本地同名方法。"""
@@ -343,15 +402,42 @@ class KdocsSheet:
 
     def insert_rows_below_header(self, sheet_name: str, n: int, header_row: int) -> None:
         """在表头正下方插入 n 个空行（0-based 插入位置 = header_row）。"""
+        self.insert_rows_at(sheet_name, n, header_row)
+
+    def insert_rows_at(self, sheet_name: str, n: int, row_from: int) -> None:
+        """在 0-based row_from 处插入 n 个空行（该行及以下整体下移）。
+
+        采集页支持「从第 R 行开始插」，故插入点不再固定为表头正下方。
+        """
         if n <= 0:
             return
         self._run("sheet", "insert_rows_cols", {
             "worksheet_id": self._worksheet_id(sheet_name),
-            "type": "row", "row_from": header_row, "row_to": header_row + n - 1,
+            "type": "row", "row_from": row_from, "row_to": row_from + n - 1,
         })
 
-    def write_rows(self, sheet_name: str, rows: List[dict], header_row: int) -> dict:
-        """把 plan.rows 插到表头正下方并写入值与图片，返回 {written, images, images_failed}。
+    def data_end_row(self, sheet_name: str) -> int:
+        """数据区末行（0-based），取自 sheets_info 的 rowTo。
+
+        表尾追加要用它算落点。缓存里的 row_to 由 write_rows 写后本地增量维护
+        （见那里的注释），故连续多批追加不必反复拉 get_sheets_info。
+        """
+        return int(self.sheets_info().get(sheet_name, {}).get("row_to", 0))
+
+    def write_rows(self, sheet_name: str, rows: List[dict], header_row: int,
+                   insert_at_top: bool = True,
+                   first_row: Optional[int] = None) -> dict:
+        """写入若干行（值 + 图片），返回 {written, images, images_failed, first_row}。
+
+        insert_at_top=True（默认）插到表头正下方，新行在最上面——订单登记表的既定要求。
+        False 则**追加到数据区末尾**：商品采集表习惯新品接在旧品后面，且它的判重是整列
+        比对、不依赖行序（与订单靠「表头下第一条」当水位不同），所以两种都安全。
+        追加分支不必插行——直接往末行之后的空白区写即可，还省掉一次 insert_rows_cols。
+
+        first_row（1-based）显式指定落点，用于采集页的「从第 R 行向下/向上插」：给了它就
+        按它插行，insert_at_top 只决定「要不要插行腾位」（给了 first_row 且要插行时，
+        插入点就是 first_row，而不是表头正下方）。调用方须自行把 row_up 的减法算完
+        （见 pipeline._cloud_first_row），这里只认最终落点。
 
         rows 的元素在 plan.rows 的 {values, image_column, image_path} 之上多带一个
         image_url（service 组装，见 service._write_plans）：云端嵌图走 URL 不走本地
@@ -363,13 +449,26 @@ class KdocsSheet:
         宁可留几个空格，不让整批文本陪葬。
         """
         if not rows:
-            return {"written": 0, "images": 0, "images_failed": 0}
-        self.insert_rows_below_header(sheet_name, len(rows), header_row)
+            return {"written": 0, "images": 0, "images_failed": 0, "first_row": None}
+        if first_row is not None:
+            # 显式落点（采集页「从第 R 行插」）：1-based → 0-based
+            at = first_row - 1
+            if insert_at_top:
+                self.insert_rows_at(sheet_name, len(rows), at)
+            first_row = at
+        elif insert_at_top:
+            self.insert_rows_below_header(sheet_name, len(rows), header_row)
+            first_row = header_row  # 0-based：表头正下方
+        else:
+            # 追加：落在数据区末行之后。末行读不到（空表）时退回表头正下方，
+            # 避免把首行写到表头上。
+            end = self.data_end_row(sheet_name)
+            first_row = max(end + 1, header_row)
 
         text_ops: List[dict] = []
         pic_ops: List[dict] = []
         for i, item in enumerate(rows):
-            r = header_row + i  # 0-based 目标行
+            r = first_row + i  # 0-based 目标行
             for col, value in sorted(item.get("values", {}).items(),
                                      key=lambda kv: pipeline._col_key(kv[0])):
                 if value is None or str(value) == "":
@@ -378,7 +477,7 @@ class KdocsSheet:
                 text_ops.append({
                     "op_type": "cell_operation_type_formula",
                     "row_from": r, "row_to": r, "col_from": ci, "col_to": ci,
-                    "formula": str(value),
+                    "formula": force_text_input(value),
                 })
             url = pipeline.to_jpeg_url(str(item.get("image_url") or ""))
             if url and item.get("image_column"):
@@ -417,19 +516,28 @@ class KdocsSheet:
                     f"（文本已登记，图片格留空）：{e}"
                 )
 
-        self._verify_top_row(sheet_name, rows[0], header_row)
-        # 数据区行数变了，缓存的 row_to 已过期
-        self.sheets_info(refresh=True)
-        return {"written": len(rows), "images": images, "images_failed": images_failed}
+        self._verify_top_row(sheet_name, rows[0], first_row)
+        # 数据区行数变了，缓存的 row_to 已过期。但不必再跑一次 get_sheets_info——
+        # 插行/追加都是精确 +n 行（追加分支落点本就由 row_to 算出），本地算即可。
+        # 这一次省下的调用在【逐行写】场景下是每行一次（采集管线按商品逐行写协作文档，
+        # 一批 20 个就是 20 次纯开销），而 kdocs 有配额、429001 限频要等 20s，省得值。
+        # sheetId/sheetName 映射插行不会变，故整份缓存仍然有效，只需修 row_to。
+        # 追加分支要按【实际落点】算末行：空表时 first_row 可能跳过了旧 row_to。
+        info = (self._sheets or {}).get(sheet_name)
+        if info is not None:
+            grown = int(info.get("row_to", 0)) + len(rows)
+            info["row_to"] = max(grown, first_row + len(rows) - 1)
+        return {"written": len(rows), "images": images,
+                "images_failed": images_failed, "first_row": first_row}
 
-    def _verify_top_row(self, sheet_name: str, first: dict, header_row: int) -> None:
-        """读回新写区域第一行，抽查一个非空值是否真的落上去了。"""
+    def _verify_top_row(self, sheet_name: str, first: dict, first_row: int) -> None:
+        """读回新写区域第一行（0-based first_row），抽查一个非空值是否真的落上去了。"""
         expect = [(col_to_index(c), str(v)) for c, v in first.get("values", {}).items()
                   if str(v or "").strip()]
         if not expect:
             return
         ci, want = expect[0]
-        cells = self._get_range(sheet_name, header_row, header_row, ci, ci)
+        cells = self._get_range(sheet_name, first_row, first_row, ci, ci)
         got = str(cells[0].get("cellText") or "").strip() if cells else ""
         if got != want.strip():
             raise KdocsSheetError(
