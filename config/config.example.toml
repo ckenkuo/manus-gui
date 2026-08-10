@@ -251,3 +251,39 @@ store = "StoreC"
 sites = ["哥伦比亚", "秘鲁"]
 sheet = "StoreC全球"
 store_value = "StoreC"
+
+# 采购汇总上传到 NAS（可选）：配了 webdav_url 才启用，留空则完全不上传。
+#
+# TNAS 侧开启：控制面板 → 文件服务 → WebDAV。端口在那里自定，2026-08-10 实测
+# 本机是 HTTP=8800 / HTTPS=474（TOS 允许改，别照抄别处文档写的默认 5005/5006）。
+#
+# HTTP vs HTTPS 的安全取舍：
+#   - HTTP + Basic Auth = 账号密码 base64 后放在请求头里，base64 不是加密，等于明文，
+#     路由上的每一跳都能读。只能内网测试用，绝不要暴露到公网。
+#   - HTTPS 才能安全穿公网。外网访问需要 DDNS 域名或反向代理指到 HTTPS 端口。
+#   - SMB(445) 无论如何都不要开到公网（会被扫描器和勒索软件盯上）。
+#
+# 关于自签证书（2026-08-10 实测本机 NAS）：
+#   TOS 出厂带的是 TerraMaster 自签证书（CN=webdav，自己签自己，2040 到期），
+#   requests 默认 verify=True 会直接 SSLError 握手失败，所以自签证书下必须
+#   verify_ssl = false。代价是失去中间人防护——公网长期用的话，更好的做法是在
+#   TOS 里给 NAS 配一张正规证书（支持 Let's Encrypt），配好后把 verify_ssl 改回 true。
+#
+# 内网 IP vs 公网域名：
+#   - 内网（https://192.168.x.x:474/manus）：只在家里网络可用，速度快
+#   - 公网（https://你的域名:474/manus）：外网可用，需 DDNS 或反向代理
+#   端口 474 是实测值，TOS 可自定义，用你实际配置的那个。
+#
+# 人看文件仍可继续用 TNAS.online 的网页端，与本上传互不影响。
+[orders.upload]
+# WebDAV 根地址，指到要存放的共享。留空 = 关闭上传功能。
+# 公网示例: https://你的域名:474/manus
+# 内网示例: https://192.168.10.252:474/manus
+webdav_url = ""
+username = ""
+# 密码建议不写在这里，改设环境变量 TNAS_WEBDAV_PASSWORD（本仓库是 public，
+# 虽然 config.toml 已 gitignored，少一处明文就少一次误提交的机会）
+password = ""
+# 自签证书必须设 false，否则 requests 直接 SSLError（见上方实测说明）。
+# HTTP 连接忽略此项。
+verify_ssl = true

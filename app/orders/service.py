@@ -34,7 +34,7 @@ from app.collect.service import (
 from app.cloud_docs import remember as remember_cloud_doc
 from app.config import PROJECT_ROOT, config, get_output_dir
 from app.logger import logger
-from app.orders import pipeline
+from app.orders import pipeline, upload
 from app.orders.kdocs_sheet import KdocsSheet
 from app.temu_region import (
     confirm_region_from_context,
@@ -1198,6 +1198,14 @@ def _export_purchase(
         )
     except Exception as e:
         logger.warning(f"导出新增订单采购统计 md 失败（不影响登记表写入）：{e}")
+
+    # 配了 [orders.upload].webdav_url 才会真上传，没配就安静跳过（见 upload.py）。
+    # 放在两份导出之后：只有落盘成功的文件才有得传；整段 best-effort，NAS 不在线不影响本地产物。
+    try:
+        purchase["upload"] = upload.upload_purchase(purchase, stamp)
+    except Exception as e:
+        logger.warning(f"上传采购汇总到 TNAS 失败（不影响本地产物）：{e}")
+        purchase["upload"] = {"uploaded": 0, "failed": 0, "urls": [], "errors": [str(e)]}
     return purchase
 
 
