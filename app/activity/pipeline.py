@@ -123,6 +123,41 @@ async def dismiss_site_notification_panel(page) -> bool:
         return False
 
 
+_CLOSE_ALL_POPUPS_JS = r"""() => {
+  const norm = value => (value || '').replace(/\s+/g, '');
+  const candidates = [...document.querySelectorAll('button,a,[role=button]')];
+  const button = candidates.find(element => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0 &&
+      norm(element.innerText || element.textContent).startsWith('关闭所有弹窗');
+  });
+  if (!button) return false;
+  button.click();
+  return true;
+}"""
+
+
+async def click_assistant_close_all_popups(page) -> bool:
+    """只点商家助手插件注入的「关闭所有弹窗」按钮，返回是否点到。
+
+    插件未装 / 按钮未注入 / 页面未就绪都返回 False，不影响原流程（best-effort）。
+
+    单独抽出来是给【逐页循环】用的（订单采集 sweep_pages）：dismiss_all_page_popups 里
+    的站点通知面板重试在面板没开时是纯等待（最多 5×0.5s），每页都做会累出分钟级开销；
+    而这个按钮是插件注入的、一次 evaluate 就有结论，适合高频探测。
+    """
+    if page is None:
+        return False
+    try:
+        clicked = await page.evaluate(_CLOSE_ALL_POPUPS_JS)
+    except Exception as exc:
+        logger.warning(f"点击商家助手「关闭所有弹窗」失败（忽略）：{exc}")
+        return False
+    if clicked:
+        await asyncio.sleep(0.5)
+    return bool(clicked)
+
+
 async def dismiss_all_page_popups(page) -> bool:
     """在业务动作开始前关闭站点通知面板和商家助手弹窗。
 
@@ -139,20 +174,7 @@ async def dismiss_all_page_popups(page) -> bool:
                 break
             if attempt < 4:
                 await asyncio.sleep(0.5)
-        clicked = await page.evaluate(r"""() => {
-          const norm = value => (value || '').replace(/\s+/g, '');
-          const candidates = [...document.querySelectorAll('button,a,[role=button]')];
-          const button = candidates.find(element => {
-            const rect = element.getBoundingClientRect();
-            return rect.width > 0 && rect.height > 0 &&
-              norm(element.innerText || element.textContent).startsWith('关闭所有弹窗');
-          });
-          if (!button) return false;
-          button.click();
-          return true;
-        }""")
-        if clicked:
-            await asyncio.sleep(0.5)
+        clicked = await click_assistant_close_all_popups(page)
         return bool(site_closed or clicked)
     except Exception as exc:
         logger.warning(f"点击商家助手「关闭所有弹窗」失败（忽略）：{exc}")

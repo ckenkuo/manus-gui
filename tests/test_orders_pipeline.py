@@ -633,6 +633,32 @@ def test_build_row_values_quantity_column_aliases():
         assert P.build_row_values(_order(qty="3"), header, "S")["P"] == 3
 
 
+def test_build_row_values_writes_goods_name_when_column_exists():
+    """用户手工加了「商品名称」列就写平台原始商品名；没这列则完全不碰。"""
+    name = "【HME】春夏新品-怀旧西部牛仔风，女士牛仔微喇长裤，四季可穿"
+    header = dict(STORE_A_HEADER, P="商品名称")
+    values = P.build_row_values(_order(goods_name=name), header, store_value="StoreA全球")
+    assert values["P"] == name, "商品名要写原文，不截断——截了就对不上货"
+
+    # 表里没这列时不该凭空多出键（沿用「有就写、没有就跳过」）
+    plain = P.build_row_values(_order(goods_name=name), STORE_A_HEADER, "StoreA全球")
+    assert name not in plain.values()
+
+
+def test_build_row_values_goods_name_aliases():
+    """商品名列的几种写法都认。"""
+    for title in ("商品名称", "商品名", "产品名称", "货品名称"):
+        header = dict(STORE_A_HEADER, P=title)
+        assert P.build_row_values(_order(goods_name="连衣裙"), header, "S")["P"] == "连衣裙"
+
+
+def test_build_row_values_never_touches_human_curated_name_column():
+    """「产品名描述」是人工二次加工列（截短品名+拼尺码），管线绝不能覆盖。"""
+    header = dict(STORE_A_HEADER, P="产品名描述")
+    values = P.build_row_values(_order(goods_name="平台原始长商品名"), header, "S")
+    assert "P" not in values, "产品名描述由人工维护，管线不该碰"
+
+
 def test_quantity_number_keeps_dirty_text_and_skips_empty():
     """空值不落单元格；解析不出的脏值留原文给人看，不要静默写 0。"""
     assert P._qty_number("") == "" and P._qty_number("--") == ""
@@ -1286,6 +1312,56 @@ def test_sweep_pages_awaits_async_on_page(monkeypatch):
     assert got[-1]["selected"] == 4 and res["pages"] == 2
     assert len(res["images"]) == 2
     assert res["truncated"] is False, "正常翻完不算截断"
+
+
+def test_sweep_pages_dismisses_popups_before_each_page(monkeypatch):
+    """每页开工前都要清一次站点运营弹窗，且必须清在滚动抓图/勾选【之前】。
+
+    只在开页时清一次不够：一批要翻几十页、跑十几分钟，Temu 的推广模态遮罩随时冒出来，
+    盖住勾选框和分页条后所有点击都会 hit-target 超时（2026-08-07 用户实机卡住）。
+    """
+    import asyncio
+
+    pages = [
+        {"total": 4, "page": 1, "page_size": 2, "has_next": True},
+        {"total": 4, "page": 2, "page_size": 2, "has_next": False},
+    ]
+    cur = {"v": pages[0]}
+    seq_after = iter(pages[1:])
+    trace = []
+
+    async def fake_dismiss(page):
+        trace.append(f"dismiss-p{cur['v']['page']}")
+        return True
+
+    async def fake_read(page):
+        return cur["v"]
+
+    async def fake_grab(page):
+        trace.append(f"grab-p{cur['v']['page']}")
+        return {f"045-{cur['v']['page']}": {"url": "u", "price": "1"}}
+
+    async def fake_select(page):
+        trace.append(f"select-p{cur['v']['page']}")
+
+    async def fake_count(page):
+        return 2 * cur["v"]["page"]
+
+    async def fake_next(page):
+        cur["v"] = next(seq_after)
+
+    monkeypatch.setattr(P, "dismiss_site_popups", fake_dismiss)
+    monkeypatch.setattr(P, "read_pagination", fake_read)
+    monkeypatch.setattr(P, "grab_page_images", fake_grab)
+    monkeypatch.setattr(P, "select_all_on_page", fake_select)
+    monkeypatch.setattr(P, "selected_count", fake_count)
+    monkeypatch.setattr(P, "goto_next_page", fake_next)
+
+    asyncio.run(P.sweep_pages(object(), max_pages=5))
+
+    assert trace == ["dismiss-p1", "grab-p1", "select-p1",
+                     "dismiss-p2", "grab-p2", "select-p2"], \
+        "每页顺序必须是「先清弹窗 → 抓图 → 勾选」"
 
 
 def _patch_sweep(monkeypatch, total=100, page_size=20):

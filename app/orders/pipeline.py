@@ -981,6 +981,11 @@ QTY_TITLES = {"数量", "件数", "商品数量", "采购件数", "应履约件�
 QTY_TITLE = "数量"          # 管线插列时写入的标题
 QTY_AFTER_TITLE = "尺码"    # 插在这一列右侧（2026-07-30 用户指定）
 
+# 商品名称列的标题写法集合（2026-08-07 起支持，用户手工加列后管线自动写入）。
+# 不含「产品名描述」：那是人工二次加工的列（详见 _FIELD_SOURCES 里的说明），
+# 管线绝不能覆盖。精确相等匹配，所以「产品名称」不会误命中「产品名描述」。
+GOODS_NAME_TITLES = {"商品名称", "商品名", "产品名称", "货品名称"}
+
 
 def _qty_number(raw: Any):
     """把「应履约件数」转成【数字】写进登记表；空值返回空串（不落单元格）。
@@ -1014,6 +1019,12 @@ _FIELD_SOURCES: List[tuple] = [
     ({"子订单号"}, lambda o, ctx: o.sub_order_no),
     ({"尺码"}, lambda o, ctx: o.attrs),
     (QTY_TITLES, lambda o, ctx: _qty_number(o.qty)),
+    # 商品名称：表里本来没有这列，2026-08-07 起支持（有就写、没有就跳过）。取导出的
+    # 「商品名称」原文，不截断——它是平台原始标题，长的有 90 字，截了就对不上货。
+    # 【刻意不认「产品名描述」】：`牛仔裤`/`Pawly牛仔裤`/` Vibe Link` 三张表已有这一列，
+    # 但实测内容是人工二次加工的（截短的品名 + 拼上尺码/货号，如「T257-L」、「白色 / L」），
+    # 不是平台原文。管线写进去会覆盖掉人工的活儿，所以只认下面这几种明确的「商品名」写法。
+    (GOODS_NAME_TITLES, lambda o, ctx: o.goods_name),
     ({"平台物流跟踪号", "平台跟踪号"}, lambda o, ctx: o.tracking_no),
     ({"平台创建时间"}, lambda o, ctx: o.created_at),
     ({"平台成交价"}, lambda o, ctx: o.deal_price),
@@ -1502,6 +1513,28 @@ async def grab_page_images(page) -> Dict[str, Dict[str, str]]:
     return out
 
 
+async def dismiss_site_popups(page) -> bool:
+    """清一次站点运营弹窗：探商家助手插件的「关闭所有弹窗」按钮，有就点，返回是否点到。
+
+    为什么采集途中要反复清：Temu 后台会随机弹推广浮层（实测「使用在线下单，物流费用低至
+    5 折」这类），它是居中的模态遮罩，盖住表格勾选框和分页条。被盖住时 Playwright 的
+    hit-target 检查命中的是遮罩、不是目标元素，于是一路 retry 到超时——症状和商家助手悬浮球
+    那个坑一样（见 _POINTER_OVERLAYS），但成因不同：悬浮球是插件的常驻浮层、用
+    pointer-events:none 让它不吃指针即可；这个是站点自己的模态弹窗，必须真的关掉，
+    否则它还盖着内容、也拦着后续交互。
+
+    开页时那次清弹窗（service 里调 dismiss_all_page_popups）只覆盖开页那一刻，而一批要翻
+    几十页、跑十几分钟，弹窗随时会冒出来，所以每页开工前都要再清一次。
+
+    【函数级 import 是刻意的】app/activity/pipeline.py 模块级 import 了 app.llm，在订单
+    管线的模块级引它会把整个 LLM 栈拖进导入链（订单采集全程不用 LLM）。同一批流程里
+    service 开页时已经引过一次，模块已缓存，这里再引不产生额外开销。
+    """
+    from app.activity.pipeline import click_assistant_close_all_popups
+
+    return await click_assistant_close_all_popups(page)
+
+
 async def sweep_pages(
     page,
     on_page: Optional[Callable[[dict], None]] = None,
@@ -1549,6 +1582,11 @@ async def sweep_pages(
     desc_broken = False       # 排序校验失败 → 本批退全量，不早停
     while pages < max_pages:
         pages += 1
+        # 每页开工前先清一次站点运营弹窗：它是居中模态遮罩，盖住勾选框和分页条会让
+        # 滚动抓图/勾选/翻页全部 hit-target 超时（详见 dismiss_site_popups）。
+        # 放在读分页之前，让本页所有交互都在干净页面上进行。
+        if await dismiss_site_popups(page):
+            logger.info(f"第 {pages} 页开工前清掉了站点弹窗")
         cur = await read_pagination(page)
         page_imgs = await grab_page_images(page)
         images.update(page_imgs)
@@ -1705,6 +1743,13 @@ async def trigger_export(page, out_dir: str, timeout_ms: int = 180000) -> str:
     os.makedirs(out_dir, exist_ok=True)
     # 「导出订单」在底部操作栏，和分页条一样会被悬浮球盖住（见 _POINTER_OVERLAYS）
     await disable_pointer_overlays(page)
+    # 站点运营弹窗也会盖住底部操作栏，这里清一次（翻页途中清过，但最后一页到点导出之间
+    # 仍可能新弹出来）。
+    # 【只能清在这里，往后一步都不行】下面 btn.click() 之后打开的是【导出字段设置弹窗】，
+    # 那是业务弹窗；「关闭所有弹窗」不区分业务与运营，之后再调会把它一起关掉，
+    # 于是找不到「确认导出」、整批白跑。同理 _warn_if_export_scope_is_all 和点确认前也
+    # 不得再清（那两处只做 disable_pointer_overlays，屏蔽指针不关节点，是安全的）。
+    await dismiss_site_popups(page)
 
     btn = page.locator('button:has-text("导出订单"), [class*="BTN_"]:has-text("导出订单")').first
     if await btn.count() == 0:

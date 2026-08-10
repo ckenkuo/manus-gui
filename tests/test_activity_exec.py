@@ -22,6 +22,38 @@ class FakePage:
         self.closed = True
 
 
+class _EvalPage:
+    """只实现 evaluate 的假页面：ret 是返回值，boom=True 时抛异常。"""
+    def __init__(self, ret=False, boom=False):
+        self.ret = ret
+        self.boom = boom
+        self.calls = 0
+
+    async def evaluate(self, *_args, **_kw):
+        self.calls += 1
+        if self.boom:
+            raise RuntimeError("页面还没就绪")
+        return self.ret
+
+
+def test_click_assistant_close_all_popups_is_best_effort():
+    """插件按钮探测是 best-effort：点到返 True，没按钮返 False，页面报错也只返 False。
+
+    订单采集的逐页循环靠它清运营弹窗，绝不能因为插件没装/页面瞬时报错就中断整批。
+    """
+    import asyncio
+    from app.activity.pipeline import click_assistant_close_all_popups as click_close
+
+    # 按钮存在并点到
+    assert asyncio.run(click_close(_EvalPage(ret=True))) is True
+    # 按钮不存在（插件未装/未注入）
+    assert asyncio.run(click_close(_EvalPage(ret=False))) is False
+    # evaluate 抛异常：吞掉，不往上抛
+    assert asyncio.run(click_close(_EvalPage(boom=True))) is False
+    # page 为 None 直接返回，不去碰属性
+    assert asyncio.run(click_close(None)) is False
+
+
 def test_activity_table_uses_per_activity_status_cells():
     """计划表状态必须按 SPU+活动逐行维护，不能再把整个 SPU 状态 rowspan 合并。"""
     html = Path("templates/activity.html").read_text(encoding="utf-8")
