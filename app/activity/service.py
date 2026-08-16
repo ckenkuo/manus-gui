@@ -68,7 +68,7 @@ from playwright.async_api import async_playwright
 from app.activity import pipeline  # 以模块引用调用其函数，便于测试 monkeypatch（judge_activity 等）
 # 复用采集 service 已实测的 CDP 护栏 / 进度回调 / LLM token 清零，避免重复实现。
 from app.collect.service import CDP_URL, _emit, ensure_cdp_alive, reset_pipeline_llms
-from app.config import PROJECT_ROOT
+from app.config import PROJECT_ROOT, config_search_dirs
 from app.logger import logger
 from app.tool.wps_excel_tool import WpsExcelTool
 
@@ -93,19 +93,23 @@ def global_min_margin() -> float:
     """读 config.toml [activity].min_margin 作全局默认；缺失/损坏兜底 0.15（best-effort）。"""
     import tomllib
 
-    for name in ("config.toml", "config.example.toml"):
-        p = PROJECT_ROOT / "config" / name
-        if not p.exists():
-            continue
-        try:
-            with p.open("rb") as f:
-                data = tomllib.load(f)
-            m = _normalize_margin((data.get("activity") or {}).get("min_margin"))
-            if m is not None:
-                return m
-        except Exception as e:
-            logger.warning(f"读 [activity].min_margin 失败（用兜底 0.15）：{e}")
-        break
+    # 目录维度也要遍历：冻结后 example 只存在于随包只读侧（_internal/config）。
+    # 保留原先「只认第一个存在的文件」语义（break），避免 config.toml 显式写了
+    # min_margin 却被 example 的默认值盖掉。
+    for cfg_dir in config_search_dirs():
+        for name in ("config.toml", "config.example.toml"):
+            p = cfg_dir / name
+            if not p.exists():
+                continue
+            try:
+                with p.open("rb") as f:
+                    data = tomllib.load(f)
+                m = _normalize_margin((data.get("activity") or {}).get("min_margin"))
+                if m is not None:
+                    return m
+            except Exception as e:
+                logger.warning(f"读 [activity].min_margin 失败（用兜底 0.15）：{e}")
+            break
     return _FALLBACK_MIN_MARGIN
 
 

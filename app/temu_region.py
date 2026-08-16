@@ -54,13 +54,27 @@ _REGION_GROUP_JS = r"""
   // 定位顶栏区域切换器那一组，返回按 x 排序的 [{el, text, x, cls}]；找不到返回 []。
   //
   // 判据（全部来自 2026-08-07 实测，不含任何类名）：
-  //  - 位于顶栏（top <= 140）、同一父容器下的 ≥2 个可见短文本叶子节点
+  //  - 位于顶栏（视口或布局 top ≤ 140，见下方 _inTopBand）、同一父容器下的 ≥2 个可见
+  //    短文本叶子节点
   //  - **横排同一行**：这是区域切换器与「商家助手」竖排浮层菜单的决定性区别
   //    （实测浮层组 sameRow=false / xSpread=0，区域组 4 项同 y、x 依次展开）
   //  - 类名首 token 一致（同一渲染循环产出），用于打分排除杂牌组合
   //
   // 【刻意不按 cursor:pointer 过滤】区域标签在自身区域/无权限时是 disabled、cursor:auto，
   // 早先加了 pointer 过滤，导致 product-select 页的区域组被整组滤掉、反而误中助手菜单。
+  // 【「位于顶栏」按布局位置判，不按视口位置】2026-08-11 实测 product-select：商品列表在
+  // 内部容器里滚动（window.scrollY 恒为 0），往下滚时整个顶栏被平移出视口
+  // （getBoundingClientRect().top ≈ -360），但它在文档流里的布局位置仍是 y≈84。
+  // 只看视口坐标会把「用户往下滚了」误判成「读不到区域切换器」。故顶栏带用两个坐标系
+  // 任一命中即算：视口 top ∈ [0,140]（fixed/吸顶头、未滚动时），或布局 top ∈ [0,140]
+  // （offsetTop 链，不受 transform 与内层滚动影响）。
+  const _layoutTop = (el) => {
+    let y = 0, n = el;
+    while (n) { y += n.offsetTop || 0; n = n.offsetParent; }
+    return y;
+  };
+  const _inTopBand = (el, r) =>
+    (r.top >= 0 && r.top <= 140) || (_layoutTop(el) >= 0 && _layoutTop(el) <= 140);
   const _regionGroup = () => {
     const norm = (el) => (el.textContent || '').replace(/\s+/g, '').trim();
     const groups = new Map();
@@ -68,7 +82,7 @@ _REGION_GROUP_JS = r"""
       if (el.children.length > 1) continue;
       const r = el.getBoundingClientRect();
       if (r.width <= 0 || r.height <= 0) continue;
-      if (r.top < 0 || r.top > 140) continue;
+      if (!_inTopBand(el, r)) continue;
       const t = norm(el);
       if (!t || t.length < 2 || t.length > 10) continue;
       const p = el.parentElement;
@@ -79,19 +93,27 @@ _REGION_GROUP_JS = r"""
         cls: String(el.className || ''),
       });
     }
-    // 顶栏左侧的粗体短文本集合：当前区域名一定在里面（平台在页面标题左侧重复显示它）。
-    // 这是区分「区域切换器」与「学习/运营对接/规则中心…」这类功能按钮组的**决定性判据**：
-    // 后者的任何一项都不会以粗体出现在顶栏左侧（实测全球域 product-select 上，功能按钮组
-    // 6 项同行且更靠右，纯靠几何/类名打分会盖过区域组）。
-    const boldLeft = new Set();
+    // 顶栏的粗体短文本（文本 → 最左 x）：当前区域名一定在里面（平台在页面标题左侧重复
+    // 显示它，且位于切换器左边）。这是区分「区域切换器」与「学习/运营对接/规则中心…」
+    // 这类功能按钮组的**决定性判据**。
+    //
+    // 【为什么必须带 x 且要求在组左侧】2026-08-11 实测订单页：店名（如 WINTAK）本身是
+    // 粗体，又是顶栏右侧「履约中心 / 99+消息 / 店名」这一组的成员——只看文本是否粗体，
+    // 这组会【自我锚定】，在区域组尚未渲染（页面加载中）时以 100000 的锚定权重盖过一切，
+    // 把店名组当区域标签交出去（active 读不到 → 报「读不到当前区域…顶栏区域标签：
+    // 履约中心、99+消息、WINTAK」）。真正的区域组，其同名粗体文本是【另一个元素】、
+    // 位于组的左侧（页面标题位）；自我锚定/右侧锚定的组一律不算。
+    const boldLeft = new Map();
     for (const el of document.querySelectorAll('body *')) {
       if (el.children.length > 0) continue;
       const r = el.getBoundingClientRect();
-      if (r.top < 0 || r.top > 140) continue;
+      if (!_inTopBand(el, r)) continue;
       const w = getComputedStyle(el).fontWeight;
       if (!(String(w) === 'bold' || Number(w) >= 600)) continue;
       const t = norm(el);
-      if (t && t.length >= 2 && t.length <= 10) boldLeft.add(t);
+      if (!t || t.length < 2 || t.length > 10) continue;
+      const x = Math.round(r.left);
+      if (!boldLeft.has(t) || x < boldLeft.get(t)) boldLeft.set(t, x);
     }
 
     let best = null;
@@ -103,8 +125,13 @@ _REGION_GROUP_JS = r"""
       if (Math.max(...xs) - Math.min(...xs) < 20) continue;  // 必须横向展开
       const base = items[0].cls.split(/\s+/)[0] || '';
       const same = items.filter(i => !base || i.cls.split(/\s+/)[0] === base).length;
-      // 组内有项与顶栏粗体文本同名 → 几乎必然是区域切换器，权重给到压倒性
-      const anchored = items.some(i => boldLeft.has(i.text)) ? 1 : 0;
+      // 组内有项与【组左侧的】粗体文本同名 → 几乎必然是区域切换器，权重给到压倒性。
+      // 粗体同名项必须在组左边（页面标题位），排除组成员自身粗体造成的自我锚定（店名组）。
+      const minX = Math.min(...xs);
+      const anchored = items.some(i => {
+        const bx = boldLeft.get(i.text);
+        return bx !== undefined && bx < minX;
+      }) ? 1 : 0;
       const score = anchored * 100000 + same * 100 + items.length * 10
         + Math.max(...xs) / 1000;
       if (!best || score > best.score) best = {items, score, anchored};
@@ -131,7 +158,7 @@ _ACTIVE_REGION_JS = r"""
   for (const el of document.querySelectorAll('body *')) {
     if (el.children.length > 0) continue;
     const r = el.getBoundingClientRect();
-    if (r.top < 0 || r.top > 140) continue;
+    if (!_inTopBand(el, r)) continue;               // 顶栏带（布局或视口位置，同分组判据）
     if (r.left >= leftMost) continue;                 // 必须在切换器左边
     const t = norm(el);
     if (!labels.includes(t)) continue;
@@ -291,7 +318,7 @@ def _candidate_hosts(want: str, cur_host: str) -> list:
     return [f"{prefix}.{base_domain}"] if prefix else []
 
 
-async def _await_region(page, tries: int = 30, interval: float = 0.5) -> Region:
+async def await_region(page, tries: int = 30, interval: float = 0.5) -> Region:
     """轮询等顶栏区域标签渲染出来再读区域。
 
     为什么需要等：`domcontentloaded` 只保证 HTML 解析完，顶栏是 React 挂载后才出现的。
@@ -374,7 +401,7 @@ async def switch_region(page, want_label: str, timeout: int = 60000) -> Region:
             last = str(e)
             logger.warning(f"导航到 {url} 失败（继续尝试下一个候选）：{e}")
             continue
-        after = await _await_region(page)
+        after = await await_region(page)
         if after.ok and after.label == want:
             logger.info(f"已切换区域：{cur.describe()} → {after.describe()}")
             return after
@@ -410,7 +437,9 @@ async def confirm_region_from_context(ctx, want_label: str = "") -> Region:
     if str(want_label or "").strip():
         base = await switch_region(pages[0], want_label)
     else:
-        base = await read_region(pages[0])
+        # 轮询等顶栏渲染：进来时页面可能刚导航完，区域切换器还没挂载，
+        # 单次读会把「还没渲染」误报成「读不到区域」。
+        base = await await_region(pages[0])
         if not base.ok:
             known = "、".join(base.labels) if base.labels else "未读到"
             raise RegionUnconfirmed(

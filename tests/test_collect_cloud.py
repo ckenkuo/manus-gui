@@ -90,12 +90,16 @@ SAMPLE_CELLS = [
     {"rowFrom": 1, "colFrom": 6, "cellText": "3.2"},
     {"rowFrom": 1, "colFrom": 7, "cellText": "0.3"},
     {"rowFrom": 1, "colFrom": 8, "cellText": "6"},
-    {"rowFrom": 1, "colFrom": 9, "cellText": "5"},
+    {"rowFrom": 1, "colFrom": 9, "cellText": "5", "numFormat": "0.00_ "},
     {"rowFrom": 1, "colFrom": 10, "cellText": "33.2", "fmlaText": "=G2+J2+H2*80"},
-    {"rowFrom": 1, "colFrom": 11, "cellText": "1", "fmlaText": "=E2/F2"},
+    {"rowFrom": 1, "colFrom": 11, "cellText": "100%", "fmlaText": "=E2/F2",
+     "numFormat": "0.00%", "alignment": {"horizontal": "haCenter",
+                                         "vertical": "vaCenter"}},
     {"rowFrom": 2, "colFrom": 2, "cellText": "SPU-2"},
     {"rowFrom": 2, "colFrom": 9, "cellText": "5"},
     {"rowFrom": 2, "colFrom": 10, "cellText": "41.2", "fmlaText": "=G3+J3+H3*80"},
+    {"rowFrom": 2, "colFrom": 11, "cellText": "", "numFormat": "0.00%",
+     "alignment": {"horizontal": "haCenter", "vertical": "vaCenter"}},
 ]
 
 
@@ -123,6 +127,11 @@ def test_read_data_sample_aggregates_rows_and_formulas(monkeypatch):
     assert row1["K"]["formula"] == "=G2+J2+H2*80"
     assert row1["K"]["text"] == "33.2"
     assert row1["D"]["formula"].startswith("=_xlfn.DISPIMG")  # 原样返回，调用方过滤
+    # 响应里的 numFormat/alignment 必须翻成写侧 xf（numfmt 小写 + alcH/alcV），
+    # 直接取 cell["xf"] 是取不到的——响应里没这个键（这正是格式一直没生效的根因）。
+    assert sample[1]["L"]["format"] == {
+        "numfmt": "0.00%", "alcH": 2, "alcV": 1,
+    }, "空白格的既有格式也要保留，且要翻成写侧字段名"
     # 请求的列上限取 sheets_info 的 colTo（12）
     rng_payloads = [p for s, a, p in cli._fake.calls if a == "get_range_data"]
     assert rng_payloads[0]["range"]["colTo"] == 12
@@ -147,10 +156,134 @@ def test_schema_cloud_maps_fields_formulas_constants(monkeypatch):
     assert schema.fields["spu"] == "C"
     assert schema.fields["image"] == "D"
     assert schema.fields["purchase"] == "G"
-    # 公式列行号模板化；图片列（DISPIMG）被排除
-    assert schema.formula_columns == {"K": "=G{r}+J{r}+H{r}*80", "L": "=E{r}/F{r}"}
-    # 常量列：公式引用到、非公式列、非逐商品字段列，且采样行里全是同一个纯数字
-    assert schema.constant_columns == {"J": 5}
+    # 成本链与折扣均保留模板公式；折扣格式继续按百分比回放。
+    assert schema.formula_columns == {
+        "K": "=G{r}+J{r}+H{r}*80",
+        "L": "=E{r}/F{r}",
+    }
+    assert schema.constant_columns == {"I": 6, "J": 5}
+    assert schema.format_columns == {
+        "J": {"numfmt": "0.00_ "},
+        "L": {"numfmt": "0.00%", "alcH": 2, "alcV": 1},
+    }
+
+
+def test_schema_cloud_inherits_percent_and_cost_inputs_from_complete_row():
+    """截图回归：55%/84/25/6.72/10 等公式输入必须随 Sheet 模板继承。
+
+    第二行模拟管线刚写坏的行（公式还在，但模板输入只剩 P=1）；解析必须选第一条完整
+    历史行，不能被末尾坏行反向污染。
+    """
+    header = {
+        "D": "SPU ID", "E": "产品图片", "F": "货号", "G": "日常价",
+        "H": "折扣", "I": "折扣参数", "J": "加速器参考价格", "K": "销售价格",
+        "L": "采购价格", "M": "重量", "N": "空运头程", "O": "尾程运费",
+        "P": "操作费", "Q": "广告", "R": "ros", "T": "成本", "U": "利润", "V": "毛利",
+    }
+    complete = {
+        "D": {"text": "OLD", "formula": ""},
+        "G": {"text": "152", "formula": "", "format": {"numfmt": "0.00_ "}},
+        "H": {"text": "55%", "formula": "=K2/G2", "format": {"numfmt": "0.00%"}},
+        "I": {"text": "55%", "formula": "", "format": {"numfmt": "0.00%"}},
+        "J": {"text": "84", "formula": ""},
+        "K": {"text": "67.2", "formula": "=J2*I2+J2*(1-I2)*H2"},
+        "L": {"text": "22", "formula": "", "format": {"numfmt": "0.00_ "}},
+        "M": {"text": "0.3", "formula": ""},
+        "N": {"text": "25", "formula": "=M2*80+1"},
+        "O": {"text": "25", "formula": ""},
+        "P": {"text": "3", "formula": ""},
+        "Q": {"text": "6.72", "formula": ""},
+        "R": {"text": "10", "formula": ""},
+        "T": {"text": "53.72", "formula": "=L2+N2+O2+P2+Q2"},
+        "U": {"text": "13.48", "formula": "=K2-T2"},
+        "V": {"text": "16.05%", "formula": "=U2/J2"},
+    }
+    broken = {
+        "D": {"text": "NEW", "formula": ""},
+        "G": {"text": "41", "formula": ""},
+        "H": {"text": "2.04", "formula": "=K3/G3"},
+        "K": {"text": "0", "formula": "=J3*I3+J3*(1-I3)*H3",
+              "format": {"numfmt": "0.00_ "}},
+        "N": {"text": "1", "formula": "=M3*80+1"},
+        "P": {"text": "1", "formula": ""},
+        "T": {"text": "1", "formula": "=L3+N3+O3+P3+Q3"},
+        "U": {"text": "-1", "formula": "=K3-T3"},
+        "V": {"text": "-0.01", "formula": "=U3/J3"},
+    }
+
+    class Cloud:
+        def read_header(self, _sheet):
+            return header, 1
+
+        def read_data_sample(self, _sheet, _header_row):
+            return [complete, broken]
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(Cloud(), "VibeMakers全球"))
+
+    assert schema.constant_columns == {"O": 25, "P": 3, "Q": 6.72, "R": 10}
+    assert schema.formula_columns == {
+        "H": "=K{r}/G{r}",
+        "N": "=M{r}*80+1",
+        "T": "=L{r}+N{r}+O{r}+P{r}+Q{r}",
+        "U": "=K{r}-T{r}",
+        "V": "=U{r}/J{r}",
+    }
+    assert schema.format_columns["H"] == {"numfmt": "0.00%"}
+    assert schema.format_columns["G"] == {"numfmt": "0.00_ "}
+    assert schema.format_columns["K"] == {"numfmt": "0.00_ "}, (
+        "模板行缺格式时按同列历史格式补齐"
+    )
+    assert schema.format_columns["L"] == {"numfmt": "0.00_ "}
+
+    row = P._cloud_row(
+        {"spu": "NEW-2", "sku_spec": "红色", "price": "46"},
+        P.CollectResult(spu="NEW-2", ok=True), schema, 0, 9,
+    )
+    assert row["values"]["H"] == "=K9/G9", "折扣保留模板公式，结果显示为 100%"
+    assert row["values"]["K"] == 46, "销售价格直接取清单，不仿历史公式"
+    assert "I" not in row["values"] and "J" not in row["values"], (
+        "加速器参考价、叠加折扣没有清单来源，必须留空"
+    )
+    assert row["values"]["O"] == 25 and row["values"]["R"] == 10
+    assert row["values"]["T"] == "=L9+N9+O9+P9+Q9"
+    assert row["formats"]["G"] == {"numfmt": "0.00_ "}
+    assert row["formats"]["K"] == {"numfmt": "0.00_ "}
+
+
+def test_schema_cloud_votes_numfmt_separately_from_alignment():
+    """数字格式与对齐分开投票：少数行才有的数字格式不能被「只有对齐」的多数票压掉。
+
+    实机现象：广告列 6 行里只有 2 行带 0.00_，其余是管线自己写的、只有对齐没有数字
+    格式的行。整字典投票时后者赢，新行又退回通用格式——历史包袱反过来决定新行。
+    """
+    header = {"D": "SPU ID", "T": "成本", "U": "利润"}
+    only_align = {"alcH": 2, "alcV": 1}
+    with_numfmt = {"alcH": 2, "alcV": 1, "numfmt": "0.00_ "}
+    sample = [
+        {"D": {"text": "1", "formula": "", "format": only_align},
+         "T": {"text": "1", "formula": "=A2+B2", "format": only_align},
+         "U": {"text": "1", "formula": "", "format": only_align}},
+        {"D": {"text": "2", "formula": "", "format": only_align},
+         "T": {"text": "2", "formula": "=A3+B3", "format": only_align},
+         "U": {"text": "2", "formula": "", "format": with_numfmt}},
+        {"D": {"text": "3", "formula": "", "format": only_align},
+         "T": {"text": "3", "formula": "=A4+B4", "format": with_numfmt},
+         "U": {"text": "3", "formula": "", "format": only_align}},
+    ]
+
+    class Cloud:
+        def read_header(self, _sheet):
+            return header, 1
+
+        def read_data_sample(self, _sheet, _header_row):
+            return sample
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(Cloud(), "S"))
+
+    assert schema.format_columns["T"] == {
+        "alcH": 2, "alcV": 1, "numfmt": "0.00_ ",
+    }, "1/3 的行有数字格式也要赢——没设格式的行不该参与数字格式投票"
+    assert schema.format_columns["D"] == {"alcH": 2, "alcV": 1}, "全列都没数字格式就不设"
 
 
 def test_schema_cloud_rejects_missing_spu(monkeypatch):
@@ -220,7 +353,7 @@ def test_write_row_cloud_sequence_and_payload(monkeypatch):
     assert by_col["G"] == "4.0"            # 采购价 = 货价 3.2 + 运费 0.8
     assert by_col["H"] == "0.3"            # 重量 300g → 0.3kg
     assert by_col["J"] == "5"              # 常量列回填
-    assert by_col["I"] == "7"              # ros 非常量 → 默认值兜底
+    assert "I" not in by_col                 # 没有模板值就留空，不再固定写默认 ros
     assert by_col["K"] == "=G2+J2+H2*80"   # 公式行号 = header_row + 1 = 2
 
     pic_ops = calls[2][2]["range_data"]
@@ -261,6 +394,85 @@ def test_write_row_cloud_append_bottom_skips_insert(monkeypatch):
     assert all(o["row_from"] == 6 for o in ops), "0-based 落在末行(5)之后"
     by_col = {K.index_to_col(o["col_from"]): o["formula"] for o in ops}
     assert by_col["K"] == "=G7+J7+H7*80", "公式行号跟随实际落点(1-based 7)"
+
+
+def test_write_row_cloud_replays_template_cell_formats(monkeypatch):
+    """云端追加到空白行时要回放模板格式，保住百分比/金额等显示。
+
+    并钉住「只回放到本行真写了值/公式的格」：给空白格设格式白占 payload，而 kdocs
+    有配额（429001 限频要等 20s），一批 20 行 × 二十来列全设一遍是纯浪费。
+    """
+    verify = {"rangeData": [{"rowFrom": 6, "colFrom": 0, "cellText": "美国"}]}
+    routes = {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "range_data_batch_update"): {"code": 0},
+        ("sheet", "update_range_data"): {"code": 0},
+        ("sheet", "get_range_data"): verify,
+    }
+    cli = _make(monkeypatch, routes)
+    schema = _schema()
+    schema.format_columns = {
+        "E": {"numfmt": "0.00_ "},                    # 销售价：本行会写值
+        "K": {"numfmt": "0.00%", "alcH": 2},          # 成本：本行会写公式
+        "L": {"numfmt": "0.00%"},                     # 本行不写这列 → 不该发格式
+    }
+
+    ok, msg = asyncio.run(P.write_product_row_cloud(
+        cli, "pawly全球", {"spu": "SPU-9", "site": "美国", "price": "12.5"},
+        P.CollectResult(spu="SPU-9", ok=True), schema,
+    ))
+
+    assert ok, msg
+    format_call = next(
+        payload for _service, action, payload in cli._fake.calls
+        if action == "update_range_data"
+    )
+    by_col = {
+        K.index_to_col(op["colFrom"]): op["xf"]
+        for op in format_call["rangeData"]
+    }
+    assert by_col == {
+        "E": {"numfmt": "0.00_ "},
+        "K": {"numfmt": "0.00%", "alcH": 2},
+    }, "只回放到写了值/公式的列，空白列跳过"
+    assert all(op["opType"] == "format" for op in format_call["rangeData"])
+
+
+def test_write_row_cloud_keeps_numfmt_off_text_cells(monkeypatch):
+    """文本格不回放数字格式，只留对齐。
+
+    实测：站点/类目这些文本列的历史单元格上常年挂着 `0_ ` 这种数字格式（表格默认
+    样式，文本显示不受影响），照抄过去一旦写进形似数字的文本就会被格式化。
+    """
+    verify = {"rangeData": [{"rowFrom": 6, "colFrom": 0, "cellText": "美国"}]}
+    routes = {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "range_data_batch_update"): {"code": 0},
+        ("sheet", "update_range_data"): {"code": 0},
+        ("sheet", "get_range_data"): verify,
+    }
+    cli = _make(monkeypatch, routes)
+    schema = _schema()
+    schema.format_columns = {
+        "A": {"numfmt": "0_ ", "alcH": 2, "alcV": 1},   # 站点：写的是文本
+        "E": {"numfmt": "0.00_ ", "alcV": 1},           # 销售价：写的是数字
+    }
+
+    ok, msg = asyncio.run(P.write_product_row_cloud(
+        cli, "pawly全球", {"spu": "SPU-9", "site": "美国", "price": "12.5"},
+        P.CollectResult(spu="SPU-9", ok=True), schema,
+    ))
+
+    assert ok, msg
+    format_call = next(
+        payload for _service, action, payload in cli._fake.calls
+        if action == "update_range_data"
+    )
+    by_col = {
+        K.index_to_col(op["colFrom"]): op["xf"] for op in format_call["rangeData"]
+    }
+    assert by_col["A"] == {"alcH": 2, "alcV": 1}, "文本格摘掉 numfmt，对齐仍要回放"
+    assert by_col["E"] == {"numfmt": "0.00_ ", "alcV": 1}, "数字格保留数字格式"
 
 
 def test_write_row_cloud_error_is_per_product(monkeypatch):
@@ -403,9 +615,10 @@ def test_run_batch_local_path_unchanged(monkeypatch, tmp_path):
 
     monkeypatch.setattr(S, "excel_write_locked", locked)
     monkeypatch.setattr(S, "spu_col_of", lambda e, s: "C")
+    # header_row 是 existing_keys 统一传下来的（本地 1-based），故打桩要收这个参数
     monkeypatch.setattr(
         S.WpsExcelTool, "existing_key_values",
-        classmethod(lambda cls, e, s, c: set()),
+        classmethod(lambda cls, e, s, c, header_row=1: set()),
     )
 
     async def fake_schema(tool, excel, sheet):
@@ -451,9 +664,10 @@ def test_run_batch_explicit_local_overrides_prefs_cloud(monkeypatch, tmp_path):
 
     monkeypatch.setattr(S, "excel_write_locked", locked)
     monkeypatch.setattr(S, "spu_col_of", lambda e, s: "C")
+    # header_row 是 existing_keys 统一传下来的（本地 1-based），故打桩要收这个参数
     monkeypatch.setattr(
         S.WpsExcelTool, "existing_key_values",
-        classmethod(lambda cls, e, s, c: set()),
+        classmethod(lambda cls, e, s, c, header_row=1: set()),
     )
 
     async def fake_schema(tool, excel, sheet):
@@ -745,9 +959,10 @@ def _patch_local_batch(monkeypatch, tmp_path, worklist):
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     monkeypatch.setattr(S, "excel_write_locked", lambda _p: False)
     monkeypatch.setattr(S, "spu_col_of", lambda e, s: "C")
+    # header_row 是 existing_keys 统一传下来的（本地 1-based），故打桩要收这个参数
     monkeypatch.setattr(
         S.WpsExcelTool, "existing_key_values",
-        classmethod(lambda cls, e, s, c: set()),
+        classmethod(lambda cls, e, s, c, header_row=1: set()),
     )
 
     async def fake_schema(tool, excel, sheet):

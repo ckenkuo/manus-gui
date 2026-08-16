@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import threading
 import tomllib
 from pathlib import Path
@@ -8,13 +9,100 @@ from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+def is_frozen() -> bool:
+    """是否运行在 PyInstaller 冻结产物里。"""
+    return bool(getattr(sys, "frozen", False))
+
+
 def get_project_root() -> Path:
-    """获取项目根目录"""
+    """获取项目根目录（可写侧：配置、workspace、经验库都挂在这里）。
+
+    冻结后源码被塞进 _internal，__file__ 推出来的是只读的解包目录，
+    配置写在那里用户既看不见、升级时又会被覆盖。所以冻结态改以 exe 所在目录为根，
+    让 config/、workspace/ 与 exe 平级，跟绿色版/安装版的直觉一致。
+    """
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
 
+def get_bundle_root() -> Path:
+    """只读资源根目录（templates/static/示例配置等随包分发的东西）。
+
+    冻结后 PyInstaller 把 datas 解到 sys._MEIPASS（onedir 模式下就是 _internal/）；
+    未冻结时与项目根同一个目录，因此开发态调用方无需区分。
+    """
+    if is_frozen():
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+    return Path(__file__).resolve().parent.parent
+
+
+def _is_writable(path: Path) -> bool:
+    """探测目录是否可写（建目录 + 落一个探针文件再删）。
+
+    只看 os.access 在 Windows 上不可靠（UAC 虚拟化、ACL 继承都会骗过它），
+    唯一可信的判断是真去写一次。
+    """
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".manus_write_probe"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def get_data_root() -> Path:
+    """可写数据根目录：配置、workspace、经验库、日志都落在这里。
+
+    冻结态优先用 exe 同级目录——便携版解压到哪就跑到哪，配置和产物都在用户
+    眼前，符合直觉也便于整包备份/迁移。
+    但一旦装进 C:\\Program Files，该目录对普通用户只读；而 app/logger.py 是在
+    import 期就建日志文件的，届时三个 exe 会在任何日志系统就绪之前一起闪退，
+    用户只看到一闪而过的窗口。故此处显式探测可写性，不可写就降级到
+    %LOCALAPPDATA%\\ManusGUI，保证「装到哪都能跑起来」。
+    可用 MANUS_DATA_DIR 强制指定，便于多实例或放到共享盘。
+    """
+    override = os.environ.get("MANUS_DATA_DIR")
+    if override:
+        return Path(override)
+
+    if not is_frozen():
+        # 开发态一律用项目根，保持与改动前完全一致的行为
+        return Path(__file__).resolve().parent.parent
+
+    exe_dir = Path(sys.executable).resolve().parent
+    if _is_writable(exe_dir):
+        return exe_dir
+
+    return Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ManusGUI"
+
+
 PROJECT_ROOT = get_project_root()
-WORKSPACE_ROOT = PROJECT_ROOT / "workspace"
+BUNDLE_ROOT = get_bundle_root()
+DATA_ROOT = get_data_root()
+
+
+def config_search_dirs() -> List[Path]:
+    """按优先级返回所有可能存放配置文件的目录（已去重、保序）。
+
+    可写侧在前、随包只读侧在后。各管线（collect/orders/activity）读自己那段
+    配置时都该走这个列表，否则冻结后只查安装目录会漏掉 _internal 里的
+    example，导致 [orders]/[collect] 段取不到、功能直接中止。
+    开发态三个根同一目录，去重后就剩一项，与改动前等价。
+    """
+    seen = []
+    for root in (DATA_ROOT, PROJECT_ROOT, BUNDLE_ROOT):
+        candidate = root / "config"
+        if candidate not in seen:
+            seen.append(candidate)
+    return seen
+# 运行时状态（判重水位、采集偏好、经验库等）属可写侧，不能跟只读的 _internal
+# 或只读的安装目录绑在一起，否则装到 Program Files 后采集入口第一步就 PermissionError。
+WORKSPACE_ROOT = DATA_ROOT / "workspace"
 
 
 # 桌面产物输出根目录：Excel 备份、商品图片、调试截图等所有生成物集中分类存放，
@@ -222,10 +310,15 @@ class MCPSettings(BaseModel):
     @classmethod
     def load_server_config(cls) -> Dict[str, MCPServerConfig]:
         """从 JSON 文件加载 MCP 服务器配置"""
-        config_path = PROJECT_ROOT / "config" / "mcp.json"
+        # 与 config.toml 同理：优先读可写副本，其次才是随包只读副本。
+        candidates = [
+            DATA_ROOT / "config" / "mcp.json",
+            PROJECT_ROOT / "config" / "mcp.json",
+            BUNDLE_ROOT / "config" / "mcp.json",
+        ]
 
         try:
-            config_file = config_path if config_path.exists() else None
+            config_file = next((p for p in candidates if p.exists()), None)
             if not config_file:
                 return {}
 
@@ -293,13 +386,23 @@ class Config:
 
     @staticmethod
     def _get_config_path() -> Path:
-        root = PROJECT_ROOT
-        config_path = root / "config" / "config.toml"
-        if config_path.exists():
-            return config_path
-        example_path = root / "config" / "config.example.toml"
-        if example_path.exists():
-            return example_path
+        """定位配置文件。
+
+        查找顺序刻意把「可写侧」排在前面：冻结态下 exe 同级的 config/config.toml
+        才是用户实际编辑的那份；随包分发的只读副本（BUNDLE_ROOT，即 _internal/）
+        只作兜底，保证首次运行还没生成用户配置时也能起得来。
+        开发态两个根指向同一目录，行为与改动前一致。
+        """
+        candidates = [
+            DATA_ROOT / "config" / "config.toml",
+            PROJECT_ROOT / "config" / "config.toml",
+            BUNDLE_ROOT / "config" / "config.toml",
+            PROJECT_ROOT / "config" / "config.example.toml",
+            BUNDLE_ROOT / "config" / "config.example.toml",
+        ]
+        for path in candidates:
+            if path.exists():
+                return path
         raise FileNotFoundError("No configuration file found in config directory")
 
     def _load_config(self) -> dict:

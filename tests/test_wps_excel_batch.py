@@ -458,6 +458,47 @@ def test_append_rows_empty_input_is_noop(book):
     assert book.read_bytes() == before
 
 
+def test_collect_value_style_falls_back_to_nearest_historical_cell():
+    """采集末行缺少金额格时，仍沿用最近历史金额格的两位小数样式。"""
+    rows = [
+        ("1", '<c r="L1" s="1" t="str"><v>销售价格</v></c>'),
+        ("2", '<c r="L2" s="8"><v>12.50</v></c>'),
+        ("3", '<c r="L3" s="9"><v>13.50</v></c>'),
+        ("4", '<c r="A4" s="2" t="str"><v>末行缺销售价</v></c>'),
+    ]
+
+    assert WpsExcelTool._value_cell_style(rows, "L") == "9"
+
+
+def test_collect_append_preserves_two_decimal_style_when_last_row_is_blank(book):
+    """真实落盘回归：末行金额格为空，也要从上一条金额继承两位小数样式。"""
+    with zipfile.ZipFile(book) as source:
+        parts = {item.filename: source.read(item.filename) for item in source.infolist()}
+    sheet = parts["xl/worksheets/sheet1.xml"].decode("utf-8")
+    sheet = sheet.replace(
+        '<c r="D2" s="5" t="str"><v>杏色 / 3-4Y</v></c>',
+        '<c r="D2" s="5" t="str"><v>杏色 / 3-4Y</v></c>'
+        '<c r="E2" s="3"><v>12.50</v></c>',
+    )
+    sheet = re.sub(r'<row r="[4-7]"[^>]*/>', "", sheet)
+    parts["xl/worksheets/sheet1.xml"] = sheet.encode("utf-8")
+    styles = parts["xl/styles.xml"].decode("utf-8").replace(
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="2" xfId="0"/>',
+        '<xf numFmtId="2" fontId="0" fillId="0" borderId="2" xfId="0"/>',
+    )
+    parts["xl/styles.xml"] = styles.encode("utf-8")
+    with zipfile.ZipFile(book, "w", zipfile.ZIP_DEFLATED) as target:
+        for name, data in parts.items():
+            target.writestr(name, data)
+
+    result = WpsExcelTool()._append(
+        str(book), "订单表", {"A": "StoreB全球", "E": 13.5}, {}, None, None
+    )
+
+    assert not result.error
+    assert '<c r="E4" s="3"><v>13.5</v></c>' in _sheet(book)
+
+
 # ---- 插到表头下方（订单登记表要求「新的在上面」）---------------------------
 
 

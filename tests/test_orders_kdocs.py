@@ -102,6 +102,34 @@ def test_force_text_input():
     assert K.force_text_input("'12") == "'12"
 
 
+def test_read_cell_xf_translates_read_fields_to_write_fields():
+    """读侧与写侧的格式字段根本不是一套，必须翻译。
+
+    2026-08-12 实测：get_range_data 返回的是 numFormat / alignment{horizontal,vertical}，
+    响应里【没有】xf 这个键；而 update_range_data 要的是 numfmt（全小写）+ alcH/alcV。
+    此前代码直接取 cell["xf"] 原样回写，于是格式字典恒空，采集写的新行永远拿不到
+    历史行的两位小数/百分比（历史行显示 25.00 / 16.05%，新行显示 1 / 0）。
+    """
+    assert K.read_cell_xf({
+        "numFormat": "0.00_ ",
+        "alignment": {"horizontal": "haCenter", "vertical": "vaCenter"},
+    }) == {"numfmt": "0.00_ ", "alcH": 2, "alcV": 1}
+    # 百分比列
+    assert K.read_cell_xf({"numFormat": "0.00%"}) == {"numfmt": "0.00%"}
+    # 尾随空格是格式串的一部分（`_ ` 是对齐占位），不能被 strip 掉
+    assert K.read_cell_xf({"numFormat": "0.00_ "})["numfmt"] == "0.00_ "
+    # 通用格式 = 没设过，回放它没有意义
+    assert K.read_cell_xf({"numFormat": "G/通用格式"}) is None
+    assert K.read_cell_xf({"numFormat": "General"}) is None
+    assert K.read_cell_xf({}) is None
+    # haGeneral 没有对应的 alcH 数字（就是"没设过"），只留数字格式
+    assert K.read_cell_xf({
+        "numFormat": "0.00", "alignment": {"horizontal": "haGeneral"},
+    }) == {"numfmt": "0.00"}
+    # 只有对齐、没有数字格式的格也要回放对齐
+    assert K.read_cell_xf({"alignment": {"vertical": "vaTop"}}) == {"alcV": 0}
+
+
 def test_read_header_picks_fullest_row(monkeypatch):
     # 第 1 行只有一个跨列大标题，第 2 行才是真表头（与本地 detect_header_row 同口径）
     routes = {

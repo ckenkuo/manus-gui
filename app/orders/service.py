@@ -32,7 +32,7 @@ from app.collect.service import (
     list_workbooks,
 )
 from app.cloud_docs import remember as remember_cloud_doc
-from app.config import PROJECT_ROOT, config, get_output_dir
+from app.config import PROJECT_ROOT, config, config_search_dirs, get_output_dir
 from app.logger import logger
 from app.orders import pipeline, upload
 from app.orders.kdocs_sheet import KdocsSheet
@@ -192,17 +192,19 @@ def load_orders_config() -> dict:
     兜底——猜错就是写错表。所以让随仓库分发的 example 充当默认值，用户在 config.toml
     写了 [orders] 就完全覆盖它。解析失败只告警返回 {}，由调用方按缺字段中止。
     """
-    for name in ("config.toml", "config.example.toml"):
-        p = PROJECT_ROOT / "config" / name
-        if not p.exists():
-            continue
-        try:
-            with p.open("rb") as f:
-                section = tomllib.load(f).get("orders") or {}
-            if section:
-                return section
-        except Exception as e:
-            logger.warning(f"读 {name} 的 [orders] 配置失败：{e}")
+    # 目录维度也要遍历：冻结后 example 只存在于随包只读侧（_internal/config）。
+    for cfg_dir in config_search_dirs():
+        for name in ("config.toml", "config.example.toml"):
+            p = cfg_dir / name
+            if not p.exists():
+                continue
+            try:
+                with p.open("rb") as f:
+                    section = tomllib.load(f).get("orders") or {}
+                if section:
+                    return section
+            except Exception as e:
+                logger.warning(f"读 {p} 的 [orders] 配置失败：{e}")
     return {}
 
 

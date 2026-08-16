@@ -15,6 +15,7 @@ from app.temu_region import (
     is_seller_page,
     read_region,
     region_conflict,
+    switch_region,
     url_in_region,
 )
 
@@ -39,6 +40,10 @@ def _tabs(active, labels=("全球", "美国", "欧区")):
 
 GLOBAL_URL = "https://agentseller.temu.com/newon/product-select"
 US_URL = "https://agentseller-us.temu.com/newon/product-select"
+
+
+async def _no_sleep(_secs):
+    """_enumerate_one_store 里有等抓包的 3s + 20×1s 轮询，测试里必须掐掉否则要跑 20 秒。"""
 
 
 class TestHostOf:
@@ -115,47 +120,105 @@ class TestRegionConflict:
         assert region_conflict(base, cur) == ""
 
 
-class TestConfirmActiveRegion:
-    def test_no_pages_aborts_instead_of_opening_global(self):
-        """一个列表页都没开 → 报错，绝不默认新开全球域页面（那等于替用户选了全球）。"""
-        with pytest.raises(S.RegionNotConfirmed) as e:
-            asyncio.run(S.confirm_active_region([]))
-        assert "product-select" in str(e.value)
+class _FakeCdpClient:
+    """够 _enumerate_one_store 跑通的 CDP 替身：不产生任何网络事件。
 
-    def test_single_page_confirmed(self):
-        r = asyncio.run(S.confirm_active_region([FakePage(US_URL, _tabs("美国"))]))
-        assert r.ok and r.label == "美国"
+    于是 cap["body"] 始终为 None，走的正是「没抓到列表请求」那条 best-effort 分支——
+    这恰好是我们要验证的：即使抓包一无所获，区域打标也必须照常完成。
+    """
 
-    def test_mixed_regions_aborts(self):
-        """混着全球和美国的列表页 → 中止，不擅自取第一个。"""
-        pages = [FakePage(GLOBAL_URL, _tabs("全球")), FakePage(US_URL, _tabs("美国"))]
-        with pytest.raises(S.RegionNotConfirmed) as e:
-            asyncio.run(S.confirm_active_region(pages))
-        assert "区域不一致" in str(e.value)
+    async def send(self, _method, _params=None):
+        return {}
 
-    def test_same_region_multiple_pages_ok(self):
-        """同区域多店页签是正常场景（多店账号），必须放行。"""
-        pages = [FakePage(GLOBAL_URL, _tabs("全球")),
-                 FakePage(GLOBAL_URL, _tabs("全球"))]
-        assert asyncio.run(S.confirm_active_region(pages)).label == "全球"
+    def on(self, _event, _cb):
+        pass
 
-    def test_unreadable_region_aborts(self):
-        with pytest.raises(S.RegionNotConfirmed):
-            asyncio.run(S.confirm_active_region([FakePage(GLOBAL_URL, _tabs(""))]))
+    async def detach(self):
+        pass
 
 
-class TestCheckRegion:
-    def test_drifted_page_raises(self):
-        """采集中页签飘到别的区域（导航/用户手点）→ 立刻中止，别混数据。"""
-        base = Region(host="agentseller.temu.com", label="全球")
-        with pytest.raises(S.RegionNotConfirmed) as e:
-            asyncio.run(S._check_region(
-                FakePage(US_URL, _tabs("美国")), base, "第 2 个页签"))
-        assert "第 2 个页签" in str(e.value)
+class _FakeCtx:
+    def __init__(self, pages):
+        self.pages = pages
 
-    def test_same_region_passes(self):
-        base = Region(host="agentseller.temu.com", label="全球")
-        asyncio.run(S._check_region(FakePage(GLOBAL_URL, _tabs("全球")), base, "x"))
+    async def new_cdp_session(self, _page):
+        return _FakeCdpClient()
+
+    async def cookies(self):
+        return []
+
+
+class _EnumPage:
+    """最小 product-select 页替身：按脚本特征分派 evaluate 的返回值。"""
+
+    def __init__(self, url, active_label="全球", items=None, region_raises=None):
+        self.url = url
+        self._label = active_label
+        self._items = items if items is not None else [{"spu": "1", "sku_id": "11"}]
+        self._region_raises = region_raises
+
+    async def bring_to_front(self):
+        pass
+
+    async def evaluate(self, script, _arg=None):
+        if "_regionGroup" in script:                      # 读顶栏区域
+            if self._region_raises:
+                raise self._region_raises
+            return {"labels": ["全球", "美国"], "active": self._label, "ambiguous": []}
+        if "__USER_INFO__" in script:                     # 读店名
+            return "WINTAK"
+        if "dataList" in script:                          # 翻页取商品
+            return self._items
+        return None                                       # 点「查询」等
+
+
+class TestCollectRegionComesFromTabHost:
+    """采集侧不再有「确认区域」关卡：区域＝域名，直接取自页签 URL（2026-08-11 改）。
+
+    删掉的 confirm_active_region / _check_region 原本会在读不到顶栏时中止整批，
+    而顶栏读不到的常见原因（没渲染完、列表在内部容器里滚导致顶栏被平移出视口）
+    与「该采哪个区域」毫无关系——host 已经把区域定死了。
+    """
+
+    def test_blocking_confirm_helpers_are_gone(self):
+        assert not hasattr(S, "confirm_active_region")
+        assert not hasattr(S, "_check_region")
+
+    def test_tags_region_with_tab_host(self, monkeypatch):
+        """每条商品的 region ＝ 本页签的 host；顶栏中文名进 region_label 供 UI 显示。"""
+        monkeypatch.setattr(S.asyncio, "sleep", _no_sleep)
+        page = _EnumPage(US_URL, "美国")
+        _mid, label, items = asyncio.run(
+            S._enumerate_one_store(_FakeCtx([page]), page))
+        assert label == "WINTAK"
+        assert items[0]["region"] == "agentseller-us.temu.com"
+        assert items[0]["region_label"] == "美国"
+
+    def test_unreadable_top_bar_still_tags_host(self, monkeypatch):
+        """顶栏读不到（改版/没渲染/滚出视口）→ 照采，region 仍是 host，只是显示名为空。
+
+        这是本次改动的要点：原先这种情况会抛 RegionNotConfirmed、整批中止。
+        """
+        monkeypatch.setattr(S.asyncio, "sleep", _no_sleep)
+        page = _EnumPage(GLOBAL_URL, region_raises=RuntimeError("顶栏没读到"))
+        _mid, _label, items = asyncio.run(
+            S._enumerate_one_store(_FakeCtx([page]), page))
+        assert items[0]["region"] == "agentseller.temu.com"
+        assert items[0]["region_label"] == ""
+
+    def test_tabs_in_different_regions_each_keep_own_host(self, monkeypatch):
+        """同时开着全球和美国的页签不再是错误：各自打自己的 host、归各自的店铺键。"""
+        monkeypatch.setattr(S.asyncio, "sleep", _no_sleep)
+        got = []
+        for page in (_EnumPage(GLOBAL_URL, "全球"), _EnumPage(US_URL, "美国")):
+            _m, _l, items = asyncio.run(
+                S._enumerate_one_store(_FakeCtx([page]), page))
+            got.append(items[0])
+        assert got[0]["region"] != got[1]["region"]
+        # 同 mallid 跨区域仍分得开——这正是当初引入 region 维度要保住的性质
+        for it in got:
+            it["mallid"] = "SAME-MALL"
+        assert S._store_key(got[0]) != S._store_key(got[1])
 
 
 class TestStoreKeyWithRegion:
@@ -532,27 +595,25 @@ class TestSwitchRegion:
 
 
 class TestUiSelectionWins:
-    def test_collect_switches_mismatched_tab_to_ui_choice(self):
-        """采集：UI 选美国、浏览器停在全球 → 切过去，不再报错要求手动处理。"""
+    """显式选定区域仍然以 UI 为准（采集侧改动后，这是唯一会主动动浏览器的路径）。
+
+    采集侧「不选区域」的默认路径已不再探测/校验区域，见 TestCollectRegionComesFromTabHost；
+    这里只保留「显式指定 → 切过去」的语义，它由 switch_region 承担。
+    """
+
+    def test_switches_mismatched_tab_to_ui_choice(self):
+        """UI 选美国、页签停在全球 → 换域名导航切过去。"""
         page = SwitchablePage(GLOBAL_URL, "全球")
-        got = asyncio.run(S.confirm_active_region([page], "美国"))
+        got = asyncio.run(switch_region(page, "美国"))
         assert got.label == "美国"
         assert len(page.gotos) == 1
 
-    def test_collect_aligns_all_tabs_to_ui_choice(self):
-        """多页签处在不同区域时，UI 指定了区域就把它们都对齐，而不是让用户去收拾。"""
-        a = SwitchablePage(US_URL, "美国")
-        b = SwitchablePage(GLOBAL_URL, "全球")
-        got = asyncio.run(S.confirm_active_region([a, b], "美国"))
+    def test_tab_already_in_target_region_is_untouched(self):
+        """已经在目标区域的页签不做无谓跳转（换域名是整页重载，代价不小）。"""
+        page = SwitchablePage(US_URL, "美国")
+        got = asyncio.run(switch_region(page, "美国"))
         assert got.label == "美国"
-        assert len(b.gotos) == 1   # 落后的那个被切过去了
-        assert a.gotos == []       # 已经在目标区域的不动
-
-    def test_collect_without_ui_choice_still_refuses_mixed_regions(self):
-        """没选区域时保持原行为：混区域直接抛，不猜。"""
-        pages = [SwitchablePage(GLOBAL_URL, "全球"), SwitchablePage(US_URL, "美国")]
-        with pytest.raises(RegionUnconfirmed):
-            asyncio.run(S.confirm_active_region(pages, ""))
+        assert page.gotos == []
 
     def test_context_level_confirm_switches_too(self):
         ctx = FakeContext([SwitchablePage(GLOBAL_URL, "全球")])

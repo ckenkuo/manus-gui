@@ -14,6 +14,7 @@ cellimages.xml / cellimages.xml.rels，并新增 media 图片。原有公式、�
 import json
 import re
 import shutil
+import unicodedata
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -42,16 +43,87 @@ _CELL_REF_RE = re.compile(r"(?<![A-Za-z0-9_$])(\$?)([A-Z]{1,3})(\$?)(\d+)")
 # Sheet 有多列备注（前置那列常被挪作它用），取末列最稳。判定前对标题 strip()。
 _FIELD_RULES = [
     ("spu", lambda t: "spu" in t.lower(), "first"),
+    # 货号列＝逐 SKU 标识（2026-08-11 起清单是一个 SKU 一行，同 SPU 多行靠它区分）。
+    # 【必须排在 spu 之后】一列至多归一个字段、先到先得，"SPU货号"这类标题该归 spu。
+    ("sku", lambda t: t == "货号" or t.endswith("货号") or t.upper() == "SKU", "first"),
     ("image", lambda t: ("产品图片" in t) or t == "图片", "first"),
     ("site", lambda t: t == "站点", "first"),
     ("category", lambda t: t in ("类目", "类别", "品类", "分类"), "first"),
     ("daily", lambda t: t == "日常价", "first"),
+    ("discount", lambda t: t == "折扣", "first"),
     ("sale", lambda t: t in ("销售价格", "销售价", "售价"), "first"),
     ("purchase", lambda t: t in ("采购价格", "采购价", "购入价格"), "first"),
     ("weight", lambda t: t == "重量", "first"),
     ("ros", lambda t: t.lower() == "ros", "first"),
     ("note", lambda t: t == "备注", "last"),
 ]
+
+# 商品采集对 Sheet 列分三类：
+# 1. 平台清单有来源的字段由 _FIELD_RULES 动态映射后直接写（见 _ITEM_INPUT_FIELDS）；
+# 2. 历史行是公式的列一律仿公式（公式是本表的计算逻辑，抄逻辑不是抄数据）；
+# 3. 剩下的非公式列里，只有下列成本/计算语义的列才照抄历史固定值，其它保持空白。
+#
+# 【为什么第 3 类必须留一张标题表】曾想过全按数据证据判定（「该列历史值恒定就抄」），
+# 实测行不通：同一张表里「尾程运费=25」和「加速器参考价格=84」在数据形态上完全一样
+# （都是逐行填的数字、采样里都只出现在完整历史行），只有标题语义能区分哪个该抄、
+# 哪个必须留空等人填。所以这张表是刻意保留的语义闸，不是偷懒的硬编码。
+_COLLECT_MIMIC_TITLES = {
+    "折扣", "空运头程", "尾程运费", "广告", "ros", "成本", "利润", "毛利", "操作费",
+}
+# 上表的常见写法变体：各 Sheet 表头是人手打的，「操作费」会写成「操作费用」、
+# 「ros」会写成「ROS(%)」、「空运头程」会写成「空运头程费」。精确等值匹配下这些
+# 列会被整体漏掉——公式依赖的输入变空白，成本/利润当场算错，而且很难看出来。
+_MIMIC_TRIM_SUFFIXES = ("费用", "费", "用", "金额", "率")
+
+
+def _norm_title(raw: str) -> str:
+    """表头标题归一化：全角转半角、去括号注释、去空白与常见符号、转小写。
+
+    「ROS(%)」「空运头程 费」「尾程运费（美元）」归一后分别是 ros / 空运头程费 /
+    尾程运费，才能跟 _COLLECT_MIMIC_TITLES 比得上。
+    """
+    s = unicodedata.normalize("NFKC", str(raw or "")).strip().lower()
+    s = re.sub(r"[（(\[【][^）)\]】]*[)）\]】]", "", s)  # 去掉括号里的单位/注释
+    return re.sub(r"[\s%￥$、,，:：/\\-]+", "", s)
+
+
+def _is_mimic_title(raw: str) -> bool:
+    """该表头是否属于「允许照抄历史固定值」的成本/计算列。
+
+    判法是「白名单项是标题前缀，且余下的只是无意义尾巴」：`操作费用` = 操作费 + 用，
+    `毛利率` = 毛利 + 率。反过来按「标题去后缀」判会漏（操作费用去掉『费用』只剩
+    『操作』，白名单里没有）。前缀判也天然挡住了误命中：`折扣参数` 余下是『参数』、
+    `成本核算` 余下是『核算』，都不在尾巴表里；`加速器参考价格`/`叠加折扣1` 压根
+    不以任何白名单项开头。
+    """
+    s = _norm_title(raw)
+    if not s:
+        return False
+    if s in _COLLECT_MIMIC_TITLES:
+        return True
+    for title in _COLLECT_MIMIC_TITLES:
+        if s.startswith(title) and s[len(title):] in _MIMIC_TRIM_SUFFIXES:
+            return True
+    return False
+
+
+def _collect_mimic_columns(header: Dict[str, str]) -> set:
+    """返回允许照抄历史固定值的列；匹配表头语义，不依赖固定列字母。"""
+    return {col for col, raw_title in header.items() if _is_mimic_title(raw_title)}
+
+
+# 逐商品写值的逻辑字段：这些列的值每行都来自平台清单/比价结果，历史行即便有公式
+# 也【不能】仿写覆盖。实测教训：Leoaqr 表的「销售价格」列历史是 =J*K（参考价×折扣），
+# 若当普通公式仿走，新行的申报价就会被一个依赖空白列的公式顶掉，显示成 0。
+_ITEM_INPUT_FIELDS = (
+    "spu", "sku", "image", "site", "category", "daily", "sale",
+    "purchase", "weight", "note",
+)
+
+
+def item_input_columns(fields: Dict[str, str]) -> set:
+    """{逻辑字段: 列} → 逐商品写值的列集合（见 _ITEM_INPUT_FIELDS）。"""
+    return {fields[k] for k in _ITEM_INPUT_FIELDS if fields.get(k)}
 
 
 def _col_to_idx(col: str) -> int:
@@ -796,6 +868,16 @@ class WpsExcelTool(BaseTool):
             return {}
 
     @classmethod
+    def collect_mimic_columns(cls, header: Dict[str, str]) -> set:
+        """商品采集允许照抄历史固定值的列，按真实表头动态识别。"""
+        return _collect_mimic_columns(header)
+
+    @classmethod
+    def item_input_columns(cls, fields: Dict[str, str]) -> set:
+        """逐商品写值的列（本地/云端两条写入路径共用，见 _ITEM_INPUT_FIELDS）。"""
+        return item_input_columns(fields)
+
+    @classmethod
     def _resolve_fields_from_header(cls, header: Dict[str, str]) -> Dict[str, str]:
         """把逻辑字段解析到该 Sheet 的真实列：{字段名: 列字母}。见 _FIELD_RULES。
 
@@ -969,7 +1051,13 @@ class WpsExcelTool(BaseTool):
             masters = self._shared_formula_masters(sheet_xml)
             sample = {}
 
-            def _row_cells(rid: int) -> List[tuple]:
+            def _row_cells(rid: int) -> List[str]:
+                """该行有哪些列（列字母列表）。
+
+                【返回的是列字母、不是 (列, 内容) 二元组】正则里只有一个捕获组，
+                findall 给的就是字符串列表——按二元组解包会 ValueError，实测让整个
+                inspect 在真实工作簿上直接崩（本地采集路径因此完全不可用）。
+                """
                 body = row_map.get(str(rid), "")
                 return re.findall(r'<c r="([A-Z]+)%d"[^>]*?(?:/>|>.*?</c>)' % rid, body, re.S)
 
@@ -1024,34 +1112,81 @@ class WpsExcelTool(BaseTool):
         )
         existing_spus = self.existing_key_values(file_path, sheet_name, spu_col)
 
-        # 公式列 = sample 里 = 开头的列（排除图片列的 DISPIMG）。
         image_col = field_cols.get("image")
+        mimic_cols = _collect_mimic_columns(header)
+        # 逐商品输入列（采集逐条填的，不是常量）：这些列不当常量、不仿公式、也不该被常量覆盖。
+        item_cols = item_input_columns(field_cols)
+        # 公式列＝历史行里本来就是公式的列，【不再受成本列白名单限制】：公式是本表自己的
+        # 计算逻辑，仿写它等于把这张表的算法延续到新行；用一张标题表去卡，换个 Sheet
+        # 把「毛利率」写成「毛利率(%)」、多一列「含税成本」，新行这些列就整列空白，
+        # 而空白列往往又是别的公式的输入，错会顺着公式链扩散。图片列与逐商品输入列除外。
         formula_cols = {
             c for c, v in sample.items()
-            if isinstance(v, str) and v.startswith("=") and c != image_col
+            if isinstance(v, str) and v.startswith("=")
+            and c != image_col and c not in item_cols
         }
-        # 逐商品输入列（采集逐条填的，不是常量）：这些列不当常量、也不该被常量覆盖。
-        item_cols = {
-            field_cols[k] for k in
-            ("spu", "image", "site", "category", "daily", "sale", "purchase", "weight", "note")
-            if k in field_cols
-        }
-        # 公式实际引用到、却既非公式列也非逐商品输入列的列 → 是【固定数值输入】(操作费/尾程/
-        # ros 等)。这些列若新行留空，成本/利润公式会算错。从历史行学出它们的常量值并回填。
-        # ros 是特例：它常逐商品变(6/7/8 混填)，学不出稳定常量，故若未学出则由管道兜底默认。
-        referenced: set = set()
-        for c in formula_cols:
-            for m in re.finditer(r"(?<![A-Za-z$])([A-Z]{1,3})\d+", sample[c]):
-                referenced.add(m.group(1))
-        need_const_cols = referenced - formula_cols - item_cols
-        all_consts = self._scan_numeric_constants(rows, shared, item_cols | formula_cols)
-        constant_columns = {c: all_consts[c] for c in need_const_cols if c in all_consts}
+        # 照抄历史固定值的列：只在成本语义白名单内，且本身不是公式列/逐商品输入列。
+        # 这道闸不能放开——见 _COLLECT_MIMIC_TITLES 的注释（数据形态区分不了
+        # 「尾程运费」和「加速器参考价格」，只有标题能）。
+        template_cols = mimic_cols - formula_cols - item_cols
+
+        def _template_row_score(rid: int) -> tuple:
+            formula_count = 0
+            input_count = 0
+            populated = 0
+            for col in _row_cells(rid):
+                cx = _cell_xml(rid, col)
+                formula = self._resolve_cell_formula(
+                    cx, rid, _col_to_idx(col), masters
+                )
+                text = self._cell_text(cx, shared).strip()
+                if formula is not None and col in formula_cols:
+                    formula_count += 1
+                if col in template_cols and text and formula is None:
+                    input_count += 1
+                if text or formula is not None:
+                    populated += 1
+            return formula_count, input_count, populated
+
+        candidate_rows = [
+            int(rid) for rid, _body in rows
+            if 1 < int(rid) <= last_data
+        ]
+        template_rid = max(candidate_rows, key=_template_row_score, default=last_data)
+        # 公式与输入必须来自同一健康模板行。否则会出现「参数抄了老行、公式却沿用坏尾行」的
+        # 混搭，下一批仍可能继续传播错误。平移到 last_data 只是为了保持 inspect 输出契约，
+        # resolve_sheet_schema 随后会把相对行号统一模板化成 {r}。
+        for col in formula_cols:
+            cx = _cell_xml(template_rid, col)
+            formula = self._resolve_cell_formula(
+                cx, template_rid, _col_to_idx(col), masters
+            )
+            if formula is not None:
+                sample[col] = "=" + self._shift_formula(
+                    formula, last_data - template_rid, 0
+                )
+        constant_columns = {}
+        for col in sorted(template_cols, key=_col_to_idx):
+            cx = _cell_xml(template_rid, col)
+            if not cx or self._resolve_cell_formula(
+                cx, template_rid, _col_to_idx(col), masters
+            ) is not None:
+                continue
+            text = self._cell_text(cx, shared).strip()
+            if not text:
+                continue
+            try:
+                number = float(text)
+                constant_columns[col] = int(number) if number == int(number) else number
+            except ValueError:
+                constant_columns[col] = text
 
         out = {
             "sheet": sheet_name,
             "part": part,
             "header_列标题": header,
             "字段列映射": field_cols,
+            "模板输入列": constant_columns,
             "常量输入列": constant_columns,
             "last_data_row_最后数据行": last_data,
             "next_row_建议插入行": last_data + 1,
@@ -1167,7 +1302,8 @@ class WpsExcelTool(BaseTool):
 
             # 构造新行单元格
             def s_attr(col: str) -> str:
-                return f' s="{cell_styles[col]}"' if col in cell_styles else ""
+                style = cell_styles.get(col) or self._value_cell_style(rows, col)
+                return f' s="{style}"' if style else ""
 
             cells = []
             cols_all = set(column_values) | set(formula_columns)
@@ -1753,10 +1889,27 @@ class WpsExcelTool(BaseTool):
         （尤其 R=毛利 的百分比、L/P 的两位小数）。向下扫所有行找该列首个带公式且带
         s= 的单元格，取其样式，让追加的公式列显示格式与历史行一致。
         """
-        for _, body in rows:
+        for rid, body in reversed(rows):
+            if rid == "1":
+                continue
             m = re.search(r'<c r="%s\d+"\s+s="(\d+)"[^>]*?><f\b' % col, body)
             if m:
                 return m.group(1)
+        return None
+
+    @staticmethod
+    def _value_cell_style(rows: List[tuple], col: str) -> Optional[str]:
+        """取最近一个同列非公式数据格的样式，供模板末行缺格时继承数字格式。"""
+        for rid, body in reversed(rows):
+            if rid == "1":
+                continue
+            for match in re.finditer(
+                r'<c r="%s\d+"\s+s="(\d+)"[^>]*?(?:/>|>(.*?)</c>)' % col,
+                body,
+                re.S,
+            ):
+                if "<f" not in (match.group(2) or ""):
+                    return match.group(1)
         return None
 
     @staticmethod

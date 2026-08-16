@@ -23,10 +23,33 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+from app.config import BUNDLE_ROOT, DATA_ROOT, PROJECT_ROOT
+
+
+def _resolve_user_config_path() -> Path:
+    """用户配置 config.toml 的落点（读写共用同一口径）。
+
+    与 app/config.py 的 _get_config_path 保持一致：可写侧优先。
+    已存在就用已存在的那份，避免出现「读的是 A、写的是 B」的分裂；
+    都不存在时返回可写侧路径，供保存接口首次创建。
+    """
+    for root in (DATA_ROOT, PROJECT_ROOT):
+        candidate = root / "config" / "config.toml"
+        if candidate.exists():
+            return candidate
+    return DATA_ROOT / "config" / "config.toml"
+
 app = FastAPI()
 
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# 静态资源与模板属「只读随包」侧：冻结后它们被解到 _internal/，而进程工作目录
+# 通常是 exe 所在目录甚至任意目录，原先的相对路径 "static"/"templates" 会直接
+# 让 StaticFiles 在构造时抛 RuntimeError（目录不存在），Web 端起不来。
+# 统一走 BUNDLE_ROOT 取绝对路径；开发态该值即项目根，行为不变。
+_STATIC_DIR = BUNDLE_ROOT / "static"
+_TEMPLATES_DIR = BUNDLE_ROOT / "templates"
+
+app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 app.add_middleware(
     CORSMiddleware,
@@ -283,12 +306,26 @@ async def get_task(task_id: str):
 
 @app.get("/config/status")
 async def check_config_status():
-    config_path = Path(__file__).parent / "config" / "config.toml"
-    example_config_path = Path(__file__).parent / "config" / "config.example.toml"
+    # 必须与 app/config.py 的查找口径一致：可写侧（DATA_ROOT）优先。
+    # 冻结后 __file__ 指向 _internal，那里只有 example，本接口会恒定报 missing，
+    # 前端每次启动都弹配置向导，且报告的不是真正生效的那份配置。
+    config_path = _resolve_user_config_path()
+    example_config_path = next(
+        (
+            p
+            for p in (
+                DATA_ROOT / "config" / "config.example.toml",
+                PROJECT_ROOT / "config" / "config.example.toml",
+                BUNDLE_ROOT / "config" / "config.example.toml",
+            )
+            if p.exists()
+        ),
+        None,
+    )
 
     if config_path.exists():
         return {"status": "exists"}
-    elif example_config_path.exists():
+    elif example_config_path is not None:
         try:
             with open(example_config_path, "rb") as f:
                 example_config = tomllib.load(f)
@@ -302,10 +339,12 @@ async def check_config_status():
 @app.post("/config/save")
 async def save_config(config_data: dict = Body(...)):
     try:
-        config_dir = Path(__file__).parent / "config"
-        config_dir.mkdir(exist_ok=True)
-
-        config_path = config_dir / "config.toml"
+        # 存到可写侧。原先写进 _internal/config：用户在文件管理器里找不到，
+        # 升级覆盖 _internal 就丢，而且 config 查找是可写侧优先——一旦别处也有
+        # config.toml，这份会被永久静默忽略，表现为「保存成功但不生效」。
+        config_path = _resolve_user_config_path()
+        config_dir = config_path.parent
+        config_dir.mkdir(parents=True, exist_ok=True)
 
         toml_content = ""
 
@@ -438,8 +477,10 @@ async def collect_enumerate(status: str = Body("", embed=True),
         prefs.get("sheet", ""), prefs.get("store", ""), tab,
         region_label=region or "",
     )
-    # 区域问题（读不到 / 目标区域不存在 / 切过去后复核失败）是可操作的用户侧问题，
-    # 不是服务异常：回 409 + 明确文案，让前端红条提示，而不是抛 500 堆栈。
+    # 区域/页签问题（没开商品列表页 / 显式指定的区域不存在 / 切过去后复核失败）是可操作的
+    # 用户侧问题，不是服务异常：回 409 + 明确文案，让前端红条提示，而不是抛 500 堆栈。
+    # 注意采集本身已不再要求「先确认区域」——留空区域时按各页签所在域名归类，不会因读不到
+    # 顶栏而 409（见 collect_service.enumerate_worklist）。
     try:
         count = await collect_service.enumerate_worklist(
             status_tab=tab, region_label=region or "")
@@ -824,7 +865,9 @@ def open_local_browser(config):
 
 def load_config():
     try:
-        config_path = Path(__file__).parent / "config" / "config.toml"
+        # 冻结后入口脚本的 __file__ 指向 _internal 里的解包路径，推不出用户实际
+        # 编辑的那份配置；PROJECT_ROOT 在冻结态即 exe 所在目录，开发态即项目根。
+        config_path = PROJECT_ROOT / "config" / "config.toml"
 
         if not config_path.exists():
             return {"host": "localhost", "port": 5172}

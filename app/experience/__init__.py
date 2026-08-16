@@ -13,7 +13,7 @@
 
 from typing import List, Optional
 
-from app.config import PROJECT_ROOT, config
+from app.config import DATA_ROOT, config
 from app.experience.recorder import distill_recipe
 from app.experience.store import Recipe, RecipeStore
 from app.logger import logger
@@ -28,8 +28,10 @@ __all__ = [
     "RecipeStore",
 ]
 
-# 经验库持久化路径：<project>/experience/recipes.jsonl
-_RECIPES_PATH = PROJECT_ROOT / "experience" / "recipes.jsonl"
+# 经验库持久化路径：<data>/experience/recipes.jsonl
+# 用 DATA_ROOT 而非 PROJECT_ROOT：这是运行期不断追加的用户数据，冻结后若挂在
+# 安装目录下，装到 Program Files 就写不进去（store.save 会 PermissionError）。
+_RECIPES_PATH = DATA_ROOT / "experience" / "recipes.jsonl"
 
 # 模块级单例：load() 廉价（个人级几十~几百条），import 时即重建索引。
 store = RecipeStore(_RECIPES_PATH)

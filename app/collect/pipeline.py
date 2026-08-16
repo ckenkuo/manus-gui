@@ -30,8 +30,9 @@ import asyncio
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from app.collect.image_extract import extract_white_bg
 from app.config import config
@@ -811,10 +812,17 @@ async def collect_one_product(
 # 【勿再硬编码列】不同 Sheet（pawly美国/全球、wintak、VibeMakers…）的列序完全不同：
 # SPU 在 C 还是 D、图片在 D 还是 E、采购价在 I 还是 J、ros 在 O/P/Q…全不一样。写入列现在
 # 一律由 inspect 的「字段列映射」按【本 Sheet 真实表头】解析（见 WpsExcelTool._FIELD_RULES），
-# 公式列/常量输入列同样从 inspect 学出，天然适配任意 Sheet。
-# ros 兜底：多数 Sheet 的 ros 是稳定常量（会出现在 inspect 的「常量输入列」），少数逐商品变
-# （学不出常量）时用此默认值，保证 N=销售价/ros 之类公式不除空。
-_DEFAULT_ROS = 7
+# 公式/固定值只对明确的成本计算列仿写；平台清单没有的加速器参考价、叠加折扣保持空白。
+
+
+def _template_cell_value(text: Any) -> Any:
+    """历史模板格显示值 → 写回值；纯数字保持数值，百分比/文本保持原文。"""
+    value = str(text or "").strip()
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return int(number) if number == int(number) else number
 
 
 def _to_number(v) -> Optional[float]:
@@ -843,9 +851,12 @@ class SheetSchema:
 
     字段：
     - sheet：表名。
-    - fields：逻辑字段 → 列字母（spu/image/site/category/daily/sale/purchase/weight/ros/note）。
+    - fields：逻辑字段 → 列字母（spu/image/site/category/daily/discount/sale/purchase/weight/ros/note）。
     - formula_columns：公式列 → 模板（行号已换成 {r} 占位，随行自适应）。
-    - constant_columns：公式依赖的固定数值列（操作费/尾程等）→ 历史学出的常量。
+    - constant_columns：从同 Sheet 健康历史行继承的允许仿写固定值（空运头程、尾程、
+      广告、ros、成本、利润、毛利、操作费）。名称为兼容旧调用保留。
+    - format_columns：逐列学到的单元格格式（数字格式/对齐），写新行时回放，
+      新行才有和历史行一样的两位小数、百分比。云端专用（本地靠复制样式索引）。
     - ok / error：结构是否可写（解析不出 SPU 列即不可写，error 带原因）。
     - header_row：表头行号（1-based）。云端写行/判重需要它（新行插到表头正下方、
       公式行号 = header_row + 1）；本地路径用不上，默认 1 无影响。
@@ -855,6 +866,7 @@ class SheetSchema:
     fields: dict = field(default_factory=dict)
     formula_columns: dict = field(default_factory=dict)
     constant_columns: dict = field(default_factory=dict)
+    format_columns: dict = field(default_factory=dict)
     ok: bool = False
     error: str = ""
     header_row: int = 1
@@ -884,17 +896,22 @@ async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> Sheet
             error=f"无法在 Sheet「{sheet}」表头解析出 SPU 列（避免列错位，拒绝写入）",
         )
     image_col = fields.get("image")
+    # 逐商品写值的列不仿公式：本表「销售价格」这类列历史可能是 =参考价*折扣，仿走会把
+    # 平台申报价顶掉（见 wps_excel_tool._ITEM_INPUT_FIELDS 的注释）。云端同口径。
+    item_cols = WpsExcelTool.item_input_columns(fields)
 
-    # 公式列：sample 里 = 开头、非图片列、且不含 DISPIMG。把公式里【所有相对单元格引用】的
-    # 行号换成 {r} 占位符，_append 的 .format(r=新行号) 才能让公式随行自适应；否则新行公式
-    # 冻在旧行号。
+    # 公式列：sample 里 = 开头、非图片列、非逐商品写值列、且不含 DISPIMG。把公式里
+    # 【所有相对单元格引用】的行号换成 {r} 占位符，_append 的 .format(r=新行号) 才能让公式
+    # 随行自适应；否则新行公式冻在旧行号。
     # 【关键教训】不能假设引用行号=最后数据行去替换：采样行本身可能是历史坏行、公式冻在更早
     # 行号 → 按【实际出现的引用行号】通配替换，谁在换谁。
     # (?<![A-Za-z$]) 避开函数名尾随数字与绝对引用（$G$1）；常数（如 *80，无字母前缀）不误伤。
     sample = info.get("sample_最后行公式与值", {})
     formula_columns = {}
     for c, f in sample.items():
-        if c == image_col or not isinstance(f, str) or not f.startswith("="):
+        if c == image_col or c in item_cols:
+            continue
+        if not isinstance(f, str) or not f.startswith("="):
             continue
         if "DISPIMG" in f:  # 坏行把嵌入图落到了普通列 → 别当公式复制
             continue
@@ -904,7 +921,9 @@ async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> Sheet
         sheet=sheet,
         fields=fields,
         formula_columns=formula_columns,
-        constant_columns=info.get("常量输入列", {}) or {},
+        constant_columns=(
+            info.get("模板输入列", {}) or info.get("常量输入列", {}) or {}
+        ),
         ok=True,
     )
 
@@ -912,7 +931,7 @@ async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> Sheet
 def _build_column_values(item: dict, res: CollectResult, schema: SheetSchema) -> dict:
     """构造新行的 {列字母: 值}（不含公式列），本地/云端两个写入口共用。
 
-    含：采购价=货价+运费、售价剥¥转数字、重量克→公斤、常量输入列回填、ros 兜底、
+    含：采购价=货价+运费、售价剥¥转数字、重量克→公斤、成本语义列的历史固定值回填、
     存疑备注列。字段没解析到的列跳过，不误写。公式列由调用方按各自行号规则补上
     （本地是 _append 复制样式时 format，云端是写前 format(r=header_row+1)）。
     """
@@ -924,6 +943,9 @@ def _build_column_values(item: dict, res: CollectResult, schema: SheetSchema) ->
     else:
         purchase_cell = ""
     # 价格剥¥转数字（否则 折扣=销售价/日常价 公式崩）；解析不出则留空、不写脏字符串。
+    # item["price"] 现在是【该 SKU 自己的申报价】（枚举时从 siteSupplierPriceList 取）。
+    # 改造前这里拿的是 SPU 级 supplierPrice，对多 SKU 商品是区间串 "60.00~299.68¥"，
+    # 被下面的 _to_number 正则静默截成下限——实测 128 个商品里 89 个销售价因此写错。
     sale_price = _to_number(item.get("price"))
     sale_cell = sale_price if sale_price is not None else ""
     # 重量：judge_price 返回【克】，本表重量列是【公斤】（历史 0.3kg→空运头程=K*80+1=25 吻合），克÷1000。
@@ -934,6 +956,14 @@ def _build_column_values(item: dict, res: CollectResult, schema: SheetSchema) ->
             weight_cell = ""
     else:
         weight_cell = ""
+
+    # 货号列＝逐 SKU 标识：清单已是一个 SKU 一行（见 service._FETCH_ALL_JS），同一 SPU 会
+    # 占多行、SPU 列必然重复，必须靠它区分。
+    # 写【纯规格值】（如 `奶白+黑色/10双`）而不是 skuId：这列本来就是人工在记规格，历史值
+    # 形如「5双」「直径32CM」「单人」，塞一串平台 skuId 进去会让新旧行风格割裂、也没法人工核对。
+    # 判重因此认这串文本（见 service.dedupe_key），代价是平台改文案会多写一行。
+    # 没有 sku_spec（老清单/无 SKU 结构）就不写这列，行为与改造前一致。
+    sku_cell = str(item.get("sku_spec") or "").strip()
 
     # 按解析出的真实列填逐商品字段（字段没解析到就跳过该列，不误写）。
     column_values = {}
@@ -946,19 +976,16 @@ def _build_column_values(item: dict, res: CollectResult, schema: SheetSchema) ->
         "purchase": purchase_cell,
         "weight": weight_cell,
     }
+    if sku_cell:
+        _field_val["sku"] = sku_cell
     for fname, val in _field_val.items():
         col = fields.get(fname)
         if col:
             column_values[col] = val
 
-    # 常量输入列（公式依赖的固定数值：操作费/尾程/ros 等），从历史行学出并回填，
-    # 否则新行这些格留空会让成本/利润公式算错。逐商品输入列不会出现在这里（已被 inspect 排除）。
+    # 只回填 schema 明确筛选出的允许仿写列。加速器参考价、叠加折扣等不在其中，保持空白。
     for col, cval in schema.constant_columns.items():
         column_values.setdefault(col, cval)
-    # ros 列若既非学出的常量、也还没被填（逐商品变的 Sheet）→ 用默认值兜底，避免除空。
-    ros_col = fields.get("ros")
-    if ros_col and ros_col not in column_values:
-        column_values[ros_col] = _DEFAULT_ROS
 
     note = res.note or ""
     note_col = fields.get("note")
@@ -1029,56 +1056,95 @@ async def resolve_sheet_schema_cloud(cloud, sheet: str) -> SheetSchema:
 
     sample = await asyncio.to_thread(cloud.read_data_sample, sheet, header_row)
 
-    # 公式列：逐列取采样行里第一条 fmlaText（跳过图片列与含 DISPIMG 的坏行污染），
-    # 行号模板化与本地同一正则（见 resolve_sheet_schema 的注释）。
-    formula_columns = {}
+    # 先枚举采样区里真实公式列。随后不是盲取第一/最后一行，而是选出「公式最齐、公式依赖
+    # 输入最完整」的健康历史行作模板，避免刚写坏的新行反过来污染下一批。
+    # 公式列【不受成本列白名单限制】（与本地 _inspect 同口径）：公式是本表的计算逻辑，
+    # 按标题表去卡会让改过列名/多加一列计算列的 Sheet 整列丢公式。
+    mimic_cols = WpsExcelTool.collect_mimic_columns(header)
+    item_cols = WpsExcelTool.item_input_columns(fields)
+    formula_candidates = {}
     for row in sample:
         for col, cell in row.items():
-            if col in formula_columns or col == image_col:
+            if col == image_col or col in item_cols:
                 continue
             f = cell.get("formula") or ""
             if not f.startswith("=") or "DISPIMG" in f:
                 continue
-            formula_columns[col] = re.sub(
-                r"(?<![A-Za-z$])([A-Z]{1,3})\d+", r"\1{r}", f
-            )
+            formula_candidates.setdefault(col, f)
 
-    # 常量输入列：公式引用到、但本身不是公式列也不是逐商品字段列的列；采样行里该列
-    # 非空 cellText 全是同一个纯数字 → 收为常量（本地 _scan_numeric_constants 的简化版：
-    # 采样只有约 10 行，样本少故用「全同」的严口径，避免把逐行变化的列误当常量）。
-    referenced = set()
-    for tpl in formula_columns.values():
-        referenced.update(
-            re.findall(r"(?<![A-Za-z$])([A-Z]{1,3})(?:\{r\}|\d+)", tpl)
+    # 照抄历史固定值仍只在成本语义白名单内——数据形态区分不了「尾程运费」和
+    # 「加速器参考价格」，只有标题能（见 wps_excel_tool._COLLECT_MIMIC_TITLES）。
+    template_input_cols = mimic_cols - set(formula_candidates) - item_cols
+
+    def row_score(row: dict) -> tuple:
+        formulas = sum(
+            1 for col in formula_candidates
+            if str((row.get(col) or {}).get("formula") or "").startswith("=")
         )
-    field_cols = {
-        fields.get(k)
-        for k in ("spu", "image", "site", "category", "daily", "sale",
-                  "purchase", "weight", "note")
+        inputs = sum(
+            1 for col in template_input_cols
+            if str((row.get(col) or {}).get("text") or "").strip()
+        )
+        populated = sum(
+            1 for cell in row.values()
+            if str(cell.get("text") or cell.get("formula") or "").strip()
+        )
+        return formulas, inputs, populated
+
+    template_row = max(sample, key=row_score, default={})
+    formula_columns = {}
+    # 优先拿同一健康模板行的公式，缺列才退回采样区其它行；保证整套逻辑来自同一行。
+    for col in formula_candidates:
+        f = (template_row.get(col) or {}).get("formula") or formula_candidates[col]
+        formula_columns[col] = re.sub(
+            r"(?<![A-Za-z$])([A-Z]{1,3})\d+", r"\1{r}", f
+        )
+
+    constant_columns = {
+        col: _template_cell_value(template_row[col]["text"])
+        for col in sorted(template_input_cols)
+        if col in template_row and template_row[col].get("text", "").strip()
     }
-    field_cols.discard(None)
-    constant_columns = {}
-    for col in sorted(referenced - set(formula_columns) - field_cols):
-        texts = [
-            row[col]["text"].strip()
-            for row in sample
-            if col in row and row[col]["text"].strip()
-        ]
-        if not texts:
-            continue
-        try:
-            nums = {float(t) for t in texts}
-        except ValueError:
-            continue
-        if len(nums) == 1:
-            n = nums.pop()
-            constant_columns[col] = int(n) if n == int(n) else n
+    # 数字格式/对齐：按【同列多行投票取最常见的那个】，不用「模板行优先」。
+    # 理由是实测出来的：模板行往往就是上一批管线写的行，而管线此前根本没回放过格式
+    # （读侧字段名认错，见 kdocs_sheet.read_cell_xf），那行自己就是「无格式」——
+    # 拿它当基准等于把没格式一代代继承下去。同列投票天然绕开这类行。
+    #
+    # 【数字格式与对齐分开投票】否则「没设数字格式」的行会连带压掉真实格式：实测
+    # 广告列只有部分历史行带 0.00_，整字典投票时「只有对齐」那一版反而赢，新行又
+    # 退回通用格式。而管线自己写出来的行恰恰是「只有对齐、没有数字格式」那一类，
+    # 让它们参与数字格式的投票等于让历史包袱决定新行长什么样。
+    numfmt_votes: Dict[str, Counter] = {}
+    align_votes: Dict[str, Counter] = {}
+    for row in sample:
+        for col, cell in row.items():
+            if col == image_col:
+                continue
+            fmt = cell.get("format")
+            if not isinstance(fmt, dict) or not fmt:
+                continue
+            if fmt.get("numfmt"):
+                numfmt_votes.setdefault(col, Counter())[fmt["numfmt"]] += 1
+            align = {k: fmt[k] for k in ("alcH", "alcV") if k in fmt}
+            if align:
+                key = json.dumps(align, sort_keys=True)
+                align_votes.setdefault(col, Counter())[key] += 1
+
+    format_columns = {}
+    for col in set(numfmt_votes) | set(align_votes):
+        xf = {}
+        if col in align_votes:
+            xf.update(json.loads(align_votes[col].most_common(1)[0][0]))
+        if col in numfmt_votes:
+            xf["numfmt"] = numfmt_votes[col].most_common(1)[0][0]
+        format_columns[col] = xf
 
     return SheetSchema(
         sheet=sheet,
         fields=fields,
         formula_columns=formula_columns,
         constant_columns=constant_columns,
+        format_columns=format_columns,
         ok=True,
         header_row=header_row,
     )
@@ -1159,8 +1225,12 @@ def _cloud_row(item: dict, res: CollectResult, schema: SheetSchema,
         values[col] = tpl.format(r=first_row + offset)
     return {
         "values": values,
+        "formats": schema.format_columns,
         "image_column": schema.fields.get("image"),
-        "image_url": item.get("image"),
+        # 优先用该 SKU 自己的预览图：一个 SKU 一行后，同 SPU 的不同颜色行若都嵌 SPU 主图，
+        # 表里看不出行与行的差别。sku_image 在枚举时已按 skuPreviewImage → SKC 预览图 →
+        # SPU 主图逐级取好（见 service._FETCH_ALL_JS），这里只兜老清单没有该字段的情况。
+        "image_url": item.get("sku_image") or item.get("image"),
     }
 
 

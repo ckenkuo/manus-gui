@@ -52,7 +52,16 @@ MANIFEST
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
-*.spec
+# *.spec  # 注释掉，我们需要提交 manus.spec
+
+# 打包生成的文件和目录
+build/
+dist/
+installer_output/
+updates/
+config_backup_*/
+version.json
+*.exe
 
 # Installer logs
 pip-log.txt

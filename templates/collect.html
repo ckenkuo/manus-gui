@@ -102,10 +102,19 @@
             <div class="text-muted small">已入库</div>
           </div>
         </div>
-        <div class="col-6 col-md-3">
+        <div class="col-12 col-md-3">
           <div class="stat-card p-3 text-center">
-            <div class="stat-num text-primary" id="statTodo">–</div>
-            <div class="text-muted small">待采</div>
+            <div class="text-muted small mb-1">待采</div>
+            <div class="d-flex justify-content-center gap-4">
+              <div>
+                <div class="stat-num text-primary" id="statTodoSpu">–</div>
+                <div class="text-muted small">SPU 总数</div>
+              </div>
+              <div>
+                <div class="stat-num text-primary" id="statTodoSku">–</div>
+                <div class="text-muted small">SKU 数量</div>
+              </div>
+            </div>
           </div>
         </div>
         <div class="col-6 col-md-3">
@@ -224,14 +233,15 @@
               title="默认「跟随页面当前」：页签+类目/站点/商品名等筛选都在 Temu 页面设好，枚举时点页面「查询」原样采集。选具体页签则先替你切该页签（可能重置详细筛选）"
             ></select>
           </div>
-          <!-- 区域以这里选的为准：枚举时若浏览器停在别的区域，会先替你切过去再采
-               （区域切换是换域名的整页跳转，见 app/temu_region.py） -->
+          <!-- 留空（默认）＝完全不碰浏览器：每个列表页签按自己所在的域名归类，同时开着
+               全球和美国的页签也能一次采完。选具体区域＝主动把页签切过去（换域名的整页跳转，
+               见 app/temu_region.py） -->
           <div class="input-group input-group-sm" style="width: 240px">
             <span class="input-group-text">区域</span>
             <select
               id="selRegion"
               class="form-select"
-              title="以这里选的区域为准：枚举时浏览器若停在别的区域，会先替你切过去再采。选「跟随浏览器当前」则用浏览器此刻所在的区域"
+              title="默认「不切换」：采集就在你已打开的页签里进行，页签在哪个区域就采哪个区域，可同时开多个区域的页签。选具体区域＝枚举前先把这些页签切过去"
             ></select>
           </div>
           <button id="btnRefresh" class="btn btn-outline-secondary btn-sm">
@@ -487,7 +497,8 @@
       function renderStats(s) {
         $("statTotal").textContent = s.total;
         $("statDone").textContent = s.done == null ? "–" : s.done;
-        $("statTodo").textContent = s.todo;
+        $("statTodoSpu").textContent = s.todo_spu ?? s.todo;
+        $("statTodoSku").textContent = s.todo_sku ?? s.todo;
         $("lockAlert").classList.toggle("d-none", !s.excel_locked);
         // 云端模式读失败（kdocs-cli 没装上/未认证/链接无效）→ 红条直接显示原因
         $("cloudAlert").classList.toggle("d-none", !(s.cloud && s.cloud_error));
@@ -574,15 +585,16 @@
       }
 
       // 区域下拉：候选只能从页面读（账号能看到哪些区域随权限变，代码里写死就是猜）。
-      // 首项 value="" ＝跟随浏览器当前区域；其余是顶栏实际可见的区域。
+      // 首项 value="" ＝不切换，各页签按自己所在区域采；其余是顶栏实际可见的区域。
       // 「商家中心」不是业务区域（没有商品列表），从候选里剔掉，免得选了采不到东西。
+      // 读不到候选不影响采集：区域归类走页签域名，这个下拉只是「主动切区域」的入口。
       function renderRegionSelect(s) {
         const box = $("selRegion");
         if (!box) return;
         const r = s.region || {};
         const want = s.region_label || "";
         const opts = (r.options || []).filter((x) => x !== "商家中心");
-        const curTip = r.current ? `跟随浏览器当前（${r.current}）` : "跟随浏览器当前";
+        const curTip = r.current ? `不切换（当前 ${r.current}）` : "不切换（按页签所在区域）";
         box.innerHTML =
           `<option value=""${want === "" ? " selected" : ""}>${esc(curTip)}</option>` +
           opts
@@ -591,11 +603,12 @@
                 `<option value="${esc(t)}"${t === want ? " selected" : ""}>${esc(t)}</option>`
             )
             .join("");
-        // 读不到区域时把原因挂在 title 上，不弹红条——浏览器没开是常态，
-        // 真正需要区域时（点枚举）后端会回 409 带可操作文案
+        // 读不到区域名时把原因挂在 title 上，不弹红条：采集不依赖它（区域归类走页签域名），
+        // 读不到只是没法在这里主动切区域而已
         box.title = r.error
-          ? `读不到区域：${r.error}。请在调试 Chrome 里打开 Temu 后台页面`
-          : "以这里选的区域为准：枚举时浏览器若停在别的区域，会先替你切过去再采";
+          ? `读不到区域名：${r.error}。不影响采集——采集按页签所在域名归类；`
+            + `想主动切区域才需要它，请在调试 Chrome 里打开 Temu 后台页面`
+          : "默认「不切换」：采集就在你已打开的页签里进行。选具体区域＝枚举前先把页签切过去";
       }
 
       // 当前选中的文档模式；首屏未渲染时返回空串＝让后端按上次选择决定
@@ -603,7 +616,7 @@
         return document.querySelector('input[name="docMode"]:checked')?.value || "";
       }
 
-      async function loadWorklist() {
+      async function loadWorklist({ syncCollectLimit = false } = {}) {
         try {
           const qs = new URLSearchParams({
             excel: sel.excel,
@@ -626,6 +639,11 @@
           $(s.doc_mode === "cloud" ? "docModeCloud" : "docModeLocal").checked = true;
           fillSelectors(s);
           renderStats(s);
+          if (syncCollectLimit) {
+            const maxCollectible = Math.max(0, Number(s.todo_sku ?? s.todo) || 0);
+            $("inputLimit").max = String(Math.max(1, maxCollectible));
+            $("inputLimit").value = String(maxCollectible);
+          }
           renderTable();
           updateStartEnabled();
         } catch (e) {
@@ -636,8 +654,13 @@
       // 未选 Sheet 时禁用「开始采集」（无处判重/写入）
       function updateStartEnabled() {
         const noSheet = !sel.sheet;
-        $("btnStart").disabled = noSheet;
-        $("btnStart").title = noSheet ? "请先选目标 Sheet" : "";
+        const noTodo = Number(lastStatus?.todo_sku ?? lastStatus?.todo ?? 0) <= 0;
+        $("btnStart").disabled = noSheet || noTodo;
+        $("btnStart").title = noSheet
+          ? "请先选目标 Sheet"
+          : noTodo
+          ? "当前没有待采 SKU"
+          : "";
       }
 
       // ---- 事件处理：把 service 的结构化事件映射到 UI ----
@@ -704,7 +727,11 @@
           showToast("无法开始", "请先选择目标 Sheet", "warning");
           return;
         }
-        const limit = parseInt($("inputLimit").value, 10) || 20;
+        const limit = parseInt($("inputLimit").value, 10);
+        if (!Number.isInteger(limit) || limit < 1) {
+          showToast("无法开始", "当前没有可采 SKU，或数量不是有效正整数", "warning");
+          return;
+        }
         const auto1688 = $("switchAuto1688").checked;
         const usePipeline = $("switchPipeline").checked;
         $("btnStart").disabled = true;
@@ -764,7 +791,7 @@
           const scope = sel.status ? `切到「${sel.status}」` : "跟随页面当前";
           const rg = sel.region ? `区域「${sel.region}」，` : "";
           showToast("枚举完成", `${rg}${scope}，共 ${data.count} 个商品`, "success");
-          await loadWorklist();
+          await loadWorklist({ syncCollectLimit: true });
         } catch (e) {
           showToast("枚举失败", String(e), "danger");
         } finally {

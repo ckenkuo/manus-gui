@@ -30,6 +30,7 @@ import inspect
 import json
 import os
 import tomllib
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Optional, Union
 
 from playwright.async_api import async_playwright
@@ -41,16 +42,21 @@ if TYPE_CHECKING:
 
 from app.agent.manus import Manus
 from app.cloud_docs import remember as remember_cloud_doc
-from app.config import PROJECT_ROOT, config
+from app.config import PROJECT_ROOT, config, config_search_dirs
 from app.logger import logger
 
 # 区域未确认异常与活动/订单侧共用同一个类型，三条管线的 UI/CLI 可用同一套 except 转成
 # 「去浏览器里选好区域」的提示。沿用采集侧原有名字，调用方无需改名。
+# host_of 是采集侧的区域主力：区域就是域名，从页签 URL 直接取，不必探测顶栏（见
+# _enumerate_one_store）。read_region 只用来读那个供 UI 显示的中文名，best-effort。
 from app.temu_region import RegionUnconfirmed as RegionNotConfirmed
+from app.temu_region import host_of, read_region
 from app.tool.wps_excel_tool import WpsExcelTool
 
 # 采集目标出厂默认（偏好文件缺失时兜底；工作簿/Sheet 现已可在 UI/CLI 选择）
-DEFAULT_EXCEL = r"C:\Users\Administrator\Desktop\商品成本核算_原始备份.xlsx"
+# 按当前用户的桌面拼，不写死用户名：原先硬编码 C:\Users\Administrator\... 是打包机的
+# 路径，换机器/换账号必然指向不存在的文件，分发出去第一次采集就报错。
+DEFAULT_EXCEL = str(Path.home() / "Desktop" / "商品成本核算_原始备份.xlsx")
 DEFAULT_SHEET = "pawly全球"
 # 商品列表页【路径】。刻意不留完整 URL：域名随区域变（全球 agentseller.temu.com、
 # 美国 agentseller-us.temu.com），留个全球域常量，早晚有代码拿它 goto，把操作者选定的
@@ -92,17 +98,19 @@ def load_collect_config() -> dict:
     随仓库分发的 example 充当默认值（占位空值），用户在 config.toml 写了就完全覆盖。
     解析失败只告警返回 {}，由调用方按「无云端目标」走本地路径。
     """
-    for name in ("config.toml", "config.example.toml"):
-        p = PROJECT_ROOT / "config" / name
-        if not p.exists():
-            continue
-        try:
-            with p.open("rb") as f:
-                section = tomllib.load(f).get("collect") or {}
-            if section:
-                return section
-        except Exception as e:
-            logger.warning(f"读 {name} 的 [collect] 配置失败：{e}")
+    # 目录维度也要遍历：冻结后 example 只存在于随包只读侧（_internal/config）。
+    for cfg_dir in config_search_dirs():
+        for name in ("config.toml", "config.example.toml"):
+            p = cfg_dir / name
+            if not p.exists():
+                continue
+            try:
+                with p.open("rb") as f:
+                    section = tomllib.load(f).get("collect") or {}
+                if section:
+                    return section
+            except Exception as e:
+                logger.warning(f"读 {p} 的 [collect] 配置失败：{e}")
     return {}
 
 
@@ -357,6 +365,116 @@ def spu_col_of(excel: str, sheet: str) -> str:
     return WpsExcelTool.spu_column(excel, sheet, default="D")
 
 
+def dedupe_key(spu, sku="") -> str:
+    """把（SPU, 规格文本）归一成判重键 `SPU|规格`。清单侧与读表侧共用同一个口径。
+
+    货号列存的就是规格文本（如 `奶白+黑色/10双`，见 pipeline._build_column_values），
+    两侧都用本函数造键，键与写入值同源、不会各写一套悄悄漂移（对齐 orders 的 dedupe_key）。
+
+    【只 strip、不做别的归一】规格串里空格是有意义的（实测有「1-2 Pack Black/Large-X-Large」
+    这种），不能按空格截断；大小写与全半角也照原样比——平台给什么就是什么，自作主张归一
+    反而会把两个真不同的规格并成一个。
+    代价是平台改文案（"10双"→"10 双"）会让同一个 SKU 算成新键、多写一行；这是选「纯规格值
+    货号」换来的，取舍见本次改动的决策记录。
+    """
+    return f"{str(spu or '').strip()}|{str(sku or '').strip()}"
+
+
+def worklist_key(it: dict) -> str:
+    """清单条目 → 判重键。老清单没有 sku_spec 时退化成 `SPU|`，与纯 SPU 判重等价。"""
+    return dedupe_key(it.get("spu"), it.get("sku_spec"))
+
+
+def done_flags(items: list, done: set) -> list:
+    """逐行判「是否已入库」，返回与 items 等长的布尔列表。两条规则叠加：
+
+    ① **组合键精确命中**（`SPU|规格` 已在表里）→ 已入库。这是常规判重。
+
+    ② **历史 SPU 整体跳过**：表里已有该 SPU 的行，但那些行的货号没有一个能对上本清单里
+       该 SPU 的任何规格 → 判定它们是改造前的人工行，整个 SPU 跳过。
+       为什么需要这条：历史行是「一个 SPU 一行」，货号由人手填（实测 wintak美国 是「5双」、
+       pawly全球 是「直径32CM」「单人」），与本管线生成的规格串对不上，纯按组合键判重会把
+       整表 388 行全判成待采、重写一遍。操作者选定的口径是「跳过已有 SPU」。
+
+    【为什么用「有没有交集」而不是「SPU 在不在表里」】后者会误伤分批采集：本管线第一批
+    写了某 SPU 的 2 个规格，第二批时该 SPU 已在表里，剩下的规格就永远补不上了。
+    改用交集判据后，只要表里有一行是本管线写的（货号能对上清单里的某个规格），就说明这个
+    SPU 正在被本管线采，此时只跳过精确命中的那几行，其余规格照采。
+    """
+    sheet_specs: dict = {}
+    for k in done:
+        spu, _, spec = str(k).partition("|")
+        sheet_specs.setdefault(spu, set()).add(spec)
+
+    list_specs: dict = {}
+    for it in items:
+        list_specs.setdefault(str(it.get("spu") or "").strip(), set()).add(
+            str(it.get("sku_spec") or "").strip()
+        )
+
+    flags = []
+    for it in items:
+        spu = str(it.get("spu") or "").strip()
+        in_sheet = sheet_specs.get(spu)
+        if worklist_key(it) in done:
+            flags.append(True)
+        elif in_sheet and not (in_sheet & list_specs.get(spu, set())):
+            flags.append(True)  # 表里是历史人工行 → 整个 SPU 跳过
+        else:
+            flags.append(False)
+    return flags
+
+
+def existing_keys(
+    excel: str,
+    sheet: str,
+    cloud=None,
+    fields: Optional[dict] = None,
+    header_row: int = 1,
+) -> set:
+    """读目标表已入库的判重键集合 `{"SPU|skuId"}`；本地/云端只在最后一步分叉。
+
+    【为什么必须是组合键】2026-08-11 起清单是一个 SKU 一行，同一 SPU 占多行、SPU 列必然
+    重复。仍按纯 SPU 判重的话，该商品第一行写进去之后，其余规格全被判成"已入库"跳过——
+    一个商品永远只落一行，正是要修的症状。
+
+    货号列不存在（老表没这列）→ 退回纯 SPU 判重（键的 SKU 位为空），与改造前行为一致。
+    读表失败由底层各自吞成空集（判重失效只会多写、不会写坏表），此处不另加 try。
+
+    header_row：云端是 0-based、本地是 1-based（两边底层约定不同，别传串）。
+    """
+    if fields is None:
+        fields = (
+            WpsExcelTool._resolve_fields_from_header(cloud.read_header(sheet)[0])
+            if cloud is not None
+            else WpsExcelTool.resolve_field_columns(excel, sheet)
+        )
+    spu_col = fields.get("spu") or (
+        None if cloud is not None else spu_col_of(excel, sheet)
+    )
+    if not spu_col:
+        return set()
+    sku_col = fields.get("sku")
+
+    if cloud is not None:
+        rows = (
+            cloud.existing_key_tuples(sheet, [spu_col, sku_col], header_row)
+            if sku_col
+            else [(v,) for v in cloud.existing_key_values(sheet, spu_col, header_row)]
+        )
+    else:
+        rows = (
+            WpsExcelTool.existing_key_tuples(
+                excel, sheet, [spu_col, sku_col], header_row)
+            if sku_col
+            else [
+                (v,) for v in WpsExcelTool.existing_key_values(
+                    excel, sheet, spu_col, header_row)
+            ]
+        )
+    return {dedupe_key(*r) for r in rows}
+
+
 def list_workbooks() -> list:
     """列出可选工作簿（桌面 + 桌面输出根目录下的 .xlsx），按修改时间倒序。
 
@@ -407,6 +525,20 @@ def list_workbooks() -> list:
 # （由 _enumerate_one_store 抓包传入），只把 pageNum/pageSize 覆盖掉逐页翻。这样筛选条件
 # （secondarySelectStatusList 等，即你选的页签）完全跟随当前页面，不再写死「已发布到站点」。
 # url/body 任一没抓到就返回空（best-effort，交上层「0 条不覆盖」护栏兜底），绝不猜接口/造 body。
+#
+# 【2026-08-11 改·一个 SKU 一条】原先每个商品只出一条、价取 SPU 级 `it.supplierPrice`。
+# 实测（128 商品 / 388 SKU）那个字段对多 SKU 商品是【价格区间串】如 "60.00~299.68¥"，
+# 写入时被 pipeline._to_number 的正则截成下限 60.0——128 个商品里 89 个（70%）销售价是错的。
+# 样本 SPU 7948115685（蕾丝袜 2/4/6/8/10 双装）表里写 60，而 10 双装实际 299.68。
+#
+# 逐 SKU 真价挂在 `skcList[].skuList[].siteSupplierPriceList[]`（按站点分列），实测：
+#   - 388/388 的 SKU 都有这个数组，且每个 SKU 恒为 1 条（不存在一 SKU 多站点价）
+#   - 388/388 的 siteName 与 SPU 级 siteName 一致
+#   - sku.supplierPrice / sku.weight / extCode 基本全空，别指望它们（extCode 仅 4/388 非空）
+# 故按 SPU 站点名匹配取那条，匹配不上退第一条；不硬编码 siteId（站点会增减）。
+#
+# skcList/skuList 缺失或为空 → 退回原来的「一个商品一条」（sku_id 留空），保住不比现在差；
+# 这是既有 best-effort 取向，不是另造备用分支。
 _FETCH_ALL_JS = r"""
 async ({mallid, url, body}) => {
   const out = [];
@@ -416,6 +548,18 @@ async ({mallid, url, body}) => {
   let tpl = {};
   try { tpl = JSON.parse(body); } catch (e) { return out; }
   const size = tpl.pageSize || 50;
+  // 取该 SKU 在本商品站点下的申报价：先按站点名匹配，匹配不上退第一条有价的。
+  const skuPrice = (sku, site) => {
+    const list = sku.siteSupplierPriceList || [];
+    const hit = list.find(x => x && String(x.siteName || '') === String(site || ''));
+    const pick = hit || list.find(x => x && x.supplierPrice);
+    return (pick && pick.supplierPrice) || '';
+  };
+  // 规格文本：只取属性【值】拼成「奶白+黑色/10双」，写进货号列。
+  // 【为什么不带属性名】这列本来就是人工在记规格，历史值形如「5双」「直径32CM」「单人」，
+  // 带上「颜色=…/数量=…」会让新旧行风格割裂。判重也认这串文本（见 service.dedupe_key）。
+  const skuSpec = (sku) => (sku.productPropertyList || [])
+      .map(p => String(p.value == null ? '' : p.value).trim()).filter(Boolean).join('/');
   for (let pageNum = 1; pageNum <= 40; pageNum++) {
     // 以捕获 body 为模板，仅覆盖翻页字段，保留其余筛选条件原样
     const payload = Object.assign({}, tpl, {pageNum, pageSize: size});
@@ -426,14 +570,35 @@ async ({mallid, url, body}) => {
     const j = await resp.json();
     const dl = (j.result && j.result.dataList) || [];
     for (const it of dl) {
-      out.push({
+      const site = it.siteName || (it.siteInfoList && it.siteInfoList[0] && it.siteInfoList[0].siteName) || '';
+      const base = {
         spu: String(it.productId),
         name: (it.productName || '').slice(0, 120),
-        site: it.siteName || (it.siteInfoList && it.siteInfoList[0] && it.siteInfoList[0].siteName) || '',
+        site,
         category: it.leafCategoryName || (Array.isArray(it.fullCategoryName) ? it.fullCategoryName[it.fullCategoryName.length - 1] : '') || '',
-        price: it.supplierPrice || '',
         image: (it.carouselImageUrlList && it.carouselImageUrlList[0]) || ''
-      });
+      };
+      let expanded = 0;
+      for (const skc of (it.skcList || [])) {
+        for (const sku of (skc.skuList || [])) {
+          if (!sku || sku.skuId === undefined || sku.skuId === null) continue;
+          out.push(Object.assign({}, base, {
+            sku_id: String(sku.skuId),
+            sku_spec: skuSpec(sku),
+            // 该 SKU 自己的申报价；读不到就留空（宁可空着待人工，也不写别的 SKU 的价）
+            price: skuPrice(sku, site),
+            // 不同颜色的 SKU 有各自预览图，缺则退回 SPU 主图
+            sku_image: sku.skuPreviewImage || (skc.previewImgUrlList && skc.previewImgUrlList[0]) || base.image
+          }));
+          expanded++;
+        }
+      }
+      if (!expanded) {
+        // 没有可用的 SKU 结构 → 退回一个商品一条（与改造前一致）
+        out.push(Object.assign({}, base, {
+          sku_id: '', sku_spec: '', price: it.supplierPrice || '', sku_image: base.image
+        }));
+      }
     }
     if (dl.length < size) break;  // 最后一页
   }
@@ -554,14 +719,15 @@ _CLICK_TAB_JS = r"""
 
 async def _enumerate_one_store(
     ctx, page, status_tab: str = "", allow_cookie_fallback: bool = False,
-    region: Optional["Region"] = None,
 ) -> tuple:
     """在单个 product-select 店铺标签内嗅 mallid + 抓该店当前筛选下的全部商品 + 读店名。
 
     返回 (mallid, store_label, items)。items 每条打上该店 mallid/store/region 标签。
 
-    region：调用方已确认的基准区域（见 confirm_active_region）。传入时每条商品都打上它，
-    使「同 mallid 跨区域」的数据在清单里可区分。
+    **区域直接取自本页签的域名**（`host_of(page.url)`）：区域就是域名（见 app/temu_region.py），
+    而页签 URL 天然带着它。这条路零探测、永不失败，也不需要「所有页签必须在同一区域」——
+    每个页签的商品各自打自己的 host，同时开着全球和美国两个页签也能一次采完、各归各的店铺键。
+    顶栏那个中文显示名（全球/美国）只用于 UI 显示，故 best-effort 读、读不到就留空。
     单店内任一步失败只告警、返回已拿到的部分（best-effort），不阻断其它店。
 
     触发方式：点页面自带的「查询」按钮，用表单里当前所有筛选（页签 + 类目/站点/商品名/时间…）
@@ -687,14 +853,22 @@ async def _enumerate_one_store(
     except Exception:
         pass
 
+    # 区域随每条商品落库：同一 mallid 在不同区域（全球/美国…）是不同的数据范围、通常也落
+    # 不同 Sheet，缺了这个维度就会被判成同一个店（见 app/temu_region.py）。
+    # host 从本页签 URL 直接取——区域就是域名，不必探测顶栏，也不会失败。
+    region_host = host_of(getattr(page, "url", "") or "")
+    # 显示名仅供 UI 展示（店铺下拉里的「WINTAK · 全球」），读不到就空着，绝不阻断采集
+    region_label = ""
+    try:
+        region_label = (await read_region(page)).label
+    except Exception as e:
+        logger.warning(f"读顶栏区域显示名失败（仅影响 UI 显示，继续采集）：{e}")
+
     for it in items:
         it["mallid"] = mallid["v"] or ""
         it["store"] = store_label
-        # 区域随每条商品落库：同一 mallid 在不同区域（全球/美国…）是不同的数据范围、
-        # 通常也落不同 Sheet，缺了这个维度就会被判成同一个店（见 app/temu_region.py）。
-        if region is not None:
-            it["region"] = region.key
-            it["region_label"] = region.label
+        it["region"] = region_host
+        it["region_label"] = region_label
     return mallid["v"], store_label, items
 
 
@@ -730,69 +904,14 @@ async def peek_regions() -> dict:
         return {"error": str(e), "options": []}
 
 
-async def confirm_active_region(pages: list, want_label: str = "") -> "Region":
-    """采集前确认基准区域：所有 product-select 页签必须在【同一个区域】。
-
-    为什么必须先确认再采：区域是页面级过滤器，选了区域后商品数据自动限定在该区域。
-    代码这边什么都不用重建，但必须知道【是哪个区域】——否则同 mallid 跨区域的商品会
-    被归成同一个店、落进同一张 Sheet（本机 worklist 实测已出现全球/美国混装）。
-
-    want_label（UI 上选定的区域）非空时【以 UI 为准】：浏览器停在别的区域就替操作者切过去
-    并复核，省掉「去浏览器点一下再回来点开始」这一趟。为空则沿用浏览器当前区域，读不到
-    就抛 RegionNotConfirmed（不猜——猜错等于把别的区域的商品写进这张表）。
-
-    返回第一个页签的 Region 作为基准；后续每进一个新页签都要再比对一次（见 _check_region）。
-    """
-    from app.temu_region import read_region, region_conflict, switch_region
-
-    if not pages:
-        raise RegionNotConfirmed(
-            "没有打开任何 Temu 商品列表页（product-select）。请先在调试 Chrome 里打开"
-            "商品列表页，再开始采集。"
-        )
-
-    want = str(want_label or "").strip()
-    if want:
-        base = await switch_region(pages[0], want)
-    else:
-        base = await read_region(pages[0])
-        if not base.ok:
-            known = "、".join(base.labels) if base.labels else "未读到"
-            raise RegionNotConfirmed(
-                f"读不到当前区域（{base.describe()}；顶栏区域标签：{known}）。"
-                "请确认页面已加载完成、顶栏能看到区域标签（全球 / 美国 / 欧区），再重试。"
-            )
-
-    for page in pages[1:]:
-        conflict = region_conflict(base, await read_region(page))
-        if conflict:
-            # UI 指定了区域 → 把落后的页签也切过去，把环境对齐到 UI 的选择
-            if want:
-                await switch_region(page, want)
-                continue
-            raise RegionNotConfirmed(
-                f"{conflict}。多个商品列表页签处在不同区域时无法判断本批该采哪个区域，"
-                "请只保留你要采的那个区域的列表页，或把它们都切到同一区域后重试。"
-            )
-    logger.info(
-        f"已确认采集区域：{base.describe()}"
-        + (f"（该账号可见区域：{'、'.join(base.labels)}）" if base.labels else "")
-    )
-    return base
-
-
-async def _check_region(page, base: "Region", what: str) -> None:
-    """进入新页签/新页面后复核它仍在基准区域，不一致就抛 RegionNotConfirmed。
-
-    为什么每次都要复核：区域切换是换域名的整页跳转，采集过程里任何一次导航（或用户手动
-    点了顶栏）都可能把页签带到另一个区域，此后抓到的数据就不属于本批确认的范围了。
-    """
-    from app.temu_region import read_region, region_conflict
-
-    cur = await read_region(page)
-    conflict = region_conflict(base, cur)
-    if conflict:
-        raise RegionNotConfirmed(f"{what}：{conflict}。已中止，避免把别的区域的数据混入本批。")
+# 【已删除 confirm_active_region / _check_region（2026-08-11）】
+# 它们是采集前的「确认基准区域 + 逐页签复核同区域」关卡，读不到顶栏就抛 RegionNotConfirmed
+# 中止整批。删掉的理由：采集本来就在操作者已打开的页签里干活，页签停在哪个区域、采到的就是
+# 那个区域的数据；而区域就是域名，页签 URL 天然带着它（见 _enumerate_one_store 的 host 打标）。
+# 那道关卡想保护的「同 mallid 跨区域数据别混成一个店」，host 打标已经免费做到了，且不会因为
+# 顶栏没渲染完/页面往下滚（列表在内部容器里滚，顶栏会被平移出视口）而误报中止。
+# 顺带解除了「所有页签必须在同一区域」的限制：现在同时开着全球和美国的页签也能一次采完。
+# 显式切区域的能力保留在 temu_region.switch_region，仅当 UI/CLI 明确指定区域时才调。
 
 
 async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> int:
@@ -806,13 +925,20 @@ async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> in
     多店关键：mallid cookie 是 context 级、跨标签共享、只反映当前激活店，故【不能】靠
     cookie 区分店铺——必须逐标签从各自的网络请求头嗅 mallid（见 _enumerate_one_store）。
 
-    region_label：UI 上选定的区域，**以它为准**——浏览器停在别的区域就先切过去再采
-    （区域切换换域名，见 app/temu_region.py）。为空则沿用浏览器当前区域。确认到的区域会
-    打进每条商品，使同 mallid 跨区域的数据可区分。
+    **区域不再是前置关卡**（2026-08-11 改）：采集就在你已打开的那些页签里干活，页签停在哪个
+    区域、采到的就是那个区域的数据，而区域就是域名（见 app/temu_region.py），页签 URL 天然
+    带着它——所以每个页签各自按自己的 host 打标即可，不必先探测顶栏、更不必要求所有页签同区域。
+    原先那道「确认区域，读不到就中止」的关卡只会白白挡住采集：顶栏没渲染完、页面往下滚了
+    （列表在内部容器里滚，顶栏会被平移出视口）都能让它误报，而它拦下来保护的东西，host 打标
+    已经免费提供了。
+
+    region_label：仅当**显式指定**时才动浏览器——把各页签切到该区域再采（换域名的整页跳转）。
+    留空（默认，也是 UI 的默认）＝完全不碰页签，跟随它们当前所在的区域。
     """
     cdp = CDP_URL
     all_items: list = []
     store_count = 0
+    want_region = str(region_label or "").strip()
     async with async_playwright() as pw:
         browser = await pw.chromium.connect_over_cdp(cdp)
         ctx = browser.contexts[0]
@@ -821,32 +947,45 @@ async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> in
             store_pages = [
                 p for p in ctx.pages if PRODUCT_SELECT_PATH in (p.url or "")
             ]
-            # 采集前置动作：确认区域（UI 选了就切过去；读不到/切不动则抛，由 UI/CLI 提示）
-            region = await confirm_active_region(store_pages, region_label)
+            if not store_pages:
+                raise RegionNotConfirmed(
+                    "没有打开任何 Temu 商品列表页（product-select）。请先在调试 Chrome 里"
+                    "打开商品列表页，再开始采集。"
+                )
+            # 只有显式选了区域才切页签：这是操作者主动要求换区域作业，切不动就该如实报错
+            if want_region:
+                from app.temu_region import switch_region
+
+                for page in store_pages:
+                    await switch_region(page, want_region)
 
             for idx, page in enumerate(store_pages, 1):
-                # 逐页签复核：多店场景下每个页签都要确认还在基准区域，别串区域
-                await _check_region(page, region, f"第 {idx} 个商品列表页签")
                 mid, label, items = await _enumerate_one_store(
                     ctx, page, status_tab=status_tab,
-                    allow_cookie_fallback=len(store_pages) == 1, region=region,
+                    allow_cookie_fallback=len(store_pages) == 1,
                 )
                 store_count += 1
+                region_desc = (items[0].get("region_label") or "") if items else ""
                 logger.info(
-                    f"[店 {idx}/{len(store_pages)}] 区域={region.describe()} "
+                    f"[店 {idx}/{len(store_pages)}] "
+                    f"区域={region_desc or '(顶栏未读到)'}（{host_of(page.url or '')}） "
                     f"mallid={mid or '无'} 店名={label or '(未读到)'} 商品={len(items)}"
                 )
                 all_items.extend(items)
         finally:
             await browser.close()
 
-    # 合并去重：同一 spu 可能出现在不同店/不同区域 → 按 (店铺+区域, spu) 去重，各留一份
+    # 合并去重：同一 spu 可能出现在不同店/不同区域 → 按 (店铺+区域, spu, sku) 去重，各留一份
     # （可落不同 Sheet）。键必须含区域：同一 SPU 在全球区和美国区各有一条时，只按 mallid
     # 去重会误删掉其中一条（mallid 跨区域不变，见 _store_key）。
+    # 键还必须含 SKU：清单已是一个 SKU 一条（见 _FETCH_ALL_JS），只按 spu 去重会把同一
+    # 商品的其余规格全当重复项删掉，只剩第一个 SKU。老结构（无 sku_id）该位是空串，行为不变。
+    # 这里用 sku_id（平台主键）而非规格文本：同一商品下两个 SKU 规格文案偶有雷同，
+    # 用文本会在枚举阶段就把其中一个丢掉；判重落表用的才是规格文本（见 dedupe_key）。
     seen, uniq = set(), []
     for it in all_items:
         spu = it.get("spu")
-        key = (_store_key(it), spu)
+        key = (_store_key(it), spu, str(it.get("sku_id") or ""))
         if spu and key not in seen:
             seen.add(key)
             uniq.append(it)
@@ -932,7 +1071,7 @@ def get_worklist_status(
     store: Optional[str] = None,
     doc_mode: Optional[str] = None,
 ) -> dict:
-    """UI 展示用：返回清单总量 / 已入库 / 待采、可选工作簿/Sheet/店铺列表及每条状态。
+    """UI 展示用：返回清单总量 / 已入库 / 待采 SPU 与 SKU 数等状态。
 
     不触发任何采集，纯读 worklist.json + 已入库 SPU 集合，供 UI 渲染。
     - excel/sheet/store 均缺省回填「上次选择」偏好，再兜底出厂默认。
@@ -1011,9 +1150,11 @@ def get_worklist_status(
         if sheet_valid and not cloud_err:
             try:  # 云端判重：按真实表头定位 SPU 列（勿硬编码 D）
                 header, header_row = cloud.read_header(sheet)
-                spu_col = WpsExcelTool._resolve_fields_from_header(header).get("spu")
-                if spu_col:
-                    done = set(cloud.existing_key_values(sheet, spu_col, header_row))
+                fields = WpsExcelTool._resolve_fields_from_header(header)
+                if fields.get("spu"):
+                    done = existing_keys(
+                        excel, sheet, cloud=cloud, fields=fields, header_row=header_row
+                    )
             except Exception as e:
                 logger.warning(f"读协作文档判重水位失败：{e}")
                 cloud_err = str(e)
@@ -1021,22 +1162,27 @@ def get_worklist_status(
         sheets = WpsExcelTool.list_sheets(excel)
         # 选中的 sheet 若不在该工作簿里（换了工作簿导致失配）→ 视为未选
         sheet_valid = bool(sheet) and sheet in sheets
-        done = (
-            WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
-            if sheet_valid else set()
-        )
+        done = existing_keys(excel, sheet) if sheet_valid else set()
     # 选中的 store 若不在清单里（换清单）→ 视为未选（全部）
     store_valid = bool(store) and any(s["key"] == store for s in stores)
 
+    # 判重按 SPU|规格 组合键 + 历史 SPU 整体跳过（见 done_flags）：同一 SPU 的多个规格
+    # 各占一行，纯 SPU 比对会把后面的规格全算成已入库。
+    scoped = [
+        it for it in worklist
+        if not (store_valid and _store_key(it) != store)
+    ]
+    flags = done_flags(scoped, done) if sheet_valid else [False] * len(scoped)
+
     items = []
-    todo = 0
-    for it in worklist:
-        if store_valid and _store_key(it) != store:
-            continue
+    todo_spus: set[str] = set()
+    todo_sku = 0
+    for it, is_done in zip(scoped, flags):
         spu = str(it.get("spu", "")).strip()
-        is_done = bool(spu) and spu in done if sheet_valid else False
+        is_done = bool(spu) and is_done
         if spu and not is_done:
-            todo += 1
+            todo_spus.add(spu)
+            todo_sku += 1
         items.append(
             {
                 "spu": spu,
@@ -1049,13 +1195,20 @@ def get_worklist_status(
                 "category": it.get("category", ""),
                 "price": it.get("price", ""),
                 "image": it.get("image", ""),
+                # 规格：一个 SKU 一行后，同一 SPU 在列表里会出现多次，不给规格前端没法区分
+                "sku_id": it.get("sku_id", ""),
+                "sku_spec": it.get("sku_spec", ""),
                 "done": is_done,
             }
         )
     result = {
         "total": len(items),
         "done": len([i for i in items if i["done"]]) if sheet_valid else None,
-        "todo": todo,
+        # 清单是一行一个 SKU；待采展示同时给出商品（SPU 去重）与实际可采行（SKU）口径。
+        # todo 保持旧接口语义，避免 CLI/旧前端断裂；新 UI 明确读取 todo_spu / todo_sku。
+        "todo": todo_sku,
+        "todo_spu": len(todo_spus),
+        "todo_sku": todo_sku,
         "excel": excel,
         "sheet": sheet if sheet_valid else "",
         "store": store if store_valid else "",
@@ -1218,7 +1371,13 @@ async def collect_one(
             except Exception:
                 pass
 
-        if spu in WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet)):
+        # 【这条路径仍按纯 SPU 确认，是刻意的】agent 是照提示词自己写表的，提示词没教它写
+        # 货号列（也没法教稳——它连列号都按老表硬编码在提示词里），写出来的行货号是空的。
+        # 若这里改用 SPU|skuId 组合键，就会永远确认不到、重试到耗尽。
+        # 代价是多 SKU 商品在这条路径上可能把「本行没写进去」误判成已入库（同 SPU 的前一行
+        # 已在列里）。属已知局限：agent 路径只是兜底，主路径是基础/管道模式，两者都走
+        # write_product_row(_cloud)、会正确写货号列。
+        if spu in {k.split("|", 1)[0] for k in existing_keys(excel, sheet)}:
             return True
         if attempt < PRODUCT_RETRIES:
             logger.info(f"↻ SPU={spu} 未入库，重试（{attempt + 1}/{PRODUCT_RETRIES}）")
@@ -1287,9 +1446,9 @@ async def collect_one_pipeline(
             return spu in cloud.read_new_rows_column(
                 sheet, schema.fields["spu"], cloud_first_row["v"], 1
             )
-        return spu in WpsExcelTool.existing_key_values(
-            excel, sheet, spu_col_of(excel, sheet)
-        )
+        # 本地按 SPU|skuId 组合键确认：一个 SKU 一行后，同 SPU 的前一行早就在 SPU 列里，
+        # 只比 SPU 会把「这一行没写进去」误判成成功、静默漏掉该规格。
+        return worklist_key(item) in existing_keys(excel, sheet)
 
     reset_pipeline_llms()  # 单商品护栏：清零 samematch/default 单例 token 计数
 
@@ -1511,9 +1670,8 @@ async def collect_one_base(
         wrote, msg = await write_product_row(
             WpsExcelTool(), excel, sheet, item, res, img_path, schema=schema
         )
-        confirmed = wrote and spu in WpsExcelTool.existing_key_values(
-            excel, sheet, spu_col_of(excel, sheet)
-        )
+        # 组合键确认，理由同 collect_one_pipeline._written_confirmed
+        confirmed = wrote and worklist_key(item) in existing_keys(excel, sheet)
     if confirmed:
         logger.info(f"⬜ SPU={spu} 基础行已写入（采购价/重量留空待人工填）")
         return CollectOutcome(
@@ -1674,9 +1832,10 @@ async def run_batch(
         try:
             pipe_schema = await resolve_sheet_schema_cloud(cloud, sheet)
             if pipe_schema.ok:
-                done = set(cloud.existing_key_values(
-                    sheet, pipe_schema.fields["spu"], pipe_schema.header_row
-                ))
+                done = existing_keys(
+                    excel, sheet, cloud=cloud, fields=pipe_schema.fields,
+                    header_row=pipe_schema.header_row,
+                )
         except KdocsSheetError as e:
             reason = f"读取协作文档失败（{e}），已中止本批。"
             await _emit(on_progress, {"type": "aborted", "reason": reason})
@@ -1688,14 +1847,30 @@ async def run_batch(
             return {"ok": 0, "fail": 0, "batch": 0}
         logger.info(
             f"目标=协作文档；目标表结构已解析：字段列={pipe_schema.fields} "
-            f"公式列={list(pipe_schema.formula_columns)} 常量列={pipe_schema.constant_columns}"
+            f"公式列={list(pipe_schema.formula_columns)} 模板输入={pipe_schema.constant_columns}"
         )
     else:
-        done = WpsExcelTool.existing_key_values(excel, sheet, spu_col_of(excel, sheet))
+        done = existing_keys(excel, sheet)
     todo = [
-        it for it in worklist
-        if str(it.get("spu", "")).strip() and str(it["spu"]) not in done
+        it for it, is_done in zip(worklist, done_flags(worklist, done))
+        if str(it.get("spu", "")).strip() and not is_done
     ]
+    # 同批撞键护栏：本批里若有多行判重键相同（SKU 展开异常/清单被手工改过/接口给了重复
+    # skuId），它们会各写一行进表、却只留下一个判重键——下次重跑时其余份全被判成已入库，
+    # 人工很难看出表里那几行是重复的。只告警不拦：数据仍写得进去，但必须让操作者看见
+    # （对齐 orders 侧 _stage_order 区分「本批内撞键」与「表里已有」的取向）。
+    seen_keys: set = set()
+    collided: set = set()
+    for it in todo:
+        k = worklist_key(it)
+        if k in seen_keys:
+            collided.add(k)
+        seen_keys.add(k)
+    if collided:
+        logger.warning(
+            f"本批有 {len(collided)} 个判重键重复（如 {list(collided)[:3]}），"
+            f"这些行会重复写入且下批会被判为已入库，请检查清单"
+        )
     batch = min(limit, len(todo))
     mode_label = "基础(价/重人工填)" if base_only else ("管道" if use_pipeline else "agent")
     target_label = (f"协作文档（{cloud.file_id}）" if cloud is not None
@@ -1710,7 +1885,9 @@ async def run_batch(
     logger.info(
         f"=== 采集批次：模式={mode_label} {target_label} Sheet={sheet} 店铺={store or '全部'} "
         f"落点={append_label}；"
-        f"清单 {len(worklist)} 个，已入库 {len(done)}，待采 {len(todo)}，本批 {batch} 个 ==="
+        # 计量单位是【行】不是商品：清单一个 SKU 一行，一个多规格商品占多行，
+        # 说"个"会让人以为采少了（128 个商品会显示成 388 行）。
+        f"清单 {len(worklist)} 行，已入库 {len(done)}，待采 {len(todo)}，本批 {batch} 行 ==="
     )
     await _emit(on_progress, {
         "type": "batch_start", "total": len(worklist),
@@ -1732,7 +1909,7 @@ async def run_batch(
             return {"ok": 0, "fail": 0, "batch": 0}
         logger.info(
             f"目标表结构已解析：字段列={pipe_schema.fields} "
-            f"公式列={list(pipe_schema.formula_columns)} 常量列={pipe_schema.constant_columns}"
+            f"公式列={list(pipe_schema.formula_columns)} 模板输入={pipe_schema.constant_columns}"
         )
 
     ok = fail = 0

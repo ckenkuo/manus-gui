@@ -46,6 +46,75 @@ _IMAGE_PX = -1
 # 数值字段（成交价、件数）不可能有 12 位，故这个阈值不会误伤需要求和的列。
 _TEXT_DIGITS_MIN = 12
 
+# 读侧（get_range_data）与写侧（update_range_data 的 xf）的对齐枚举不是同一套：
+# 读回来是 haCenter/vaCenter 这样的字符串，写进去要的是 alcH/alcV 数字。
+# 枚举取自 kdocs 参数文档：alcH 1=左 2=居中 3=右 4=填充 5=两端 6=跨列 7=分散；
+# alcV 0=上 1=中 2=下 3=两端 4=分散。haGeneral 没有对应数字（就是"没设过"），不回放。
+_ALIGN_H = {
+    "haleft": 1, "hacenter": 2, "haright": 3, "hafill": 4,
+    "hajustify": 5, "hadistributed": 7,
+}
+_ALIGN_V = {
+    "vatop": 0, "vacenter": 1, "vabottom": 2, "vajustify": 3, "vadistributed": 4,
+}
+# 通用格式＝没设过数字格式，回放它没有意义（还白占一次格式操作）。
+_GENERAL_NUMFMT = {"g/通用格式", "general", ""}
+
+
+def _writes_number(value: Any) -> bool:
+    """这一格写进去的东西最终会不会以数值形态显示（公式的计算结果也算）。
+
+    用来决定要不要把历史行的数字格式回放到这一格：站点/类目/货号这些文本列，
+    历史单元格上常年挂着 `0_ ` 之类的数字格式（表格默认样式，文本显示不受影响），
+    照抄到新行虽然当下看不出问题，但一旦写进去的是「20cm」「01 号仓」这类
+    形似数字的文本就会被格式化。数字格式只回放给真数字。
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    s = str(value).strip()
+    if s.startswith("="):  # 公式：结果按数字格式显示
+        return True
+    try:
+        float(s)
+        return True
+    except ValueError:
+        return False
+
+
+def read_cell_xf(cell: dict) -> Optional[dict]:
+    """把 get_range_data 读回的单元格格式，翻成 update_range_data 能吃的 xf。
+
+    【为什么必须有这层翻译】两侧字段名根本不是一套：读回来是
+    `numFormat`/`alignment:{horizontal,vertical}`/`fonts`/`cell_background_color`，
+    写进去要的是 `numfmt`（**全小写**）/`alcH`/`alcV`/`font`/`fill`。
+    此前代码直接取 `cell["xf"]` 再原样写回——响应里压根没有 xf 这个键，于是
+    格式字典恒为空，新写的行永远拿不到历史行的两位小数/百分比（实测：历史行
+    显示 `25.00`/`16.05%`，管线写的新行显示 `1`/`0`）。
+
+    只翻【数字格式与对齐】：这两项决定数值怎么显示（小数位、百分比、居中），是
+    「按其它数据的格式写入」的实质。字体/底色/边框不翻——颜色要 ARGB 转色对象，
+    kdocs 文档明确要求「不确定颜色值时不传」，臆造一个反而会把整行刷成别的样子；
+    况且新行插进来本就继承表格既有外观，缺的只是数字格式。
+    无格式可回放（通用格式 + 未设对齐）返回 None，调用方据此跳过。
+    """
+    xf: Dict[str, Any] = {}
+    # 【不能 strip】`0.00_ ` 尾部那个空格是格式串的一部分（`_ ` = 预留一个字符宽度用于
+    # 与负数右对齐），去掉它写回去，新行的小数位就跟历史行差半个字符。
+    numfmt = str(cell.get("numFormat") or "")
+    if numfmt.strip() and numfmt.strip().lower() not in _GENERAL_NUMFMT:
+        xf["numfmt"] = numfmt
+    align = cell.get("alignment")
+    if isinstance(align, dict):
+        h = _ALIGN_H.get(str(align.get("horizontal") or "").strip().lower())
+        v = _ALIGN_V.get(str(align.get("vertical") or "").strip().lower())
+        if h is not None:
+            xf["alcH"] = h
+        if v is not None:
+            xf["alcV"] = v
+    return xf or None
+
 
 def _resolve_cli(cli: str) -> str:
     """定位 kdocs-cli 可执行文件。
@@ -207,8 +276,8 @@ class KdocsSheet:
         """带重试的调用：429001 等 _RATE_LIMIT_WAIT 秒后重试一次；retry_5xx=True 时
         HTTP 5xx（网关超时等）等 3s 重试一次。429002（熔断）与未知错误直接抛。
 
-        retry_5xx 只能开给【幂等】操作：range_data_batch_update（同值写同格）和
-        所有读操作。insert_rows_cols 非幂等（重试会重复插行），禁止开。
+        retry_5xx 只能开给【幂等】操作：range_data_batch_update / update_range_data
+        （同值或同格式写同格）和所有读操作。insert_rows_cols 非幂等（重试会重复插行），禁止开。
         """
         try:
             return self._run_once(service, action, payload)
@@ -367,9 +436,10 @@ class KdocsSheet:
                          ) -> List[Dict[str, dict]]:
         """读表头下前 max_rows 行数据区，返回 [{列字母: {"text": cellText, "formula": fmlaText或""}}]。
 
-        供云端模式学公式模板/常量列用（采集管线 resolve_sheet_schema_cloud）：
-        fmlaText 是公式原文（含公式才返回），cellText 是显示值。isCellPic 的 DISPIMG
-        单元格 formula 原样返回，由调用方过滤（坏行会把嵌入图落到普通列）。
+        供云端模式学公式模板/模板输入/格式用（采集管线 resolve_sheet_schema_cloud）：
+        fmlaText 是公式原文（含公式才返回），cellText 是显示值，format 是【已翻成写侧 xf】
+        的数字格式与对齐（见 read_cell_xf——响应里没有 xf 这个键，必须翻译）。
+        isCellPic 的 DISPIMG 单元格 formula 原样返回，由调用方过滤（坏行会把嵌入图落到普通列）。
         列上限取 sheets_info 的 col_to，兜底/封顶 _HEADER_SCAN_COLS。
         """
         try:
@@ -391,10 +461,13 @@ class KdocsSheet:
         for c in cells:
             text = str(c.get("cellText") or "")
             formula = str(c.get("fmlaText") or "")
-            if not text and not formula:
+            cell_format = read_cell_xf(c)
+            if not text and not formula and cell_format is None:
                 continue
             by_row.setdefault(int(c["rowFrom"]), {})[index_to_col(int(c["colFrom"]))] = {
-                "text": text, "formula": formula,
+                "text": text,
+                "formula": formula,
+                "format": cell_format,
             }
         return [by_row[r] for r in sorted(by_row)]
 
@@ -466,18 +539,41 @@ class KdocsSheet:
             first_row = max(end + 1, header_row)
 
         text_ops: List[dict] = []
+        format_ops: List[dict] = []
         pic_ops: List[dict] = []
         for i, item in enumerate(rows):
             r = first_row + i  # 0-based 目标行
+            written: Dict[str, Any] = {}
             for col, value in sorted(item.get("values", {}).items(),
                                      key=lambda kv: pipeline._col_key(kv[0])):
                 if value is None or str(value) == "":
                     continue
                 ci = col_to_index(col)
+                written[col] = value
                 text_ops.append({
                     "op_type": "cell_operation_type_formula",
                     "row_from": r, "row_to": r, "col_from": ci, "col_to": ci,
                     "formula": force_text_input(value),
+                })
+            # 格式只回放到【本行真写了值/公式的格】：给空白格设格式除了多占 payload
+            # 没有意义，而 kdocs 有配额（429001 限频要等 20s），一批 20 行 × 二十来列
+            # 全设一遍是白花的调用量。文本格再摘掉数字格式（见 _writes_number）。
+            for col, cell_format in sorted(item.get("formats", {}).items(),
+                                           key=lambda kv: pipeline._col_key(kv[0])):
+                if not isinstance(cell_format, dict) or not cell_format:
+                    continue
+                if col not in written:
+                    continue
+                xf = dict(cell_format)
+                if "numfmt" in xf and not _writes_number(written[col]):
+                    xf.pop("numfmt")
+                if not xf:
+                    continue
+                ci = col_to_index(col)
+                format_ops.append({
+                    "opType": "format",
+                    "rowFrom": r, "rowTo": r, "colFrom": ci, "colTo": ci,
+                    "xf": xf,
                 })
             url = pipeline.to_jpeg_url(str(item.get("image_url") or ""))
             if url and item.get("image_column"):
@@ -497,6 +593,14 @@ class KdocsSheet:
             self._run("sheet", "range_data_batch_update", {
                 "worksheet_id": wsid,
                 "range_data": text_ops[start:start + 500],
+            }, retry_5xx=True)
+
+        # 云端追加落在空白行，天然没有模板行的百分比/货币/小数位/边框。按 read_data_sample
+        # 读到的 xf 原样回放；这是展示与计算逻辑的一部分，不能只写值和公式。
+        for start in range(0, len(format_ops), 500):
+            self._run("sheet", "update_range_data", {
+                "worksheet_id": wsid,
+                "rangeData": format_ops[start:start + 500],
             }, retry_5xx=True)
 
         images = 0

@@ -89,8 +89,9 @@ async def main():
     parser.add_argument("--store", default=None, help="只采该店铺（mallid 或店名；缺省=全部）")
     parser.add_argument(
         "--region", default="",
-        help="目标区域（顶栏「全球 / 美国 / 欧区」）。以此为准：浏览器停在别的区域会先"
-             "替你切过去再采；缺省=跟随浏览器当前区域",
+        help="主动把列表页签切到该区域（顶栏「全球 / 美国 / 欧区」）再采。"
+             "缺省=不切换：每个已打开的列表页签按自己所在的域名归类，"
+             "可同时开多个区域的页签一次采完",
     )
     parser.add_argument(
         "--doc-mode", choices=["auto", "local", "cloud"], default="auto",

@@ -1,9 +1,33 @@
 import asyncio
 import os
+import shutil
 import sys
 from typing import Dict
 
 from app.tool.base import BaseTool
+
+
+def _resolve_interpreter():
+    """定位一个真正的 Python 解释器，返回可执行文件路径；找不到返回 None。
+
+    不能直接用 sys.executable：冻结后它指向 manus-*.exe 自身，而 PyInstaller
+    的 bootloader 不认 -X/-c，会把这些参数当成业务 argv 把整个应用重新拉起
+    ——Web 入口会二次绑定端口、再开一次浏览器、再建一份 agent。
+    开发态 sys.executable 就是解释器，直接用；冻结态退回系统 PATH 上的 python。
+    """
+    if not getattr(sys, "frozen", False):
+        return sys.executable
+
+    override = os.environ.get("MANUS_PYTHON")
+    if override and os.path.exists(override):
+        return override
+
+    for name in ("python", "python3", "py"):
+        found = shutil.which(name)
+        if found:
+            return found
+
+    return None
 
 
 class PythonExecute(BaseTool):
@@ -46,9 +70,20 @@ class PythonExecute(BaseTool):
         # 用 -X utf8（UTF-8 模式）而非依赖 PYTHONIOENCODING，更可靠。
         env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
 
+        interpreter = _resolve_interpreter()
+        if interpreter is None:
+            return {
+                "observation": (
+                    "未找到可用的 Python 解释器，无法执行代码。\n"
+                    "打包版不自带解释器，请在本机安装 Python 后重试"
+                    "（或设置环境变量 MANUS_PYTHON 指向 python.exe）。"
+                ),
+                "success": False,
+            }
+
         try:
             process = await asyncio.create_subprocess_exec(
-                sys.executable,
+                interpreter,
                 "-X",
                 "utf8",
                 "-c",
