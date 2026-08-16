@@ -1633,7 +1633,12 @@ async def collect_one_base(
     img_path = os.path.join(str(config.output_dir("image")), f"{spu}.jpeg")
 
     if cloud is not None and schema is None:
-        schema = await resolve_sheet_schema_cloud(cloud, sheet)
+        # 公式要学落点附近那一段，故先按表头行号把落点算出来再解析（口径同 run_batch）。
+        _hdr, _hdr_row = await asyncio.to_thread(cloud.read_header, sheet)
+        _at_top, _at_row, _ = resolve_append_target(append_mode, append_row, _hdr_row)
+        schema = await resolve_sheet_schema_cloud(
+            cloud, sheet, landing_row=_at_row
+        )
 
     # 主图：能下就下（供 Excel 产品图片列），下不到只告警、仍写基础行。
     # 云端模式走在线 URL 嵌入，不需要本地图，跳过下载。
@@ -1830,7 +1835,16 @@ async def run_batch(
         from app.orders.kdocs_sheet import KdocsSheetError
 
         try:
-            pipe_schema = await resolve_sheet_schema_cloud(cloud, sheet)
+            # 落点要先算出来再解析 schema：公式必须学【落点附近】那一段，而不是表头下前
+            # 10 行——同一张表顶部与底部常常不是一套公式（见 pipeline._sample_near_landing）。
+            # resolve_append_target 只需要表头行号，故先单独读一次表头（3 行小请求）。
+            _hdr, _hdr_row = await asyncio.to_thread(cloud.read_header, sheet)
+            _at_top, _at_row, _ = resolve_append_target(
+                append_mode, append_row, _hdr_row
+            )
+            pipe_schema = await resolve_sheet_schema_cloud(
+                cloud, sheet, landing_row=_at_row
+            )
             if pipe_schema.ok:
                 done = existing_keys(
                     excel, sheet, cloud=cloud, fields=pipe_schema.fields,

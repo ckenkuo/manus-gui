@@ -432,16 +432,8 @@ class KdocsSheet:
         rows = sorted({r for v in per_col.values() for r in v})
         return [tuple(per_col[col].get(r, "") for col in cols) for r in rows]
 
-    def read_data_sample(self, sheet_name: str, header_row: int, max_rows: int = 10
-                         ) -> List[Dict[str, dict]]:
-        """读表头下前 max_rows 行数据区，返回 [{列字母: {"text": cellText, "formula": fmlaText或""}}]。
-
-        供云端模式学公式模板/模板输入/格式用（采集管线 resolve_sheet_schema_cloud）：
-        fmlaText 是公式原文（含公式才返回），cellText 是显示值，format 是【已翻成写侧 xf】
-        的数字格式与对齐（见 read_cell_xf——响应里没有 xf 这个键，必须翻译）。
-        isCellPic 的 DISPIMG 单元格 formula 原样返回，由调用方过滤（坏行会把嵌入图落到普通列）。
-        列上限取 sheets_info 的 col_to，兜底/封顶 _HEADER_SCAN_COLS。
-        """
+    def _sample_col_to(self, sheet_name: str) -> int:
+        """采样列上限（0-based）：取数据区 col_to，兜底/封顶 _HEADER_SCAN_COLS。"""
         try:
             col_to = int(self.sheets_info()[sheet_name].get("col_to", 0))
         except KeyError:
@@ -454,9 +446,23 @@ class KdocsSheet:
                 f"{_HEADER_SCAN_COLS} 列兜底"
             )
             col_to = _HEADER_SCAN_COLS - 1
-        col_to = min(max(col_to, 0), _HEADER_SCAN_COLS - 1)
-        row_from = header_row  # 0-based 的表头下一行
-        cells = self._get_range(sheet_name, row_from, row_from + max_rows - 1, 0, col_to)
+        return min(max(col_to, 0), _HEADER_SCAN_COLS - 1)
+
+    def read_rows(self, sheet_name: str, row_from: int, row_to: int
+                  ) -> Dict[int, Dict[str, dict]]:
+        """读【任意行区间】→ {1-based 行号: {列字母: {"text","formula","format"}}}。
+
+        row_from/row_to 都是 1-based 闭区间，会被夹到 >= 1。全空行不出现在结果里
+        （调用方据此判断「这个窗口有没有真数据」）。
+
+        为什么要按行号返回而不是像 read_data_sample 那样返回无名列表：采集管线要按
+        【落点附近】学公式，既要知道公式原文、也要知道它原本在第几行，才能把本行引用
+        换成占位符而不误伤跨行/绝对引用（见 pipeline._templatize_formula）。
+        """
+        row_from = max(int(row_from), 1)
+        row_to = max(int(row_to), row_from)
+        col_to = self._sample_col_to(sheet_name)
+        cells = self._get_range(sheet_name, row_from - 1, row_to - 1, 0, col_to)
         by_row: Dict[int, Dict[str, dict]] = {}
         for c in cells:
             text = str(c.get("cellText") or "")
@@ -464,12 +470,28 @@ class KdocsSheet:
             cell_format = read_cell_xf(c)
             if not text and not formula and cell_format is None:
                 continue
-            by_row.setdefault(int(c["rowFrom"]), {})[index_to_col(int(c["colFrom"]))] = {
+            by_row.setdefault(int(c["rowFrom"]) + 1, {})[
+                index_to_col(int(c["colFrom"]))
+            ] = {
                 "text": text,
                 "formula": formula,
                 "format": cell_format,
             }
-        return [by_row[r] for r in sorted(by_row)]
+        return by_row
+
+    def read_data_sample(self, sheet_name: str, header_row: int, max_rows: int = 10
+                         ) -> List[Dict[str, dict]]:
+        """读表头下前 max_rows 行数据区，返回 [{列字母: {"text": cellText, "formula": fmlaText或""}}]。
+
+        fmlaText 是公式原文（含公式才返回），cellText 是显示值，format 是【已翻成写侧 xf】
+        的数字格式与对齐（见 read_cell_xf——响应里没有 xf 这个键，必须翻译）。
+        isCellPic 的 DISPIMG 单元格 formula 原样返回，由调用方过滤（坏行会把嵌入图落到普通列）。
+
+        采集管线已改成按【落点附近】采样（见 pipeline.resolve_sheet_schema_cloud），
+        不再走这个「固定取顶部」的入口；这里保留原语义供其它调用方与单测使用。
+        """
+        rows = self.read_rows(sheet_name, header_row + 1, header_row + max_rows)
+        return [rows[r] for r in sorted(rows)]
 
     # ---- 写：插行 + 批量写值/图 ------------------------------------------
 

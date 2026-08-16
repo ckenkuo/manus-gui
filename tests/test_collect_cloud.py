@@ -22,6 +22,7 @@ import pytest
 from app.collect import pipeline as P
 from app.collect import service as S
 from app.orders import kdocs_sheet as K
+from app.tool.wps_excel_tool import WpsExcelTool as W
 
 
 def _resp(env: dict):
@@ -212,11 +213,15 @@ def test_schema_cloud_inherits_percent_and_cost_inputs_from_complete_row():
     }
 
     class Cloud:
-        def read_header(self, _sheet):
+        def read_header(self, _sheet, _max_scan=3):
             return header, 1
 
-        def read_data_sample(self, _sheet, _header_row):
-            return [complete, broken]
+        def data_end_row(self, _sheet):
+            return 2  # 0-based：数据到第 3 行（complete=2、broken=3）
+
+        def read_rows(self, _sheet, row_from, row_to):
+            return {r: c for r, c in ((2, complete), (3, broken))
+                    if row_from <= r <= row_to}
 
     schema = asyncio.run(P.resolve_sheet_schema_cloud(Cloud(), "VibeMakers全球"))
 
@@ -272,11 +277,15 @@ def test_schema_cloud_votes_numfmt_separately_from_alignment():
     ]
 
     class Cloud:
-        def read_header(self, _sheet):
+        def read_header(self, _sheet, _max_scan=3):
             return header, 1
 
-        def read_data_sample(self, _sheet, _header_row):
-            return sample
+        def data_end_row(self, _sheet):
+            return 3  # 0-based：数据到第 4 行
+
+        def read_rows(self, _sheet, row_from, row_to):
+            return {r: row for r, row in zip((2, 3, 4), sample)
+                    if row_from <= r <= row_to}
 
     schema = asyncio.run(P.resolve_sheet_schema_cloud(Cloud(), "S"))
 
@@ -298,6 +307,356 @@ def test_schema_cloud_rejects_missing_spu(monkeypatch):
 
     assert not schema.ok
     assert "SPU" in schema.error
+
+
+# ---- 公式模板化 / 渲染（纯函数） -------------------------------------------
+
+
+def test_templatize_keeps_cross_row_offsets_and_function_names():
+    """公式模板化必须按【相对偏移】记账，且不许把函数名里的数字当行号。
+
+    旧实现是「所有 [A-Z]+\\d+ 的行号一律换成 {r}」，实测三类算错：
+      - `=J9-J8`（与上一行环比）→ `=J{r}-J{r}` → 渲染成 `=J100-J100`，恒等于 0；
+      - `=SUM(I2:I9)`（累计求和）→ `=SUM(I{r}:I{r})`，区间塌成单格；
+      - `=LOG10(G9)` → `=LOG{r}(G{r})` → 渲染成 `=LOG100(G100)`，公式直接失效。
+    """
+    t = P._templatize_formula
+    assert t("=I9/G9", 9) == "=I{r}/G{r}"
+    assert t("=J9-J8", 9) == "=J{r}-J{r-1}", "跨行引用要记成偏移，不能压平成本行"
+    assert t("=SUM(I2:I9)", 9) == "=SUM(I{r-7}:I{r})", "区间起点的偏移要留住"
+    assert t("=LOG10(G9)", 9) == "=LOG10(G{r})", "函数名里的 10 不是行号"
+    assert t("=ATAN2(A9,B9)", 9) == "=ATAN2(A{r},B{r})"
+    # 绝对行不动：WINTAK欧洲 的空运头程 = 重量 × 顶部运费表单价
+    assert t("=L9*$B$2", 9) == "=L{r}*$B$2"
+    assert t("=$C$2", 9) == "=$C$2"
+    # 同一套逻辑在不同行要归一成同一个模板，逐列多数表决才统计得到一起
+    assert t("=J9-J8", 9) == t("=J10-J9", 10)
+
+
+def test_render_formula_resolves_offsets_and_clamps():
+    r = P.render_formula
+    assert r("=I{r}/G{r}", 100) == "=I100/G100"
+    assert r("=J{r}-J{r-1}", 100) == "=J100-J99"
+    assert r("=SUM(I{r-7}:I{r})", 100) == "=SUM(I93:I100)"
+    assert r("=L{r}*$B$2", 100) == "=L100*$B$2"
+    assert r("=J{r}-J{r-1}", 1) == "=J1-J1", "落点靠顶时行号夹到 1，不出 0 行"
+
+
+# ---- 按落点采样（本次修复的核心） ------------------------------------------
+
+
+def _layered_cloud(top_rows: dict, bottom_rows: dict, header: dict,
+                   end_row: int, header_row: int = 1):
+    """造一个「顶部与底部公式不同」的云端替身，复刻真实工作簿的改版历史。"""
+
+    class Cloud:
+        calls: list = []
+
+        def read_header(self, _sheet, _max_scan=3):
+            return header, header_row
+
+        def data_end_row(self, _sheet):
+            return end_row - 1  # 0-based
+
+        def read_rows(self, _sheet, row_from, row_to):
+            self.calls.append((row_from, row_to))
+            out = {}
+            for src in (top_rows, bottom_rows):
+                for rid, row in src.items():
+                    if row_from <= rid <= row_to:
+                        out[rid] = row
+            return out
+
+    return Cloud()
+
+
+def test_schema_cloud_learns_formulas_near_landing_not_from_top():
+    """公式要学【落点附近】那一段，不能固定学表头下前 10 行。
+
+    这是本次修复的根因回归：实测同一张表顶部与底部根本不是一套公式——表格中途改过算法
+    或插过列，历史行不会被回刷。例 wintak童装货盘记录 顶部毛利 `=T{r}/L{r}`、底部是
+    `=T{r}/I{r}`；pawly全球 顶部销售价 `=J{r}*K{r}`（一层折扣）、底部 `=J{r}*K{r}*L{r}`
+    （两层）。新行落在底部却按顶部公式写，成本/毛利算出来就是错的，而且数字照样显示。
+    """
+    header = {"D": "SPU ID", "G": "日常价", "I": "加速器价格", "L": "销售价格",
+              "M": "采购价格", "S": "成本", "T": "利润", "U": "毛利"}
+    top = {
+        r: {"D": {"text": f"OLD-{r}", "formula": ""},
+            "S": {"text": "45", "formula": f"=M{r}+O{r}"},
+            "U": {"text": "18%", "formula": f"=T{r}/L{r}"}}
+        for r in (2, 3, 4)
+    }
+    bottom = {
+        r: {"D": {"text": f"NEW-{r}", "formula": ""},
+            "S": {"text": "53", "formula": f"=M{r}+O{r}+P{r}"},
+            "U": {"text": "15%", "formula": f"=T{r}/I{r}"}}
+        for r in (1869, 1870, 1871, 1872, 1873)
+    }
+    cloud = _layered_cloud(top, bottom, header, end_row=1873)
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "wintak童装货盘记录"))
+
+    assert schema.ok
+    assert schema.formula_columns["S"] == "=M{r}+O{r}+P{r}", "要学底部那版成本公式"
+    assert schema.formula_columns["U"] == "=T{r}/I{r}", "毛利分母跟底部，不跟顶部"
+    assert all(lo > 1000 for lo, _hi in cloud.calls), (
+        "采样窗口必须落在数据区末尾附近，不该去读表头下前几行"
+    )
+
+
+def test_schema_cloud_samples_above_explicit_landing_row():
+    """「从第 R 行插」时要学 R 上方的公式，不是表尾的。"""
+    header = {"D": "SPU ID", "S": "成本"}
+    top = {r: {"D": {"text": "x", "formula": ""},
+               "S": {"text": "1", "formula": f"=A{r}+B{r}"}} for r in (2, 3, 4, 5, 6)}
+    bottom = {r: {"D": {"text": "y", "formula": ""},
+                  "S": {"text": "2", "formula": f"=A{r}*B{r}"}} for r in (500, 501)}
+    cloud = _layered_cloud(top, bottom, header, end_row=501)
+
+    schema = asyncio.run(
+        P.resolve_sheet_schema_cloud(cloud, "S", landing_row=7)
+    )
+    assert schema.formula_columns["S"] == "=A{r}+B{r}", "插在第 7 行就学上方那段"
+
+
+def test_schema_cloud_looks_further_up_when_tail_is_blank():
+    """表尾有空白预留区时要继续往上翻，而不是判定「本表无公式」。
+
+    实测 wintak美国 数据到第 223 行，但最后一个带公式的行是 215——中间那几行是留白。
+    只看紧邻末行的窗口会一个公式都学不到，新行整行没有成本/利润公式。
+    """
+    header = {"D": "SPU ID", "S": "成本"}
+    rows = {r: {"D": {"text": "x", "formula": ""},
+                "S": {"text": "1", "formula": f"=M{r}+N{r}"}}
+            for r in range(206, 216)}
+    blank = {r: {"A": {"text": " ", "formula": ""}} for r in range(216, 224)}
+    cloud = _layered_cloud(rows, blank, header, end_row=223)
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "wintak美国"))
+    assert schema.formula_columns["S"] == "=M{r}+N{r}"
+
+
+def test_schema_cloud_votes_per_column_majority():
+    """逐列多数表决：同列个别行被人工改过，不该让新行跟着那一行走。
+
+    实测 pawly全球 末尾 6 行里毛利列 4 行是 `=U{r}/M{r}`、2 行是 `=U{r}/J{r}`；
+    整行取「公式最全的模板行」会把那一行的异常一起继承。
+    """
+    header = {"D": "SPU ID", "V": "毛利"}
+    rows = {}
+    for r in (590, 591, 593, 595):
+        rows[r] = {"D": {"text": "x", "formula": ""},
+                   "V": {"text": "16%", "formula": f"=U{r}/M{r}"}}
+    for r in (592, 594):
+        rows[r] = {"D": {"text": "x", "formula": ""},
+                   "V": {"text": "16%", "formula": f"=U{r}/J{r}"}}
+    cloud = _layered_cloud(rows, {}, header, end_row=595)
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "pawly全球"))
+    assert schema.formula_columns["V"] == "=U{r}/M{r}", "取多数票那版"
+
+
+def test_schema_cloud_skips_column_whose_formula_differs_every_row():
+    """逐行因地制宜的列宁可留空，不能抄多数票。
+
+    实测 WINTAK欧洲 的「空运头程」= 重量 × 该国运费单价，采样行分别引用 $B$2/$D$2/$F$2…
+    （跟着货号列的站点走）。抄一个等于把最后一行那个国家的运费按到所有新行上——算得出
+    数、看不出错，比留空危险得多。
+    """
+    header = {"C": "SPU ID", "M": "空运头程", "U": "利润"}
+    rates = ["$B$2", "$D$2", "$F$2", "$J$2", "$L$2", "$N$2", "$O$2", "$Q$2"]
+    rows = {}
+    for i, r in enumerate(range(401, 409)):
+        rows[r] = {
+            "C": {"text": f"spu{r}", "formula": ""},
+            "M": {"text": "23", "formula": f"=L{r}*{rates[i]}"},
+            "U": {"text": "18", "formula": f"=J{r}-T{r}"},
+        }
+    cloud = _layered_cloud(rows, {}, header, end_row=408)
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "WINTAK欧洲"))
+    assert "M" not in schema.formula_columns, "众口不一的列留空待人工填"
+    assert schema.formula_columns["U"] == "=J{r}-T{r}", "同表其它稳定列照常仿写"
+
+
+def test_schema_cloud_deep_scans_header_when_top_rows_are_another_table():
+    """前 3 行认不出 SPU 时要往下深扫：真表头可能在第 4 行。
+
+    实测 WINTAK欧洲 前 3 行是一张各国运费/操作费小表（22 列，被「非空最多」规则选中
+    当表头），真表头在第 4 行（35 列）。深扫前这张表整个 ok=False、写不进去。
+    """
+    shallow = {"A": "相关项目", "B": "德国运费", "C": "税费"}
+    real = {"C": "SPU ID", "D": "产品图片", "L": "重量", "T": "Y2成本"}
+
+    class Cloud:
+        def read_header(self, _sheet, max_scan=3):
+            return (shallow, 1) if max_scan <= 3 else (real, 4)
+
+        def data_end_row(self, _sheet):
+            return 407
+
+        def read_rows(self, _sheet, row_from, row_to):
+            return {r: {"C": {"text": f"s{r}", "formula": ""},
+                        "T": {"text": "1", "formula": f"=K{r}+M{r}"}}
+                    for r in range(max(row_from, 400), min(row_to, 408) + 1)}
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(Cloud(), "WINTAK欧洲"))
+    assert schema.ok and schema.header_row == 4
+    assert schema.fields["spu"] == "C"
+    assert schema.formula_columns["T"] == "=K{r}+M{r}"
+
+
+def test_schema_cloud_skips_column_that_is_formula_in_only_few_rows():
+    """某列只有个别数据行是公式 → 那是异常行，不是本表算法，不许仿。
+
+    实测 wintak童装货盘记录 第 1872 行有人把「折扣」和「加速器价格」写反了（H 填成值
+    70%、I 变成 =H*G），其余 8 行都是 H==I/G、I 是纯值。旧口径按「有公式的行」当分母，
+    I 列以 1/1 满票当选，新行于是 H==I/G 且 I==H*G——直接【循环引用】。
+    """
+    header = {"D": "SPU ID", "G": "日常价", "H": "折扣", "I": "加速器价格",
+              "L": "最终销售价格"}
+    rows = {}
+    for r in range(1862, 1872):  # 正常行：H 是公式，I 是纯值
+        rows[r] = {"D": {"text": f"spu{r}", "formula": ""},
+                   "G": {"text": "100", "formula": ""},
+                   "H": {"text": "85%", "formula": f"=I{r}/G{r}"},
+                   "I": {"text": "85", "formula": ""}}
+    rows[1872] = {"D": {"text": "spu1872", "formula": ""},   # 异常行：H/I 写反
+                  "G": {"text": "129", "formula": ""},
+                  "H": {"text": "70%", "formula": ""},
+                  "I": {"text": "90", "formula": "=H1872*G1872"}}
+    cloud = _layered_cloud(rows, {}, header, end_row=1872)
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "wintak童装货盘记录"))
+    assert schema.formula_columns.get("H") == "=I{r}/G{r}", "多数行的算法照常仿"
+    assert "I" not in schema.formula_columns, (
+        "只有 1/11 行是公式的列按纯值列处理，否则新行 H 与 I 互相引用"
+    )
+
+
+def test_schema_cloud_counts_data_rows_when_spu_spans_rows():
+    """一个 SPU 占多行（每行一个站点）时，数据行的分母不能只数 SPU 非空的行。
+
+    实测 WINTAK欧洲 一个 SPU 铺 13 行欧洲站点，只有首行填 SPU。只认 SPU 会把分母压成 1，
+    「逐行不同就留空」那道闸随之失效，各国运费公式又会被抄成同一个国家的。
+    """
+    header = {"C": "SPU ID", "E": "货号", "L": "重量", "M": "空运头程", "U": "利润"}
+    rates = ["$B$2", "$D$2", "$F$2", "$J$2", "$L$2", "$N$2", "$O$2", "$Q$2", "$R$2"]
+    rows = {}
+    for i, r in enumerate(range(400, 409)):
+        rows[r] = {
+            # SPU 只有首行有值，其余行靠货号列区分站点
+            "C": {"text": "39463986367" if i == 0 else "", "formula": ""},
+            "E": {"text": f"站点{i}", "formula": ""},
+            "M": {"text": "23", "formula": f"=L{r}*{rates[i]}"},
+            "U": {"text": "18", "formula": f"=J{r}-T{r}"},
+        }
+    cloud = _layered_cloud(rows, {}, header, end_row=408)
+
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "WINTAK欧洲"))
+    assert "M" not in schema.formula_columns, (
+        "各国运费单价逐行不同，必须留空——分母只数 SPU 会让这道闸失效"
+    )
+    assert schema.formula_columns["U"] == "=J{r}-T{r}"
+
+
+# ---- 表头被改写 --------------------------------------------------------------
+
+
+def test_field_rules_tolerate_real_header_variants():
+    """表头标题的常见改写要认得出来：认不出的代价是把钱算错。
+
+    「最终销售价格」是【线上真实存在】的写法（wintak童装货盘记录），旧规则精确等值匹配
+    认不出 sale，于是该列失去「不许仿公式」的保护、被历史公式 =叠加折扣*加速器价格 顶掉，
+    平台申报价根本没落进表里。
+    """
+    R = W._resolve_fields_from_header
+    base = {"E": "SPU ID", "F": "产品图片", "M": "销售价格",
+            "N": "采购价格", "O": "重量"}
+    assert R(base)["sale"] == "M"
+    # 前置限定语
+    assert R({**base, "M": "最终销售价格"})["sale"] == "M"
+    assert R({**base, "M": "折后销售价格"})["sale"] == "M"
+    # 括号注释与计量/币种尾巴
+    assert R({**base, "M": "销售价格(USD)"})["sale"] == "M"
+    assert R({**base, "N": "采购价格（含税）"})["purchase"] == "N"
+    assert R({**base, "O": "重量kg"})["weight"] == "O"
+    assert R({**base, "O": "重量（kg）"})["weight"] == "O"
+    assert R({**base, "N": "进货价"})["purchase"] == "N"
+
+
+def test_field_rules_do_not_overreach_on_lookalike_titles():
+    """容忍改写不能变成乱认：这些列各有各的用途，认错比认不出更糟。"""
+    R = W._resolve_fields_from_header
+    # 「叠加折扣1」「折扣参数」是公式输入/参数，不是折扣列
+    f = R({"E": "SPU ID", "I": "折扣", "K": "叠加折扣1", "L": "叠加折扣2",
+           "J": "折扣参数"})
+    assert f["discount"] == "I"
+    # 「调整前ROS」不能把真正的 ros 列顶掉（pawly美国 两列并存，前者列序更靠前）
+    f2 = R({"C": "SPU ID", "Q": "调整前ROS", "R": "ros"})
+    assert f2["ros"] == "R", "ros 必须精确匹配，否则被前置限定语的列抢走"
+    # 「加速器参考价格」不是销售价，「日常价」也不该被「非日常价」之类抢走
+    f3 = R({"E": "SPU ID", "J": "加速器参考价格", "M": "销售价格"})
+    assert f3["sale"] == "M" and "J" not in f3.values()
+
+
+def test_schema_cloud_warns_and_protects_when_value_field_unrecognized(caplog):
+    """表头改得认不出来时：告警 + 该列既不写值也不被历史公式覆盖。
+
+    这是「宁可留空也不要写错」的兜底——猜标题猜错等于把申报价写进别的列，更糟。
+    """
+    # 售价列标题改成完全认不出来的写法，且历史行该列是公式
+    header = {"E": "SPU ID", "F": "产品图片", "M": "成交单价X",
+              "N": "采购价格", "O": "重量", "T": "成本"}
+    rows = {
+        r: {"E": {"text": f"spu{r}", "formula": ""},
+            "M": {"text": "67", "formula": f"=J{r}*K{r}"},
+            "T": {"text": "53", "formula": f"=N{r}+P{r}"}}
+        for r in range(590, 596)
+    }
+    cloud = _layered_cloud(rows, {}, header, end_row=595)
+
+    import logging
+    with caplog.at_level(logging.WARNING):
+        schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "S"))
+
+    assert schema.ok, "认不出可选字段不该整批拒写——SPU 在就还能写"
+    assert "sale" not in schema.fields
+    row = P._cloud_row({"spu": "NEW", "price": "46.10¥"},
+                       P.CollectResult(spu="NEW", ok=True), schema, 0, 596)
+    assert "M" not in row["values"] or not str(row["values"].get("M")).startswith("="), (
+        "认不出的值列不能被历史公式顶掉（会把申报价算成依赖空白列的结果）"
+    )
+    assert schema.formula_columns.get("T") == "=N{r}+P{r}", "其它列照常"
+
+
+def test_schema_cloud_still_refuses_when_spu_unrecognized():
+    """SPU 列认不出来仍必须整批拒写：没有判重键，写进去就是重复+错位。"""
+    header = {"E": "商品编号X", "F": "产品图片", "M": "销售价格"}
+    cloud = _layered_cloud(
+        {590: {"E": {"text": "x", "formula": ""}}}, {}, header, end_row=590)
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "S"))
+    assert not schema.ok and "SPU" in schema.error
+
+
+def test_cloud_row_renders_cross_row_formula_per_offset():
+    """整批写时每行公式按自己的行号渲染，跨行偏移也要跟着走。"""
+    schema = P.SheetSchema(
+        sheet="S", fields={"spu": "C"},
+        formula_columns={"T": "=K{r}+M{r}", "L": "=J{r}-J{r-1}"},
+        ok=True, header_row=1,
+    )
+    rows = [
+        P._cloud_row({"spu": f"S{i}"}, P.CollectResult(spu=f"S{i}", ok=True),
+                     schema, i, 100)
+        for i in range(3)
+    ]
+    assert [r["values"]["T"] for r in rows] == [
+        "=K100+M100", "=K101+M101", "=K102+M102",
+    ]
+    assert [r["values"]["L"] for r in rows] == [
+        "=J100-J99", "=J101-J100", "=J102-J101",
+    ]
 
 
 # ---- write_product_row_cloud -------------------------------------------------
@@ -574,7 +933,7 @@ def test_run_batch_cloud_branch(monkeypatch, tmp_path):
     cloud = FakeCloud()
     seen = _patch_common(monkeypatch, tmp_path, cloud)
 
-    async def fake_schema_cloud(c, sheet):
+    async def fake_schema_cloud(c, sheet, landing_row=None):
         assert c is cloud
         return P.SheetSchema(sheet=sheet, fields={"spu": "C"}, ok=True, header_row=1)
 
@@ -693,7 +1052,7 @@ def test_run_batch_cloud_from_prefs_keeps_link(monkeypatch, tmp_path):
     seen = _patch_common(monkeypatch, tmp_path, cloud)
     S.save_prefs(excel=cloud.file_id, sheet="pawly全球")
 
-    async def fake_schema_cloud(c, sheet):
+    async def fake_schema_cloud(c, sheet, landing_row=None):
         return P.SheetSchema(sheet=sheet, fields={"spu": "C"}, ok=True, header_row=1)
 
     monkeypatch.setattr(P, "resolve_sheet_schema_cloud", fake_schema_cloud)
@@ -715,7 +1074,7 @@ def test_run_batch_cloud_read_error_aborts_cleanly(monkeypatch, tmp_path):
     """云端读失败（未认证/限频/网络）：结构化 aborted 事件，不抛裸 traceback（CLI 场景）。"""
     _patch_common(monkeypatch, tmp_path, FakeCloud())
 
-    async def boom_schema(c, sheet):
+    async def boom_schema(c, sheet, landing_row=None):
         raise K.KdocsSheetError("鉴权失败")
 
     monkeypatch.setattr(P, "resolve_sheet_schema_cloud", boom_schema)
@@ -1145,7 +1504,7 @@ def test_run_batch_cloud_batch_write_failure_reports_all_failed(monkeypatch, tmp
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": cloud)
 
-    async def fake_schema_cloud(c, sheet):
+    async def fake_schema_cloud(c, sheet, landing_row=None):
         return P.SheetSchema(sheet=sheet, fields={"spu": "C"}, ok=True, header_row=1)
 
     monkeypatch.setattr(P, "resolve_sheet_schema_cloud", fake_schema_cloud)
