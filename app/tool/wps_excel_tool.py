@@ -41,6 +41,36 @@ _CELL_REF_RE = re.compile(r"(?<![A-Za-z0-9_$])(\$?)([A-Z]{1,3})(\$?)(\d+)")
 # 把每个逻辑字段解析到该 Sheet 的真实列。
 # 规则顺序即认领优先级；一列至多归一个字段（先到先得）。pick='last' 用于"备注"——有的
 # Sheet 有多列备注（前置那列常被挪作它用），取末列最稳。判定前对标题 strip()。
+# 计量/币种尾巴：「重量kg」「采购价格(美元)」这类标题去掉它就能和标准写法对上。
+# 括号里的内容已由 _norm_title 摘掉，这里只处理裸写的尾巴。
+_UNIT_TAILS = ("kg", "g", "克", "公斤", "千克", "斤", "lb", "usd", "rmb", "cny", "元")
+
+
+def _title_hits(raw: str, cores: tuple, allow_prefix: bool = True) -> bool:
+    """标题是否命中 cores 里的某个核心词。
+
+    归一化（全角转半角、摘括号注释、去空白与符号、转小写）后按三种方式比：
+      1. 完全相等；
+      2. 以核心词【结尾】——容忍前置限定语，`最终销售价格` 要能认成销售价（实测
+         wintak童装货盘记录 的售价列就叫这个，旧的精确匹配认不出来，后果见下）；
+      3. 以核心词【开头】且余下的只是计量/币种尾巴，`重量kg` → 重量。
+
+    allow_prefix=False 用于 ros 这类【必须精确】的字段：pawly美国 同时有「调整前ROS」和
+    「ros」两列，容忍前置限定语会让前者按列序先被认领，把真正的 ros 列顶掉。
+    """
+    s = _norm_title(raw)
+    if not s:
+        return False
+    for core in cores:
+        if s == core:
+            return True
+        if allow_prefix and s.endswith(core):
+            return True
+        if s.startswith(core) and s[len(core):] in _UNIT_TAILS:
+            return True
+    return False
+
+
 _FIELD_RULES = [
     ("spu", lambda t: "spu" in t.lower(), "first"),
     # 货号列＝逐 SKU 标识（2026-08-11 起清单是一个 SKU 一行，同 SPU 多行靠它区分）。
@@ -49,12 +79,16 @@ _FIELD_RULES = [
     ("image", lambda t: ("产品图片" in t) or t == "图片", "first"),
     ("site", lambda t: t == "站点", "first"),
     ("category", lambda t: t in ("类目", "类别", "品类", "分类"), "first"),
-    ("daily", lambda t: t == "日常价", "first"),
-    ("discount", lambda t: t == "折扣", "first"),
-    ("sale", lambda t: t in ("销售价格", "销售价", "售价"), "first"),
-    ("purchase", lambda t: t in ("采购价格", "采购价", "购入价格"), "first"),
-    ("weight", lambda t: t == "重量", "first"),
-    ("ros", lambda t: t.lower() == "ros", "first"),
+    # 日常价/折扣：不容忍前置限定语。「叠加折扣1」「折扣参数」都不该被认成折扣列
+    # （前者是公式输入、后者是参数），而它们恰好以「折扣」结尾或开头。
+    ("daily", lambda t: _title_hits(t, ("日常价", "日常价格"), allow_prefix=False), "first"),
+    ("discount", lambda t: _norm_title(t) == "折扣", "first"),
+    # 售价/采购价/重量容忍前置限定语与计量尾巴：这三列写错会直接算错钱，认不出来的代价
+    # （申报价被历史公式顶掉）远大于偶尔多认一列。
+    ("sale", lambda t: _title_hits(t, ("销售价格", "销售价", "售价")), "first"),
+    ("purchase", lambda t: _title_hits(t, ("采购价格", "采购价", "购入价格", "进货价")), "first"),
+    ("weight", lambda t: _title_hits(t, ("重量",)), "first"),
+    ("ros", lambda t: _title_hits(t, ("ros",), allow_prefix=False), "first"),
     ("note", lambda t: t == "备注", "last"),
 ]
 
@@ -110,6 +144,25 @@ def _is_mimic_title(raw: str) -> bool:
 def _collect_mimic_columns(header: Dict[str, str]) -> set:
     """返回允许照抄历史固定值的列；匹配表头语义，不依赖固定列字母。"""
     return {col for col, raw_title in header.items() if _is_mimic_title(raw_title)}
+
+
+# 「值语义」词：标题带这些词的列装的是逐商品填的价/费/重量，不是计算结果。
+# 用途见 suspect_value_columns：表头被改名、字段认不出来时，靠它锁定「疑似那一列」。
+# 刻意不含「成本/利润/毛利」——那三个是算出来的，本来就该仿公式。
+_VALUE_SEMANTIC_WORDS = ("价", "费", "金额", "重量", "单价", "价格")
+
+
+def suspect_value_columns(header: Dict[str, str]) -> set:
+    """标题带值语义词的列（不判断是否已被字段认领，由调用方剔除）。
+
+    表头被改写导致 sale/purchase/weight 认不出时，这些列很可能就是改了名的那几列。
+    采集侧据此把它们排除在公式仿写之外——历史行往往正是公式（销售价常年是
+    =参考价×折扣），照抄会把平台申报价顶掉，显示成一个由空白列算出的数、看不出错。
+    """
+    return {
+        col for col, raw_title in header.items()
+        if any(w in _norm_title(raw_title) for w in _VALUE_SEMANTIC_WORDS)
+    }
 
 
 # 逐商品写值的逻辑字段：这些列的值每行都来自平台清单/比价结果，历史行即便有公式
@@ -876,6 +929,11 @@ class WpsExcelTool(BaseTool):
     def item_input_columns(cls, fields: Dict[str, str]) -> set:
         """逐商品写值的列（本地/云端两条写入路径共用，见 _ITEM_INPUT_FIELDS）。"""
         return item_input_columns(fields)
+
+    @classmethod
+    def suspect_value_columns(cls, header: Dict[str, str]) -> set:
+        """标题带值语义（价/费/重量…）的列，用于表头改名时的兜底保护。"""
+        return suspect_value_columns(header)
 
     @classmethod
     def _resolve_fields_from_header(cls, header: Dict[str, str]) -> Dict[str, str]:

@@ -825,6 +825,65 @@ def _template_cell_value(text: Any) -> Any:
     return int(number) if number == int(number) else number
 
 
+# 单元格引用：$?列$?行。前后都要卡死，否则会误伤两类东西——
+# 前面不能是字母/数字/下划线/$/!：否则 `LOG10(` 里的 `G10` 会被当引用（实测 `=LOG10(G4)`
+# 被旧正则改成 `=LOG{r}(G{r})`，渲染出 `=LOG100(G100)`，公式直接失效）。
+# 后面不能紧跟 `(` 或字母数字下划线：`ATAN2(` 的 `N2`、`LOG10(` 的 `G10` 都靠这一条挡住。
+_CELL_REF = re.compile(r"(?<![A-Za-z0-9_$!])(\$?)([A-Z]{1,3})(\$?)(\d+)(?![(0-9A-Za-z_])")
+
+
+def _col_key(col: str) -> int:
+    """列字母 → 1-based 序号，用于按真实列序排序（A=1, Z=26, AA=27）。"""
+    n = 0
+    for ch in col:
+        n = n * 26 + (ord(ch) - ord("A") + 1)
+    return n
+
+
+# 模板占位符：{r} 是本行，{r-1}/{r+2} 是相对本行的偏移（跨行引用用，见 render_formula）。
+_TPL_PLACEHOLDER = re.compile(r"\{r([+-]\d+)?\}")
+
+
+def _templatize_formula(formula: str, row: int) -> str:
+    """公式原文 + 它所在的行号 → 行号无关的模板（{r} 本行、{r-1} 上一行…）。
+
+    与旧实现（把所有 `[A-Z]+\\d+` 的行号一律换成 {r}）的差别是本函数按【相对偏移】记账，
+    这挡住三类实测会算错的情况：
+
+    1. 跨行引用被压平成本行。`=J9-J8`（与上一行环比）旧实现给出 `=J{r}-J{r}`，新行渲染成
+       `=J100-J100`，恒等于 0。现在记成 `=J{r}-J{r-1}`，渲染出 `=J100-J99`。
+    2. 区间被塌成单格。`=SUM(I2:I9)` 旧实现给出 `=SUM(I{r}:I{r})`（累计求和退化为单格），
+       现在记成 `=SUM(I{r-7}:I{r})`，偏移得以保留。
+    3. 函数名里的数字被当行号吃掉（见 _CELL_REF 的注释）。
+
+    绝对行（`$2`）本就该固定，不参与替换——WINTAK欧洲 的 `=L{r}*$B$2`（乘以顶部运费表的
+    单价）正是靠这一条才没被改坏。
+
+    按相对偏移记账还有个必需的副作用：同一列不同行的同一套逻辑会归一成【同一个模板】
+    （第 9 行的 `=J9-J8` 与第 10 行的 `=J10-J9` 都是 `=J{r}-J{r-1}`），逐列多数表决才
+    统计得到一起。
+    """
+    def repl(m: "re.Match") -> str:
+        col_abs, col, row_abs, rownum = m.group(1), m.group(2), m.group(3), m.group(4)
+        if row_abs:
+            return m.group(0)
+        delta = int(rownum) - row
+        return f"{col_abs}{col}{{r{delta:+d}}}" if delta else f"{col_abs}{col}{{r}}"
+
+    return _CELL_REF.sub(repl, formula)
+
+
+def render_formula(template: str, row: int) -> str:
+    """把公式模板渲染到第 row 行：{r} → row，{r-1} → row-1，以此类推。
+
+    不能直接用 str.format：模板里的 {r-1} 不是合法的 format 字段名（会抛 KeyError），
+    而跨行引用必须保留偏移才算得对。行号下限夹到 1，避免落点靠顶时引用出 0 行。
+    """
+    return _TPL_PLACEHOLDER.sub(
+        lambda m: str(max(row + int(m.group(1) or 0), 1)), template
+    )
+
+
 def _to_number(v) -> Optional[float]:
     """从可能带货币符（¥）/千分位的价格串解析出数字；失败返回 None。
 
@@ -1036,9 +1095,85 @@ async def write_product_row(
     return True, r.output or "已写入"
 
 
-async def resolve_sheet_schema_cloud(cloud, sheet: str) -> SheetSchema:
+# 学公式时向落点上方回溯的最大行数与每次拉取的窗口大小。表尾常有一段空白预留区
+# （实测 wintak美国 数据到 223 行、最后一个带公式的行是 215），所以要能往上翻几窗；
+# 但也不能无限翻——翻过头会翻回「布局改版前」的老区域，学到与落点不同的一套列序。
+_SAMPLE_WINDOW = 12
+_SAMPLE_MAX_LOOKBACK = 60
+# 前 3 行认不出 SPU 列时的深扫行数（WINTAK欧洲 真表头在第 4 行，前 3 行是运费小表）。
+_HEADER_DEEP_SCAN = 8
+# 采集必须认出来的逐商品字段：认不出就告警并让该列留空（见 resolve_sheet_schema_cloud）。
+# 只列「有平台来源、写错会算错钱」的几个；site/category/note 认不出只是少写点描述性内容，
+# 不至于污染成本链，不值得为它们刷告警。
+_REQUIRED_ITEM_FIELDS = {"spu", "image", "sale", "purchase", "weight"}
+
+
+def _pick_formula_rows(rows: dict, image_col: Optional[str],
+                       item_cols: set) -> dict:
+    """从 {行号: {列: cell}} 里挑出「有真公式」的行 → {行号: {列: 公式原文}}。
+
+    过滤图片列、DISPIMG（坏行把嵌入图落到了普通列）、以及逐商品写值的列。
+    """
+    out = {}
+    for rid, row in rows.items():
+        got = {}
+        for col, cell in row.items():
+            if col == image_col or col in item_cols:
+                continue
+            f = str(cell.get("formula") or "")
+            if not f.startswith("=") or "DISPIMG" in f:
+                continue
+            got[col] = f
+        if got:
+            out[rid] = got
+    return out
+
+
+async def _sample_near_landing(cloud, sheet: str, header_row: int,
+                               image_col: Optional[str], item_cols: set,
+                               landing_row: Optional[int]) -> tuple:
+    """取【落点附近】的采样行，返回 (rows, formula_rows)。
+
+    为什么必须按落点采样而不是固定取表头下 10 行（旧实现）：实测这份工作簿里多张 Sheet
+    的顶部与底部根本不是同一套公式——表格中途改过算法或插过列，而历史行不会被回刷。
+    例：wintak童装货盘记录 顶部毛利 `=T{r}/L{r}`、底部是 `=T{r}/I{r}`；pawly全球 顶部
+    销售价 `=J{r}*K{r}`（一层折扣）、底部是 `=J{r}*K{r}*L{r}`（两层）。新行落在底部，
+    却按顶部的公式写，算出来的成本/毛利就是错的，而且数字照样显示、看不出报错。
+
+    landing_row 为 None（追加到末尾）时从数据区末行往上找；有值（插到第 R 行）时从 R-1
+    往上找——那才是新行的真实邻居。找不到任何公式行就一路回溯到表头下方，仍找不到则
+    返回最后拿到的窗口（整表无公式的 Sheet 走这条，如 牛仔裤实量尺码）。
+    """
+    if landing_row is not None:
+        anchor = max(int(landing_row) - 1, header_row + 1)
+    else:
+        end = await asyncio.to_thread(cloud.data_end_row, sheet)  # 0-based
+        anchor = max(end + 1, header_row + 1)
+
+    rows: dict = {}
+    lowest = anchor
+    while True:
+        hi = lowest
+        lo = max(hi - _SAMPLE_WINDOW + 1, header_row + 1)
+        got = await asyncio.to_thread(cloud.read_rows, sheet, lo, hi)
+        rows.update(got)
+        formula_rows = _pick_formula_rows(rows, image_col, item_cols)
+        if formula_rows:
+            return rows, formula_rows
+        if lo <= header_row + 1 or anchor - lo >= _SAMPLE_MAX_LOOKBACK:
+            return rows, {}
+        lowest = lo - 1
+
+
+async def resolve_sheet_schema_cloud(cloud, sheet: str,
+                                     landing_row: Optional[int] = None
+                                     ) -> SheetSchema:
     """云端协作文档版的 resolve_sheet_schema：从 KdocsSheet 读表头与采样数据行，
     解析出与本地同构的 SheetSchema（字段列/公式模板/常量列）。每批调用一次。
+
+    landing_row：本批新行的 1-based 落点，用来决定【学哪一段的公式】。追加到末尾时传
+    None（内部按数据区末行定位）。这个参数是本函数正确性的关键——详见
+    _sample_near_landing 的注释：同一张表顶部与底部的公式常常不是一套。
 
     与本地版的差异只在数据源：云端 API 的 fmlaText 直接给公式原文（本地要解 xlsx
     里的 <f> 节点），cellText 是显示值。表头→字段映射复用本地同一个纯函数
@@ -1048,63 +1183,157 @@ async def resolve_sheet_schema_cloud(cloud, sheet: str) -> SheetSchema:
     header, header_row = await asyncio.to_thread(cloud.read_header, sheet)
     fields = WpsExcelTool._resolve_fields_from_header(header)
     if not fields.get("spu"):
+        # 默认只扫前 3 行，认不出 SPU 时往下多扫几行再试一次：WINTAK欧洲 前 3 行是一张
+        # 各国运费/操作费小表（22 列，被「非空最多」规则选中当表头），真表头在第 4 行
+        # （35 列）。不直接调大 read_header 的默认值，是因为订单登记侧也用它，那边靠
+        # 「前 3 行取最宽」已经稳定跑着，没必要为采集表的特例改动共用口径。
+        header, header_row = await asyncio.to_thread(
+            cloud.read_header, sheet, _HEADER_DEEP_SCAN
+        )
+        fields = WpsExcelTool._resolve_fields_from_header(header)
+        if fields.get("spu"):
+            logger.info(
+                f"「{sheet}」前 3 行认不出表头，深扫 {_HEADER_DEEP_SCAN} 行后"
+                f"定位到第 {header_row} 行"
+            )
+    if not fields.get("spu"):
         return SheetSchema(
             sheet=sheet,
             error=f"无法在 Sheet「{sheet}」表头解析出 SPU 列（避免列错位，拒绝写入）",
         )
     image_col = fields.get("image")
 
-    sample = await asyncio.to_thread(cloud.read_data_sample, sheet, header_row)
+    # 表头被改写时的护栏：逐商品写值的字段（销售价/采购价/重量…）一旦认不出来，那一列
+    # 就不再受"不许仿公式"的保护，而这些列的历史行【往往正是公式】（销售价常年是
+    # =参考价×折扣）。后果是平台申报价被一个依赖空白列的公式顶掉、新行显示成 0——算得出
+    # 数、看不出错，正是 _ITEM_INPUT_FIELDS 那条注释里记着的事故。
+    # 实测触发条件很轻：「销售价格」改成「销售价格(USD)」或「最终销售价格」就够了
+    # （_FIELD_RULES 的 sale 规则是精确等值匹配）。
+    # 这里不去猜标题（猜错等于把申报价写进别的列，更糟），而是把「表头认不出的字段」
+    # 显式记下来并告警；随后这些列一律【既不写值也不仿公式】，留空待人工补。
+    missing_fields = sorted(_REQUIRED_ITEM_FIELDS - set(fields))
+    # 认不出的字段【原本该占哪一列】无从得知，但可以反过来锁定：标题里带价/费/金额/重量
+    # 这类「值语义」词、却没被任何字段认领的列，很可能就是被改了名的那一列。把它们一并
+    # 排除在公式仿写之外——写空比被历史公式顶掉安全（后者会显示成一个由空白列算出的数）。
+    suspect_value_cols = (
+        WpsExcelTool.suspect_value_columns(header) - set(fields.values())
+        if missing_fields else set()
+    )
+    if missing_fields:
+        logger.warning(
+            f"「{sheet}」表头有 {len(missing_fields)} 个字段认不出："
+            f"{missing_fields}（标题可能被改过）。"
+            + (f"疑似被改名的值列 {sorted(suspect_value_cols)} 本批留空、"
+               f"且不会被历史公式覆盖；" if suspect_value_cols else "")
+            + "如需写入请把表头改回标准写法，或在 _FIELD_RULES 里补上新写法"
+        )
 
-    # 先枚举采样区里真实公式列。随后不是盲取第一/最后一行，而是选出「公式最齐、公式依赖
-    # 输入最完整」的健康历史行作模板，避免刚写坏的新行反过来污染下一批。
+    rows_by_id, formula_rows = await _sample_near_landing(
+        cloud, sheet, header_row, image_col,
+        WpsExcelTool.item_input_columns(fields) | suspect_value_cols, landing_row,
+    )
+    sample = [rows_by_id[r] for r in sorted(rows_by_id)]
+
     # 公式列【不受成本列白名单限制】（与本地 _inspect 同口径）：公式是本表的计算逻辑，
     # 按标题表去卡会让改过列名/多加一列计算列的 Sheet 整列丢公式。
     mimic_cols = WpsExcelTool.collect_mimic_columns(header)
-    item_cols = WpsExcelTool.item_input_columns(fields)
-    formula_candidates = {}
-    for row in sample:
-        for col, cell in row.items():
-            if col == image_col or col in item_cols:
-                continue
-            f = cell.get("formula") or ""
-            if not f.startswith("=") or "DISPIMG" in f:
-                continue
-            formula_candidates.setdefault(col, f)
+    item_cols = WpsExcelTool.item_input_columns(fields) | suspect_value_cols
+    formula_candidates = {
+        col for cols in formula_rows.values() for col in cols
+    }
 
     # 照抄历史固定值仍只在成本语义白名单内——数据形态区分不了「尾程运费」和
     # 「加速器参考价格」，只有标题能（见 wps_excel_tool._COLLECT_MIMIC_TITLES）。
-    template_input_cols = mimic_cols - set(formula_candidates) - item_cols
+    template_input_cols = mimic_cols - formula_candidates - item_cols
 
-    def row_score(row: dict) -> tuple:
-        formulas = sum(
-            1 for col in formula_candidates
-            if str((row.get(col) or {}).get("formula") or "").startswith("=")
+    # 【逐列多数表决，而不是整行照抄一个模板行】采样窗口里同一列常有多个版本：既有改版
+    # 遗留的老公式，也有个别行被人工改过（实测 pawly全球 毛利列 V 在末尾 6 行里 4 行是
+    # `=U{r}/M{r}`、2 行是 `=U{r}/J{r}`；wintak童装 的 L 列有 `=J{r}*I{r}` 与
+    # `=K{r}*J{r}*I{r}` 两版）。整行取一个"最全的模板行"会把那一行的个别异常也一起继承，
+    # 而按列取多数票能让每列各自回到本段的主流写法。
+    # 平票时取【离落点最近】的那版：越靠下越可能是当前在用的算法。
+    # 「数据行」＝采样窗口里真正承载商品的行。它是下面两道闸的分母：判断某列「是不是
+    # 公式列」要看它在【多少数据行】里是公式，而不是看「有公式的那几行」——后者会让
+    # 「9 行里只有 1 行是公式」的异常列以 1/1 的满票当选。
+    # 【不能只看 SPU 列非空】WINTAK欧洲 是一个 SPU 占多行（每行一个欧洲站点），只有首行
+    # 填 SPU、其余 12 行 SPU 为空；只认 SPU 会把分母压成 1，两道闸全部失效。故按
+    # 「SPU / 货号 / 图片 任一非空」判定，两种表结构都能给出正确的分母。
+    id_cols = [fields[k] for k in ("spu", "sku", "image") if fields.get(k)]
+    data_rows = [
+        rid for rid, row in rows_by_id.items()
+        if any(
+            str((row.get(c) or {}).get("text") or "").strip()
+            or str((row.get(c) or {}).get("formula") or "").strip()
+            for c in id_cols
         )
-        inputs = sum(
-            1 for col in template_input_cols
-            if str((row.get(col) or {}).get("text") or "").strip()
-        )
-        populated = sum(
-            1 for cell in row.values()
-            if str(cell.get("text") or cell.get("formula") or "").strip()
-        )
-        return formulas, inputs, populated
+    ] or list(rows_by_id)
 
-    template_row = max(sample, key=row_score, default={})
-    formula_columns = {}
-    # 优先拿同一健康模板行的公式，缺列才退回采样区其它行；保证整套逻辑来自同一行。
-    for col in formula_candidates:
-        f = (template_row.get(col) or {}).get("formula") or formula_candidates[col]
-        formula_columns[col] = re.sub(
-            r"(?<![A-Za-z$])([A-Z]{1,3})\d+", r"\1{r}", f
-        )
+    formula_columns: Dict[str, str] = {}
+    for col in sorted(formula_candidates, key=_col_key):
+        votes: Dict[str, list] = {}
+        for rid in data_rows:
+            f = (formula_rows.get(rid) or {}).get(col)
+            if f:
+                votes.setdefault(_templatize_formula(f, rid), []).append(rid)
+        if not votes:
+            continue
+        # _templatize_formula 已把本行引用与跨行偏移一并记成占位符，这里直接取多数票模板。
+        tpl, rids = max(votes.items(), key=lambda kv: (len(kv[1]), max(kv[1])))
+        covered = sum(len(v) for v in votes.values())
 
-    constant_columns = {
-        col: _template_cell_value(template_row[col]["text"])
-        for col in sorted(template_input_cols)
-        if col in template_row and template_row[col].get("text", "").strip()
+        # 【闸一：这列本来就不是公式列】公式只出现在少数数据行 → 那几行是异常，不是算法。
+        # 实测 wintak童装货盘记录 第 1872 行有人把「折扣」和「加速器价格」写反了
+        # （H=70% 值、I==H*G 公式），而其余 8 行都是 H==I/G、I 是纯值。照抄 I 列那个公式
+        # 会让新行 H 与 I 互相引用，直接算出【循环引用】。
+        if len(data_rows) >= 3 and covered * 2 < len(data_rows):
+            logger.warning(
+                f"「{sheet}」{col} 列只有 {covered}/{len(data_rows)} 个数据行是公式"
+                f"（其余是纯值），按非公式列处理、本列不仿写"
+            )
+            continue
+
+        # 【闸二：众口不一的列宁可留空】赢家拿不到半数说明这列的公式逐行因地制宜，不是
+        # 一套能照抄的算法。实测 WINTAK欧洲 的「空运头程」= 重量 × 该国运费单价，采样行
+        # 引用了 10 个不同的国家单价格（`=L{r}*$B$2` / `$D$2` / `$F$2`…），跟着货号列的
+        # 站点走。抄多数票等于把最后一行那个国家的运费按到所有新行上——算得出数、且看不
+        # 出错。留空让人工填，比写一个自信的错值安全。
+        if covered >= 3 and len(rids) * 2 <= covered:
+            logger.warning(
+                f"「{sheet}」{col} 列公式逐行不同（{covered} 行里有 {len(votes)} 种写法，"
+                f"最多的只占 {len(rids)} 行），本列留空待人工填"
+            )
+            continue
+        formula_columns[col] = tpl
+
+    # 常量列：同样按多数表决取采样窗口里最常见的值（个别行被人工改过不该带偏新行）。
+    # 平票时先看「哪一行的成本输入填得更全」，再看谁更靠近落点：管线上一批刚写坏的行往往
+    # 只填上了零星几列（实测只剩「操作费」一列），完整历史行才代表本表的口径；两行都完整
+    # 时再按靠下优先（越靠近落点越可能是当前在用的值）。
+    row_fill = {
+        rid: sum(
+            1 for c in template_input_cols
+            if c in row and str(row[c].get("text") or "").strip()
+        )
+        for rid, row in rows_by_id.items()
     }
+    constant_columns = {}
+    for col in sorted(template_input_cols, key=_col_key):
+        votes: Dict[Any, list] = {}
+        for rid, row in rows_by_id.items():
+            if col not in row or not str(row[col].get("text") or "").strip():
+                continue
+            votes.setdefault(
+                _template_cell_value(row[col]["text"]), []
+            ).append(rid)
+        if votes:
+            constant_columns[col] = max(
+                votes.items(),
+                key=lambda kv: (
+                    len(kv[1]),
+                    max(row_fill.get(r, 0) for r in kv[1]),
+                    max(kv[1]),
+                ),
+            )[0]
     # 数字格式/对齐：按【同列多行投票取最常见的那个】，不用「模板行优先」。
     # 理由是实测出来的：模板行往往就是上一批管线写的行，而管线此前根本没回放过格式
     # （读侧字段名认错，见 kdocs_sheet.read_cell_xf），那行自己就是「无格式」——
@@ -1222,7 +1451,7 @@ def _cloud_row(item: dict, res: CollectResult, schema: SheetSchema,
     # 公式放最后：write_rows 的读回校验取 values 里第一个非空值比对 cellText，
     # 公式格的 cellText 是计算值而非公式串，放前面必误判「写入验证失败」。
     for col, tpl in schema.formula_columns.items():
-        values[col] = tpl.format(r=first_row + offset)
+        values[col] = render_formula(tpl, first_row + offset)
     return {
         "values": values,
         "formats": schema.format_columns,
