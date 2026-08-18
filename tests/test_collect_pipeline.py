@@ -36,6 +36,81 @@ def test_worklist_key_reads_sku_spec():
     assert S.worklist_key({"spu": "123"}) == "123|"
 
 
+# --- 同价 SKU 折叠 -----------------------------------------------------------
+
+def test_collapse_keeps_one_row_per_distinct_price():
+    """同 SPU 里价格一样的规格只留第一条，价格不同的各留一行。
+
+    这是本次改造的核心口径：成本核算表按价核算，同价规格的整行数值完全相同，
+    逐行写只会把 Sheet 撑长；价格不同（2 双 / 10 双装）的规格必须各占一行。
+    """
+    items = [
+        {"spu": "1", "sku_id": "11", "sku_spec": "红色/5双", "price": "46.10¥"},
+        {"spu": "1", "sku_id": "12", "sku_spec": "蓝色/5双", "price": "46.10¥"},
+        {"spu": "1", "sku_id": "13", "sku_spec": "黑色/10双", "price": "299.68¥"},
+    ]
+    got = S.collapse_same_price_skus(items)
+    assert [it["sku_spec"] for it in got] == ["红色/5双", "黑色/10双"]
+
+
+def test_collapse_compares_price_numerically():
+    """同价的不同文本形态（46.1 / 46.10¥ / 1,299.00¥）要算同一价。
+
+    平台返回的价格串形态不统一，按字符串比会把同价规格判成不同价、白白多写一行。
+    """
+    items = [
+        {"spu": "1", "sku_id": "11", "sku_spec": "红", "price": "46.10¥"},
+        {"spu": "1", "sku_id": "12", "sku_spec": "蓝", "price": "46.1"},
+        {"spu": "1", "sku_id": "13", "sku_spec": "绿", "price": 46.1},
+    ]
+    assert len(S.collapse_same_price_skus(items)) == 1
+
+
+def test_collapse_never_merges_across_stores_or_regions():
+    """同一 SPU 在不同店/不同区域各留一行：它们落进不同 Sheet，合并会抹掉一整个店的行。"""
+    items = [
+        {"spu": "1", "mallid": "m1", "region": "global", "sku_spec": "红", "price": "9¥"},
+        {"spu": "1", "mallid": "m1", "region": "us", "sku_spec": "红", "price": "9¥"},
+        {"spu": "1", "mallid": "m2", "region": "global", "sku_spec": "红", "price": "9¥"},
+    ]
+    assert len(S.collapse_same_price_skus(items)) == 3
+
+
+def test_collapse_keeps_unpriced_rows_separate():
+    """价读不出的行不与任何有价行合并，也不互相合并——它们要留给人工逐行补价。"""
+    items = [
+        {"spu": "1", "sku_id": "11", "sku_spec": "红", "price": ""},
+        {"spu": "1", "sku_id": "12", "sku_spec": "蓝", "price": "46¥"},
+    ]
+    got = S.collapse_same_price_skus(items)
+    assert [it["sku_spec"] for it in got] == ["红", "蓝"]
+
+
+def test_collapse_leaves_legacy_worklist_untouched():
+    """老清单（一个 SPU 一条、无 sku_id）逐条价格各异 → 一条都不该被合并掉。"""
+    items = [
+        {"spu": "1", "price": "10¥"},
+        {"spu": "2", "price": "20¥"},
+    ]
+    assert S.collapse_same_price_skus(items) == items
+
+
+def test_load_worklist_collapses_same_price(monkeypatch, tmp_path):
+    """折叠发生在读取侧：worklist.json 存平台全量快照，读出来才是可采行。"""
+    import json
+
+    wl = tmp_path / "worklist.json"
+    wl.write_text(json.dumps([
+        {"spu": "1", "sku_id": "11", "sku_spec": "红", "price": "9¥"},
+        {"spu": "1", "sku_id": "12", "sku_spec": "蓝", "price": "9¥"},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(S, "WORKLIST", wl)
+
+    assert len(S.load_worklist()) == 1
+    # 落盘文件保持原样（全量快照），便于回看原始价、日后改折叠判据不必重新枚举
+    assert len(json.loads(wl.read_text(encoding="utf-8"))) == 2
+
+
 def test_worklist_status_reports_todo_spu_and_sku_counts(monkeypatch, tmp_path):
     """待采 SPU 按商品去重，SKU 数按实际待采清单行计数。"""
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")

@@ -1004,19 +1004,93 @@ async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> in
             pass
     WORKLIST.parent.mkdir(parents=True, exist_ok=True)
     WORKLIST.write_text(json.dumps(uniq, ensure_ascii=False, indent=2), encoding="utf-8")
+    # 落盘存平台全量快照（一个 SKU 一条），折叠只在读取侧做（见 load_worklist）：这样以后
+    # 想改折叠判据或回看某个规格的原始价，不必重新连浏览器枚举一遍。
+    # 返回值报【折叠后】的行数，与 UI 待采统计、实际写表行数同口径——报全量会让操作者按
+    # 388 去设本批数量，而实际可采只有折叠后那些行。
+    collapsed = collapse_same_price_skus(uniq)
+    merged = len(uniq) - len(collapsed)
     logger.info(
-        f"枚举完成（页签「{status_tab}」）：{len(uniq)} 个商品，"
+        f"枚举完成（页签「{status_tab}」）：{len(uniq)} 行原始 SKU，"
+        f"同 SPU 同价折叠后 {len(collapsed)} 行（合并 {merged} 行），"
         f"来自 {store_count} 个店铺标签 → {WORKLIST}"
     )
-    return len(uniq)
+    return len(collapsed)
+
+
+def _price_bucket(v) -> str:
+    """把 SKU 申报价归一成「用于比较是否同价」的桶键。
+
+    平台同一价格的文本形态并不统一（实测有 `46.10¥` / `46.1` / `1,299.00¥`），直接比
+    字符串会把同价的两个 SKU 判成不同价、白白多写一行；故复用 pipeline._to_number 剥成
+    数字再比——那也正是最终写进销售价列的值，「同价」的判据与落表的值同源。
+    保留两位小数：申报价就是两位精度，浮点直接比会因 46.1 与 46.10 的表示差异出岔。
+    读不出数字（空价/脏值）→ 返回原始文本做桶键，不与任何有价 SKU 合并：价读不到的行
+    本就要留给人工，不能被同 SPU 的别的行「代表」掉。
+    """
+    from app.collect.pipeline import _to_number
+
+    n = _to_number(v)
+    return f"n:{round(n, 2)}" if n is not None else f"s:{str(v or '').strip()}"
+
+
+def collapse_same_price_skus(items: list) -> list:
+    """同一 SPU 下申报价相同的多个 SKU 只保留一条，返回折叠后的清单。
+
+    【为什么要折叠】清单一个 SKU 一条后，一个 SPU 常展开出十几行（实测 128 商品 → 388
+    行），但成本核算表关心的是【采购价与销售价】：同 SPU 里价格一样的规格（比如只是颜色
+    不同的 5 双装），每行的销售价、采购价、重量、折扣全都一模一样，逐行写只会把 Sheet
+    撑得又长又难看，人工核对时还得逐行确认「这几行是不是重复的」。价格不同的规格（2 双
+    /10 双装那种）才是真正需要各占一行、各自核价的对象，一条都不能少。
+
+    折叠键是 (店铺+区域, SPU, 价格桶)：
+    - 必须带店铺+区域：同一 SPU 在全球区与美国区各有一条、落进不同 Sheet，跨区域合并会
+      直接抹掉其中一个店的行（与 enumerate_worklist 里合并去重的理由相同）。
+    - 价格桶按数值比，见 _price_bucket。
+
+    保留组内【第一条】（即平台返回顺序里的首个 SKU），它的 sku_spec 就成了这一行的货号。
+    这样判重键 `SPU|规格`（见 dedupe_key）仍与写进表里的值同源，不会因为折叠而漂移。
+    代价是平台调整 SKU 顺序后，同一价格组的「代表规格」可能换成另一个规格名，届时该组会
+    被判成新键、多写一行；这是选「货号写纯规格文本」换来的，与平台改文案的既有代价同源。
+
+    老清单（无 sku_id / 无 price）不受影响：价读不出时各自独立成桶（见 _price_bucket），
+    一条也不会被合并掉。
+    """
+    seen: set = set()
+    out: list = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        spu = str(it.get("spu") or "").strip()
+        if not spu:
+            out.append(it)  # 无 SPU 的行不参与折叠，原样透传给下游护栏处理
+            continue
+        key = (_store_key(it), spu, _price_bucket(it.get("price")))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    dropped = len(items) - len(out)
+    if dropped:
+        # 走 debug：本函数在每次 UI 刷新状态时都会被调（load_worklist），打 info 会刷屏。
+        # 给操作者看的那条汇总由 enumerate_worklist 在枚举结束时打一次。
+        logger.debug(
+            f"同价 SKU 折叠：{len(items)} 行 → {len(out)} 行（合并掉 {dropped} 行同 SPU 同价规格）"
+        )
+    return out
 
 
 def load_worklist() -> list:
+    """读工作清单，并在返回前做【同 SPU 同价 SKU 折叠】（见 collapse_same_price_skus）。
+
+    落盘的 worklist.json 始终是平台全量快照（一个 SKU 一条），折叠只发生在读取侧——
+    判重水位、UI 待采统计、写表全都走这个入口，口径天然一致。
+    """
     if not WORKLIST.exists():
         return []
     try:
         data = json.loads(WORKLIST.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
+        return collapse_same_price_skus(data) if isinstance(data, list) else []
     except Exception as e:
         logger.warning(f"读取工作清单失败：{e}")
         return []

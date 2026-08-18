@@ -790,7 +790,9 @@
           }
           const scope = sel.status ? `切到「${sel.status}」` : "跟随页面当前";
           const rg = sel.region ? `区域「${sel.region}」，` : "";
-          showToast("枚举完成", `${rg}${scope}，共 ${data.count} 个商品`, "success");
+          // count 是【同 SPU 同价折叠后】的可采行数，不是商品数（一个 SPU 可能因价格
+          // 不同占多行）。说「个商品」会与下方 SPU/SKU 两个统计数对不上，故说「行」。
+          showToast("枚举完成", `${rg}${scope}，共 ${data.count} 行可采`, "success");
           await loadWorklist({ syncCollectLimit: true });
         } catch (e) {
           showToast("枚举失败", String(e), "danger");
