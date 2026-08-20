@@ -950,9 +950,10 @@ async def resolve_sheet_schema(excel_tool, excel_path: str, sheet: str) -> Sheet
 
     fields = info.get("字段列映射", {}) or {}
     if not fields.get("spu"):
+        # 本地路径同口径：inspect 已给出表头，据它区分「选错文档」与「表头改名」
         return SheetSchema(
             sheet=sheet,
-            error=f"无法在 Sheet「{sheet}」表头解析出 SPU 列（避免列错位，拒绝写入）",
+            error=explain_missing_spu(sheet, info.get("header_列标题", {}) or {}),
         )
     image_col = fields.get("image")
     # 逐商品写值的列不仿公式：本表「销售价格」这类列历史可能是 =参考价*折扣，仿走会把
@@ -1107,6 +1108,54 @@ _HEADER_DEEP_SCAN = 8
 # 不至于污染成本链，不值得为它们刷告警。
 _REQUIRED_ITEM_FIELDS = {"spu", "image", "sale", "purchase", "weight"}
 
+# 订单登记表专有的表头标题（归一化后比对）。用途见 explain_missing_spu：
+# 【商品采集】与【订单登记】是两条独立管线、各写各的文档，但两页共用协作文档登记簿
+# （app/cloud_docs.py）与相似的 Sheet 名（两份文档里都有「WINTAK8.4+」这种名字），
+# 实测很容易在采集页选到订单登记表那份文档——2026-08-18 那批就是：目标是订单表的
+# WINTAK8.4+（列＝订单店铺/订单号/尺码/平台物流跟踪号…），压根没有 SPU 列。
+# 原来的中止文案只说「表头解析不出 SPU 列」，读起来像是商品表的表头被改了名，
+# 排查方向完全错。故这里按表头特征把两种成因分开说。
+_ORDERS_HEADER_TITLES = {
+    "订单号", "订单店铺", "站点区分", "平台物流跟踪号", "国内物流单号",
+    "子订单号", "采购订单号", "平台成交价", "物流情况",
+}
+# 判为订单登记表所需的命中数：单个「订单号」不够（商品表的备注列也可能提到），
+# 两个以上专有列同时出现才足够确定。
+_ORDERS_HEADER_HITS = 2
+
+
+def looks_like_orders_sheet(header: Dict[str, str]) -> bool:
+    """该表头是否属于【订单登记表】而非商品成本核算表。
+
+    只看订单侧专有列的命中数，不看 Sheet 名——两份文档的 Sheet 名高度重合
+    （WINTAK8.4+ / VibeMakers全球 在两边都有），名字区分不了。
+    """
+    titles = {WpsExcelTool.norm_title(t) for t in header.values()}
+    hits = titles & {WpsExcelTool.norm_title(t) for t in _ORDERS_HEADER_TITLES}
+    return len(hits) >= _ORDERS_HEADER_HITS
+
+
+def explain_missing_spu(sheet: str, header: Dict[str, str]) -> str:
+    """解析不出 SPU 列时的中止原因（要能指向正确的排查方向）。
+
+    两种成因的修法完全不同：选错文档要去换文档，表头改名要去补 _FIELD_RULES 或改回
+    标准写法。文案里带上实际读到的前几个标题，便于一眼看出手上是哪张表。
+    """
+    sample = "/".join(
+        header[c] for c in sorted(header, key=_col_key)[:6]
+    )
+    if looks_like_orders_sheet(header):
+        return (
+            f"Sheet「{sheet}」是【订单登记表】的表（读到的列：{sample}…），"
+            f"没有 SPU 列。商品采集与订单登记是两条独立管线、写不同的文档："
+            f"请把目标文档换成【商品成本核算表】，再选里面的商品 Sheet。"
+        )
+    return (
+        f"无法在 Sheet「{sheet}」表头解析出 SPU 列（读到的列：{sample}…），"
+        f"避免列错位，拒绝写入。若这就是商品表，请把 SPU 列标题改回含「SPU」的写法，"
+        f"或在 wps_excel_tool._FIELD_RULES 里补上新写法。"
+    )
+
 
 def _pick_formula_rows(rows: dict, image_col: Optional[str],
                        item_cols: set) -> dict:
@@ -1197,10 +1246,7 @@ async def resolve_sheet_schema_cloud(cloud, sheet: str,
                 f"定位到第 {header_row} 行"
             )
     if not fields.get("spu"):
-        return SheetSchema(
-            sheet=sheet,
-            error=f"无法在 Sheet「{sheet}」表头解析出 SPU 列（避免列错位，拒绝写入）",
-        )
+        return SheetSchema(sheet=sheet, error=explain_missing_spu(sheet, header))
     image_col = fields.get("image")
 
     # 表头被改写时的护栏：逐商品写值的字段（销售价/采购价/重量…）一旦认不出来，那一列
@@ -1479,11 +1525,9 @@ async def write_product_rows_cloud(
     也就 6 次。实测 20 个商品从 124 次降到 10 次。kdocs 有配额（429001 限频要等 20s、
     429002 直接熔断），这个量级的差距决定了整批能不能一次跑完。
 
-    【原子性是刻意的「一坏全坏」】一批里任一行文本写失败/读回校验不过，整批算失败并
-    落日志，不做「挑出坏的再写剩下的」——那样表里会留下半批数据，而判重键已落表，
-    重跑时这半批被当成已入库跳过，人工很难看出哪几行是残缺的。整批失败则一行不落，
-    重跑即可，语义干净。图片失败仍只告警不连坐（沿用 write_rows 的既定取舍：
-    文本已登记就算这行成立，图片格留空可人工补，见 kdocs_sheet.write_rows）。
+    文本批写后必须按 SPU 逐行读回确认；图片与格式属于辅助展示，失败只告警不把已落表
+    的业务值误报成“未入库”。底层云接口没有事务，文本接口异常时不能承诺一行不落，
+    因此失败提示会要求先检查 SPU，再决定是否重跑。
 
     insert_at_top 决定落点：True 插到表头正下方，False 追加到数据区末尾。
 
@@ -1515,12 +1559,12 @@ async def write_product_rows_cloud(
             )
             for offset, item in enumerate(items)
         ]
-        await asyncio.to_thread(
+        write_result = await asyncio.to_thread(
             cloud.write_rows, sheet, rows, schema.header_row, insert_at_top,
             first_row if at_row is not None else None,
-        )
+        ) or {}
     except KdocsSheetError as e:
-        return False, f"整批写入失败（一行不落，可直接重跑）：{e}", []
+        return False, f"整批文本写入失败（请先按 SPU 检查表格，再重跑）：{e}", []
 
     # 写后确认：读新行区的 SPU 列，与本批 SPU 逐行比对（顺序与写入同序）
     try:
@@ -1537,4 +1581,12 @@ async def write_product_rows_cloud(
             f"整批写后确认不一致：{len(missing)} 行 SPU 与预期不符"
             f"（期望 {expect[:3]}… 实际 {got[:3]}…）"
         ), []
-    return True, f"整批已写入 {len(rows)} 行", expect
+    warnings = []
+    formats_failed = int(write_result.get("formats_failed") or 0)
+    images_failed = int(write_result.get("images_failed") or 0)
+    if formats_failed:
+        warnings.append(f"{formats_failed} 个单元格格式未回放")
+    if images_failed:
+        warnings.append(f"{images_failed} 张图片未写入")
+    suffix = f"；{'，'.join(warnings)}" if warnings else ""
+    return True, f"整批已写入 {len(rows)} 行{suffix}", expect

@@ -106,7 +106,7 @@ def test_read_cell_xf_translates_read_fields_to_write_fields():
     """读侧与写侧的格式字段根本不是一套，必须翻译。
 
     2026-08-12 实测：get_range_data 返回的是 numFormat / alignment{horizontal,vertical}，
-    响应里【没有】xf 这个键；而 update_range_data 要的是 numfmt（全小写）+ alcH/alcV。
+    响应里【没有】xf 这个键；而批量写接口要的是 numfmt（全小写）+ alcH/alcV。
     此前代码直接取 cell["xf"] 原样回写，于是格式字典恒空，采集写的新行永远拿不到
     历史行的两位小数/百分比（历史行显示 25.00 / 16.05%，新行显示 1 / 0）。
     """
@@ -188,7 +188,10 @@ def test_write_rows_sequence_and_payload(monkeypatch):
     res = cli.write_rows("StoreA全球1", rows, header_row=2)
     # first_row 是新增的返回字段（0-based 落点）：订单默认 insert_at_top，落在表头
     # （第 2 行）正下方 = 0-based 2，行为与采集加落点开关之前一致。
-    assert res == {"written": 1, "images": 1, "images_failed": 0, "first_row": 2}
+    assert res == {
+        "written": 1, "images": 1, "images_failed": 0,
+        "formats_failed": 0, "first_row": 2,
+    }
 
     kinds = [a for _, a, _ in cli._fake.calls if a != "get_sheets_info"]
     # 插行 → 写文本 → 写图片（先文后图）→ 读回验证
@@ -263,6 +266,17 @@ def test_business_error_raises(monkeypatch):
     routes = {("sheet", "get_sheets_info"): {"code": 400006, "msg": "鉴权失败"}}
     cli = _make(monkeypatch, routes)
     with pytest.raises(K.KdocsSheetError, match="400006"):
+        cli.sheet_names()
+
+
+def test_business_error_without_msg_uses_other_detail(monkeypatch):
+    routes = {
+        ("sheet", "get_sheets_info"): {
+            "code": 400001, "msg": None, "error": "invalid rangeData",
+        },
+    }
+    cli = _make(monkeypatch, routes)
+    with pytest.raises(K.KdocsSheetError, match="invalid rangeData"):
         cli.sheet_names()
 
 

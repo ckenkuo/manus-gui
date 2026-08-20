@@ -46,7 +46,7 @@ _IMAGE_PX = -1
 # 数值字段（成交价、件数）不可能有 12 位，故这个阈值不会误伤需要求和的列。
 _TEXT_DIGITS_MIN = 12
 
-# 读侧（get_range_data）与写侧（update_range_data 的 xf）的对齐枚举不是同一套：
+# 读侧（get_range_data）与写侧（range_data_batch_update 的 xf）的对齐枚举不是同一套：
 # 读回来是 haCenter/vaCenter 这样的字符串，写进去要的是 alcH/alcV 数字。
 # 枚举取自 kdocs 参数文档：alcH 1=左 2=居中 3=右 4=填充 5=两端 6=跨列 7=分散；
 # alcV 0=上 1=中 2=下 3=两端 4=分散。haGeneral 没有对应数字（就是"没设过"），不回放。
@@ -84,7 +84,7 @@ def _writes_number(value: Any) -> bool:
 
 
 def read_cell_xf(cell: dict) -> Optional[dict]:
-    """把 get_range_data 读回的单元格格式，翻成 update_range_data 能吃的 xf。
+    """把 get_range_data 读回的单元格格式，翻成批量写接口能吃的 xf。
 
     【为什么必须有这层翻译】两侧字段名根本不是一套：读回来是
     `numFormat`/`alignment:{horizontal,vertical}`/`fonts`/`cell_background_color`，
@@ -137,6 +137,25 @@ def _resolve_cli(cli: str) -> str:
 
 class KdocsSheetError(Exception):
     """kdocs-cli 调用失败（进程错误 / 业务错误码 / 响应不可解析）。"""
+
+
+def _business_error_detail(env: dict) -> str:
+    """从不同版本的 kdocs 错误信封里提取可读原因，避免只报一个 ``None``。
+
+    2.6.1 的部分接口把原因放在 error/message/detail，而不是 msg；直接读 msg 会把
+    400001 这类参数错误最关键的诊断信息丢掉。这里仅展开响应信封，不带请求体，避免
+    文档链接或业务数据被写进日志。
+    """
+    for key in ("msg", "message", "error", "reason"):
+        value = env.get(key)
+        if value not in (None, "", {}):
+            return str(value)[:300]
+    detail = env.get("detail")
+    if detail not in (None, "", {}):
+        if isinstance(detail, str):
+            return detail[:300]
+        return json.dumps(detail, ensure_ascii=False, default=str)[:300]
+    return "响应未提供错误说明"
 
 
 def col_to_index(col: str) -> int:
@@ -257,7 +276,8 @@ class KdocsSheet:
             code = env.get("code")
             if code not in (None, 0):
                 raise KdocsSheetError(
-                    f"kdocs-cli {service}.{action} 业务错误 code={code}: {env.get('msg')}"
+                    f"kdocs-cli {service}.{action} 业务错误 code={code}: "
+                    f"{_business_error_detail(env)}"
                 )
             if env.get("result") not in (None, "ok") and "code" not in env:
                 raise KdocsSheetError(f"kdocs-cli {service}.{action} 失败：{out[:300]}")
@@ -276,8 +296,8 @@ class KdocsSheet:
         """带重试的调用：429001 等 _RATE_LIMIT_WAIT 秒后重试一次；retry_5xx=True 时
         HTTP 5xx（网关超时等）等 3s 重试一次。429002（熔断）与未知错误直接抛。
 
-        retry_5xx 只能开给【幂等】操作：range_data_batch_update / update_range_data
-        （同值或同格式写同格）和所有读操作。insert_rows_cols 非幂等（重试会重复插行），禁止开。
+        retry_5xx 只能开给【幂等】操作：range_data_batch_update（同值或同格式写同格）
+        和所有读操作。insert_rows_cols 非幂等（重试会重复插行），禁止开。
         """
         try:
             return self._run_once(service, action, payload)
@@ -593,8 +613,8 @@ class KdocsSheet:
                     continue
                 ci = col_to_index(col)
                 format_ops.append({
-                    "opType": "format",
-                    "rowFrom": r, "rowTo": r, "colFrom": ci, "colTo": ci,
+                    "op_type": "cell_operation_type_format",
+                    "row_from": r, "row_to": r, "col_from": ci, "col_to": ci,
                     "xf": xf,
                 })
             url = pipeline.to_jpeg_url(str(item.get("image_url") or ""))
@@ -617,13 +637,26 @@ class KdocsSheet:
                 "range_data": text_ops[start:start + 500],
             }, retry_5xx=True)
 
-        # 云端追加落在空白行，天然没有模板行的百分比/货币/小数位/边框。按 read_data_sample
-        # 读到的 xf 原样回放；这是展示与计算逻辑的一部分，不能只写值和公式。
+        # 云端追加落在空白行，天然没有模板行的百分比/货币/小数位。格式也统一走已经
+        # 承担文本和图片写入的 range_data_batch_update，避免同一批数据混用两套参数风格。
+        #
+        # 格式写在文本之后，底层接口又没有事务：此处若把格式错误继续向上抛，上层会把
+        # 【已经落表的值】误报成“未入库”，用户直接重跑就会产生重复行。故格式回放按
+        # best-effort 处理并返回失败数；业务值仍会在后面的读回校验中独立确认。
+        formats_failed = 0
         for start in range(0, len(format_ops), 500):
-            self._run("sheet", "update_range_data", {
-                "worksheet_id": wsid,
-                "rangeData": format_ops[start:start + 500],
-            }, retry_5xx=True)
+            batch = format_ops[start:start + 500]
+            try:
+                self._run("sheet", "range_data_batch_update", {
+                    "worksheet_id": wsid,
+                    "range_data": batch,
+                }, retry_5xx=True)
+            except KdocsSheetError as e:
+                formats_failed += len(batch)
+                logger.warning(
+                    f"「{sheet_name}」第 {first_row + 1}~{first_row + len(rows)} 行"
+                    f"格式回放失败（值已写入，继续做读回确认）：{e}"
+                )
 
         images = 0
         images_failed = 0
@@ -654,7 +687,8 @@ class KdocsSheet:
             grown = int(info.get("row_to", 0)) + len(rows)
             info["row_to"] = max(grown, first_row + len(rows) - 1)
         return {"written": len(rows), "images": images,
-                "images_failed": images_failed, "first_row": first_row}
+                "images_failed": images_failed, "formats_failed": formats_failed,
+                "first_row": first_row}
 
     def _verify_top_row(self, sheet_name: str, first: dict, first_row: int) -> None:
         """读回新写区域第一行（0-based first_row），抽查一个非空值是否真的落上去了。"""

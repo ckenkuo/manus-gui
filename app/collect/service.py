@@ -1229,6 +1229,25 @@ def get_worklist_status(
                     done = existing_keys(
                         excel, sheet, cloud=cloud, fields=fields, header_row=header_row
                     )
+                else:
+                    # 选到没有 SPU 列的表（最常见是误选了订单登记表那份文档）→ 现在
+                    # 就把原因摆到红条上。原先这里静默跳过判重，页面显示「已入库 –」
+                    # 照样能点开始，跑到 run_batch 才中止，用户白等一轮枚举。
+                    # 深扫一次（口径同 resolve_sheet_schema_cloud）：WINTAK欧洲 真表头
+                    # 在第 4 行，只看前 3 行会把它误判成「没有 SPU 列」。
+                    from app.collect.pipeline import (
+                        _HEADER_DEEP_SCAN, explain_missing_spu,
+                    )
+
+                    deep, deep_row = cloud.read_header(sheet, _HEADER_DEEP_SCAN)
+                    deep_fields = WpsExcelTool._resolve_fields_from_header(deep)
+                    if deep_fields.get("spu"):
+                        done = existing_keys(
+                            excel, sheet, cloud=cloud, fields=deep_fields,
+                            header_row=deep_row,
+                        )
+                    else:
+                        cloud_err = explain_missing_spu(sheet, deep or header)
             except Exception as e:
                 logger.warning(f"读协作文档判重水位失败：{e}")
                 cloud_err = str(e)
@@ -2030,7 +2049,7 @@ async def run_batch(
                     via="base", note="采购价/重量待人工填",
                 ).to_event(i, batch))
         else:
-            # 一坏全坏：整批一行不落，逐个报失败，日志给出原因供排查后重跑
+            # 文本批写失败时逐个报失败；云接口没有事务，提示会要求先查 SPU 再重跑。
             fail = len(items)
             logger.error(f"❌ 整批未入库：{msg}")
             for i, item in enumerate(items, 1):
