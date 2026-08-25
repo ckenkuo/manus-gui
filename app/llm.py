@@ -7,12 +7,14 @@ from openai import (
     AsyncAzureOpenAI,
     AsyncOpenAI,
     AuthenticationError,
+    BadRequestError,
     OpenAIError,
     RateLimitError,
 )
 from openai.types.chat import ChatCompletion, ChatCompletionMessage
 from tenacity import (
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
     wait_random_exponential,
@@ -20,7 +22,7 @@ from tenacity import (
 
 from app.bedrock import BedrockClient
 from app.config import LLMSettings, config
-from app.exceptions import TokenLimitExceeded
+from app.exceptions import EmptyContentTruncated, TokenLimitExceeded
 from app.logger import logger  # Assuming a logger is set up in your app
 from app.schema import (
     ROLE_VALUES,
@@ -29,6 +31,73 @@ from app.schema import (
     Message,
     ToolChoice,
 )
+
+
+def _worth_retry_text(exc: BaseException) -> bool:
+    """纯文本请求是否值得退避重试。
+
+    排除三类确定性失败——它们重发只会原样再失败一次，却各要等掉一轮指数退避：
+      - BadRequestError（400）：请求本身不合法，同 _worth_retry 的理由。
+      - EmptyContentTruncated：推理链吃光额度，ask 内部已就地抬额度重发过一次
+        （见 _RETRY_TOKEN_SCALE），到这一步说明抬了也没用。2026-08-22 属性审核
+        实测：原先这类失败会走满 6 次退避，单次白等 2 分 17 秒。
+      - TokenLimitExceeded：输入本身超限，重发一样超。原先装饰器里注释写着
+        "Don't retry TokenLimitExceeded"，但 retry_if_exception_type 的元组里带着
+        Exception（等于什么都重试），这条豁免形同虚设——顺手做实。
+    """
+    return not isinstance(
+        exc, (BadRequestError, EmptyContentTruncated, TokenLimitExceeded))
+
+
+def _worth_retry(exc: BaseException) -> bool:
+    """带图请求是否值得重试：400 一律不重试。
+
+    【为什么单独判】原先 retry_if_exception_type 里写了 Exception，等于什么都重试。
+    2026-08-22 实测：Kimi 端点收到远程图片 URL 直接回 400
+    "unsupported image url"，这是请求本身不合法、重发多少次都一样，却被退避重试
+    6 次——白等几十秒、日志里同一条错误刷 6 遍，最后仍包成 RetryError 抛出，
+    真正的原因反而被埋掉。故 400 视作确定性失败立即抛出，其余（限流/超时/网关
+    抖动）照旧重试。
+    """
+    return not isinstance(exc, BadRequestError)
+
+
+# 截断返空时就地重发用的额度倍数。1.5 是够用的经验值：deepseek 档配 32000，抬到
+# 48000 足以让推理链跑完还剩下正文的量；给更大只是多烧钱（真不够时抬两倍也救不回来，
+# 那属于提示词/模型选择问题，见 EmptyContentTruncated 的注释）。
+_RETRY_TOKEN_SCALE = 1.5
+
+
+def _is_truncated_empty(response) -> bool:
+    """是不是「推理链吃光额度导致正文为空」这种确定性失败。
+
+    判据是 finish_reason == "length" 且 content 为空：单看 content 空分不清是被
+    截断（抬额度有救）还是模型真没话说（重发/改提示词才有救），两者处置完全相反。
+    """
+    if not response.choices:
+        return False
+    ch = response.choices[0]
+    return ch.finish_reason == "length" and not (ch.message.content or "").strip()
+
+
+def _empty_response_detail(response, max_tokens: int) -> str:
+    """给「响应为空」的报错补上 finish_reason 与 usage。
+
+    【为什么值得单独抽出来】2026-08-22 属性审核踩的坑：推理型模型（deepseek 视觉档、
+    grok、kimi）先产 reasoning 链再产 content，额度不够时把 max_tokens 全耗在推理上、
+    content 返回空，端点侧表现为 finish_reason="length"。原先只抛一句
+    "Empty or invalid response from LLM"，日志里分不清是被截断（该调高 max_tokens）
+    还是模型真的没话说（该改提示词）——白等两分多钟又只能靠猜。
+    """
+    if not response.choices:
+        return "no choices"
+    finish = response.choices[0].finish_reason
+    used = getattr(response.usage, "completion_tokens", "?")
+    detail = (f"finish_reason={finish}, completion_tokens={used}, "
+              f"max_tokens={max_tokens}")
+    if finish == "length":
+        detail += "（额度耗尽在推理链上，需调高 max_tokens）"
+    return detail
 
 
 REASONING_MODELS = ["o1", "o3-mini"]
@@ -52,6 +121,19 @@ MULTIMODAL_MODELS = [
     # 还误报"does NOT support images"。加入后：视觉档/GUI 档（均配 qwen3.7-plus）真正可用，
     # agent 兜底也能看页面截图（注意截图占 token，靠 max_input_tokens=60000 兜底）。
     "qwen3.7-plus",  # DashScope 思考+多模态主模型（实测可看图）
+    "grok-4.6",  # packycode Grok 4.6 多模态模型（支持图像理解）
+    # Kimi Code k3：官方文档（kimi.com/code/docs）对 k3-256k 注明「不支持视频输入」，
+    # 反向说明 k3 支持图/视频输入，故登记。但 coding 端点（api.kimi.com/coding/v1）
+    # 是否接受 base64 data URL 图未实测——不行就把 [llm.publish] 整体换回 grok。
+    "k3",  # 2026-08-21 探针实测：base64 图可用（红色测试图答「红色」）
+    "kimi-for-coding",  # Kimi K2.7 Code，同日实测文本与 base64 图均可用
+    "k3-256k",  # Kimi k3 256K 档，同日实测文本与 base64 图均可用
+    "kimi-for-coding-highspeed",  # Kimi K2.7 高速档，同日实测文本与 base64 图均可用
+    # DeepSeek 视觉（api-docs.deepseek.com/zh-cn/guides/vision）：官方 chat/completions
+    # 协议，content 用 text + image_url 两段，与本文件既有拼装完全一致，故无需另写分支。
+    # 2026-08-22 实测：base64 与远程 URL 都收（少数几家两种都行的），temperature 0.0 可用。
+    # 发布管线仍统一走 base64（image_ref 转码），不依赖服务端出网取图。
+    "deepseek-v4-flash-vision-exp",
 ]
 
 
@@ -239,6 +321,115 @@ class LLM:
 
             self.token_counter = TokenCounter(self.tokenizer)
 
+    @property
+    def use_response_api(self) -> bool:
+        """当前配置是否走 OpenAI Responses 协议（/v1/responses）而非 chat completions。
+
+        由 api_type = "openai-response" 显式开启。为什么需要这个开关：
+        2026-08-20 实测 packycode 网关（cf.api.fan）的 grok-4.5/4.6 只支持
+        /v1/responses，打 /v1/chat/completions 直接 400 protocol_not_supported
+        （纯文本和带图都一样）。同一批模型此前是支持 chat 的，网关侧改过——所以
+        这不能按模型名硬编码，必须配置可切。
+        """
+        return (self.api_type or "").lower() in ("openai-response", "openai_response",
+                                                 "responses")
+
+    def _to_response_input(self, messages: List[dict]) -> tuple:
+        """把 chat 格式的 messages 转成 Responses 协议的 (instructions, input)。
+
+        两处形态差异（2026-08-20 实测网关行为）：
+          - system 角色不进 input，要单独作为顶层 instructions 传；多条 system 用
+            换行拼接。放进 input 里网关不报错但会被当普通用户消息，指令效力下降。
+          - content 的类型名不同：chat 的 text/image_url → responses 的
+            input_text/input_image，且 input_image 的 image_url 是【字符串】而不是
+            chat 那样的 {"url": ...} 对象。写错不报错，图会被静默丢掉。
+        """
+        instructions = []
+        items = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "system":
+                if isinstance(content, str):
+                    instructions.append(content)
+                elif isinstance(content, list):
+                    instructions.extend(c.get("text", "") for c in content
+                                        if isinstance(c, dict) and c.get("text"))
+                continue
+            parts = []
+            if isinstance(content, str):
+                parts.append({"type": "input_text", "text": content})
+            elif isinstance(content, list):
+                for c in content:
+                    if not isinstance(c, dict):
+                        continue
+                    if c.get("type") == "text":
+                        parts.append({"type": "input_text", "text": c.get("text", "")})
+                    elif c.get("type") == "image_url":
+                        iu = c.get("image_url") or {}
+                        url = iu.get("url") if isinstance(iu, dict) else iu
+                        if url:
+                            parts.append({"type": "input_image", "image_url": url})
+            if parts:
+                items.append({"role": role or "user", "content": parts})
+        return ("\n\n".join(instructions), items)
+
+    @staticmethod
+    def _from_response_output(resp) -> str:
+        """从 Responses 协议的响应里取出正文文本。
+
+        output 是数组，混着 reasoning 项和 message 项，正文只在
+        message.content[].output_text.text 里。【必须按 type 过滤】——直接取
+        output[0] 会拿到 reasoning 的思考摘要（推理模型总是先产 reasoning），
+        表现为「返回了一堆自言自语而不是答案」。
+        """
+        data = resp.model_dump() if hasattr(resp, "model_dump") else resp
+        chunks = []
+        for item in (data.get("output") or []):
+            if item.get("type") != "message":
+                continue
+            for ci in (item.get("content") or []):
+                if ci.get("type") == "output_text" and ci.get("text"):
+                    chunks.append(ci["text"])
+        return "".join(chunks).strip()
+
+    async def _call_response_api(self, messages: List[dict],
+                                 temperature: Optional[float] = None) -> str:
+        """走 /v1/responses 发一次非流式请求并返回正文。
+
+        max_output_tokens 用 self.max_tokens：推理模型先产 reasoning 再产正文
+        （实测一次带图判断就吃掉 1062 个 reasoning token），给小了正文会是空串。
+        故 [llm.publish] 的 max_tokens=16000 这个值在这条协议下同样要保留。
+        """
+        instructions, items = self._to_response_input(messages)
+        params = {
+            "model": self.model,
+            "input": items,
+            "max_output_tokens": self.max_tokens,
+        }
+        if instructions:
+            params["instructions"] = instructions
+        # temperature 对部分推理模型是非法参数，故仅在显式给值时才带上
+        temp = temperature if temperature is not None else self.temperature
+        if temp is not None:
+            params["temperature"] = temp
+
+        resp = await self.client.responses.create(**params)
+        text = self._from_response_output(resp)
+        usage = (resp.model_dump() if hasattr(resp, "model_dump") else resp).get("usage") or {}
+        self.update_token_count(usage.get("input_tokens", 0),
+                                usage.get("output_tokens", 0))
+        if not text:
+            # 空正文最常见的原因就是 max_output_tokens 被 reasoning 吃光，
+            # 把 reasoning_tokens 一并报出来，免得又去怀疑提示词
+            det = usage.get("output_tokens_details") or {}
+            raise ValueError(
+                f"Responses API 返回空正文（output_tokens={usage.get('output_tokens')}, "
+                f"reasoning_tokens={det.get('reasoning_tokens')}）；"
+                f"多半是 max_tokens 给小了被推理占满"
+            )
+        return text
+
     def count_tokens(self, text: str) -> int:
         """计算文本中的 token 数"""
         if not text:
@@ -367,9 +558,9 @@ class LLM:
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        # 400 与「抬额度后仍返空」不重试（见 _worth_retry_text）：都是确定性失败，
+        # 走满退避只是白等。其余（限流/超时/网关抖动/单次返空）照旧重试。
+        retry=retry_if_exception(_worth_retry_text),
     )
     async def ask(
         self,
@@ -442,6 +633,14 @@ class LLM:
                 "messages": messages,
             }
 
+            # Responses 协议分流：该协议没有 stream 之外的形态差异要处理，
+            # 故不论调用方要不要 stream 都走非流式（本项目的单发判断点都不用流式；
+            # agent 主循环走的是 ask_tool，不经过这里）。
+            if self.use_response_api:
+                if stream:
+                    logger.info("Responses 协议下忽略 stream=True，按非流式返回")
+                return await self._call_response_api(messages, temperature)
+
             if self.model in REASONING_MODELS:
                 params["max_completion_tokens"] = self.max_tokens
             else:
@@ -451,13 +650,34 @@ class LLM:
                 )
 
             if not stream:
-                # 非流式请求
+                # 非流式请求。截断返空时就地抬额度重发一次（见 _RETRY_TOKEN_SCALE）
                 response = await self.client.chat.completions.create(
                     **params, stream=False
                 )
+                if _is_truncated_empty(response):
+                    bigger = int(self.max_tokens * _RETRY_TOKEN_SCALE)
+                    logger.warning(
+                        f"正文被推理链挤空（{_empty_response_detail(response, self.max_tokens)}）"
+                        f"，就地把额度抬到 {bigger} 重发一次"
+                    )
+                    key = ("max_completion_tokens" if self.model in REASONING_MODELS
+                           else "max_tokens")
+                    response = await self.client.chat.completions.create(
+                        **{**params, key: bigger}, stream=False
+                    )
+                    if _is_truncated_empty(response):
+                        # 抬过一次仍被挤空：额度不是差一点，是提示词或模型选得不对。
+                        # 抛专用类型让退避重试跳过它（重发只会再白烧一遍推理链）。
+                        raise EmptyContentTruncated(
+                            "抬高 max_tokens 后正文仍为空: "
+                            + _empty_response_detail(response, bigger)
+                        )
 
                 if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
+                    raise ValueError(
+                        "Empty or invalid response from LLM: "
+                        + _empty_response_detail(response, self.max_tokens)
+                    )
 
                 # 更新 token 计数
                 self.update_token_count(
@@ -496,6 +716,11 @@ class LLM:
         except TokenLimitExceeded:
             # 重新抛出 token 限制错误而不记录日志
             raise
+        except EmptyContentTruncated as e:
+            # 不打 exception 堆栈：这不是代码出错，是额度/提示词配得不对，
+            # 一行说清即可（掉到下面的 except Exception 会报成 "Unexpected error"）
+            logger.error(f"正文被推理链挤空且抬额度无效：{e}")
+            raise
         except ValueError:
             logger.exception(f"Validation error")
             raise
@@ -515,9 +740,8 @@ class LLM:
     @retry(
         wait=wait_random_exponential(min=1, max=60),
         stop=stop_after_attempt(6),
-        retry=retry_if_exception_type(
-            (OpenAIError, Exception, ValueError)
-        ),  # Don't retry TokenLimitExceeded
+        # 400 不重试（见 _worth_retry）：请求不合法，重发无意义
+        retry=retry_if_exception(_worth_retry),
     )
     async def ask_with_images(
         self,
@@ -606,6 +830,13 @@ class LLM:
             if not self.check_token_limit(input_tokens):
                 raise TokenLimitExceeded(self.get_limit_error_message(input_tokens))
 
+            # Responses 协议分流：_to_response_input 会把上面构造好的 chat 形态
+            # （text/image_url）转成 input_text/input_image，故这里不必另写一套拼装。
+            if self.use_response_api:
+                if stream:
+                    logger.info("Responses 协议下忽略 stream=True，按非流式返回")
+                return await self._call_response_api(all_messages, temperature)
+
             # 设置 API 参数
             params = {
                 "model": self.model,
@@ -627,7 +858,10 @@ class LLM:
                 response = await self.client.chat.completions.create(**params)
 
                 if not response.choices or not response.choices[0].message.content:
-                    raise ValueError("Empty or invalid response from LLM")
+                    raise ValueError(
+                        "Empty or invalid response from LLM: "
+                        + _empty_response_detail(response, self.max_tokens)
+                    )
 
                 self.update_token_count(response.usage.prompt_tokens)
                 return response.choices[0].message.content

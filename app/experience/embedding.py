@@ -22,7 +22,7 @@ def _resolve_endpoint() -> tuple[str, str]:
     if settings is None or not settings.api_key or not settings.base_url:
         raise ValueError(
             "未找到可用的 embedding 接入配置：请确保 config.toml 的 [llm] 段"
-            "（api_key/base_url）有效，或设置环境变量 DASHSCOPE_API_KEY。"
+            "（api_key/base_url）有效。"
         )
     return settings.api_key, settings.base_url
 

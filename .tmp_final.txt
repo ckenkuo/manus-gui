@@ -1,0 +1,48 @@
+C:\Users\Administrator\Desktop\manus-gui\.venv\Lib\site-packages\pytest_asyncio\plugin.py:207: PytestDeprecationWarning: The configuration option "asyncio_default_fixture_loop_scope" is unset.
+The event loop scope for asynchronous fixtures will default to the fixture caching scope. Future versions of pytest-asyncio will default the loop scope for asynchronous fixtures to function scope. Set the default fixture loop scope explicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "module", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+........................................................................ [  6%]
+........................................................................ [ 12%]
+........................................................................ [ 18%]
+........................................................................ [ 24%]
+.............s.......................................................... [ 30%]
+........................................................................ [ 36%]
+........................................................................ [ 43%]
+........................................................................ [ 49%]
+........................................................................ [ 55%]
+........................................................................ [ 61%]
+........................................................................ [ 67%]
+........................................................................ [ 73%]
+........................................................................ [ 79%]
+........................................................................ [ 86%]
+........................................................................ [ 92%]
+........................................................................ [ 98%]
+...................                                                      [100%]
+============================== warnings summary ===============================
+.venv\Lib\site-packages\pydantic\_internal\_config.py:295
+.venv\Lib\site-packages\pydantic\_internal\_config.py:295
+.venv\Lib\site-packages\pydantic\_internal\_config.py:295
+.venv\Lib\site-packages\pydantic\_internal\_config.py:295
+.venv\Lib\site-packages\pydantic\_internal\_config.py:295
+.venv\Lib\site-packages\pydantic\_internal\_config.py:295
+  C:\Users\Administrator\Desktop\manus-gui\.venv\Lib\site-packages\pydantic\_internal\_config.py:295: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.10/migration/
+    warnings.warn(DEPRECATION_MESSAGE, DeprecationWarning)
+
+.venv\Lib\site-packages\pydantic\_internal\_config.py:345
+.venv\Lib\site-packages\pydantic\_internal\_config.py:345
+  C:\Users\Administrator\Desktop\manus-gui\.venv\Lib\site-packages\pydantic\_internal\_config.py:345: UserWarning: Valid config keys have changed in V2:
+  * 'underscore_attrs_are_private' has been removed
+    warnings.warn(message, UserWarning)
+
+tests/test_orders_web.py::test_orders_page_renders
+tests/test_orders_web.py::test_index_has_orders_entry
+tests/test_publish_web.py::test_publish_page_renders
+tests/test_publish_web.py::test_申报价输入框在页面上
+tests/test_publish_web.py::test_控件行栅格不超过12列
+  C:\Users\Administrator\Desktop\manus-gui\.venv\Lib\site-packages\starlette\templating.py:161: DeprecationWarning: The `name` is not the first parameter anymore. The first parameter should be the `Request` instance.
+  Replace `TemplateResponse(name, {"request": request})` by `TemplateResponse(request, name)`.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+1170 passed, 1 skipped, 13 warnings in 116.97s (0:01:56)

@@ -58,8 +58,10 @@ temperature = 0.0                          # Controls randomness for vision mode
 # Optional GUI vision model — used as a fallback when browser_use DOM element
 # recognition fails (no interactive elements, custom date/map/canvas widgets).
 # The browser tool's action="gui_action" screenshots the page and asks this
-# model for a pixel-coordinate atomic action. Falls back to [llm.vision], then to
-# env DASHSCOPE_API_KEY with model "gui-plus", if this section is omitted.
+# model for a pixel-coordinate atomic action. Falls back to [llm.vision] if this
+# section is omitted; api_key is read from this file only (the DASHSCOPE_API_KEY
+# env fallback was removed on 2026-08-20 — two sources for one key meant the env
+# var could silently shadow the config value, which is invisible when debugging).
 # The model is expected to return absolute pixel coordinates relative to the
 # screenshot image; the browser tool scales them to viewport CSS pixels.
 # [llm.gui]
@@ -74,12 +76,23 @@ temperature = 0.0                          # Controls randomness for vision mode
 # Temu 主图常是营销拼图，直接以图搜 recall 差。启用后先用生图模型（packyapi 的
 # gpt-image-2 /images/edits）把主图重绘成「纯白背景 + 单一商品」的干净图当【搜索
 # 查询图】，配合商品标题约束保留哪一件；判同款仍用原图（生成误差只影响 recall 不影响
-# 精度）。全部走环境变量，不在此 toml 配（避免 config.py 把空 key 回退成 DASHSCOPE）：
-#   PACKY_API_KEY        必填，packyapi 的 Bearer token；未设则跳过白底提取、退回原图搜
-#   PACKY_BASE_URL       选填，默认 https://www.packyapi.com/v1
-#   PACKY_IMAGE_MODEL    选填，默认 gpt-image-2
-#   PACKY_IMAGE_SIZE     选填，默认 1024x1024
-#   PACKY_IMAGE_QUALITY  选填，默认 medium（搜索查询图够用；成本杠杆，别默认 high）
+# 精度）。
+# 【2026-08-20 起改为读本文件，不再走环境变量】原先走 PACKY_* 环境变量是为了避开
+# config.py 把空 key 回退成 DASHSCOPE 的老逻辑；那个回退已删除，于是没必要再让
+# 密钥散在两处——两处维护时环境变量优先级更高会静默盖掉配置值，排查看不出来。
+# 独立成段而不塞进 [llm.*]：那是 DashScope/Anthropic 链路，且段间合并会把 [llm]
+# 的 key 补给缺 key 的段，塞进去会拿错 key。
+[collect_image]
+# 主 key，packyapi 的 Bearer token。留空则跳过白底提取、退回原图搜索，不阻断采集
+api_key = ""
+# 备用 key（更贵但稳定）：主 key 余额耗尽（"没有可用token"）或调用失败时自动切过去
+api_key_expensive = ""
+# 以下选填，留空用代码里的默认值
+base_url = "https://www.packyapi.com/v1"
+model = "gpt-image-2"
+size = "1024x1024"
+# medium 对搜索查询图够用；这是成本杠杆，别默认 high
+quality = "medium"
 
 # Optional configuration for specific browser configuration
 # [browser]
@@ -287,3 +300,129 @@ password = ""
 # 自签证书必须设 false，否则 requests 直接 SSLError（见上方实测说明）。
 # HTTP 连接忽略此项。
 verify_ssl = true
+
+# 发布管线的文本判断模型（app/publish/）—— 类目选择、属性比对、标题生成、
+# 尺码表估算、SKU 货号翻译、包装清单判断这 6 个单发判断点都走它。
+# 已从 deepseek-v4-flash 迁移到 packycode 的 grok-4.6（更快、上下文窗口更大）。
+# 【max_tokens 必须给足】grok-4.6 同样是推理模型，先产 reasoning_content 再产
+# content。给小了推理就把额度占满、content 返回空字符串，且 finish_reason=length，
+# 表现为「调用成功但结果为空」——排查时极易误以为是提示词问题。
+# 原 deepseek 实测用量（属性审核这个最重的判断点：33 属性行 / 18 项带 options /
+# 289 个选项条目，prompt 3615 token）需要 max_tokens=16000 才不截断。
+# grok-4.6 上下文窗口 500k，保守沿用 16000；实测若够用可适当下调。
+[llm.publish]
+api_type = "openai"
+model = "grok-4.6"
+base_url = "https://cf.api.fan/v1"
+api_key = ""                                                   # 你的 packycode API key
+max_tokens = 16000
+temperature = 0.0
+api_version = ""
+
+# ---- 发布管线的备选模型（发布页下拉可切换）------------------------------------
+# 每段对应 app/publish/llm.py 的 LLM_CHOICES 一项；api_key 留空的段在下拉里显示为
+# 不可用（判据是本文件该段的 api_key 是否填了，见 _section_api_key 的注释）。
+# 切模型不需要改代码，但【换端点前先验一发它收不收图】：各家对图片的接受方式不同。
+
+# Kimi Code（api.kimi.com/coding/v1）。
+# 【temperature 必须是 1】这批模型只接受 1，给 0.0 直接 400
+# 「invalid temperature: only 1 is allowed for this model」（2026-08-21 实测）。
+# 【只接受 base64 图片】远程 http 图片 URL 一律 400 unsupported image url
+# （2026-08-22 实测）；发布管线已统一在 image_ref 里下载转 base64，故可用。
+[llm.publish-kimi]
+api_type = "openai"
+model = "k3"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = ""                                                   # 你的 Kimi Code API key
+max_tokens = 16000
+temperature = 1.0
+api_version = ""
+
+[llm.publish-kimi-k27]
+api_type = "openai"
+model = "kimi-for-coding"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = ""
+max_tokens = 16000
+temperature = 1.0  # 只能 1，同上
+api_version = ""
+
+[llm.publish-kimi-k256k]
+api_type = "openai"
+model = "k3-256k"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = ""
+max_tokens = 16000
+temperature = 1.0  # 只能 1，同上
+api_version = ""
+
+[llm.publish-kimi-highspeed]
+api_type = "openai"
+model = "kimi-for-coding-highspeed"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = ""
+max_tokens = 16000
+temperature = 1.0  # 只能 1，同上
+api_version = ""
+
+# DeepSeek 官方视觉模型（api-docs.deepseek.com/zh-cn/guides/vision）。
+# 走官方 chat/completions 协议，content 是 text + image_url 两段，与项目既有拼装一致。
+# base64 与远程 http URL 都收（2026-08-22 实测，两种都返回 200），但发布管线
+# 一律走 base64（image_ref 已统一下载
+# 转码）：远程 URL 是让服务端自己出网取图，成不成看它的出网环境，不可控。
+# 【max_tokens 给到 32000】2026-08-22 属性审核实测：32 行属性 + 各行 options 的提示词
+# 下一次推理要 11165 completion token，16000 额度会偶发撞 finish_reason="length"——
+# 推理链吃满额度、content 返回空，靠重试才成功，白等 2 分 17 秒。端点上限探到 65536
+# 可用，故留一倍余量。按量计费只算实际产出的 token，调高额度本身不涨钱。
+[llm.publish-deepseek]
+api_type = "openai"
+model = "deepseek-v4-flash-vision-exp"
+base_url = "https://api.deepseek.com"
+api_key = ""                                                   # 你的 DeepSeek API key
+max_tokens = 32000
+temperature = 0.0
+api_version = ""
+
+# ---- 店小秘 Temu 半托管发布管线（app/publish/）--------------------------------
+# 从 1688 链接到店小秘草稿保存的 12 阶段发布流程。浏览器操作走 [browser].cdp_url
+# 接管已登录的真实 Chrome，与采集/订单/活动三条管线同一个前提。
+
+# 同一个 deepseek-v4-flash-vision-exp，走 Packy（cf.api.fan）网关而不是官方端点。
+# 【为什么两条都留】官方段与本段模型名相同、能力相同，差别只在计费与出网链路：
+# 官方按量计费、要单独充值；Packy 走已有订阅额度。2026-08-25 grok-4.6 整段被
+# Packy 网关限流打死（每发都 503 packy_api_error「达到可承受的 QPS/TPM 高峰」，
+# 文本与视觉 0 成功），而同一网关同一 key 下的本段全绿——故这是 grok 档挂掉时
+# 不必换供应商就能顶上的那一档。
+# 2026-08-25 实测（本 key + cf.api.fan）：
+#   chat/completions 文本 1.19s 通；responses 协议 1.03s 也通（取 chat，与官方段
+#     协议一致，image_url 拼装可直接复用，不必像 grok 那样开 openai-response）；
+#   base64 图像理解 8.28s 通（商品图答「白色、浅蓝色」，与图相符）；
+#   temperature = 0.0 被接受（不像 Kimi 只收 1）。
+# 【max_tokens 沿用 32000】同一个推理模型，截断返空的坑与官方段完全一样——
+# 给 16000 会偶发 finish_reason="length"、content 返空，靠重试白等两分钟。
+[llm.publish-packy-deepseek]
+api_type = "openai"
+model = "deepseek-v4-flash-vision-exp"
+base_url = "https://cf.api.fan/v1"
+api_key = ""                                                   # 你的 packycode API key
+max_tokens = 32000
+temperature = 0.0
+api_version = ""
+
+[publish]
+# 图片 AI 编辑（去中文/去水印/描述图英化）用的 Packy gpt-image-2 密钥。
+# 【与 [llm.publish].api_key 是两个不同分组的 key，不能混用】2026-08-20 实测：
+# 生图 key 所在分组只有 gpt-image-2，[llm.publish] 那个分组只有 grok-4.5/4.6。
+# 拿 grok 的 key 调 gpt-image-2 会得 503「分组下模型无可用渠道」，反之同理。
+# 与 [collect_image].api_key 通常可填同一个（都是 gpt-image-2）。
+# 留空则纯本地几何合规化仍可用（fit34 / square / compress 不需要密钥），
+# 只有 AI 编辑会报错提示来配。
+packy_api_key = ""
+# 店小秘账号级常量：图片直传图床时回调要带的 fullCid。抓包 /api/cos/cosDxmCallBack.json
+# 的 fullCid 参数可得（形如 "5153348-"）。换账号必须改，否则图片传上去登记不到自己名下。
+full_cid = ""
+# 申报价（元）与库存的批量默认值，可在调用时覆盖
+declare_price = "168"
+stock = "100"
+# 仓库名（变种信息页勾选，只勾这一个）
+warehouse = "飞特COL仓库"

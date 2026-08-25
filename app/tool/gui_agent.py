@@ -66,10 +66,10 @@ c. 精确复制该action的parameters模板，并填充值。
 最终验证 (Self-Correction): 在输出前，最后检查一遍：我的回复是纯粹的JSON吗？action的值是否正确无误（大写、无空格）？parameters的结构是否与模板100%一致？例如，对于CLICK，是否有独立的x和y键，并且它们的值都是整数？"""
 
 
-# 默认接入信息（阿里云百炼 DashScope，OpenAI 兼容模式）。
-# 仅在 config 未配置 [llm.gui]/[llm.vision] 时，作为 env DASHSCOPE_API_KEY 的兜底。
+# 默认模型名（阿里云百炼 DashScope，OpenAI 兼容模式）：仅在 [llm.gui]/[llm.vision]
+# 配了段但没写 model 时兜底。base_url 与 api_key 不做兜底——2026-08-20 起一律从
+# config.toml 读，缺了直接报错让人去配，见 _resolve_gui_settings。
 _DEFAULT_GUI_MODEL = "qwen3.7-plus"
-_DEFAULT_GUI_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # 单次原子操作的输出预算。够输出一个 JSON 操作（含 thought）即可，
 # 设小了会把坐标截断（如 '"x": [703,' 处中断），导致 JSON 不合法。
 _DEFAULT_GUI_MAX_TOKENS = 1024
@@ -104,18 +104,12 @@ def _resolve_gui_llm_settings() -> Dict[str, str]:
             ),
         }
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "未找到 GUI 视觉模型配置：请在 config.toml 添加 [llm.gui] 段，"
-            "或设置环境变量 DASHSCOPE_API_KEY。"
-        )
-    return {
-        "model": _DEFAULT_GUI_MODEL,
-        "base_url": _DEFAULT_GUI_BASE_URL,
-        "api_key": api_key,
-        "max_tokens": _DEFAULT_GUI_MAX_TOKENS,
-    }
+    # 2026-08-20 起不再回退环境变量 DASHSCOPE_API_KEY：key 只从 config.toml 读，
+    # 两处维护时环境变量优先级更高会静默盖掉配置值，排查时看不出来。
+    raise ValueError(
+        "未找到 GUI 视觉模型配置：请在 config.toml 添加 [llm.gui] 段"
+        "（或确认 [llm] 段的 api_key / base_url 已填）。"
+    )
 
 
 def _repair_coord_json(text: str) -> str:

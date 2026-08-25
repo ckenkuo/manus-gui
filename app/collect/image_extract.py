@@ -12,15 +12,17 @@
 【搜索查询图】**（决定 1688 返回哪些候选，即 recall）——判同款一律用**原图**
 （决定精度）。这样生成误差只会漏采、不会误采。调用方 collect_one_product 已如此。
 
-配置走独立环境变量（不塞进 app/llm.py，那是 DashScope/Anthropic 链路，且 config.py
-会给空 key 回退 DASHSCOPE_API_KEY，塞进去会拿错 key）：
-    PACKY_API_KEY       主 key，packyapi 的 Bearer token（更便宜）；
-    PACKY_IMAGE_EXPENSIVE 备用 key（更贵但稳定）；主 key 余额耗尽（"没有可用token"）
+配置走 config.toml 的 [collect_image] 段（2026-08-20 起不再读环境变量：同一个 key
+两处维护时环境变量优先级更高、会静默盖掉配置值，看配置是新 key 实际生效是旧 key，
+排查时完全看不出来）。刻意不塞进 [llm.*]：那是 DashScope/Anthropic 链路，且 config.py
+的段间合并会把 [llm] 的 key 补给缺 key 的段，塞进去会拿错 key。
+    api_key             主 key，packyapi 的 Bearer token（更便宜）；
+    api_key_expensive   备用 key（更贵但稳定）；主 key 余额耗尽（"没有可用token"）
                         或调用失败时自动切到它兜底。两者都缺才整体降级（返回 None）
-    PACKY_BASE_URL      选填，默认 https://www.packyapi.com/v1
-    PACKY_IMAGE_MODEL   选填，默认 gpt-image-2
-    PACKY_IMAGE_SIZE    选填，默认 1024x1024
-    PACKY_IMAGE_QUALITY 选填，默认 medium（搜索查询图够用；成本杠杆，别默认 high）
+    base_url            选填，默认 https://www.packyapi.com/v1
+    model               选填，默认 gpt-image-2
+    size                选填，默认 1024x1024
+    quality             选填，默认 medium（搜索查询图够用；成本杠杆，别默认 high）
 
 任何失败（无 key/超时/HTTP 错/响应无图/写盘失败）均返回 None，调用方退回原图，
 绝不阻断采集。
@@ -58,15 +60,39 @@ def _is_balance_exhausted(resp) -> bool:
     return any(m.lower() in body for m in _BALANCE_EXHAUSTED_MARKERS)
 
 
+def _conf() -> dict:
+    """读 config.toml 的 [collect_image] 段。
+
+    每次调用都读盘而不做进程级缓存：白底提取是每商品一次的低频调用，读一个几 KB 的
+    toml 相比一次生图请求可以忽略；换来的好处是改配置不必重启，与 resolve_packy_key
+    的取向一致。读失败按 best-effort 吞掉（返回空 dict）——本模块任何失败都退回原图、
+    不阻断采集，这里不该是唯一的例外。
+    """
+    try:
+        import tomllib
+
+        from app.config import config_search_dirs
+        for d in config_search_dirs():
+            p = d / "config.toml"
+            if not p.exists():
+                continue
+            with open(p, "rb") as f:
+                return (tomllib.load(f).get("collect_image") or {})
+    except Exception as e:
+        logger.warning(f"读取 [collect_image] 配置失败：{e}")
+    return {}
+
+
 def _resolve_api_keys() -> list[tuple[str, str]]:
     """按优先级返回可用的 (label, key) 列表：主 key（便宜）在前，备用 key（贵但稳）兜底。
 
-    去重（两个变量指向同一 key 时只留一个），保持顺序。
+    去重（两项配成同一个 key 时只留一个），保持顺序。
     """
+    conf = _conf()
     keys: list[tuple[str, str]] = []
     seen: set = set()
-    for label, env in (("主", "PACKY_API_KEY"), ("备用", "PACKY_IMAGE_EXPENSIVE")):
-        v = os.getenv(env)
+    for label, field in (("主", "api_key"), ("备用", "api_key_expensive")):
+        v = conf.get(field)
         if v and v not in seen:
             seen.add(v)
             keys.append((label, v))
@@ -122,15 +148,16 @@ def _call_edit_api_one_key(
 
     import requests
 
-    base = (os.getenv("PACKY_BASE_URL") or _DEFAULT_BASE_URL).rstrip("/")
+    conf = _conf()
+    base = (conf.get("base_url") or _DEFAULT_BASE_URL).rstrip("/")
     url = f"{base}/images/edits"
-    model = os.getenv("PACKY_IMAGE_MODEL") or _DEFAULT_MODEL
-    size = os.getenv("PACKY_IMAGE_SIZE") or _DEFAULT_SIZE
-    quality = os.getenv("PACKY_IMAGE_QUALITY") or _DEFAULT_QUALITY
+    model = conf.get("model") or _DEFAULT_MODEL
+    size = conf.get("size") or _DEFAULT_SIZE
+    quality = conf.get("quality") or _DEFAULT_QUALITY
 
     # ⚠️ 不要传 response_format：gpt-image 系默认就返回 b64_json（无此参数概念），
     # _extract_image_bytes 也已同时兜底 b64_json / url。主 key（packyapi 自有池）
-    # 能通融这个参数，但备用 key（PACKY_IMAGE_EXPENSIVE）走的是 OpenAI 纯正 Images
+    # 能通融这个参数，但备用 key（api_key_expensive）走的是 OpenAI 纯正 Images
     # 兼容层，会以 400 unknown_parameter 直接拒掉 —— 主 key 余额耗尽切备用后必炸。
     # 传了只有害无益，故一律不传。
     data = {
@@ -197,8 +224,8 @@ def _call_edit_api(src_img_path: str, title: str, read_timeout: int) -> Optional
     if not keys:
         if not _warned_no_key:
             logger.warning(
-                "extract_white_bg：未设 PACKY_API_KEY / PACKY_IMAGE_EXPENSIVE，"
-                "跳过白底提取、退回原图搜索。如需启用白底图搜，设置其中之一。"
+                "extract_white_bg：[collect_image] 未配 api_key / api_key_expensive，"
+                "跳过白底提取、退回原图搜索。如需启用白底图搜，配置其中之一。"
             )
             _warned_no_key = True
         return None

@@ -130,6 +130,9 @@ OUTPUT_SUBDIRS = {
     "orders_purchase": "订单采购汇总",
     # 订单登记管线 dry-run 的「待写计划」CSV：日志只打 3 行，逐行核对靠这个
     "orders_plan": "订单待写计划",
+    # 商品发布管线：每品一个 product-<offerId>/ 工作目录，装 raw.json /
+    # product-info.json / 主图 / 详情图 / 处理后的合规图。见 app/publish/extract.py
+    "publish": "商品发布",
 }
 
 
@@ -417,8 +420,11 @@ class Config:
             k: v for k, v in raw_config.get("llm", {}).items() if isinstance(v, dict)
         }
 
-        # 优先使用配置文件中的 api_key，如果没有则从环境变量 DASHSCOPE_API_KEY 读取
-        api_key = base_llm.get("api_key") or os.getenv("DASHSCOPE_API_KEY")
+        # api_key 只从配置文件读（2026-08-20 起不再回退环境变量）。
+        # 为什么去掉环境变量回退：同一个 key 在配置文件和环境变量两处维护，改了一边
+        # 另一边还在，而环境变量优先级更高时会静默盖掉配置值——排查时看配置文件是对的、
+        # 实际生效的却是旧 key，完全看不出来。现在唯一来源就是本文件。
+        api_key = base_llm.get("api_key")
 
         default_settings = {
             "model": base_llm.get("model"),
@@ -499,15 +505,16 @@ class Config:
         else:
             experience_settings = ExperienceSettings()
 
-        # 处理 LLM 覆盖配置，也支持从环境变量读取 api_key
+        # 处理 LLM 覆盖配置。各段没写 api_key 时由下面的 default_settings 合并补上
+        # [llm] 的值（不再回退环境变量，理由同 _load_initial_config 里的说明）。
+        # 【必须剔除空值再合并】某段写了 api_key = "" 时，字典合并会用空串盖掉 [llm]
+        # 的值，那一段就没 key 可用了。原先这种情况靠环境变量回退兜住，去掉回退后
+        # 必须显式处理，否则 [llm.xxx] 里留个空 api_key 就会让该段静默失效。
         llm_configs = {}
         for name, override_config in llm_overrides.items():
-            # 如果覆盖配置中没有 api_key 或为空，尝试从环境变量读取
-            if not override_config.get("api_key"):
-                env_api_key = os.getenv("DASHSCOPE_API_KEY")
-                if env_api_key:
-                    override_config["api_key"] = env_api_key
-            llm_configs[name] = {**default_settings, **override_config}
+            effective = {k: v for k, v in override_config.items()
+                         if not (k == "api_key" and not v)}
+            llm_configs[name] = {**default_settings, **effective}
 
         config_dict = {
             "llm": {

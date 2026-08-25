@@ -148,6 +148,16 @@ async def orders_page(request: Request):
     return templates.TemplateResponse("orders.html", {"request": request})
 
 
+@app.get("/publish", response_class=HTMLResponse)
+async def publish_page(request: Request):
+    """商品发布页：1688 链接/认领行 → 店小秘 Temu 半托管刊登（15 阶段），SSE 实时进度。
+
+    发布闸门：页面上有「自动发布」开关（默认开），勾着就在 ⑭ 保存成功后继续走
+    ⑮「立即发布」。不勾则收尾在保存落库，草稿留在店小秘等人工核对。
+    """
+    return templates.TemplateResponse("publish.html", {"request": request})
+
+
 @app.get("/download")
 async def download_file(file_path: str):
     if not os.path.exists(file_path):
@@ -840,6 +850,222 @@ async def orders_batch_events(job_id: str):
             if name == "done":
                 name = "batch_done"
             yield f"event: {name}\ndata: {dumps(event)}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---- 商品发布接口（店小秘 Temu 半托管，对标 /collect/batch 三件套）-----------------
+# PublishJob 照抄 CollectJob：内部队列 + on_progress 塞事件 + SSE 逐条 yield。
+# 与采集/订单的区别：tasks 由前端从 textarea 解析（每行一个 1688 链接，或 rowid|info_path），
+# 后端不做清单枚举；阶段编排与 15 阶段语义全在 app/publish/service.py。
+# 发布闸门：/publish/batch 接 do_publish（默认 True，前端 chkDoPublish 开关控制），
+# 勾着就在 ⑭ 保存成功后继续 ⑮「立即发布」；发布不可逆，关掉开关即收尾在保存落库。
+# service 的批次收尾事件就叫 batch_done，与 SSE 哨兵映射出的 done 不撞名（不同于
+# /orders/batch 那边 service 收尾事件叫 done 需改名转发），故原样转发即可。
+
+from app.publish import service as publish_service
+from app.publish import llm as publish_llm
+from app.publish import cache as publish_cache
+from app.publish import shops as publish_shops
+
+
+@app.get("/publish/stores")
+async def publish_store_list():
+    """当前登录账号下的店铺清单，供发布页「店铺」下拉渲染。
+
+    走店小秘的 /api/userIn.json（秒级、无副作用），细节与「为什么站点不能一起给」
+    见 app/publish/shops.py 的模块 docstring。连不上 Chrome / 未登录时返回 503：
+    这不是请求写错了，是环境没就绪，前端据此提示用户去开调试 Chrome。
+    """
+    try:
+        return await publish_shops.fetch_stores()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/publish/sites")
+async def publish_site_list(store: str, refresh: bool = False):
+    """某店铺可认领的站点清单，供发布页「站点」下拉渲染。
+
+    站点只能从认领弹窗里读（勾中店铺后才渲染），故首次要 3~5 秒并占用那个 CDP
+    页面；结果按店铺缓存到磁盘，之后秒出。refresh=true 强制重探（店铺新开通了
+    站点时用）。探测过程只读、不点「确定」，不会产生任何认领。
+    """
+    try:
+        return await publish_shops.fetch_sites(store, refresh=refresh)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/publish/llm")
+async def publish_llm_list():
+    """发布管线可选模型清单 + 按阶段配置，供发布页下拉与阶段表格渲染。
+
+    stages 一起返回而不另开接口：前端渲染阶段表格时每行都要拿到完整的模型选项
+    （含可用性/是否多模态）才能决定禁用哪些项，分两个接口只会让它自己去对齐。
+    """
+    return {"choices": publish_llm.list_llm_choices(),
+            "stages": publish_llm.list_llm_stages()}
+
+
+@app.post("/publish/llm")
+async def publish_llm_switch(choice: str = Body(..., embed=True)):
+    """切换发布管线使用的模型。拒切未配置 api_key 的选项（切了也只会全线失败）。"""
+    for c in publish_llm.list_llm_choices():
+        if c["id"] == choice:
+            if not c["available"]:
+                # 段名取 LLM_CHOICES 里登记的 config_name，别按 choice 拼——grok 的段名
+                # 是 [llm.publish]（没有后缀），拼出来的路径会让人去改一个不存在的段
+                section = publish_llm.LLM_CHOICES[choice]["config_name"]
+                raise HTTPException(
+                    400, f"{c['label']} 未配置 api_key：请先在 config/config.toml "
+                         f"的 [llm.{section}] 段填上再切换")
+            publish_llm.set_llm_choice(choice)
+            return {"ok": True, "choices": publish_llm.list_llm_choices(),
+                    "stages": publish_llm.list_llm_stages()}
+    raise HTTPException(400, f"未知模型选择：{choice}")
+
+
+@app.post("/publish/llm/stage")
+async def publish_llm_stage_switch(stage: str = Body(..., embed=True),
+                                  choice: Optional[str] = Body(None, embed=True)):
+    """设/清某阶段的模型覆盖。choice 传 null 或空串表示「跟随全局默认」。
+
+    未配 key 的选项照 publish_llm_switch 的做法拒掉（切了只会该阶段全线失败）；
+    给视觉阶段配非多模态模型由 set_stage_choice 拦，错误信息原样转成 400——
+    那是配置错误而非服务端故障，不该以 500 上报。
+    """
+    if choice:
+        info = next((c for c in publish_llm.list_llm_choices() if c["id"] == choice), None)
+        if info is None:
+            raise HTTPException(400, f"未知模型选择：{choice}")
+        if not info["available"]:
+            section = publish_llm.LLM_CHOICES[choice]["config_name"]
+            raise HTTPException(
+                400, f"{info['label']} 未配置 api_key：请先在 config/config.toml "
+                     f"的 [llm.{section}] 段填上再切换")
+    try:
+        publish_llm.set_stage_choice(stage, choice)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "choices": publish_llm.list_llm_choices(),
+            "stages": publish_llm.list_llm_stages()}
+
+
+@app.get("/publish/cache")
+async def publish_cache_list():
+    """类目/属性缓存现状（统计 + 明细），供发布页缓存面板渲染。
+
+    命中缓存时阶段③约 15s、未命中要 110s，阶段④同理，所以「现在缓存里有什么」
+    是跑批前值得看一眼的信息。
+    """
+    return publish_cache.cache_stats()
+
+
+@app.delete("/publish/cache")
+async def publish_cache_clear(slug: str = ""):
+    """清缓存：带 slug 只删那一个类目的属性缓存，不带则连类目路径清单一起清空。
+
+    清完下一次跑就回落到全量遍历/全量读选项（慢，但不会错），故这里不做二次确认，
+    交前端按钮自己问。
+    """
+    return {"status": "success", "removed": publish_cache.clear(slug)}
+
+
+class PublishJob:
+    """一次商品发布作业：持有进度队列，供 SSE 消费（照抄 CollectJob）。"""
+
+    def __init__(self, job_id: str, store: str = "", site: str = ""):
+        self.id = job_id
+        self.store = store
+        self.site = site
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.done = False
+        self.summary: dict = {}
+
+    async def push(self, event: dict):
+        await self.queue.put(event)
+
+
+publish_jobs: dict = {}
+
+
+@app.post("/publish/batch")
+async def publish_batch(
+    tasks: list = Body(..., embed=True),
+    store: str = Body("", embed=True),
+    site: str = Body("", embed=True),
+    from_stage: str = Body("", embed=True),
+    use_cache: bool = Body(True, embed=True),
+    price: str = Body("", embed=True),
+    do_publish: bool = Body(True, embed=True),
+):
+    """启动一批发布作业，返回 job_id；进度经 /publish/batch/{job_id}/events (SSE) 消费。
+
+    tasks 元素：{"url": "...", "title": "..."} 或 {"rowid": "...", "info_path": "...", ...}。
+    from_stage 非空时从该阶段续跑（前序阶段按已完成跳过）；空串＝全新跑 15 阶段。
+    use_cache=False 时类目与属性都走全量读取（新品类首次跑、或怀疑缓存选错类目时用）。
+    price 是 ⑩ 变种表的申报价（人民币），空串＝用管线默认 188.88；这里不做校验，
+    交 pipeline.normalize_declare_price 归一（非法值退默认并告警，不让整批中断）。
+
+    do_publish 是阶段⑮「立即发布」的闸门，【默认 True】——用户 2026-08-25 明确要求
+    页面上给开关且默认开启、自动发布。原先本接口刻意不接这个参数（只有 CLI 有
+    --publish），实际使用中每次都要人再去命令行跑一遍，反而把「全自动优先」的取向
+    抵消掉了。开关在前端（chkDoPublish），默认勾选；不勾则流程仍收尾在 ⑭ 保存落库。
+    注意发布不可逆：上架后要下架才能改。
+    """
+    job_id = str(uuid.uuid4())
+    job = PublishJob(job_id, store, site)
+    publish_jobs[job_id] = job
+
+    async def _on_progress(event: dict):
+        await job.push(event)
+
+    async def _run():
+        try:
+            job.summary = await publish_service.run_batch(
+                tasks, store=store, site=site,
+                on_progress=_on_progress, from_stage=from_stage,
+                use_cache=use_cache, price=price, do_publish=do_publish,
+            )
+        except Exception as e:
+            await job.push({"type": "aborted", "reason": f"发布异常：{e}"})
+        finally:
+            job.done = True
+            await job.push({"type": "_end"})  # 哨兵：通知 SSE 收尾
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/publish/batch/{job_id}/events")
+async def publish_batch_events(job_id: str):
+    """SSE 推送某次发布作业的结构化进度事件（原样转发 service 的 on_progress 事件）。"""
+
+    async def event_generator():
+        job = publish_jobs.get(job_id)
+        if job is None:
+            yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
+            return
+        while True:
+            try:
+                event = await job.queue.get()
+            except asyncio.CancelledError:
+                break
+            if event.get("type") == "_end":
+                yield f"event: done\ndata: {dumps(job.summary)}\n\n"
+                break
+            yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
 
     return StreamingResponse(
         event_generator(),
