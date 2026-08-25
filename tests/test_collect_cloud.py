@@ -637,6 +637,57 @@ def test_schema_cloud_still_refuses_when_spu_unrecognized():
         {590: {"E": {"text": "x", "formula": ""}}}, {}, header, end_row=590)
     schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "S"))
     assert not schema.ok and "SPU" in schema.error
+    # 商品表被改名走「改回标题/补规则」这条修法，不能误报成选错文档
+    assert "订单登记表" not in schema.error
+    assert "_FIELD_RULES" in schema.error
+
+
+# 订单登记表 WINTAK8.4+ 的真实表头（2026-08-18 实读 chNJseYETVDF）。商品成本核算表里
+# 同名的 Sheet 是另一份文档，两边 Sheet 名高度重合，故只能按表头列区分。
+_ORDERS_SHEET_HEADER = {
+    "A": "订单店铺", "B": "站点区分", "C": "订单号", "D": "尺码",
+    "E": "国内物流单号", "F": "数量", "G": "平台物流跟踪号", "H": "状态",
+    "I": "国内发出时间", "J": "产品图片", "K": "产品图2", "L": "平台创建时间",
+    "M": "采购日期", "N": "采购费用", "O": "平台成交价", "P": "Y2头程费用",
+    "Q": "采购订单号", "R": "物流情况",
+}
+
+
+def test_schema_cloud_names_orders_sheet_as_the_real_cause():
+    """误选订单登记表时，中止原因必须指向「换文档」，不是「表头被改名」。
+
+    2026-08-18 实机：采集页目标是订单登记表的 WINTAK8.4+（订单店铺/订单号/尺码…），
+    旧文案只说「表头解析不出 SPU 列」，读起来像商品表表头被改过，排查方向完全错。
+    两页共用协作文档登记簿、两份文档的 Sheet 名又重合，这个误选会反复发生。
+    """
+    cloud = _layered_cloud(
+        {2: {"C": {"text": "PO-045-1", "formula": ""}}}, {},
+        _ORDERS_SHEET_HEADER, end_row=2)
+    schema = asyncio.run(P.resolve_sheet_schema_cloud(cloud, "WINTAK8.4+"))
+    assert not schema.ok
+    assert "订单登记表" in schema.error and "商品成本核算" in schema.error
+    # 别把用户引到「去改表头」——那张表本就不该是采集目标
+    assert "_FIELD_RULES" not in schema.error
+
+
+def test_looks_like_orders_sheet_does_not_misjudge_product_sheets():
+    """商品成本核算表的真实表头一律不能被判成订单表（否则真·改名会被误导）。
+
+    列取自 2026-08-18 实读 ch7aKVx1UKNR：wintak美国 / pawly全球 / WINTAK欧洲。
+    """
+    product_headers = [
+        {"A": "备注1", "B": "SPU ID", "C": "产品图片", "D": "货号", "E": "日常价",
+         "J": "销售价格", "K": "采购价格", "L": "重量", "O": "尾程（补贴后）"},
+        {"A": "站点", "B": "类目", "E": "SPU ID", "F": "产品图片", "G": "货号",
+         "M": "销售价格", "N": "采购价格", "Q": "尾程运费", "U": "利润"},
+        {"A": "类别", "C": "SPU ID", "D": "产品图片", "H": "销售价格",
+         "K": "采购价格", "P": "税费", "T": "Y2成本"},
+    ]
+    for h in product_headers:
+        assert not P.looks_like_orders_sheet(h), h
+    assert P.looks_like_orders_sheet(_ORDERS_SHEET_HEADER)
+    # 单个「订单号」不足以判定（商品表的备注里也可能出现）
+    assert not P.looks_like_orders_sheet({"A": "订单号", "B": "SPU ID"})
 
 
 def test_cloud_row_renders_cross_row_formula_per_offset():
@@ -765,7 +816,6 @@ def test_write_row_cloud_replays_template_cell_formats(monkeypatch):
     routes = {
         ("sheet", "get_sheets_info"): SHEETS_INFO,
         ("sheet", "range_data_batch_update"): {"code": 0},
-        ("sheet", "update_range_data"): {"code": 0},
         ("sheet", "get_range_data"): verify,
     }
     cli = _make(monkeypatch, routes)
@@ -784,17 +834,21 @@ def test_write_row_cloud_replays_template_cell_formats(monkeypatch):
     assert ok, msg
     format_call = next(
         payload for _service, action, payload in cli._fake.calls
-        if action == "update_range_data"
+        if action == "range_data_batch_update"
+        and payload["range_data"][0]["op_type"] == "cell_operation_type_format"
     )
     by_col = {
-        K.index_to_col(op["colFrom"]): op["xf"]
-        for op in format_call["rangeData"]
+        K.index_to_col(op["col_from"]): op["xf"]
+        for op in format_call["range_data"]
     }
     assert by_col == {
         "E": {"numfmt": "0.00_ "},
         "K": {"numfmt": "0.00%", "alcH": 2},
     }, "只回放到写了值/公式的列，空白列跳过"
-    assert all(op["opType"] == "format" for op in format_call["rangeData"])
+    assert all(
+        op["op_type"] == "cell_operation_type_format"
+        for op in format_call["range_data"]
+    )
 
 
 def test_write_row_cloud_keeps_numfmt_off_text_cells(monkeypatch):
@@ -807,7 +861,6 @@ def test_write_row_cloud_keeps_numfmt_off_text_cells(monkeypatch):
     routes = {
         ("sheet", "get_sheets_info"): SHEETS_INFO,
         ("sheet", "range_data_batch_update"): {"code": 0},
-        ("sheet", "update_range_data"): {"code": 0},
         ("sheet", "get_range_data"): verify,
     }
     cli = _make(monkeypatch, routes)
@@ -825,13 +878,45 @@ def test_write_row_cloud_keeps_numfmt_off_text_cells(monkeypatch):
     assert ok, msg
     format_call = next(
         payload for _service, action, payload in cli._fake.calls
-        if action == "update_range_data"
+        if action == "range_data_batch_update"
+        and payload["range_data"][0]["op_type"] == "cell_operation_type_format"
     )
     by_col = {
-        K.index_to_col(op["colFrom"]): op["xf"] for op in format_call["rangeData"]
+        K.index_to_col(op["col_from"]): op["xf"]
+        for op in format_call["range_data"]
     }
     assert by_col["A"] == {"alcH": 2, "alcV": 1}, "文本格摘掉 numfmt，对齐仍要回放"
     assert by_col["E"] == {"numfmt": "0.00_ ", "alcV": 1}, "数字格保留数字格式"
+
+
+def test_write_row_cloud_format_error_keeps_verified_business_values(monkeypatch):
+    """格式是辅助步骤：文本已经落表时，400001 不得把商品误报成未入库。"""
+    verify = {"rangeData": [{"rowFrom": 6, "colFrom": 0, "cellText": "美国"}]}
+
+    def batch_update(payload):
+        op_type = payload["range_data"][0]["op_type"]
+        if op_type == "cell_operation_type_format":
+            return {"code": 400001, "msg": None, "error": "bad numfmt"}
+        return {"code": 0}
+
+    routes = {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "range_data_batch_update"): batch_update,
+        ("sheet", "get_range_data"): verify,
+    }
+    cli = _make(monkeypatch, routes)
+    schema = _schema()
+    schema.format_columns = {"E": {"numfmt": "unsupported-format"}}
+
+    ok, msg = asyncio.run(P.write_product_row_cloud(
+        cli, "pawly全球", {"spu": "SPU-9", "site": "美国", "price": "12.5"},
+        P.CollectResult(spu="SPU-9", ok=True), schema,
+    ))
+
+    assert ok, msg
+    assert any(action == "get_range_data" for _, action, _ in cli._fake.calls), (
+        "格式失败后仍须读回业务值，不能凭接口返回猜测是否入库"
+    )
 
 
 def test_write_row_cloud_error_is_per_product(monkeypatch):
@@ -1450,8 +1535,29 @@ def test_write_rows_cloud_single_call_for_whole_batch():
     assert cloud.key_reads == [], "批量写路径不该再逐行读整列判重"
 
 
-def test_write_rows_cloud_all_or_nothing_on_write_error():
-    """写失败 → 整批算失败、返回空已写列表（一坏全坏，重跑即可，不留半批）。"""
+def test_write_rows_cloud_reports_auxiliary_write_warnings():
+    """业务值确认成功后，格式/图片失败应告警但仍返回已写 SPU。"""
+    class WarningCloud(FakeCloud):
+        def write_rows(self, sheet, rows, header_row, insert_at_top=True,
+                       first_row=None):
+            result = super().write_rows(
+                sheet, rows, header_row, insert_at_top, first_row,
+            )
+            result.update({"formats_failed": 2, "images_failed": 1})
+            return result
+
+    schema = P.SheetSchema(sheet="S", fields={"spu": "C"}, ok=True, header_row=1)
+    ok, msg, wrote = asyncio.run(
+        P.write_product_rows_cloud(WarningCloud(), "S", [{"spu": "A"}], schema)
+    )
+
+    assert ok and wrote == ["A"]
+    assert "2 个单元格格式未回放" in msg
+    assert "1 张图片未写入" in msg
+
+
+def test_write_rows_cloud_write_error_requires_spu_check_before_retry():
+    """云接口没有事务：写失败返回空确认列表，但不得承诺一行不落。"""
     from app.orders.kdocs_sheet import KdocsSheetError
 
     class BoomCloud(FakeCloud):
@@ -1468,7 +1574,8 @@ def test_write_rows_cloud_all_or_nothing_on_write_error():
 
     assert not ok
     assert wrote == []
-    assert "429002" in msg and "一行不落" in msg
+    assert "429002" in msg and "先按 SPU 检查" in msg
+    assert "一行不落" not in msg
 
 
 def test_write_rows_cloud_detects_confirm_mismatch():

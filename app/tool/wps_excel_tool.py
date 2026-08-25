@@ -936,6 +936,15 @@ class WpsExcelTool(BaseTool):
         return suspect_value_columns(header)
 
     @classmethod
+    def norm_title(cls, raw: str) -> str:
+        """表头标题归一化（全角/括号/符号/大小写），供外部按语义比对标题。
+
+        采集侧判「这张表是不是订单登记表」要用同一套归一口径，故在此暴露，
+        避免各处各写一份归一逻辑而口径不一。
+        """
+        return _norm_title(raw)
+
+    @classmethod
     def _resolve_fields_from_header(cls, header: Dict[str, str]) -> Dict[str, str]:
         """把逻辑字段解析到该 Sheet 的真实列：{字段名: 列字母}。见 _FIELD_RULES。
 
