@@ -74,6 +74,20 @@ def test_谓词_确定性失败不退避重试():
     assert _worth_retry_text(RuntimeError("网关 502")) is True
 
 
+def test_谓词_带图那条也要排除抬额度后仍返空():
+    """_worth_retry 原先只排 400，于是带图路径新增的 EmptyContentTruncated 会被
+    退避重试 6 次——每次都要把整批 base64 再传一遍，正是这个异常要避免的浪费。"""
+    from openai import BadRequestError
+
+    from app.llm import _worth_retry
+
+    assert _worth_retry(EmptyContentTruncated("抬了也没用")) is False
+    err = BadRequestError.__new__(BadRequestError)
+    assert _worth_retry(err) is False
+    # 限流/超时/网关抖动/单次返空照旧重试（那次阶段⑦ 返空就是靠重试救回来的）
+    assert _worth_retry(ValueError("Empty or invalid response")) is True
+
+
 # ---- ask 的就地抬额度重发 -------------------------------------------------------
 
 def _ask_stub(responses, max_tokens=1000, model="deepseek-v4-flash-vision-exp"):
@@ -112,7 +126,9 @@ def _ask_stub(responses, max_tokens=1000, model="deepseek-v4-flash-vision-exp"):
     obj.count_tokens = lambda text: 10
     obj.update_token_count = lambda *a, **k: None
     obj.check_token_limit = lambda n: True
-    obj.format_messages = staticmethod(lambda msgs, supports=False: list(msgs))
+    # 形参名必须是 supports_images：ask positionally 传，ask_with_images 按关键字传
+    obj.format_messages = staticmethod(
+        lambda msgs, supports_images=False: [dict(m) for m in msgs])
     return obj, sent
 
 
@@ -158,17 +174,32 @@ async def test_ask_推理模型抬的是max_completion_tokens():
 
 
 @pytest.mark.asyncio
-async def test_ask_正常收尾的空正文仍走ValueError():
-    """finish_reason="stop" 且正文空是另一码事：不抬额度，仍抛可重试的 ValueError。
+async def test_ask_正常收尾的空正文翻倍重发一次():
+    """finish_reason="stop" 且正文空是另一码事：不是额度被推理链吃光，但仍值得
+    就地翻倍重发一次（多半是单次抖动，省掉一轮退避），见 _EMPTY_STOP_TOKEN_SCALE。
 
-    绕开装饰器直接调 __wrapped__：这里要断言的是「不就地抬额度重发」，而带装饰器
-    会因 ValueError 可重试而走 6 次指数退避（真等十几秒），把断言点淹掉。
-    退避语义本身由 _worth_retry_text 那条测试覆盖。
+    与截断那条的处置刻意不同：截断抛 EmptyContentTruncated 直接放弃（额度确实是
+    瓶颈），这条重发拿到正文就正常返回。
     """
-    llm, sent = _ask_stub([_Resp("", "stop")], max_tokens=1000)
+    llm, sent = _ask_stub([_Resp("", "stop"), _Resp("答", "stop")], max_tokens=1000)
+    out = await llm.ask([{"role": "user", "content": "问"}], stream=False)
+    assert out == "答"
+    assert len(sent) == 2
+    assert sent[0]["max_tokens"] == 1000
+    assert sent[1]["max_tokens"] == 2000        # _EMPTY_STOP_TOKEN_SCALE = 2.0
+
+
+@pytest.mark.asyncio
+async def test_ask_翻倍后仍空才抛可重试的ValueError():
+    """翻倍也没救回来：这时才可能是提示词问题，交退避重试（ValueError 可重试）。
+
+    绕开装饰器直接调 __wrapped__：带装饰器会因 ValueError 可重试而走 6 次指数退避
+    （真等十几秒），把断言点淹掉。退避语义本身由 _worth_retry_text 那条覆盖。
+    """
+    llm, sent = _ask_stub([_Resp("", "stop"), _Resp("", "stop")], max_tokens=1000)
     with pytest.raises(ValueError, match="Empty or invalid response"):
         await LLM.ask.__wrapped__(llm, [{"role": "user", "content": "问"}], stream=False)
-    assert len(sent) == 1                       # 没有就地重发，也没抬额度
+    assert len(sent) == 2                       # 就地重发过一次，不是一次就放弃
 
 
 @pytest.mark.asyncio
@@ -177,3 +208,71 @@ async def test_ask_有正文时不多发一次():
     llm, sent = _ask_stub([_Resp("正常答案", "stop")], max_tokens=1000)
     assert await llm.ask([{"role": "user", "content": "问"}], stream=False) == "正常答案"
     assert len(sent) == 1
+
+
+# ---- ask_with_images 的就地抬额度重发 --------------------------------------------
+# 【为什么带图这条路也要有】原先只有纯文本 ask 做了就地抬额度重发，带图那条只会抛
+# ValueError 然后走满 6 次退避——而带图重发要重新上传整批 base64（阶段⑬ 单次 11 张），
+# 代价比纯文本更高。2026-08-26 实测阶段⑦ 分色选图（8 张图）返空一次，日志里只留一句
+# "Validation error in ask_with_images"。
+
+def _vision_stub(responses, max_tokens=1000):
+    """同 _ask_stub，但模型换成多模态白名单里的（否则 ask_with_images 直接拒）。"""
+    from app.llm import MULTIMODAL_MODELS
+
+    llm, sent = _ask_stub(responses, max_tokens=max_tokens,
+                          model=MULTIMODAL_MODELS[0])
+    return llm, sent
+
+
+@pytest.mark.asyncio
+async def test_带图请求截断返空也就地抬额度重发():
+    llm, sent = _vision_stub([_Resp("", "length"), _Resp('{"ok":true}', "stop")],
+                             max_tokens=1000)
+    out = await llm.ask_with_images(
+        messages=[{"role": "user", "content": "看图"}],
+        images=["data:image/jpeg;base64,AAAA"], stream=False)
+    assert out == '{"ok":true}'
+    assert len(sent) == 2                       # 只重发一次，不是走 6 次退避
+    assert sent[0]["max_tokens"] == 1000
+    assert sent[1]["max_tokens"] == 1500        # _RETRY_TOKEN_SCALE = 1.5
+
+
+@pytest.mark.asyncio
+async def test_带图请求抬额度后仍空抛专用异常():
+    """抬过一次还空：不该再白传一遍图、白烧一遍推理链。"""
+    llm, sent = _vision_stub([_Resp("", "length"), _Resp("", "length")],
+                             max_tokens=1000)
+    with pytest.raises(EmptyContentTruncated, match="仍为空"):
+        await llm.ask_with_images(
+            messages=[{"role": "user", "content": "看图"}],
+            images=["data:image/jpeg;base64,AAAA"], stream=False)
+    assert len(sent) == 2
+
+
+@pytest.mark.asyncio
+async def test_带图请求正常收尾返空也翻倍重发一次():
+    """2026-08-26 阶段⑦ 分色选图报的正是这个：finish_reason=stop、
+    completion_tokens=101、max_tokens=32000——额度根本没用完，靠退避重试白等 18 秒。
+    """
+    llm, sent = _vision_stub([_Resp("", "stop"), _Resp('{"rows":[]}', "stop")],
+                             max_tokens=1000)
+    out = await llm.ask_with_images(
+        messages=[{"role": "user", "content": "看图"}],
+        images=["data:image/jpeg;base64,AAAA"], stream=False)
+    assert out == '{"rows":[]}'
+    assert len(sent) == 2
+    assert sent[1]["max_tokens"] == 2000        # _EMPTY_STOP_TOKEN_SCALE = 2.0
+
+
+@pytest.mark.asyncio
+async def test_带图请求要记completion_tokens():
+    """原先只传 prompt_tokens，于是所有视觉阶段的日志都显示 Completion=0
+    （2026-08-26 实测那批 11 张描述图的质检调用无一例外），对花费账时会误判。"""
+    llm, sent = _vision_stub([_Resp("答", "stop")], max_tokens=1000)
+    seen = []
+    llm.update_token_count = lambda inp, comp=0: seen.append((inp, comp))
+    await llm.ask_with_images(
+        messages=[{"role": "user", "content": "看图"}],
+        images=["data:image/jpeg;base64,AAAA"], stream=False)
+    assert seen == [(100, 200)]                 # _Usage 的 prompt/completion

@@ -25,7 +25,7 @@ import asyncio
 import json
 import os
 import re
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from app.config import config, get_output_dir
 from app.logger import logger
@@ -92,6 +92,10 @@ _JS_DETAIL = """(async () => {
   const imgs = m ? [...new Set(m)] : [];
   return JSON.stringify({status: r.status, len: t.length, imgs: imgs});
 })()"""
+
+# 描述图 URL 的抠取规则，与上面 JS 里那条正则保持一字不差：两条取图路径
+# （页面内 fetch / Python 直连）必须抠出同一批图，否则同一商品换条路径结果就变。
+_RE_DESC_IMG = re.compile(r"""https?://[^"'\s\\]+\.(?:jpg|jpeg|png|webp)""", re.I)
 
 # 图片 CDN 的 bot 拦截规避（同 collect 侧的坑）：裸请求会连接重置或 403。
 _IMG_HEADERS = {
@@ -308,12 +312,182 @@ def _download_image(url: str, dst_path: str, retries: int = 3) -> int:
     raise RuntimeError(f"重试 {retries} 次仍失败：{last_err}")
 
 
+def _fetch_desc_imgs_direct(detail_url: str, retries: int = 3) -> list:
+    """Python 直连详情接口抠描述图 URL（页面内 fetch 被 CORS 拦下时走这条）。
+
+    2026-08-26 实测：detailUrl 有两种形态，老形态不带 CORS 头，页面内 fetch 必挂——
+        新 https://itemcdn.tmall.com/1688offer/icoss<hash>          有 access-control-allow-origin: *
+        老 https://itemcdn.tmall.com/desc/icoss!<offerId>!<x>?var=desc  无该头
+    浏览器读不到跨域响应体，抛的是 TypeError: Failed to fetch——没有状态码、与网络延迟
+    无关，重试多少次都一样（故这条路径不是「fetch 慢了」的补救，是换协议栈）。
+    老端点【不认来源】：无 UA、无 Referer、无 cookie 裸请求也是 200，所以直连能拿到，
+    上面 _JS_DETAIL 那句「该接口认来源」的注释只对新端点成立。
+
+    编码按 GB18030 而非 UTF-8（老端点响应头就是 charset=GB18030，按 UTF-8 解会乱码），
+    但只用来抠 ASCII 的图片 URL，故解码 errors='ignore' 足够、不影响结果。
+    """
+    import time
+
+    import requests
+
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.get(detail_url, headers=_IMG_HEADERS, timeout=(10, 30))
+            r.raise_for_status()
+            text = r.content.decode("gb18030", errors="ignore")
+            # dict.fromkeys 而非 set：保持接口返回顺序，描述图顺序即详情页排版顺序
+            return list(dict.fromkeys(_RE_DESC_IMG.findall(text)))
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                wait = (0, 1, 3)[min(attempt, 2)]
+                logger.warning(f"详情接口直连失败（{attempt}/{retries}）：{e}；{wait}s 后重试")
+                time.sleep(wait)
+    raise RuntimeError(f"直连重试 {retries} 次仍失败：{last_err}")
+
+
+# ---- 阶段① 反爬人工验证闸门 -------------------------------------------------
+# 1688 详情页在同 IP 高频访问后会弹「滑动验证」（阿里 baxia/nocaptcha），或整页跳到
+# punish 页。这两种情况下 window.context.result.data 压根不存在，原先的表现是
+# wait_for 干等 40s 然后抛「页面数据未就绪（未登录或被拦截？）」——阶段① 直接失败，
+# 而人就坐在那台机器前，本来两秒拖一下滑块就过了。滑块是刻意设计成不可自动化的，
+# 也没有绕过它的正当做法，唯一正确的处理就是【停下来喊人】。
+#
+# 故这里做成显式闸门：检测到验证 → 发 manual_check 事件（Web 页面弹人工检查条目、
+# CLI 打「! 人工检查」行）+ warning 日志 + 把页签提到前台，然后原地轮询等到验证过关
+# 再继续，而不是失败退出。等待期间不重试导航——punish 页在验证未过时刷新只会再弹一次。
+_ANTIBOT_TIMEOUT = 600.0   # 人工过关的最长等待（秒）；超时才把阶段① 判失败
+_ANTIBOT_INTERVAL = 3.0    # 轮询间隔：滑块过关后页面几乎立刻恢复，不必更密
+_ANTIBOT_REMIND = 30.0     # 每隔多久在日志里重复提醒一次（别每 3s 刷一行）
+
+# 判据三路，任一命中即算被拦：
+#   url  ：整页已跳到 punish / captcha / 登录页（_____tmd_____ 是阿里 punish 的固定参数）
+#   dom  ：验证浮层挂在当前页上（baxia 对话框 / nocaptcha 容器 / punish iframe）
+#   text ：兜住换皮的验证页——【只在商品数据缺失时才看文案】，否则正常详情页里随便
+#          一句「验证」都会误判，而误判的代价是把一次能跑通的提取卡成等人工。
+# 可见性只看 rect 尺寸（>20px）：nc 容器在正常页面上也可能存在但 display:none，
+# 那种 rect 是 0，不该算命中（与本项目其它浮层判据一致）。
+_JS_ANTIBOT = r"""(() => {
+  const href = location.href;
+  const urlHit = /punish|captcha|_____tmd_____|\/\/sec\.|login\.1688\.com/i.exec(href);
+  const SEL = '#baxia-dialog, .baxia-dialog, #nc_1_wrapper, .nc-container, #nocaptcha,'
+    + ' .nch-container, iframe[src*="punish"], iframe[src*="captcha"], iframe[id*="baxia"]';
+  let domHit = '';
+  document.querySelectorAll(SEL).forEach(el => {
+    if (domHit) return;
+    const r = el.getBoundingClientRect();
+    if (r.width > 20 && r.height > 20) domHit = el.id || el.className || el.tagName;
+  });
+  const hasData = !!((((window.context||{}).result)||{}).data);
+  const WORDS = ['滑动验证','拖动滑块','请拖动','安全验证','完成验证','智能验证',
+                 '验证码','访问被拒绝','环境异常','您的访问'];
+  let wordHit = '';
+  if (!hasData && document.body) {
+    const t = (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 3000);
+    wordHit = WORDS.find(w => t.includes(w)) || '';
+  }
+  return JSON.stringify({
+    blocked: !!(urlHit || domHit || wordHit),
+    kind: domHit ? 'dom' : (urlHit ? 'url' : (wordHit ? 'text' : '')),
+    detail: String(domHit || (urlHit && urlHit[0]) || wordHit || ''),
+    hasData: hasData, url: href, title: document.title || ''
+  });
+})()"""
+
+
+def _antibot_hint(probe: dict) -> str:
+    """把检测结果翻成一句给人看的处置提示（人工要做什么，不是命中了什么选择器）。"""
+    detail = str(probe.get("detail") or "")
+    if "login.1688.com" in detail:
+        return "已跳转到 1688 登录页，需要在该 Chrome 窗口里重新登录"
+    if probe.get("kind") == "dom":
+        return "页面弹出滑块/安全验证浮层，需要手动拖动滑块过关"
+    if probe.get("kind") == "url":
+        return f"整页被拦到验证页（{detail}），需要手动完成页面上的验证"
+    return f"疑似验证页（页面文案含「{detail}」），需要手动完成验证"
+
+
+async def wait_human_verify(
+    session: BrowserSession,
+    url: str,
+    on_manual: Optional[Callable[[str], Any]] = None,
+    timeout: float = _ANTIBOT_TIMEOUT,
+) -> bool:
+    """检测 1688 反爬验证；命中则提示人工并原地等到过关。返回「是否等过人工」。
+
+    返回 False 表示没被拦（调用方照原路走），True 表示拦过且已过关（调用方需要重新
+    读一次页面数据）。超时抛 RuntimeError，由上层把阶段① 判失败——此时状态文件里
+    阶段① 未完成，人工过关后原命令重跑即可（提取是纯只读的，重跑幂等）。
+
+    on_manual 是提示通道（service 层传的是发 manual_check 事件的闭包）。它是辅助路径，
+    按本项目惯例 best-effort 吞异常：提示没发出去不该让一次本来能等到人工的提取失败。
+    """
+    try:
+        probe = await session.eval_json(_JS_ANTIBOT)
+    except RuntimeError as e:
+        # 检测本身失败（导航中途上下文销毁等）不下结论：让调用方照常等数据
+        logger.debug(f"反爬检测执行失败，按未拦截处理：{e}")
+        return False
+    if not probe.get("blocked"):
+        return False
+
+    mins = int(timeout // 60)
+    message = (f"1688 触发反爬验证：{_antibot_hint(probe)}。"
+               f"请切到已打开的 Chrome 窗口手动处理，完成后流程会自动继续"
+               f"（最多等 {mins} 分钟，超时本商品判失败可重跑）")
+    logger.warning(message)
+    if on_manual is not None:
+        try:
+            r = on_manual(message)
+            if asyncio.iscoroutine(r) or isinstance(r, asyncio.Future):
+                await r
+        except Exception as e:
+            logger.warning(f"人工提示回调异常（忽略）：{e}")
+    # 把页签提到前台：验证浮层要人拖，页签藏在后面人根本看不见（best-effort）
+    try:
+        await session.page.bring_to_front()
+    except Exception as e:
+        logger.debug(f"页签提前台失败（忽略）：{e}")
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    last_remind = loop.time()
+    renav = 0
+    while loop.time() < deadline:
+        await asyncio.sleep(_ANTIBOT_INTERVAL)
+        try:
+            probe = await session.eval_json(_JS_ANTIBOT)
+        except RuntimeError as e:
+            logger.debug(f"反爬轮询失败，继续等：{e}")
+            continue
+        if not probe.get("blocked"):
+            if probe.get("hasData"):
+                logger.info("反爬验证已通过，继续提取")
+                return True
+            # 验证过了但停在中转页（punish 过关后不一定自动回详情页）：导回目标页
+            # 再接着轮询。只允许两次，避免验证反复弹时在这里无限刷页。
+            if renav < 2:
+                renav += 1
+                logger.info(f"验证已过但当前页不是详情页，重新导航（第 {renav} 次）")
+                await session.navigate(url)
+                continue
+        now = loop.time()
+        if now - last_remind >= _ANTIBOT_REMIND:
+            last_remind = now
+            logger.warning(f"仍在等待人工完成 1688 验证…剩余 {int(deadline - now)}s")
+    raise RuntimeError(
+        f"等待人工完成 1688 反爬验证超时（{int(timeout)}s）：{_antibot_hint(probe)}；"
+        f"过关后重跑本商品即可")
+
+
 async def extract_product(
     offer: str,
     session: Optional[BrowserSession] = None,
     outdir: Optional[str] = None,
     with_images: bool = True,
     enrich: bool = False,
+    on_manual: Optional[Callable[[str], Any]] = None,
 ) -> dict:
     """提炼 1688 商品信息 + 下图，产出 raw.json / product-info.json，返回摘要。
 
@@ -323,6 +497,9 @@ async def extract_product(
     enrich=True 时接着跑一次视觉回填（见 enrich_vision）。默认关闭：提取是纯只读的
     确定性步骤且已真站验证，视觉判断要花钱、要几十秒、还可能因模型/额度失败，
     不该绑进必经路径。开了也不会因回填失败作废整次抓取（产物已落盘）。
+
+    on_manual 是人工提示通道：1688 弹滑块/安全验证时用它通知人（见 wait_human_verify），
+    不给也照样等、只是提示仅进日志。
 
     只读操作：只导航 1688 详情页 + 页面内 fetch 详情接口 + 下载图片，不写任何店小秘数据。
     """
@@ -345,23 +522,44 @@ async def extract_product(
         r = await session.navigate(url, new_tab=own_session is False)
         if not r.get("ok"):
             raise RuntimeError(f"导航失败: {r}")
+        # 反爬闸门放在等数据【之前】：被拦时 window.context 压根不存在，先干等 40s 再
+        # 报「数据未就绪」纯属浪费——那 40s 里人本来就能把滑块拖完（见 wait_human_verify）
+        await wait_human_verify(session, url, on_manual=on_manual)
         data = await session.wait_for(
             _JS_EXTRACT, lambda d: d.get("found"), timeout=40
         )
         if not data.get("found"):
-            raise RuntimeError("页面数据未就绪（未登录或被拦截？）")
+            # 滑块也可能在首屏之后才弹（导航时那一刻还干净），故这里再判一次：
+            # 等到人工过关后重读一次数据，而不是直接把阶段① 判失败。
+            if await wait_human_verify(session, url, on_manual=on_manual):
+                data = await session.wait_for(
+                    _JS_EXTRACT, lambda d: d.get("found"), timeout=40
+                )
+            if not data.get("found"):
+                raise RuntimeError("页面数据未就绪（未登录或被拦截？）")
         logger.info(f"页面数据就绪：{data.get('subject')}")
 
         # 2. 详情接口拿描述长图（best-effort：拿不到就没有描述图，不阻断提取）
+        #    先页面内 fetch（新形态 detailUrl 走这条即可），失败或抠不到图再 Python
+        #    直连——老形态 detailUrl 没有 CORS 头，页面内 fetch 必抛 Failed to fetch，
+        #    详见 _fetch_desc_imgs_direct 的注释。
         desc_imgs: list = []
         if data.get("detailUrl"):
+            detail_url = data["detailUrl"]
             try:
-                d = await session.eval_json(
-                    _JS_DETAIL.replace("__URL__", J(data["detailUrl"]))
-                )
+                d = await session.eval_json(_JS_DETAIL.replace("__URL__", J(detail_url)))
                 desc_imgs = d.get("imgs", [])
+                if not desc_imgs:
+                    logger.warning(f"详情接口页面内 fetch 未抠到图（status={d.get('status')} "
+                                   f"len={d.get('len')}），改直连重试")
             except Exception as e:
-                logger.warning(f"详情接口拉取失败（描述图为空）：{e}")
+                logger.warning(f"详情接口页面内 fetch 失败：{e}；改直连重试")
+            if not desc_imgs:
+                try:
+                    desc_imgs = _fetch_desc_imgs_direct(detail_url)
+                    logger.info(f"详情接口直连成功：描述图 {len(desc_imgs)} 张")
+                except Exception as e:
+                    logger.warning(f"详情接口直连也失败（描述图为空）：{e}")
     finally:
         if own_session:
             await session.close()

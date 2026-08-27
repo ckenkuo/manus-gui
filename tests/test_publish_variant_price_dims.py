@@ -231,8 +231,9 @@ async def test_service_传递price与cat_path(monkeypatch):
     seen = {}
 
     async def _fake_set_variant(session, info_path, price="", dims=None,
-                                weight=None, cat_path=None):
-        seen.update(price=price, cat_path=cat_path, info_path=info_path)
+                                weight=None, cat_path=None, pack_est=None):
+        seen.update(price=price, cat_path=cat_path, info_path=info_path,
+                    pack_est=pack_est)
         return {"status": "ok", "price": "99", "dims": ["30", "25", "3"],
                 "weight": "420", "msrp": "14.14", "rowCount": 3}
 

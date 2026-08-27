@@ -52,3 +52,8 @@ jieba~=0.42.1
 # 连带装 pygetwindow（focus_window 用）；中文输入走剪贴板时需 pyperclip
 pyautogui~=0.9.54
 pyperclip~=1.8.2
+
+# 产品视频合规化（发布阶段⑥b：把 1688 搬来的 9:16 竖屏裁成 Temu 只收的 1:1/3:4/16:9）
+# 自带 win_amd64 的 ffmpeg.exe，不必装系统 ffmpeg（这台机器 PATH 里没有）；
+# 注意它【不带 ffprobe】，故 video.probe_video 要能只靠 ffmpeg 读元数据
+imageio-ffmpeg~=0.6.0

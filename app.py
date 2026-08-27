@@ -962,6 +962,29 @@ async def publish_llm_stage_switch(stage: str = Body(..., embed=True),
             "stages": publish_llm.list_llm_stages()}
 
 
+@app.get("/publish/settings")
+async def publish_settings():
+    """发布管线的运行参数（目前只有生图并发数），供发布页初始化输入框。"""
+    return {"imageConcurrency": publish_service.get_image_concurrency(),
+            "imageConcurrencyMax": publish_service.IMAGE_CONCURRENCY_MAX,
+            "imageConcurrencyDefault": publish_service.IMAGE_CONCURRENCY_DEFAULT}
+
+
+@app.post("/publish/settings")
+async def publish_settings_save(imageConcurrency: int = Body(..., embed=True)):
+    """设生图并发数。越界由 set_image_concurrency 拒掉，原样转 400（配置错误不是故障）。
+
+    为什么做成用户可配置而不是写死：Packy 侧 gpt-image-2 的实际并发上限随网关档位
+    与本机出网链路（VPN）变化，最佳值只有用户的环境能测出来（见
+    publish_service.get_image_concurrency 的说明）。
+    """
+    try:
+        n = publish_service.set_image_concurrency(imageConcurrency)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "imageConcurrency": n}
+
+
 @app.get("/publish/cache")
 async def publish_cache_list():
     """类目/属性缓存现状（统计 + 明细），供发布页缓存面板渲染。

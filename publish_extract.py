@@ -28,8 +28,16 @@ async def main() -> int:
     if not await ensure_cdp_alive():
         return 2
     try:
+        # 单独 CLI 没有事件通道，人工提示直接打屏（logger 已经写了一份 warning，
+        # 这里再 print 一次是为了在滚动的日志里显眼——人要立刻去拖滑块）
+        def _on_manual(message: str) -> None:
+            print("")
+            print("[需要人工处理] " + message, flush=True)
+            print("")
+
         result = await extract_product(
-            args.offer, outdir=args.out, with_images=not args.no_images
+            args.offer, outdir=args.out, with_images=not args.no_images,
+            on_manual=_on_manual,
         )
     except Exception as e:
         logger.error(f"提炼失败：{e}")

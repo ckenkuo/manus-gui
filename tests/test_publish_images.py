@@ -365,13 +365,14 @@ async def test_skc新图不足下限不在入口拦(monkeypatch, tmp_path):
     async def fake_open(session, kw):
         return {"opened": True}
 
-    async def fake_pick(session, fid):
-        return {"picked": True}
+    async def fake_pick_many(session, fids):
+        # 2026-08-26 起按批挂图（一次弹窗勾多张），注入点从 _pick_from_space 换到这里
+        return {"stage": "ok", "picked": list(fids), "counted": len(fids)}
 
     monkeypatch.setattr(pipeline, "_skc_row_state", fake_state)
     monkeypatch.setattr(pipeline, "upload_image", fake_upload)
     monkeypatch.setattr(pipeline, "_skc_open_space", fake_open)
-    monkeypatch.setattr(pipeline, "_pick_from_space", fake_pick)
+    monkeypatch.setattr(pipeline, "_pick_many_from_space", fake_pick_many)
     r = await pipeline.skc_replace_row(None, "米色马甲", str(tmp_path))
     # 走到了 verify-row（假 state 恒返回空 srcs），关键是【没有】被 precheck 拦
     assert r.get("stage") != "precheck", r

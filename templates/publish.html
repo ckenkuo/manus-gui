@@ -242,6 +242,35 @@
                 <i class="bi bi-image"></i> 的阶段要看图，只能选多模态模型。
               </div>
               <div id="stageLlmRows" class="row g-2"></div>
+              <!-- 生图并发数：⑤b 图片清理与 ⑬ 描述图英化共用同一个 gpt-image-2 端点，
+                   故只有一个旋钮。放在这个折叠区而不是上面那排控件里：那排的 md 宽度
+                   合计已经正好 12（见 test_控件行栅格不超过12列），再加就会把
+                   「开始发布」挤到下一行。 -->
+              <hr class="my-2" />
+              <div class="row g-2 align-items-end">
+                <div class="col-6 col-md-3">
+                  <label
+                    class="form-label small text-muted mb-1"
+                    for="inputImgConc"
+                    >生图并发数</label
+                  >
+                  <input
+                    id="inputImgConc"
+                    type="number"
+                    min="1"
+                    max="64"
+                    class="form-control form-control-sm"
+                    placeholder="30"
+                    title="⑤b 图片清理与 ⑬ 描述图英化的并发出图数，默认 30。链路好时调高能把生图墙压到接近单张耗时；网络拥堵时反而会互相挤占带宽集体超时，此时调小。改完立即保存，长期生效"
+                  />
+                </div>
+                <div class="col-12 col-md-9">
+                  <div class="small text-muted">
+                    默认 30。出网链路（VPN）不稳时调小，稳定时可调高；上限 64。
+                    <span id="imgConcHint" class="ms-1"></span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
           <label class="form-label small text-muted mb-1">
@@ -539,6 +568,45 @@
         loadLlmChoices(); // 无论成败都以后端状态为准重绘
       });
       loadLlmChoices();
+
+      // 生图并发数：值存在后端 prefs（不是 localStorage）——它决定服务端跑批时开多少路
+      // 并发出图，CLI 跑批也要读同一个值，存浏览器里 CLI 就看不到。
+      // 改完立即 POST，不等「开始发布」：用户调它往往是因为当前批次正在超时。
+      async function loadImgConc() {
+        try {
+          const r = await fetch("/publish/settings");
+          const d = await r.json();
+          $("inputImgConc").value = d.imageConcurrency;
+          $("inputImgConc").max = d.imageConcurrencyMax;
+          $("imgConcHint").textContent =
+            d.imageConcurrency === d.imageConcurrencyDefault
+              ? "（当前为默认值）"
+              : `（已自定义，默认 ${d.imageConcurrencyDefault}）`;
+        } catch (e) {
+          $("imgConcHint").textContent = "（读取失败，将按默认 30 运行）";
+        }
+      }
+      $("inputImgConc").addEventListener("change", async () => {
+        const n = parseInt($("inputImgConc").value, 10);
+        if (!n) {
+          loadImgConc(); // 清空/非数字：回填后端现值，不提交
+          return;
+        }
+        try {
+          const r = await fetch("/publish/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ imageConcurrency: n }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          showToast("生图并发数已保存", `并发 ${d.imageConcurrency}`, "success");
+        } catch (e) {
+          showToast("保存失败", String(e), "danger");
+        }
+        loadImgConc(); // 照 loadLlmChoices 的闭环：一律以后端状态重绘
+      });
+      loadImgConc();
 
       // 缓存面板：照 loadLlmChoices 的闭环——任何操作后都重新拉取、以后端状态为准，
       // 不在前端自己维护一份可能与磁盘不一致的镜像。

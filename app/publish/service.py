@@ -30,11 +30,22 @@ app/collect/service.py：_emit 回调制事件、aborted 统一出口、队列/S
     ⑨ sizechart  尺码表              ⑩ variant   变种信息
     ⑪ stock      仓库/库存/SKU分类    ⑫ shipping  运输信息（选最长时效）
     ⑬ desc       描述长图（视觉规划→删/换→desc_save）
+    ⑬b video     产品视频（比例裁到 1:1/3:4/16:9 后回填，纯增益、从不 fail）
     ⑭ save       保存落库
 
 【⑤b 为什么插在⑥ 之前而不是并进⑥】清理产物要被⑥素材图与⑦SKC颜色图共用，
 放进⑥ 就得在⑦ 再清一遍同一批图，而 gpt-image-2 每张都是一次生图调用。
 它是纯增益路径：清不动就按原图继续（⑥ 会按脏度打分挑最不脏的），从不 fail。
+
+【⑬b 产品视频为什么在 save 之前、且从不 fail】视频不是我们传的，是阶段② 认领时
+平台从 1688 连带搬来的（edit.json 的 videoUrl，指向淘宝 CDN）。1688 视频绝大多数
+是 9:16 竖屏，而 Temu 只收 1:1/3:4/16:9，于是发布时被打回「Video ratio should be
+1:1 or 3:4 or 16:9」——这个报错出现在阶段⑮【之后】：前 14 阶段全绿、save 也落库了，
+最后一步才弹回，回执还不说是哪个视频。故必须在发布前把关，且要在 save 之前完成
+（它改的是未保存的表单字段，与 ⑤~⑬ 同性质）。
+它是纯增益路径：没视频/已合规则 skipped，下载或转码或回填失败一律报 manual_check
+但仍返回 ok——视频只是加分项，为它让整个商品 fail 不值得（失败的实际后果只是
+「带着不合规视频去发布被打回」，人工删掉视频即可发布）。
 
 【生图产物一律落盘复用，重跑不重烧】gpt-image-2 是全流程最贵的调用，而 ⑤~⑬ 的
 成果 save 前一重载就丢（见下方续跑那段），重跑很常见。两处生图都做了产物复用：
@@ -45,6 +56,23 @@ app/collect/service.py：_emit 回调制事件、aborted 统一出口、队列/S
 
 【页面生命周期约束】② 之后 open_edit 打开编辑页，此后直到 ⑭ save 全程不刷新——
 open_edit 会刷新页面把未保存的修改丢掉（publish_inspect.py 的实测注释）。
+
+【哪些动作被提前/并行了（2026-08-26 提速改造）】阶段表本身仍是严格串行，提速只动
+两处「与页面无关的等待」：
+
+1. ① 之后立刻起一个后台预热任务（_start_prewarm → _run_prewarm），并发跑五件
+   只依赖本地产物的事：⑤ 标题生成、⑤b 主图清理（整段）、⑩ 包装尺寸重量估算、
+   ⑪ SKU 分类判断、⑬ 描述图规划 + 英化备料。它与 ② 认领（实测 33~37s）、③ 类目
+   （缓存命中 15s，未命中曾达 314s）并行——那段时间浏览器在忙、LLM 完全空闲。
+   各阶段到点用 _await_prewarm 取结果，取不到就照原路现场算，故预热纯属增益。
+   【⑥ 素材图与 ⑦ SKC 刻意不预热】它们要读 ⑤b 清理【之后】的 complianceNotes，
+   提前跑会读到旧标注、把清理成果作废（详见 _st_material 里那段）。
+2. ⑬ 描述图的生图与替换拆成两段：先并发把所有英化产物烧好，再串行逐张定位 + 替换。
+   原先两者在同一循环里，生图被迫一张一张来（单张约 35s，是该阶段耗时主体）。
+
+生图并发数由用户配置（get_image_concurrency，默认 30，发布页与 CLI 共用一份 prefs）：
+Packy 侧的实际并发上限随网关档位与出网链路变化，写死任何一个数都会在另一种环境里
+是错的（链路差时高并发只会互相挤占带宽、集体超时）。
 
 断点续跑：workspace/publish-state/<key>.json 记录每阶段状态与耗时（key = offerId
 或 rowid-<rowid>）。重跑时已 ok/skipped 的阶段自动跳过（stage_done 发 skipped）；
@@ -85,7 +113,7 @@ import time
 from typing import Awaitable, Callable, Optional, Union
 
 from app.logger import logger
-from app.publish import cache, extract, images, vision
+from app.publish import cache, extract, images, video as videolib, vision
 from app.publish.browser import BrowserSession, ensure_cdp_alive
 from app.publish.claim import collect_and_claim
 from app.publish.llm import reset_token_counters, active_llm_label
@@ -100,8 +128,11 @@ from app.publish.pipeline import (
     desc_replace,
     desc_save,
     ensure_desc_closed,
+    estimate_pack,
     fix_sizes,
     fix_sku_codes,
+    generate_titles,
+    judge_sku_category,
     live_state,
     open_edit,
     publish_now,
@@ -111,7 +142,9 @@ from app.publish.pipeline import (
     set_stock,
     set_titles,
     set_variant,
+    set_video,
     skc_replace_row,
+    read_video_url,
     SKC_ROW_MIN_IMAGES,
     _skc_row_matches,
     _skc_row_state,
@@ -124,6 +157,23 @@ PREFS_PATH = os.path.join("workspace", "publish_prefs.json")
 
 PRODUCT_TIMEOUT = 1800   # 单商品 15 阶段含多次 LLM + 图片上传/生图，给足 30 分钟
 CDP_PING_RETRIES = 3     # 每商品前的 CDP 健康检查次数（对齐 collect 侧）
+
+# 生图并发的默认值与上限（实际值由用户在发布页配置，见 get_image_concurrency）
+IMAGE_CONCURRENCY_DEFAULT = 30
+IMAGE_CONCURRENCY_MAX = 64
+# 描述图英化的「出图 + 质检」总发数：质检未过时再烧一发（理由见 _prepare_desc_image）
+DESC_QC_TRIES = 2
+# 【文字层没清干净的给更多发数】判据是 vision.check_cleaned 的 residualChinese 或
+# garbled——这两类都是「这一发生图碰巧没弄好」，正是重试能救的随机失败：
+#   - residualChinese：中文是 Temu 最硬的红线，退回原图的代价是这张图既带中文又撞
+#     1340×1785 闸门（2026-08-26 实测那批：pos 2/3/5 三张退回原图，desc_save 回读
+#     同时报「仍有外链图未转存」和三张破线）。
+#   - garbled：生图自己吐出的无意义英文，随机性最强的一类。2026-08-26 ⑤b main-04
+#     两发都是这个（「AI英化后英文为无意义拼写」→「疑似乱码/无意义文字」），恰好
+#     2 发用完就放弃、那张主图于是以脏图身份参与 ⑥⑦ 选图（vision._dirty_score）。
+# brokenSubject 仍只给 DESC_QC_TRIES：模型在改坏商品主体时多烧只会得到另一张坏图，
+# 且风险方向相反（宁可退回原图，也不要一张主体被改烂的图上真店）。
+DESC_QC_TRIES_TEXT = 4
 
 STAGES = [
     ("extract", "① 采集提炼"),
@@ -141,6 +191,7 @@ STAGES = [
     ("stock", "⑪ 库存SKU"),
     ("shipping", "⑫ 运输信息"),
     ("desc", "⑬ 描述长图"),
+    ("video", "⑬b 产品视频"),
     ("save", "⑭ 保存落库"),
     ("publish", "⑮ 立即发布"),
 ]
@@ -170,7 +221,7 @@ _CAT_STAGES = ["auto_cat", "attrs"]
 # ⑤ 起的纯表单阶段（类目有效时只有这些需要按实况逐项细判）
 _FORM_STAGES_AFTER_CAT = [
     "titles", "clean_images", "material", "skc", "fix_sizes",
-    "sizechart", "sku_code", "variant", "stock", "shipping", "desc",
+    "sizechart", "sku_code", "variant", "stock", "shipping", "desc", "video",
 ]
 
 _FORM_ONLY_STAGES = _CAT_STAGES + _FORM_STAGES_AFTER_CAT
@@ -253,12 +304,51 @@ def load_prefs() -> dict:
 
 
 def save_prefs(prefs: dict) -> None:
+    """把 prefs 里的键【合并】进偏好文件，未提及的键原样保留。
+
+    【为什么必须是合并而不是覆盖】这个文件同时存着两类东西：run_batch 每次成功启动
+    都会记的 store/site，以及用户在页面上单独设过一次就该长期生效的生图并发数
+    （imageConcurrency）。原先是整体覆盖，run_batch 一跑就把并发配置抹掉、静默回落
+    默认值——用户改过的设置在下一次跑批后自己消失，且没有任何提示。
+    """
     try:
+        merged = {**load_prefs(), **prefs}
         os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
         with open(PREFS_PATH, "w", encoding="utf-8") as f:
-            json.dump(prefs, f, ensure_ascii=False, indent=2)
+            json.dump(merged, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"prefs 写入失败（忽略）：{e}")
+
+
+def get_image_concurrency() -> int:
+    """生图（gpt-image-2）并发数：读用户配置，非法值回落默认，并夹到 1~上限。
+
+    【为什么要让用户自己配】Packy 侧对 gpt-image-2 的实际并发上限随网关档位与本机
+    出网链路（VPN）变化：链路好时 30 并发能把 ⑤b 与 ⑬ 的生图墙压到接近单张耗时，
+    链路差时高并发只会互相挤占带宽、集体超时，反而比小并发更慢。这个最佳值只有
+    用户的实际环境能测出来，写死任何一个数都会在另一种环境里是错的。
+
+    默认 30 是常规链路的经验值（原先写死 3 是「Packy 限流未知先保守」的临时取值，
+    实测远未触及上限）；上限 64 只为挡住手改配置时的荒谬值（几百并发必然全线超时）。
+    """
+    raw = load_prefs().get("imageConcurrency")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return IMAGE_CONCURRENCY_DEFAULT
+    return max(1, min(IMAGE_CONCURRENCY_MAX, n))
+
+
+def set_image_concurrency(n) -> int:
+    """设生图并发数并落盘，返回实际生效值（越界被夹住时与入参不同）。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        raise ValueError(f"生图并发数必须是整数，收到 {n!r}")
+    if n < 1 or n > IMAGE_CONCURRENCY_MAX:
+        raise ValueError(f"生图并发数需在 1~{IMAGE_CONCURRENCY_MAX} 之间，收到 {n}")
+    save_prefs({"imageConcurrency": n})
+    return n
 
 
 def _task_key(task: dict) -> str:
@@ -335,6 +425,13 @@ def _stale_form_stages(live: dict) -> list:
     # 描述区一张图都没有时不判 stale——那可能是本商品本就无描述图，交阶段自己判。
     if live.get("descImgCount") and live.get("descForeignCount") == live.get("descImgCount"):
         stale.append("desc")
+    # ⑬b 视频：【无条件进重跑集】。save 没成功时 videoUrl 会退回认领带来的 1688 原始
+    # 竖屏地址，而这个字段不在 DOM 里（只在 edit.json 响应里），live_state 那段 JS
+    # 读不到它、没法像别的阶段那样按实况细判。让它自己去判是安全且便宜的：阶段开头
+    # 就读接口，没视频或已合规都直接 skipped（只花一次接口 + 一次下载探测的几秒），
+    # 与 clean_images「自己判已有干净图就跳过」同一取向。
+    # 漏跑的代价反过来大得多——带着竖屏视频去发布，走完 15 个阶段才被平台打回。
+    stale.append("video")
     return [s for s in _FORM_ONLY_STAGES if s in set(stale)]
 
 
@@ -342,7 +439,13 @@ async def _st_extract(ctx: dict, session: BrowserSession, emit) -> dict:
     if ctx.get("info_path"):
         ctx["workdir"] = os.path.dirname(os.path.abspath(ctx["info_path"]))
         return {"status": "skipped", "note": "任务自带 product-info.json"}
-    r = await extract.extract_product(ctx["url"], session=session, enrich=True)
+    # 1688 弹滑块时把提示转成 manual_check 事件：Web 页面会多出一条人工检查、CLI 打
+    # 「! 人工检查」行，提取本身原地等人过关（见 extract.wait_human_verify）
+    async def _on_manual(message: str) -> None:
+        await emit({"type": "manual_check", "stage": "extract", "message": message})
+
+    r = await extract.extract_product(ctx["url"], session=session, enrich=True,
+                                      on_manual=_on_manual)
     if r.get("status") != "ok":
         return {"status": "fail", "note": f"提取失败: {r}"[:200]}
     ctx["info_path"] = r["infoPath"]
@@ -353,6 +456,242 @@ async def _st_extract(ctx: dict, session: BrowserSession, emit) -> dict:
                     "message": f"视觉回填失败（图片阶段将现场看图）：{r['visionError'][:100]}"})
     return {"status": "ok",
             "note": f"属性 {r.get('attrCount')} 项 | 图 {r.get('mainImgs')}+{r.get('descImgs')}"}
+
+
+def _start_prewarm(ctx: dict, emit) -> None:
+    """把预热任务丢到后台跑，立刻返回，不等它（见 _run_prewarm 的说明）。
+
+    【为什么是后台任务而不是一个阶段】它的价值恰恰在于与 ② 认领、③ 类目【并行】：
+    做成阶段就又变成串行等待，一点提速都没有。任务句柄挂在 ctx 里由 publish_one
+    在收尾时统一回收（见那边的 finally），免得批次结束还留着悬挂任务。
+
+    【失败一律不影响主流程】_run_prewarm 内部逐项吞异常；这里再兜一层 done 回调只为
+    把「整个预热协程炸了」也写成 warning——预热没跑成，各阶段照原路现场算而已。
+    """
+    if not ctx.get("info_path") or not ctx.get("workdir"):
+        return
+
+    task = asyncio.ensure_future(_run_prewarm(ctx, emit))
+
+    def _done(t) -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning(f"预热任务整体失败（各阶段将现场计算）：{exc}")
+
+    task.add_done_callback(_done)
+    ctx["prewarm_task"] = task
+
+
+# ---- 纯本地判断的提前预热 ----------------------------------------------------
+#
+# 【为什么能提前】① extract 一跑完，product-info.json 与 main/desc 图就全在磁盘上了。
+# ⑤ 标题、⑥ 素材图、⑦ SKC 分色、⑩ 包装估算、⑪ SKU 分类、⑬ 描述图规划这六个判断的
+# 输入【只有这些本地产物】，与店小秘页面无关（逐个核对过各自的取值来源：set_titles 读
+# title/attributes/skus/imageUnderstanding，pick_material 与 plan_skc 读 workdir 的
+# main-NN + complianceNotes，set_variant 读 title/packInfo，set_stock 的分类判断读
+# title/套装件数，plan_desc 读描述图 URL 与尺寸）。
+#
+# 【为什么值得提前】它们原先各自等在自己的阶段里串行发请求，而 ② 认领 + 打开编辑页
+# （实测 33~37s）和 ③ 类目（缓存命中 15s，未命中曾达 314s）这段时间浏览器在忙、
+# LLM 完全空闲。把这六个判断挪到 ① 之后并发起跑，正好填进这段空窗。
+#
+# 【必须是纯增益，绝不改变判定】预热只把结果放进 ctx["prewarm"]，各阶段命中就用、
+# 没有就照原路现场算。任何一个预热失败都只写 warning：这是本项目辅助路径的既定取向
+# （见模块头「best-effort」那段），不是 fallback——现场算那条路本来就一直在。
+#
+# 【描述图规划为什么也算纯本地】plan_desc 的输入是 modules 的 url + tooSmall，而
+# 认领后店小秘描述区挂的就是 1688 源外链（desc_save 的校验项「仍有外链图未转存」即
+# 此，2026-08-23 真站取证），与 raw.json 的 descImages 同源。故可按源 URL 预先出计划、
+# 并把英化产物按 URL 哈希烧进 desc-edit/ 缓存；⑬ 到点仍按页面实况重查一遍 modules，
+# 命中缓存直接复用、URL 对不上就现场跑。预热在这里【只做备料，不替代 plan_desc】。
+_PREWARM_KEYS = ("titles", "material", "skc", "variant", "stock", "desc")
+
+
+def _desc_modules_from_raw(workdir: str) -> list:
+    """按 raw.json + 本地 desc-NN.jpg 拼一份 plan_desc 能吃的 modules（供预热用）。
+
+    尺寸从本地文件读而不是靠网络：extract 下载时 `enumerate(imgs, 1)` 保证
+    desc-NN.jpg 与 descImages 按下标一一对应，故第 i 张的尺寸就是 desc-{i:02d}.jpg 的。
+    读不到尺寸的不标 tooSmall——与 desc_map 的取向一致（naturalWidth 为 0 时按
+    「读不到」处理，不当成不达标），免得把好图误判成要放大。
+    """
+    raw_path = os.path.join(workdir, "raw.json")
+    try:
+        with open(raw_path, encoding="utf-8") as f:
+            urls = (json.load(f) or {}).get("descImages") or []
+    except Exception as e:
+        logger.warning(f"预热读 raw.json 失败（跳过描述图预热）：{e}")
+        return []
+    mods = []
+    for i, u in enumerate(urls, 1):
+        if not isinstance(u, str) or not u:
+            continue
+        m = {"pos": i, "url": u, "onDxmHost": "dianxiaomi.com" in u}
+        wh = images.image_size(os.path.join(workdir, f"desc-{i:02d}.jpg"))
+        if wh:
+            m["size"] = f"{wh[0]}x{wh[1]}"
+            m["tooSmall"] = wh[0] < images.CLOTH_MIN_W or wh[1] < images.CLOTH_MIN_H
+        mods.append(m)
+    return mods
+
+
+def _replan_desc_by_url(pre_plan: dict, mods: list) -> dict:
+    """把预热出的规划按页面 modules 的【当前序号】重挂，返回同 plan_desc 形状的产物。
+
+    【为什么必须重挂而不能直接用】预热的 pos 是 raw.json 里 descImages 的源顺序；页面
+    描述区的 pos 由 desc_map 按 .desc-img-box img 现数（且文字模块处理后还会重排）。
+    两套序号只是常常相同、并不保证相同——直接拿源 pos 去删/换，就是本项目已经踩过的
+    那类错位（见 pipeline._JS_DESC_IDX_MAP 上方那次「删 pos 3/2 实际删掉 pos 2/1」）。
+    URL 是稳定标识，故一律按 URL 重新对齐 pos。
+
+    动作从预热计划里按 URL 取；页面上有而预热没判过的图【一律按 keep 处理】——与
+    plan_desc 对漏判项的取向一致（保守方向，不删不该删的）。needsUpscale 则按页面
+    现测的 tooSmall 重算：尺寸是页面事实，预热按本地文件算的只是估计，两者不一致时
+    要信页面（本地 desc-NN.jpg 与页面挂的图理论同源，但页面可能已被替换过）。
+    """
+    # plan_desc 的 delete 只回 pos，要还原成 URL 得靠预热时那份 modules 的映射，
+    # 故 _prewarm_desc 会把它翻成 deleteUrls 一起落下来（见那边）。
+    act_by_url, reason_by_url = {}, {}
+    for u in pre_plan.get("deleteUrls") or []:
+        act_by_url[u] = "delete"
+    for r in pre_plan.get("replace") or []:
+        if r.get("url"):
+            act_by_url[r["url"]] = "replace"
+            reason_by_url[r["url"]] = r.get("reason") or ""
+
+    delete, replace = [], []
+    for m in mods:
+        u, pos = m.get("url"), m.get("pos")
+        if not u or not pos:
+            continue
+        act = act_by_url.get(u, "keep")
+        if act == "delete":
+            delete.append(pos)
+            continue
+        # 尺寸按页面现测重算：keep 但不达标的照 plan_desc 的规矩改判 replace + 放大
+        too_small = bool(m.get("tooSmall"))
+        if act == "replace":
+            replace.append({"pos": pos, "url": u,
+                            "reason": reason_by_url.get(u, "")})
+        elif too_small:
+            replace.append({"pos": pos, "url": u, "needsUpscale": True,
+                            "reason": f"尺寸 {m.get('size')} 低于 "
+                                      f"{images.CLOTH_MIN_W}x{images.CLOTH_MIN_H}"})
+    replace.sort(key=lambda r: r["pos"])
+    keep = [m["pos"] for m in mods
+            if m.get("pos") not in set(delete)
+            and all(r["pos"] != m.get("pos") for r in replace)]
+    return {"status": "ok", "delete": sorted(set(delete)),
+            "replace": replace, "keep": sorted(set(keep))}
+
+
+async def _prewarm_desc(ctx: dict, info: dict, emit) -> dict:
+    """预热描述图：按源 URL 出规划 + 并发把英化产物烧进 desc-edit/ 缓存。
+
+    返回 {"plan": plan_desc 产物, "prepared": {url: 备料结果}}。⑬ 阶段拿 plan 当
+    页面实况对得上时的现成计划，prepared 则由 _prewarm_desc_images 的落盘缓存自然生效
+    （产物在磁盘上，⑬ 那边 how=cached 直接命中）。
+    """
+    mods = _desc_modules_from_raw(ctx["workdir"])
+    if not mods:
+        return {}
+    plan = await vision.plan_desc(mods, info)
+    # delete 只回 pos，而 ⑬ 那边要按 URL 重挂序号（见 _replan_desc_by_url），故这里
+    # 就把 pos 翻成 URL 存下来——翻译要用的映射只在此刻手上有。
+    by_pos = {m["pos"]: m["url"] for m in mods}
+    plan = {**plan,
+            "deleteUrls": [by_pos[p] for p in (plan.get("delete") or []) if p in by_pos]}
+    prepared = await _prewarm_desc_images(ctx["workdir"], plan.get("replace") or [], emit)
+    return {"plan": plan, "prepared": prepared}
+
+
+async def _run_prewarm(ctx: dict, emit) -> None:
+    """并发跑完六个纯本地判断，结果写进 ctx["prewarm"]（每项独立 best-effort）。
+
+    【为什么用 gather 而不是逐个 await】它们互不依赖，且都是纯网络等待（LLM 调用）。
+    单项失败不能影响其它项，故 return_exceptions=True 逐项收，异常只写 warning。
+
+    【为什么这个函数自己不 emit stage 事件】它不是阶段，是阶段的提前量。跑成什么样
+    由各阶段照常报——预热命中时那个阶段的 elapsed_s 自然就短了，这比多一路事件清楚。
+    """
+    info = _load_info(ctx["info_path"])
+
+    async def _titles():
+        # 只做生成，不填页面：填写要 session，且必须在编辑页打开之后。
+        return await generate_titles(info)
+
+    async def _variant():
+        # 按超集问（要尺寸也要重量）：此刻 cat_path 还没有，判不了服装类是否走固定尺寸，
+        # 也不知道源 packInfo 会不会补上重量。多问的字段 set_variant 用不到即可，
+        # 缺字段才会让它补问一次（见 estimate_pack 的 need_dims/need_weight 说明）。
+        return await estimate_pack(info, need_dims=True, need_weight=True)
+
+    async def _stock():
+        return await judge_sku_category(info)
+
+    async def _desc():
+        return await _prewarm_desc(ctx, info, emit)
+
+    async def _clean():
+        return await _clean_main_images(ctx, emit)
+
+    jobs = {"titles": _titles, "variant": _variant, "stock": _stock,
+            "desc": _desc, "clean_images": _clean}
+    keys = list(jobs)
+    logger.info(f"提前预热 {len(keys)} 个纯本地判断（与认领/类目阶段并行）：{'、'.join(keys)}")
+    results = await asyncio.gather(*(jobs[k]() for k in keys), return_exceptions=True)
+
+    out: dict = {}
+    ok_keys, bad_keys = [], []
+    for k, r in zip(keys, results):
+        if isinstance(r, BaseException):
+            bad_keys.append(k)
+            logger.warning(f"预热 {k} 失败（该阶段照原路现场算）：{r}")
+            continue
+        if r:
+            out[k] = r
+            ok_keys.append(k)
+    ctx["prewarm"] = out
+    logger.info(f"预热完成：命中 {len(ok_keys)} 项（{'、'.join(ok_keys) or '无'}）"
+                + (f"，失败 {len(bad_keys)} 项（{'、'.join(bad_keys)}）" if bad_keys else ""))
+    await emit({"type": "log", "stage": "extract",
+                "message": f"提前预热完成：{len(ok_keys)}/{len(keys)} 项可直接复用"
+                           + (f"，{len(bad_keys)} 项失败将现场重算" if bad_keys else "")})
+
+
+async def _await_prewarm(ctx: dict, key: str):
+    """等预热任务跑完（若还在跑），然后取一次该项结果；没有就返回 None。
+
+    【为什么要等而不是「有就用、没有就现场算」】预热是与 ②③ 并行的后台任务，到 ⑤ 时
+    多半已完成；但类目命中缓存时 ②③ 只花 50s 左右，标题这类可能还差几秒。此时直接
+    判「没有」就会再发一次同样的请求——两条路都在跑同一个判断，既慢又多花一次调用。
+    等它反而是快的：最差情况等到的时刻，与不预热时现场算完的时刻相同。
+
+    等待本身不设超时：_run_prewarm 内部每一项都吞了异常、必然会返回，而它包住的都是
+    带自身重试上限的 LLM 调用。这里再加一层超时只会造出「等了一半又去重算」的浪费。
+    """
+    task = ctx.get("prewarm_task")
+    if task is not None and not task.done():
+        try:
+            await task
+        except Exception as e:
+            # done 回调已记过，这里只是别让它把当前阶段带下水
+            logger.warning(f"等待预热任务时出错（现场计算）：{e}")
+    return _take_prewarm(ctx, key)
+
+
+def _take_prewarm(ctx: dict, key: str):
+    """取一次预热结果并【摘掉】，取不到返回 None。
+
+    摘掉而不是留着：⑤~⑬ 的成果 save 前一重载就丢，同一批次内该阶段可能被重跑
+    （见模块头 _stale_form_stages 那段）。重跑时页面状态已变，而预热结果是按【第一轮
+    的本地产物】算的——标题/包装估算这类与页面无关的仍然有效，但让它只用一次更稳妥：
+    重跑走现场那条路，与不带预热时的行为完全一致，不必再论证「复用第二次是否安全」。
+    """
+    pool = ctx.get("prewarm") or {}
+    return pool.pop(key, None)
 
 
 async def _st_claim(ctx: dict, session: BrowserSession, emit) -> dict:
@@ -429,7 +768,10 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
 
 
 async def _st_titles(ctx: dict, session: BrowserSession, emit) -> dict:
-    r = await set_titles(session, ctx["info_path"])
+    # 预热命中直接填，省掉这里最贵的一次调用（标题生成含最多 2 轮，实测单次可达 100s+）
+    gen = await _await_prewarm(ctx, "titles")
+    generated = (gen or {}).get("generated") if (gen or {}).get("status") == "ok" else None
+    r = await set_titles(session, ctx["info_path"], generated=generated)
     if r.get("status") != "ok":
         # 带上 err（具体拒因）：只报 title-generation-failed 时排查必须去翻日志，
         # 而阶段结果是写进状态文件、UI 也直接显示的那一份，原因得在这里就看得见。
@@ -441,7 +783,6 @@ async def _st_titles(ctx: dict, session: BrowserSession, emit) -> dict:
     return {"status": "ok", "note": f"英文 {(g.get('enTitle') or '')[:40]}"}
 
 
-CLEAN_CONCURRENCY = 3   # gpt-image-2 并发清理数（Packy 侧限流未知，先保守取 3）
 CLEAN_TIMEOUT = 90      # 单张清理超时（实测一张约 35s）；超了走原图兜底，不拖住整批
 
 
@@ -454,20 +795,49 @@ def _save_info(info_path: str, info: dict) -> None:
         logger.warning(f"回写 product-info.json 失败（忽略）：{e}")
 
 
-async def _st_clean_images(ctx: dict, session: BrowserSession, emit) -> dict:
-    """阶段⑥前置：把带中文/水印/他人 logo 的主图送 gpt-image-2 清理，产物顶替原图。
+def _retry_hint(issues: str, cjk: bool) -> str:
+    """质检未过后重烧时追加的提示词（⑤b 与 ⑬ 共用）。
 
-    为什么单列一个阶段而不是塞进⑥：产物要被⑥素材图和⑦SKC颜色图【共用】。塞进⑥
+    【为什么必须加码而不是原样重发】原样重发只是赌生图的随机性；把「上一发到底哪里
+    没弄好」当成新约束喂回去，命中率明显更高（同 llm._JSON_RETRY_HINT 的取向）。
+
+    两类失败要说不同的话——2026-08-26 实测这两类真实出现的比例差不多：
+      - 残留中文（cjk=True）：要点是「逐块扫，一个字符和标点都不留」；
+      - 生图乱码（cjk=False，如 ⑤b main-04 的 `oOaLanTanAt`）：根因是模型硬造英文，
+        要点反过来——【认不出就整块删掉，不要编】。对乱码说「请翻译干净」只会让它
+        再编一串新的无意义字母。
+    【抽成一个函数】两处给的加码必须一致，各写一份必然漂移。
+    """
+    head = f"【上一次处理后仍不合格：{issues[:40]}】"
+    if cjk:
+        return head + ("请逐块检查图上每一处文字，包括竖排文字、角标、小字号说明、"
+                       "以及印在色块或图案上的文字，一个中文字符和中文标点都不能留下。")
+    return head + ("上一次生成的英文是无意义的拼写。请不要凭猜测编造英文单词："
+                   "看不清或认不出的文字直接连同背景一起干净移除，"
+                   "只保留你能确读并正确翻译的内容。")
+
+
+async def _clean_main_images(ctx: dict, emit) -> dict:
+    """把带中文/水印/他人 logo 的主图送 gpt-image-2 清理，产物顶替原图。
+
+    返回 {"status": "ok"|"skipped", "note": ...}，直接就是 ⑤b 阶段的返回值形状。
+
+    为什么单列一步而不是塞进⑥：产物要被⑥素材图和⑦SKC颜色图【共用】。塞进⑥
     就得在⑦再清一遍同一批图，而 gpt-image-2 每张都是一次生图调用。这里清完直接把
     complianceNotes 里对应条目改成 clean=true 并指向新文件，⑥⑦ 的选图逻辑一行不用改
     就自动挑到干净图。
 
     【绝不阻塞流程】这是用户明确要求：单张失败/超时/质检不过一律保留原标注，
-    该图仍以脏图身份参与⑥⑦ 的兜底打分（见 vision._dirty_score），阶段本身照常 ok。
+    该图仍以脏图身份参与⑥⑦ 的兜底打分（见 vision._dirty_score），本步照常 ok。
     清理是「能修就修」的增益路径，不是硬前置。
 
     并发而非串行：单张实测约 35s，4 张串行 140s 会明显拖慢单商品耗时。
     edit_image 是同步 curl 子进程，故用 to_thread 丢线程池 + Semaphore 限流。
+    并发数取用户配置（见 get_image_concurrency）：最佳值随出网链路变化，写死不了。
+
+    【不接 session 参数】整段只读写本地图与 product-info.json，与店小秘页面无关——
+    这正是它能被提前到 ② 认领之前跑的前提（见 _run_prewarm）。原先它作为阶段函数
+    带着 session 形参却一次没用到，抽出来时一并去掉，免得让人误以为它碰页面。
     """
     if not ctx.get("info_path"):
         return {"status": "skipped", "note": "无 product-info.json，跳过清理"}
@@ -479,29 +849,53 @@ async def _st_clean_images(ctx: dict, session: BrowserSession, emit) -> dict:
 
     outdir = os.path.join(ctx["workdir"], "cleaned")
     os.makedirs(outdir, exist_ok=True)
-    sem = asyncio.Semaphore(CLEAN_CONCURRENCY)
+    conc = get_image_concurrency()
+    sem = asyncio.Semaphore(conc)
 
     async def _one(item: dict) -> dict:
-        """清一张：出图 → 质检 → 通过才算成功。返回 {"file", "ok", "path", "why"}。"""
+        """清一张：出图 → 质检 → 通过才算成功。返回 {"file", "ok", "path", "why"}。
+
+        质检未过时再烧一发（DESC_QC_TRIES）：生图有随机性，同图同提示词两发结果不同，
+        理由与 ⑬ 那边同源，见 _prepare_desc_image 里那段实测记录。这一路的失败代价
+        更大——主图脏着会以脏图身份参与⑥⑦选图（vision._dirty_score）。
+        """
         async with sem:
             dst = os.path.join(outdir, os.path.splitext(item["file"])[0] + "-clean.png")
-            try:
-                # 素材图是轮播首图，糊了最伤转化，故这一路不降采样出图（见 pick_size 注释）
-                ed = await asyncio.to_thread(
-                    images.edit_image, item["path"], prompt=item["prompt"],
-                    out_path=dst, no_downscale=True, timeout=CLEAN_TIMEOUT)
-            except Exception as e:
-                return {"file": item["file"], "ok": False, "why": f"出图失败：{e}"[:120]}
-            try:
-                qc = await vision.check_cleaned(ed["output"])
-            except Exception as e:
-                return {"file": item["file"], "ok": False, "why": f"质检失败：{e}"[:120]}
-            if not qc.get("clean"):
-                return {"file": item["file"], "ok": False,
-                        "why": f"质检未过：{qc.get('issues') or ''}"[:120]}
-            return {"file": item["file"], "ok": True, "path": ed["output"]}
+            last_why, cjk_left = "", False
+            attempt, tries = 0, DESC_QC_TRIES
+            while attempt < tries:
+                attempt += 1
+                # 残留中文时重试要加码提示词（同 _prepare_desc_image 的理由）：
+                # 原样重发只是赌随机性，把上一发残留了什么当新约束喂回去命中率更高。
+                prompt = item["prompt"]
+                if attempt > 1 and last_why:
+                    prompt += _retry_hint(last_why, cjk_left)
+                try:
+                    # 素材图是轮播首图，糊了最伤转化，故这一路不降采样出图（见 pick_size 注释）
+                    ed = await asyncio.to_thread(
+                        images.edit_image, item["path"], prompt=prompt,
+                        out_path=dst, no_downscale=True, timeout=CLEAN_TIMEOUT)
+                except Exception as e:
+                    return {"file": item["file"], "ok": False, "why": f"出图失败：{e}"[:120]}
+                try:
+                    qc = await vision.check_cleaned(ed["output"])
+                except Exception as e:
+                    return {"file": item["file"], "ok": False, "why": f"质检失败：{e}"[:120]}
+                if qc.get("clean"):
+                    return {"file": item["file"], "ok": True, "path": ed["output"]}
+                last_why = f"质检未过：{qc.get('issues') or ''}"
+                cjk_left = bool(qc.get("residualChinese"))
+                # 同 _prepare_desc_image：中文残留与生图乱码都算「这发没弄好」，多烧
+                # 有救。main-04 那次两发全是 garbled，只给 2 发正好白放弃。
+                if cjk_left or qc.get("garbled"):
+                    tries = max(tries, DESC_QC_TRIES_TEXT)
+                if attempt < tries:
+                    logger.info(f"{item['file']} 清理质检未过（{attempt}/{tries}"
+                                f"{'，残留中文' if cjk_left else ''}），"
+                                f"重烧一发：{(qc.get('issues') or '')[:60]}")
+            return {"file": item["file"], "ok": False, "why": last_why[:120]}
 
-    logger.info(f"图片清理：{len(items)} 张待处理（并发 {CLEAN_CONCURRENCY}）")
+    logger.info(f"图片清理：{len(items)} 张待处理（并发 {conc}）")
     results = await asyncio.gather(*(_one(it) for it in items))
 
     notes = info.get("complianceNotes") or {}
@@ -534,8 +928,30 @@ async def _st_clean_images(ctx: dict, session: BrowserSession, emit) -> dict:
     return {"status": "ok", "note": note}
 
 
+async def _st_clean_images(ctx: dict, session: BrowserSession, emit) -> dict:
+    """⑤b 图片清理：预热已经清过就直接复用它的结论，否则现在清。
+
+    【为什么这一步的预热结果能整体复用，而 ⑥⑦ 不能】清理的产物是磁盘上的文件和
+    product-info.json 里的标注，两者都已落盘、与页面无关；而 ⑥⑦ 的判断要读【清理之后】
+    的标注，提前跑就会读到旧值（详见 _st_material 里那段）。所以正确的提前量是把这一步
+    整段挪早，让 ⑥⑦ 留在原位读它的成果。
+    """
+    done = await _await_prewarm(ctx, "clean_images")
+    if done:
+        note = done.get("note") or ""
+        logger.info(f"图片清理沿用提前预热的结果：{note}")
+        return {**done, "note": (note + "（已在采集后提前完成）")[:200]}
+    return await _clean_main_images(ctx, emit)
+
+
 async def _st_material(ctx: dict, session: BrowserSession, emit) -> dict:
     info = _load_info(ctx["info_path"])
+    # 【⑥⑦ 刻意不预热】pick_material 在 complianceNotes 非空时完全不看图、只按标注选
+    # （见 vision.pick_material），而那份标注正是 ⑤b 清理改写的对象：在 ① 之后预热拿到的
+    # 是「无干净图 → 兜底取最不脏的一张 + uncertain」，等于把 ⑤b 的成果作废、还多报一次
+    # 人工确认。plan_skc 的单色分支同样按 clean 排序决定首位主图。
+    # 提速改由「把 ⑤b 清理整段提前」实现（见 _start_prewarm）：生图与 ②③ 重叠，而这里
+    # 保持现场判断、读到的是清理后的标注。
     plan = await vision.pick_material(info, ctx["workdir"])
     if plan.get("status") != "ok":
         return {"status": "fail", "note": plan.get("reason") or "无可用素材图"}
@@ -817,7 +1233,8 @@ async def _st_variant(ctx: dict, session: BrowserSession, emit) -> dict:
     """
     r = await set_variant(session, ctx["info_path"],
                           price=ctx.get("price") or "",
-                          cat_path=ctx.get("cat_path"))
+                          cat_path=ctx.get("cat_path"),
+                          pack_est=await _await_prewarm(ctx, "variant"))
     if r.get("status") == "error":
         return {"status": "fail", "note": (r.get("reason") or "")[:200]}
     note = (f"{r.get('rowCount')} 行 | 申报价 {r.get('price')} | "
@@ -829,7 +1246,8 @@ async def _st_variant(ctx: dict, session: BrowserSession, emit) -> dict:
 
 
 async def _st_stock(ctx: dict, session: BrowserSession, emit) -> dict:
-    r = await set_stock(session, ctx["info_path"])
+    r = await set_stock(session, ctx["info_path"],
+                        sku_judge=await _await_prewarm(ctx, "stock"))
     if r.get("status") == "error":
         return {"status": "fail",
                 "note": f"[{r.get('stage')}] {(r.get('reason') or r.get('err') or '')}"[:200]}
@@ -896,6 +1314,139 @@ async def _resolve_desc_pos(session: BrowserSession, url: str) -> tuple:
     return hits[0], "", False
 
 
+async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
+    """把一张待替换的描述图备好本地产物，返回 {"ok", "path", "how", "why"}。
+
+    how ∈ cached（复用落盘产物）/ upscaled（纯几何放大）/ edited（生图英化）。
+    三条分支的判据与取舍原样保留自原 _st_desc 内联实现——【不要在这里重新发明】：
+    needsUpscale 走 compress 不烧生图、质检未过必须删产物、产物一律落 en_path
+    （那是缓存键），每一条都是踩过坑换来的，理由见各分支注释。
+
+    抽成独立函数【只为了能并发预热】：本函数不碰浏览器页面（输入是源 URL、输出是
+    本地文件），故 N 张可以同时跑；而定位序号与替换必须逐张串行（见
+    _resolve_desc_pos）。原实现把两者写在同一个循环里，生图就只能一张一张来——
+    单张实测约 35s，10 张串行 350s，是 ⑬ 阶段耗时的主体（2026-08-25 状态文件实测
+    971877978455 该阶段 792s）。
+
+    同步阻塞调用（下载/生图/压缩都是 requests 与 curl 子进程）一律过 to_thread：
+    并发跑时若直接调用会把事件循环整个占住，等于白并发（⑤b 清理已是这个写法）。
+    """
+    local, en_path = _desc_cache_paths(workdir, rep["url"])
+    if os.path.exists(en_path) and os.path.getsize(en_path) > 0:
+        # 缓存命中不再重复质检：check_cleaned 也是一次视觉调用，而落盘的前提就是它已通过
+        return {"ok": True, "path": en_path, "how": "cached"}
+
+    if rep.get("needsUpscale"):
+        # 【只缺像素的图走纯几何放大，不烧生图】plan_desc 判 needsUpscale 的图内容
+        # 是干净的（模型本来判 keep），只是尺寸低于 1340×1785 过不了保存校验。
+        # 走 compress 放大即可：gpt-image-2 每张都是一次付费调用，为「像素不够」
+        # 去重画一遍画面既贵又可能改坏内容。也因此不需要 check_cleaned 质检——
+        # 画面根本没动过。
+        try:
+            await asyncio.to_thread(extract._download_image, rep["url"], local)
+            # 【产物必须落到 en_path】那是缓存键（见 _desc_cache_paths）。若就地
+            # 改 local，重跑时 cached 判定看不到产物，每轮都要重新下载再放大一次。
+            shutil.copy(local, en_path)
+            out = await asyncio.to_thread(images.compress, en_path, quality=88)
+        except Exception as e:
+            return {"ok": False, "why": f"放大失败：{e}"[:150]}
+        return {"ok": True, "path": out, "how": "upscaled",
+                "note": f"{rep.get('reason')} -> {images.image_size(out)}"}
+
+    try:
+        # 同包复用，带过浏览器头的下载
+        await asyncio.to_thread(extract._download_image, rep["url"], local)
+    except Exception as e:
+        return {"ok": False, "why": f"英化失败：下载原图 {e}"[:150]}
+
+    # 【质检未过要再烧一发】生图有随机性，同一张图同一个提示词两发结果就不同：
+    # 2026-08-26 实测 700640528493 那张 749×513 的面料细节图，第一发被判
+    # 「残留英文品牌字 QSMYSTYLE」（衣服上的实物刺绣被质检当成待清理的品牌字），
+    # 重烧一发就把底部整条中文说明去干净、刺绣完好、质检通过。一发不中就放弃的代价
+    # 不只是这张图退回原图，还连带撞 1340×1785 闸门、在描述区留下 1688 外链
+    # （日志末尾那两条 manual_check 就是这么来的）。
+    #
+    # 【发数按失败类型分档】重试能救的是随机性，救不了确定性失败（字太密、嵌在花纹里
+    # 译不干净），而 gpt-image-2 每发都是一次付费生图，故不能一律多烧：
+    #   - 残留中文 / 生图乱码 → DESC_QC_TRIES_TEXT 发。中文是 Temu 最硬的红线，退回原图的代价是
+    #     连带撞 1340×1785 闸门、在描述区留下 1688 外链（2026-08-26 那批日志末尾
+    #     「仍有外链图未转存」+「三张破线」就是三张图退回原图的后果，不是独立故障）。
+    #   - 其它 issues（修图痕迹之类）→ DESC_QC_TRIES 发，多烧是同样结果。
+    last_issues, cjk_left = "", False
+    attempt, tries = 0, DESC_QC_TRIES
+    while attempt < tries:
+        attempt += 1
+        # 【重试要加码提示词，不能原样再发一遍】残留中文说明上一发没把那块文案吃掉，
+        # 同样的话再说一次只是赌随机性；把「上一发残留了什么」当成新约束喂回去，
+        # 命中率明显高于原样重发（同 llm._JSON_RETRY_HINT 的取向）。
+        prompt = None
+        if attempt > 1 and last_issues:
+            prompt = images.DEFAULT_CLEAN_PROMPT + _retry_hint(last_issues, cjk_left)
+        try:
+            ed = await asyncio.to_thread(images.edit_image, local, prompt=prompt,
+                                         out_path=en_path)
+            qc = await vision.check_cleaned(ed["output"])
+        except Exception as e:
+            return {"ok": False, "why": f"英化失败：{e}"[:150]}
+        if qc.get("clean"):
+            return {"ok": True, "path": ed["output"], "how": "edited"}
+        # 质检未过的产物必须删掉：留着会被下次重跑（以及下一轮重试）当成
+        # 「已通过的缓存」复用——en_path 就是缓存键，见 _desc_cache_paths
+        last_issues = qc.get("issues") or ""
+        cjk_left = bool(qc.get("residualChinese"))
+        # 文字层没清干净（中文残留 or 生图吐了乱码）都给到 DESC_QC_TRIES_TEXT 发，
+        # 理由见该常量注释。发数在循环里抬而不是一开始就取大值：只有确实是这两类才
+        # 多烧，brokenSubject 照旧 2 发。
+        if cjk_left or qc.get("garbled"):
+            tries = max(tries, DESC_QC_TRIES_TEXT)
+        try:
+            os.remove(ed["output"])
+        except OSError:
+            pass
+        if attempt < tries:
+            logger.info(f"描述图英化质检未过（{attempt}/{tries}"
+                        f"{'，残留中文' if cjk_left else ''}），重烧一发："
+                        f"{last_issues[:60]}")
+    return {"ok": False, "why": f"英化质检未过：{last_issues}"[:150],
+            "residualChinese": cjk_left}
+
+
+async def _prewarm_desc_images(workdir: str, replace_plan: list, emit) -> dict:
+    """并发把 replace 计划里每张图的本地产物备好，返回 {url: _prepare_desc_image 结果}。
+
+    【为什么值得单开一轮】生图与页面完全无关，而替换必须串行。先并发烧完再串行替换，
+    墙钟从「N × 单张耗时」压到「单张耗时 + N 次替换」。并发数取用户配置的生图并发
+    （与 ⑤b 同一个旋钮，本质是同一个 gpt-image-2 端点，见 get_image_concurrency）。
+
+    【best-effort】某张备料失败只记原因，由调用方按原有的 manual_check 路径报出来、
+    保留页面原图；本函数不抛，一张烧不出来不该让整个 ⑬ 阶段失败。
+    """
+    if not replace_plan:
+        return {}
+    conc = get_image_concurrency()
+    sem = asyncio.Semaphore(conc)
+
+    async def _one(rep: dict) -> tuple:
+        async with sem:
+            try:
+                return rep["url"], await _prepare_desc_image(workdir, rep)
+            except Exception as e:
+                # _prepare_desc_image 内部已分支吞异常，这里只兜住意料外的（如磁盘满）
+                return rep["url"], {"ok": False, "why": f"备料异常：{e}"[:150]}
+
+    logger.info(f"描述图备料：{len(replace_plan)} 张待处理（并发 {conc}）")
+    pairs = await asyncio.gather(*(_one(r) for r in replace_plan))
+    out = dict(pairs)
+    n_ok = sum(1 for v in out.values() if v.get("ok"))
+    n_new = sum(1 for v in out.values() if v.get("how") in ("edited", "upscaled"))
+    logger.info(f"描述图备料完成：{n_ok}/{len(replace_plan)} 张就绪"
+                f"（新出图/放大 {n_new} 张，其余复用落盘产物）")
+    await emit({"type": "log", "stage": "desc",
+                "message": f"描述图备料完成 {n_ok}/{len(replace_plan)} 张"
+                           f"（并发 {conc}，新处理 {n_new} 张）"})
+    return out
+
+
 async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     m = await desc_map(session, ctx["info_path"])
     if m.get("status") != "ok":
@@ -949,7 +1500,27 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
         await ensure_desc_closed(session)
         return {"status": "ok", "note": text_note}
 
-    plan = await vision.plan_desc(mods, info_for_desc)
+    # 预热的规划按【URL 集合是否一致】决定能否复用：预热是照 raw.json 的 descImages
+    # 出的计划，而认领后描述区挂的就是那批 1688 外链（desc_save 的校验项「仍有外链图
+    # 未转存」即此，2026-08-23 真站取证）。但上面的文字模块处理可能删掉模块、页面也
+    # 可能被人动过，故不能假定两边一定相同——集合对不上就现场重出计划，pos 一律以
+    # mods 为准（预热给的 pos 是源顺序，与页面序号可能差一截）。
+    pre = await _await_prewarm(ctx, "desc")
+    plan = None
+    if pre and pre.get("plan"):
+        page_urls = {m.get("url") for m in mods if m.get("url")}
+        pre_urls = set()
+        for p in pre["plan"].get("replace") or []:
+            pre_urls.add(p.get("url"))
+        for m in _desc_modules_from_raw(ctx["workdir"]):
+            pre_urls.add(m["url"])
+        if page_urls and page_urls <= pre_urls:
+            plan = _replan_desc_by_url(pre["plan"], mods)
+            logger.info(f"描述图规划沿用提前预热的结果（{len(mods)} 张按页面序号重挂）")
+        else:
+            logger.info("页面描述图与预热时不一致（源图有增减），现场重出规划")
+    if plan is None:
+        plan = await vision.plan_desc(mods, info_for_desc)
     deleted, replaced = 0, 0
     if plan["delete"]:
         d = await desc_delete(session, plan["delete"])
@@ -961,13 +1532,30 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     # 「状态文件记的是跑过」那段）——重跑时若连图也重新生成，等于白烧一遍生图钱。
     # 故产物落 desc-edit/<url哈希>-en.jpg，存在且质检过就直接复用。
     # 缓存命中不再重复质检：check_cleaned 也是一次视觉调用，而落盘的前提就是它已通过。
+    #
+    # 【备料与替换分两段】生图不碰页面，替换必须逐张串行（要现查 pos）。故先并发把
+    # 所有产物烧好（_prewarm_desc_images），下面的循环里每张都已在本地，只剩定位与
+    # 替换两个页面动作。原先两者写在同一循环里，生图被迫串行——单张约 35s，是本阶段
+    # 耗时的主体。备料放在 desc_delete 【之后】：删掉的图不在 replace 计划里，不会白烧；
+    # 而备料不动页面，删除后的 pos 漂移对它没有影响。
+    #
+    # 【备料前必须按页面实况筛一遍】原实现「先定位再出图」不只是为了拿准 pos，还是一道
+    # 省钱闸：源图已不在描述区时直接跳过，省掉一次 gpt-image-2 调用。前移备料若不筛，
+    # 这道闸就失效了（tests/test_publish_service.py 的「源图已不在描述区时不生图」正是
+    # 为此把守）。这里用刚读到的 mods 过滤——它就是页面实况，不必再多发一次 desc_map；
+    # 下面循环里每张仍会各自重查一次 pos（删除后序号会前移，见 _resolve_desc_pos）。
+    live_urls = {m.get("url") for m in mods if m.get("url")}
+    to_prepare = [r for r in plan["replace"] if r.get("url") in live_urls]
+    if len(to_prepare) != len(plan["replace"]):
+        skipped_n = len(plan["replace"]) - len(to_prepare)
+        logger.info(f"描述图备料跳过 {skipped_n} 张：源图已不在描述区（省掉同等次数的生图调用）")
+    prepared = await _prewarm_desc_images(ctx["workdir"], to_prepare, emit)
+
     reused, upscaled = 0, 0
     for rep_i, rep in enumerate(plan["replace"]):
-        # 【先定位再出图】计划里的 pos 是删图前的序号，必须按源 URL 现查当前序号
-        # （见 _resolve_desc_pos）。定位放在生图【之前】：源图已不在页面上时直接跳过，
-        # 省掉一次 gpt-image-2 调用——那是本阶段最贵的一步。
-        # 定位到生图之间不会再有页面操作，故这个序号到 desc_replace 时仍然有效；
-        # 真有漂移也由 desc_replace 的 expect_url 闸门拦住。
+        # 【先定位再替换】计划里的 pos 是删图前的序号，必须按源 URL 现查当前序号
+        # （见 _resolve_desc_pos）。定位到 desc_replace 之间不会再有页面操作，故这个
+        # 序号仍然有效；真有漂移也由 desc_replace 的 expect_url 闸门拦住。
         pos = rep["pos"]
         cur_pos, perr, fatal = await _resolve_desc_pos(session, rep["url"])
         if perr:
@@ -990,50 +1578,25 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
         # 报给人看的序号一律用当前序号，前移过的额外标出计划序号——只报计划 pos 会
         # 让人按它去页面上数图，数到的是另一张
         tag = f"第 {cur_pos} 张" if cur_pos == pos else f"第 {cur_pos} 张（计划 pos {pos}）"
-        local, en_path = _desc_cache_paths(ctx["workdir"], rep["url"])
-        cached = os.path.exists(en_path) and os.path.getsize(en_path) > 0
-        if cached:
-            out_img = en_path
+        # 备料结果按源 URL 取（与 _desc_cache_paths 同一个键）。缺项出现在备料轮整个
+        # 没跑起来、或该图当时不在页面上（被上面的 live_urls 筛掉）——两种情况都已经
+        # 走到「定位成功」这一步了，说明此刻它确实在页面上，就地补一张即可。
+        # 补料复用同一个函数，不另写一套逻辑（另写必然与备料轮漂移）。
+        got = prepared.get(rep["url"])
+        if got is None:
+            got = await _prepare_desc_image(ctx["workdir"], rep)
+        if not got.get("ok"):
+            await emit({"type": "manual_check", "stage": "desc",
+                        "message": f"{tag}{got.get('why')}（保留原图）"})
+            continue
+        out_img = got["path"]
+        how = got.get("how")
+        if how == "cached":
             reused += 1
-            logger.info(f"描述图{tag}复用已有英化产物：{os.path.basename(en_path)}")
-        elif rep.get("needsUpscale"):
-            # 【只缺像素的图走纯几何放大，不烧生图】plan_desc 判 needsUpscale 的图内容
-            # 是干净的（模型本来判 keep），只是尺寸低于 1340×1785 过不了保存校验。
-            # 走 compress 放大即可：gpt-image-2 每张都是一次付费调用，为「像素不够」
-            # 去重画一遍画面既贵又可能改坏内容。也因此不需要 check_cleaned 质检——
-            # 画面根本没动过。
-            try:
-                extract._download_image(rep["url"], local)
-                # 【产物必须落到 en_path】那是缓存键（见 _desc_cache_paths）。若就地
-                # 改 local，重跑时 cached 判定看不到产物，每轮都要重新下载再放大一次。
-                shutil.copy(local, en_path)
-                out_img = images.compress(en_path, quality=88)
-            except Exception as e:
-                await emit({"type": "manual_check", "stage": "desc",
-                            "message": f"{tag}放大失败（保留原图）：{e}"})
-                continue
+            logger.info(f"描述图{tag}复用已有英化产物：{os.path.basename(out_img)}")
+        elif how == "upscaled":
             upscaled += 1
-            logger.info(f"描述图{tag}按尺寸放大：{rep.get('reason')}"
-                        f" -> {images.image_size(out_img)}")
-        else:
-            try:
-                extract._download_image(rep["url"], local)  # 同包复用，带过浏览器头的下载
-                ed = images.edit_image(local, out_path=en_path)
-                qc = await vision.check_cleaned(ed["output"])
-            except Exception as e:
-                await emit({"type": "manual_check", "stage": "desc",
-                            "message": f"{tag}英化失败（保留原图）：{e}"})
-                continue
-            if not qc.get("clean"):
-                # 质检未过的产物要删掉：留着会被下次重跑当成「已通过的缓存」复用
-                try:
-                    os.remove(ed["output"])
-                except OSError:
-                    pass
-                await emit({"type": "manual_check", "stage": "desc",
-                            "message": f"{tag}英化质检未过（保留原图）：{qc.get('issues')}"})
-                continue
-            out_img = ed["output"]
+            logger.info(f"描述图{tag}按尺寸放大：{got.get('note')}")
         rr = await desc_replace(session, cur_pos, out_img, expect_url=rep["url"])
         if rr.get("status") == "ok":
             replaced += 1
@@ -1052,6 +1615,13 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
         if s.get("tooSmall"):
             parts.append(f"仍有图低于 {images.CLOTH_MIN_W}x{images.CLOTH_MIN_H}："
                          f"{s['tooSmall']}")
+        # 【把成因一起报出来】这两条校验几乎从不是独立故障：本阶段每有一张图没换成，
+        # 它的 1688 原始外链就还挂在页面上，于是「未转存」与「尺寸破线」必然同时出现
+        # （2026-08-26 那批：3 张失败 → 恰好 3 张破线 + cbu01.alicdn.com 外链）。
+        # 只报校验结果会让人去查转存链路，而真正要看的是上面那几条替换失败的原因。
+        if kept_original := len(plan["replace"]) - replaced:
+            parts.append(f"根因很可能是本阶段有 {kept_original} 张图未替换成功"
+                         f"（它们的 1688 原始外链仍在页面上），请看上面各张的失败原因")
         await emit({"type": "manual_check", "stage": "desc",
                     "message": "描述保存后 " + ("；".join(parts) or str(s)[:120])})
     elif s.get("status") != "ok":
@@ -1076,6 +1646,79 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     if extra:
         note += "（" + "；".join(extra) + "）"
     return {"status": "ok", "note": note}
+
+
+async def _st_video(ctx: dict, session: BrowserSession, emit) -> dict:
+    """⑬b 产品视频：把平台连带搬来的 1688 视频裁成 Temu 允许的比例后填回表单。
+
+    【这一步为什么存在】视频不是我们传的，是阶段② 认领时平台从 1688 连带搬来的。
+    1688 商品视频绝大多数是 9:16 竖屏，而 Temu 只收 1:1 / 3:4 / 16:9，于是发布时
+    被打回「Video ratio should be 1:1 or 3:4 or 16:9」——而这个报错出现在阶段⑮
+    发布【之后】：前 14 个阶段全绿、save 也落库了，最后一步才被弹回，且回执不说是
+    哪个视频。故必须在发布前把关（2026-08-26 那批失败品实测：720×1280，比例 0.5625）。
+
+    【纯增益路径，从不 fail】与 ⑤b 图片清理同一取向：
+      - 没有视频 → skipped（大多数 1688 商品其实没视频）；
+      - 视频已合规 → skipped，绝不重编码（重编码必然掉画质，对本来就合规的是倒扣分）；
+      - 下载/转码/上传任一步失败 → 报 manual_check 但仍返回 ok，让流程继续走到 save。
+    最后一条是刻意的：视频只是加分项，为它失败而让整个商品 fail 得不偿失——而原来
+    那批品的实际后果只是「带着不合规视频去发布、被平台打回」，人工删掉视频即可发布。
+    故这里失败时把话说清楚（哪个环节、什么原因），由人决定是删视频还是重试。
+
+    【为什么读接口而不读页面】视频区 DOM 里没有真实地址（封面是内嵌 base64 占位图，
+    Vue 3 的 setupState 也扒不到），只有 edit.json 的响应里有，见 read_video_url。
+    """
+    rowid = ctx.get("rowid") or ""
+    if not rowid:
+        return {"status": "skipped", "note": "没有 rowid，读不到视频字段"}
+
+    cur = await read_video_url(session, rowid)
+    src_url = (cur.get("videoUrl") or "").strip()
+    if not src_url:
+        return {"status": "skipped", "note": "该商品没有视频"}
+
+    workdir = os.path.join(ctx["workdir"], "video")
+    os.makedirs(workdir, exist_ok=True)
+    raw = os.path.join(workdir, "source.mp4")
+
+    # 1) 下载。视频在淘宝 CDN 上，要跟 302 且带浏览器 UA（见 video.download_video）
+    dl = await asyncio.to_thread(videolib.download_video, src_url, raw)
+    if dl.get("status") != "ok":
+        await emit({"type": "manual_check", "stage": "video",
+                    "message": f"视频下载失败，未处理（发布时可能被平台按比例打回）："
+                               f"{dl.get('err')}"})
+        return {"status": "ok", "note": f"下载失败，视频原样保留：{str(dl.get('err'))[:120]}"}
+
+    # 2) 合规化。已合规会 action=skip 原样返回，不重编码
+    norm = await asyncio.to_thread(videolib.normalize_video, raw)
+    if norm.get("status") != "ok":
+        await emit({"type": "manual_check", "stage": "video",
+                    "message": f"视频转码失败，未处理（发布时可能被平台按比例打回）："
+                               f"{norm.get('err')}"})
+        return {"status": "ok", "note": f"转码失败，视频原样保留：{str(norm.get('err'))[:120]}"}
+
+    meta = norm.get("meta") or {}
+    if norm.get("action") == "skip":
+        # 源视频本来就合规：什么都不用改，连上传都省掉
+        return {"status": "skipped",
+                "note": f"视频已合规（{meta.get('w')}×{meta.get('h')} "
+                        f"{norm.get('ratioName')}），未改动"}
+
+    # 3) 直传 + 用「网络上传」把地址填回表单
+    r = await set_video(session, norm["output"])
+    if r.get("status") != "ok":
+        await emit({"type": "manual_check", "stage": "video",
+                    "message": f"视频已裁好但没能填回表单[{r.get('stage')}]，"
+                               f"页面上仍是原视频（发布可能被打回）：{str(r)[:150]}"})
+        return {"status": "ok",
+                "note": f"裁切成功但回填失败[{r.get('stage')}]，视频原样保留"}
+
+    out = norm.get("outMeta") or {}
+    dur = f"，截断到 {out.get('duration')}s" if norm.get("trimmed") else ""
+    return {"status": "ok",
+            "note": (f"{meta.get('w')}×{meta.get('h')}（{meta.get('ratio')}）→ "
+                     f"{out.get('w')}×{out.get('h')}（{norm.get('ratioName')}）"
+                     f"{dur}，{out.get('sizeMB')}MB")[:200]}
 
 
 async def _st_save(ctx: dict, session: BrowserSession, emit) -> dict:
@@ -1151,6 +1794,7 @@ _STAGE_FUNCS = {
     "stock": _st_stock,
     "shipping": _st_shipping,
     "desc": _st_desc,
+    "video": _st_video,
     "save": _st_save,
     "publish": _st_publish,
 }
@@ -1272,50 +1916,80 @@ async def publish_one(
                                + "、".join(redo))
             run_ids = [sid for i, (sid, _) in enumerate(STAGES) if _should_run(i, sid)]
 
-    for i, (sid, name) in enumerate(STAGES):
-        prev = state["stages"].get(sid) or {}
-        should_run = _should_run(i, sid)
-        if not should_run:
-            await emit({"type": "stage_done", "stage": sid, "name": name,
-                        "status": "skipped", "elapsed_s": prev.get("elapsed_s", 0.0),
-                        "note": "此前已完成，续跑跳过"})
-            continue
+    # 【预热必须在 for 之外启动】它要与 ②③ 并行，而 ① extract 是循环里的第一个阶段：
+    # 在阶段函数里 create_task 也行，但那样 ① 被跳过（任务自带 product-info.json）时就
+    # 不会启动了——而那种情况下产物早已在磁盘上，恰恰是最该预热的。故改成循环开始前
+    # 判一次：有 info_path 直接起，没有就等 ① 跑完再起（下面 sid == "extract" 那处）。
+    try:
+        if ctx.get("info_path"):
+            _start_prewarm(ctx, emit)
 
-        await emit({"type": "stage_start", "stage": sid, "name": name})
-        st0 = time.monotonic()
-        try:
-            r = await _STAGE_FUNCS[sid](ctx, session, emit)
-            status = r.get("status") if r.get("status") in _DONE else "fail"
-            note = r.get("note") or ""
-        except Exception as e:
-            status, note = "fail", f"异常：{e}"
-            logger.exception(f"[{key}] 阶段 {sid} 异常")
-        elapsed = round(time.monotonic() - st0, 1)
-        state["stages"][sid] = {"status": status, "elapsed_s": elapsed, "note": note[:200]}
-        # ctx 里后续的产出（rowid/info_path/workdir/title/cat_path）回写状态，续跑全靠它们。
-        # cat_path 是阶段③走通的类目路径，属性缓存要用它当键——续跑 from attrs 时
-        # 阶段③被跳过，不持久化就取不到（旧状态文件没这个键 → None → 全量读，不回归）。
-        for k in ("rowid", "info_path", "workdir", "title", "cat_path", "skc_done"):
-            if ctx.get(k):
-                state[k] = ctx[k]
-        state["status"] = "running"
-        save_state(state)
-        await emit({"type": "stage_done", "stage": sid, "name": name,
-                    "status": status, "elapsed_s": elapsed, "note": note[:200]})
+        for i, (sid, name) in enumerate(STAGES):
+            prev = state["stages"].get(sid) or {}
+            should_run = _should_run(i, sid)
+            if not should_run:
+                await emit({"type": "stage_done", "stage": sid, "name": name,
+                            "status": "skipped", "elapsed_s": prev.get("elapsed_s", 0.0),
+                            "note": "此前已完成，续跑跳过"})
+                continue
 
-        if status == "fail":
-            state["status"] = "fail"
-            state["failed_stage"] = sid
+            await emit({"type": "stage_start", "stage": sid, "name": name})
+            st0 = time.monotonic()
+            try:
+                r = await _STAGE_FUNCS[sid](ctx, session, emit)
+                status = r.get("status") if r.get("status") in _DONE else "fail"
+                note = r.get("note") or ""
+            except Exception as e:
+                status, note = "fail", f"异常：{e}"
+                logger.exception(f"[{key}] 阶段 {sid} 异常")
+            elapsed = round(time.monotonic() - st0, 1)
+            state["stages"][sid] = {"status": status, "elapsed_s": elapsed,
+                                    "note": note[:200]}
+            # ctx 里后续的产出（rowid/info_path/workdir/title/cat_path）回写状态，续跑全靠它们。
+            # cat_path 是阶段③走通的类目路径，属性缓存要用它当键——续跑 from attrs 时
+            # 阶段③被跳过，不持久化就取不到（旧状态文件没这个键 → None → 全量读，不回归）。
+            for k in ("rowid", "info_path", "workdir", "title", "cat_path", "skc_done"):
+                if ctx.get(k):
+                    state[k] = ctx[k]
+            state["status"] = "running"
             save_state(state)
-            return {"status": "fail", "rowid": ctx.get("rowid"), "failed_stage": sid,
-                    "note": note[:200], "elapsed_s": round(time.monotonic() - t0, 1)}
+            await emit({"type": "stage_done", "stage": sid, "name": name,
+                        "status": status, "elapsed_s": elapsed, "note": note[:200]})
 
-    state["status"] = "ok"
-    save_state(state)
-    pub = (state["stages"].get("publish") or {}).get("status")
-    note = "已保存落库并发布" if pub == "ok" else "已保存落库（未发布）"
-    return {"status": "ok", "rowid": ctx.get("rowid"), "failed_stage": "",
-            "note": note, "elapsed_s": round(time.monotonic() - t0, 1)}
+            if status == "fail":
+                state["status"] = "fail"
+                state["failed_stage"] = sid
+                save_state(state)
+                return {"status": "fail", "rowid": ctx.get("rowid"), "failed_stage": sid,
+                        "note": note[:200],
+                        "elapsed_s": round(time.monotonic() - t0, 1)}
+
+            # ① 刚跑完就起预热，让它与 ② 认领、③ 类目并行（那两步实测 50~350s，
+            # 期间浏览器在忙、LLM 完全空闲）。放在 stage_done 之后：预热失败不该影响
+            # ① 的阶段结论，而它需要 ① 落下的 info_path/workdir。
+            if sid == "extract" and status in _DONE:
+                _start_prewarm(ctx, emit)
+
+        state["status"] = "ok"
+        save_state(state)
+        pub = (state["stages"].get("publish") or {}).get("status")
+        note = "已保存落库并发布" if pub == "ok" else "已保存落库（未发布）"
+        return {"status": "ok", "rowid": ctx.get("rowid"), "failed_stage": "",
+                "note": note, "elapsed_s": round(time.monotonic() - t0, 1)}
+    finally:
+        # 【必须回收】商品中途失败返回时，预热可能还在跑（比如 ③ 类目就挂了）。
+        # 留着它会让下一个商品的批次里多一个跑着生图的悬挂任务，既烧钱又抢并发额度。
+        # 已完成的不动（结果没人取而已）；没完成的取消，取消异常照 best-effort 吞掉。
+        task = ctx.get("prewarm_task")
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                # CancelledError 在 3.8+ 继承 BaseException，故不能只 catch Exception；
+                # 这里的等待纯为让取消真正生效，任何结果都不该影响商品收尾
+                pass
+            logger.info("商品收尾：未完成的预热任务已取消")
 
 
 async def run_batch(

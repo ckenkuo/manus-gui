@@ -43,6 +43,27 @@ WXALBUM_HOST = "https://wxalbum-10001658-file.dianxiaomi.com"
 COS_BUCKET = "wxalbum"
 COS_REGION = "ap-shanghai"
 
+# ---- 视频直传（阶段⑥b 用）----------------------------------------------------
+# 【视频复用图片这套三步，只换 bucket——2026-08-26 从前端 chunk 溯源确认】
+# 编辑页视频组件（懒加载 chunk utils-zkclcStz.js）的「本地上传」分支调的就是
+# imgUpload chunk 导出的同一个上传函数，配置是 {upSize: 100MB, type: "smtmedia"}。
+# 故不必另接接口：getSign.json → PUT 签名 URL → cosDxmCallBack.json 原样走一遍。
+# （/api/video/uploadVideo.json 确实存在，但那是【视频库】页面的接口，编辑页不走它。）
+VIDEO_BUCKET = "smtmedia"
+VIDEO_REGION = "ap-guangzhou"
+# CDN 域名替换：前端拿到签名 URL 后把 cos.ap-guangzhou 换成 picgz 当对外地址
+# （imgUpload chunk 里的 `rp` → `to` 映射，smtmedia 那一档）
+VIDEO_URL_FROM = "cos.ap-guangzhou"
+VIDEO_URL_TO = "picgz"
+# popTemu 平台只允许 mp4（前端 upVideoType 白名单，各平台不同，popTemu 就这一种）
+VIDEO_ALLOWED_EXT = (".mp4",)
+# 【两个体积上限不是一回事，别混】Temu 平台侧是 500M（video.MAX_SIZE_MB），
+# 而店小秘编辑页【本地上传】的前端校验是 100M（chunk 里的 upSize，页面提示原文
+# 「本地上传视频限制100M内」）。我们走 COS 直传绕过了前端校验，故 100M 不是硬墙；
+# 但超了就说明这条路与页面行为不一致，值得告警——真出问题时能立刻想到这里。
+VIDEO_LOCAL_UPLOAD_WARN_MB = 100
+
+
 
 def resolve_full_cid() -> str:
     """取账号级 fullCid：环境变量 DXM_FULL_CID > config.toml 的 [publish].full_cid。
@@ -76,16 +97,23 @@ def resolve_full_cid() -> str:
     )
 
 
-# 第 1 步：页面内取 COS 签名。签名接口把有效载荷套了两层 data（j.data.data），
-# 这不是笔误，是店小秘的响应约定。
+# 第 1 步：页面内取 COS 签名。
+#
+# 【两种 bucket 的响应结构不同，必须双取】wxalbum 把有效载荷套了两层 data
+# （j.data.data，不是笔误，是店小秘的响应约定）；而 smtmedia（视频）的 j.data.data
+# 是 null、sign/url/fileId 直接挂在 j.data 上（2026-08-26 实测）。只读 j.data.data
+# 会在视频路径上静默读到空值，报成「取签名失败」而看不出是结构差异。
+# 故按 `j.data.data || j.data` 兜——两种结构都能取到。
 _JS_GET_SIGN = r"""(async () => {
   const body = 'bucket=__BUCKET__&region=__REGION__&fileName=' + encodeURIComponent(__FNAME__);
   const r = await fetch('/api/cos/getSign.json', {
     method: 'POST', credentials: 'include',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body});
   const j = await r.json();
-  const d = (j.data && j.data.data) || {};
-  return JSON.stringify({code: j.code, sign: d.sign, url: d.url, fileId: d.fileId, msg: j.msg});
+  const dd = j.data || {};
+  const d = dd.data || dd;
+  return JSON.stringify({code: j.code, sign: d.sign, url: d.url, fileId: d.fileId,
+                         msg: j.msg || dd.msg});
 })()"""
 
 # 第 3 步：回调登记入库。isNeedTree=0 表示不挂到分组树上（挂了要额外传目录 id）。
@@ -98,7 +126,11 @@ _JS_CALLBACK = r"""(async () => {
     method: 'POST', credentials: 'include',
     headers: {'Content-Type': 'application/x-www-form-urlencoded'}, body});
   const j = await r.json();
-  return JSON.stringify({code: j.code, msg: j.msg});
+  // videoId 只在视频（smtmedia）回调里有值，组件把它当 dxmVideoId 用；
+  // 图片回调没有这个字段，取到 undefined 不影响图片路径。
+  const d = j.data || {};
+  return JSON.stringify({code: j.code, msg: j.msg,
+                         videoId: d.videoId != null ? d.videoId : d.id});
 })()"""
 
 
@@ -187,22 +219,26 @@ async def upload_image(session: BrowserSession, file_path: str,
             "fileName": fname, "fileSize": fsize, "callback": cb}
 
 
-async def _curl_put(put_url: str, file_path: str, sign: str, ctype: str):
+async def _curl_put(put_url: str, file_path: str, sign: str, ctype: str,
+                    timeout: int = 120):
     """在线程池里跑 curl.exe PUT，避免阻塞事件循环。
 
     用 asyncio.to_thread 而不是 create_subprocess_exec：Windows 上后者要求
     ProactorEventLoop，而本项目的 web 侧（uvicorn）事件循环策略不由这里决定，
     to_thread 对循环类型无要求，行为一致。
+
+    timeout 可调是为视频加的：图片那档 120s 够用，而视频最大 500M，
+    按保守带宽估要几分钟（见 upload_video 里按体积算超时那段）。
     """
     import asyncio
 
     def _run():
         return subprocess.run(
-            ["curl.exe", "-sS", "-X", "PUT", "--max-time", "120",
+            ["curl.exe", "-sS", "-X", "PUT", "--max-time", str(timeout),
              "-H", f"Authorization: {sign}",
              "-H", f"Content-Type: {ctype}",
              "--data-binary", f"@{file_path}", put_url],
-            capture_output=True, timeout=140,
+            capture_output=True, timeout=timeout + 20,
         )
 
     return await asyncio.to_thread(_run)
@@ -227,3 +263,95 @@ async def upload_many(session: BrowserSession, paths: list,
     return {"status": "ok" if not failed else "partial",
             "uploaded": uploaded, "failed": failed,
             "total": len(paths), "okCount": len(uploaded)}
+
+
+# ---- 视频直传 ---------------------------------------------------------------
+
+async def upload_video(session: BrowserSession, file_path: str,
+                       full_cid: Optional[str] = None,
+                       skip_ratio_check: bool = False) -> dict:
+    """把本地视频直传店小秘图床（smtmedia bucket），返回可填进表单的视频 URL。
+
+    与 upload_image 走的是【同一套】COS 三步（前端 chunk 溯源确认，见 VIDEO_BUCKET
+    上方注释），只换 bucket/region，并处理两处视频特有的差异：
+      1. 签名响应结构不同（smtmedia 不套 data.data，见 _JS_GET_SIGN 注释）；
+      2. 对外 URL 要把 cos.ap-guangzhou 换成 picgz（前端的 rp→to 映射）。
+
+    【上传即把关：宽高比是硬红线】与 upload_image 用 check_cloth_size 拦小图同构。
+    比例不合规的视频传上去，前 14 个阶段全绿、save 也落库，直到阶段⑮ 发布才被打回
+    「Video ratio should be 1:1 or 3:4 or 16:9」，且回执不说是哪个视频——排查成本
+    远高于在这里直接拒掉。skip_ratio_check=True 可跳过（调用方已自行校验时用），
+    但默认必查：上传是视频进平台的唯一入口，把关放这里才不会被新增调用路径绕过。
+
+    返回 {"status": "ok", "fileId", "url", "originUrl", "videoId", ...}；
+    任一步失败返回 {"status": "error", "stage": <失败的步骤>, ...}，由调用方决定重试。
+    """
+    if not os.path.exists(file_path):
+        return {"status": "error", "stage": "precheck", "err": f"文件不存在: {file_path}"}
+    fname = os.path.basename(file_path)
+    # popTemu 只收 mp4（前端 upVideoType 白名单）。传别的扩展名 COS 会收下，
+    # 但平台侧解析不了，最终仍在发布时报错，故在这里就拦住。
+    if not fname.lower().endswith(VIDEO_ALLOWED_EXT):
+        return {"status": "error", "stage": "precheck",
+                "err": f"popTemu 只接受 {'/'.join(VIDEO_ALLOWED_EXT)} 视频，当前是 {fname}"}
+    if not skip_ratio_check:
+        from app.publish.video import check_video
+        chk = check_video(file_path)
+        if not chk["ok"]:
+            logger.error(f"视频不合规，拒绝上传：{fname} {chk['reason']}")
+            return {"status": "error", "stage": "video-check",
+                    "err": chk["reason"], "meta": chk.get("meta")}
+    cid = full_cid or resolve_full_cid()
+    fsize = os.path.getsize(file_path)
+    size_mb = fsize / (1024 * 1024)
+    if size_mb > VIDEO_LOCAL_UPLOAD_WARN_MB:
+        logger.warning(
+            f"视频 {size_mb:.1f}MB 超过编辑页本地上传的前端限制 "
+            f"{VIDEO_LOCAL_UPLOAD_WARN_MB}MB（我们走 COS 直传不受它约束，"
+            f"但平台侧仍有 500MB 硬上限）：{fname}"
+        )
+
+    # 1. 取签名（bucket=smtmedia）
+    js = (_JS_GET_SIGN
+          .replace("__BUCKET__", VIDEO_BUCKET)
+          .replace("__REGION__", VIDEO_REGION)
+          .replace("__FNAME__", J(fname)))
+    sign = await session.eval_json(js)
+    if not sign.get("sign") or not sign.get("url"):
+        logger.error(f"取视频 COS 签名失败：{sign}")
+        return {"status": "error", "stage": "getSign", **sign}
+
+    raw_url = sign["url"]
+    put_url = ("https:" + raw_url) if raw_url.startswith("//") else raw_url
+
+    # 2. PUT 视频字节到 COS。超时按体积放宽：视频可到 500M，图片那档 120s 不够
+    #    （按 1MB/s 的保守下限估，再加 120s 底座）
+    timeout = max(300, int(fsize / (1024 * 1024)) + 120)
+    proc = await _curl_put(put_url, file_path, sign["sign"], "video/mp4", timeout=timeout)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace")[:200]
+        logger.error(f"视频 COS PUT 失败 rc={proc.returncode}: {err}")
+        return {"status": "error", "stage": "cos-put", "err": err}
+
+    # 3. 回调登记（不登记则视频在 COS 上但平台侧没有记录）
+    js2 = (_JS_CALLBACK
+           .replace("__BUCKET__", VIDEO_BUCKET)
+           .replace("__CID__", J(cid))
+           .replace("__FILEID__", J(sign["fileId"]))
+           .replace("__FNAME__", J(fname))
+           .replace("__FSIZE__", str(fsize)))
+    cb = await session.eval_json(js2)
+    # 对外地址：前端把签名 URL 里的 cos.ap-guangzhou 换成 picgz 当 videoUrl 用；
+    # originUrl 保留替换前的原值（组件两个都存）
+    origin_url = put_url
+    final_url = origin_url.replace(VIDEO_URL_FROM, VIDEO_URL_TO)
+    ok = cb.get("code") == 0
+    if not ok:
+        logger.error(f"视频登记入库失败：{cb}")
+    else:
+        logger.info(f"视频直传完成：{fname} {fsize / 1024 / 1024:.2f}MB -> {final_url}")
+    return {"status": "ok" if ok else "error",
+            "stage": "" if ok else "callback",
+            "fileId": sign["fileId"], "url": final_url, "originUrl": origin_url,
+            "videoId": cb.get("videoId"),
+            "fileName": fname, "fileSize": fsize, "callback": cb}

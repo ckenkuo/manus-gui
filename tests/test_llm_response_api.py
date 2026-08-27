@@ -117,3 +117,81 @@ def test_只有reasoning时返回空串():
 ])
 def test_协议开关识别(api_type, expected):
     assert _stub(api_type).use_response_api is expected
+
+
+# ---- 空正文的就地抬额度重发 -------------------------------------------------------
+# 【为什么这条协议也必须有】chat/completions 那两条路都做了就地抬额度重发
+# （_RETRY_TOKEN_SCALE / _EMPTY_STOP_TOKEN_SCALE），而这里原先只抛 ValueError 交退避。
+# 偏偏本协议是 grok 网关专用，而 grok 是发布管线的默认档（publish.llm._DEFAULT_CHOICE），
+# 等于默认配置反而没有这层保护——审计时才发现这个口子。
+
+def _api_stub(texts, max_tokens=1000):
+    """造一个能跑 _call_response_api 的 LLM，responses.create 按序返回预设正文。
+
+    texts 里每项是该次返回的正文（"" 表示空正文），记录每次请求的
+    max_output_tokens 以便断言确实翻倍了。
+    """
+    obj = object.__new__(LLM)
+    obj.api_type = "openai-response"
+    obj.model = "grok-4.6"
+    obj.max_tokens = max_tokens
+    obj.temperature = None
+    obj.total_input_tokens = 0
+    obj.total_completion_tokens = 0
+    obj.update_token_count = lambda *a, **k: None
+    sent = []
+
+    class _Resp:
+        def __init__(self, text):
+            self._text = text
+
+        def model_dump(self):
+            out = {"usage": {"input_tokens": 10, "output_tokens": 5,
+                             "output_tokens_details": {"reasoning_tokens": 5}}}
+            if self._text:
+                out["output"] = [{"type": "message",
+                                  "content": [{"type": "output_text",
+                                               "text": self._text}]}]
+            else:
+                # 空正文的真实形状：只有 reasoning 项，没有 message
+                out["output"] = [{"type": "reasoning", "summary": []}]
+            return out
+
+    class _Responses:
+        async def create(self, **kw):
+            sent.append(kw)
+            return _Resp(texts[min(len(sent) - 1, len(texts) - 1)])
+
+    class _Client:
+        responses = _Responses()
+
+    obj.client = _Client()
+    return obj, sent
+
+
+@pytest.mark.asyncio
+async def test_responses空正文翻倍重发一次():
+    llm, sent = _api_stub(["", '{"ok":true}'], max_tokens=1000)
+    out = await llm._call_response_api([{"role": "user", "content": "问"}])
+    assert out == '{"ok":true}'
+    assert len(sent) == 2                            # 只重发一次，不是走退避
+    assert sent[0]["max_output_tokens"] == 1000
+    assert sent[1]["max_output_tokens"] == 2000      # _EMPTY_STOP_TOKEN_SCALE = 2.0
+
+
+@pytest.mark.asyncio
+async def test_responses翻倍后仍空才抛():
+    """抬过仍空才是提示词/模型问题，报错要带上抬到了多少，免得又去怀疑额度。"""
+    llm, sent = _api_stub(["", ""], max_tokens=1000)
+    with pytest.raises(ValueError, match="抬高额度后仍返回空正文"):
+        await llm._call_response_api([{"role": "user", "content": "问"}])
+    assert len(sent) == 2
+    assert "max_output_tokens=2000" in str(sent) or sent[1]["max_output_tokens"] == 2000
+
+
+@pytest.mark.asyncio
+async def test_responses有正文时不多发一次():
+    """常路不该因为新增分支多打一次请求（每次都要重传整批图）。"""
+    llm, sent = _api_stub(["正常答案"], max_tokens=1000)
+    assert await llm._call_response_api([{"role": "user", "content": "问"}]) == "正常答案"
+    assert len(sent) == 1

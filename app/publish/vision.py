@@ -99,8 +99,11 @@ def plan_clean(info: dict, workdir: str) -> dict:
                  "（含商品吊牌/标牌上的品牌字样）"]
         if n.get("chinese"):
             # 商品图上的中文若是有效信息（如尺码标注）直接删会丢信息，故先英化再删装饰性中文
+            # 标点要单独点出来：只说「中文文字」时模型会留下『』这类中日韩标点，
+            # 过不了 check_cleaned（理由见 images._NO_CJK_PUNCT）
             parts.append("图中若有中文文字，翻译成简洁英文并原位替换，字体风格和排版尽量保持一致；"
-                         "属于店铺宣传/装饰性质的中文直接移除")
+                         "属于店铺宣传/装饰性质的中文直接移除；"
+                         "中文标点（『』「」、，。！？等）也必须一并去掉或换成英文标点")
         parts.append("商品主体、配色、图案和构图完全不变，被移除处按周围内容自然补全")
         items.append({"file": name, "path": p, "prompt": "，".join(parts) + "。",
                       "note": (n.get("note") or "")[:30]})
@@ -433,16 +436,50 @@ actions 必须覆盖每一张（pos 从 1 到 {len(mods)}）。"""
 async def check_cleaned(image_path: str) -> dict:
     """AI 英化后的质检：残留中文/拼音/乱码或破坏主体都算不过。
 
-    返回 {"status": "ok", "clean": bool, "issues": str}。
+    返回 {"status": "ok", "clean": bool, "issues": str, "residualChinese": bool}。
     实测生图会残留拼音、误译品类（pipeline.desc_replace 注释），只看「中文没了」
     会把带乱码文案的图挂上去，故替换前必须过这道。
-    """
-    prompt = """这张图片刚经过 AI 英化处理（把中文文案改成英文）。请质检：
-- 是否还残留任何中文字符、拼音、或乱码/无意义文字；
-- 是否有明显修图痕迹破坏商品主体。
 
-只输出 JSON：{"clean": true/false, "issues": "<20字内，没有问题留空>"}"""
+    【residualChinese 单独回一个字段，因为它决定重试次数】残留中文是「必须清干净」
+    的一类（Temu 最硬的红线），而生图有随机性，多烧一发常常就过；其它 issues
+    （修图痕迹之类）多烧也是同样结果。调用方据此给中文那一类更多次数，见
+    service.DESC_QC_TRIES_CJK。
+
+    【商品实物上的图案/刺绣/品牌织标一律不算问题】2026-08-26 实测这条提示词的代价：
+    一张棒球服图被判「衣服上有品牌logo及疑似乱码英文字符」而退回原图，可那是衣服上
+    真实的绣标与装饰字母——人工选品阶段已经筛掉了不能用的款，实物的一部分不是「待
+    清理的文字层」。误报的后果不是保守而是更糟：退回原图 = 中文外链图留在描述区，
+    既过不了 1340×1785 闸门、也过不了合规。故这里把判据收窄到【叠加在图上的文案层】。
+    """
+    prompt = """这张图片刚经过 AI 英化处理（把叠加在图上的中文文案改成英文）。请质检：
+
+只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）：
+- residualChinese：是否还残留任何中文字符或中文标点（『』「」、，。！？；：《》等）；
+- garbled：是否有拼音、乱码、断词、无意义字母串（正常英文单词不算）；
+- brokenSubject：是否有明显修图痕迹破坏了商品主体（糊掉、变形、缺块）。
+
+【以下一律不算问题，不要报】：
+- 商品实物本身的印花、刺绣、织标、袖标、胸标、图案上的字母或品牌标识
+  —— 那是实物的一部分，选品时已人工确认过，不需要清理；
+- 图片本身的构图、留白、配色。
+
+只输出 JSON：{"residualChinese": true/false, "garbled": true/false,
+"brokenSubject": true/false, "issues": "<20字内，没有问题留空>"}"""
     data = await ask_json_with_images(prompt, [image_path], what="英化质检", system=_SYS,
                                       stage="clean_images")
-    return {"status": "ok", "clean": bool(data.get("clean")),
-            "issues": (data.get("issues") or "")[:80]}
+    cjk = bool(data.get("residualChinese"))
+    garbled = bool(data.get("garbled"))
+    bad = cjk or garbled or bool(data.get("brokenSubject"))
+    # 【兼容只回 clean 的旧形状】提示词换过好几版，模型偶尔仍按老约定只回一个
+    # clean 布尔（老提示词的字段）。此时以它为准，免得把「模型说不干净」读成干净——
+    # 三个新字段缺失时 bad 恒 False，那才是真的危险。
+    if "clean" in data and not any(
+            k in data for k in ("residualChinese", "garbled", "brokenSubject")):
+        bad = not bool(data.get("clean"))
+    # 【residualChinese 与 garbled 都要透出去】service 侧靠这两个字段决定重试发数
+    # （见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
+    # 的 `qc.get("garbled")` 恒为 None，加长重试对乱码那一路形同虚设——而 ⑤b main-04
+    # 两发恰好全是 garbled，正是要救的那种。
+    return {"status": "ok", "clean": not bad,
+            "issues": (data.get("issues") or "")[:80],
+            "residualChinese": cjk, "garbled": garbled}

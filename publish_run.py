@@ -24,7 +24,7 @@ import json
 import sys
 
 from app.logger import logger
-from app.publish.service import STAGES, run_batch
+from app.publish.service import STAGES, run_batch, set_image_concurrency
 
 
 def _gbk(s: str) -> str:
@@ -93,6 +93,9 @@ async def main() -> int:
     ap.add_argument("--publish", action="store_true",
                     help="⑭ 保存成功后继续点「发布」→「立即发布」真正上架"
                          "（不可逆，不给这个开关时 ⑮ 阶段跳过）")
+    ap.add_argument("--image-concurrency", type=int, default=0,
+                    help="生图并发数（⑤b 图片清理与 ⑬ 描述图英化共用）。"
+                         "不给则用发布页配置的值（默认 30）；给了会写进配置、长期生效")
     args = ap.parse_args()
 
     if args.list_stages:
@@ -111,6 +114,16 @@ async def main() -> int:
         tasks = [{"rowid": args.rowid, "info_path": args.info, "title": args.title}]
     else:
         ap.error("必须给 --tasks / --url / --rowid 之一")
+
+    # 并发数落的是同一份 prefs（Web 页与 CLI 共用），故这里是「设置」而不是「本次覆盖」。
+    # 刻意不做成临时值：用户在链路差的环境里调小它，下次跑批照样该小，
+    # 每次都要重新加参数反而容易忘（同 save_prefs 合并语义那段的理由）。
+    if args.image_concurrency:
+        try:
+            n = set_image_concurrency(args.image_concurrency)
+            logger.info(f"生图并发数已设为 {n}（写入配置，后续跑批沿用）")
+        except ValueError as e:
+            ap.error(str(e))
 
     r = await run_batch(tasks, store=args.store, site=args.site,
                         on_progress=_print_progress, from_stage=args.from_stage,

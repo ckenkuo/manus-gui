@@ -50,7 +50,7 @@ def _worth_retry_text(exc: BaseException) -> bool:
 
 
 def _worth_retry(exc: BaseException) -> bool:
-    """带图请求是否值得重试：400 一律不重试。
+    """带图请求是否值得重试：400 与「抬额度后仍返空」一律不重试。
 
     【为什么单独判】原先 retry_if_exception_type 里写了 Exception，等于什么都重试。
     2026-08-22 实测：Kimi 端点收到远程图片 URL 直接回 400
@@ -58,14 +58,31 @@ def _worth_retry(exc: BaseException) -> bool:
     6 次——白等几十秒、日志里同一条错误刷 6 遍，最后仍包成 RetryError 抛出，
     真正的原因反而被埋掉。故 400 视作确定性失败立即抛出，其余（限流/超时/网关
     抖动）照旧重试。
+
+    EmptyContentTruncated 同样排除，理由与 _worth_retry_text 那条完全一样：
+    ask_with_images 内部已就地抬过一次额度（见 _RETRY_TOKEN_SCALE），到这一步说明
+    抬了也没用。带图重发还要把整批 base64 再传一遍（阶段⑬ 单次 11 张图），走满 6 次
+    退避比纯文本更贵。
     """
-    return not isinstance(exc, BadRequestError)
+    return not isinstance(exc, (BadRequestError, EmptyContentTruncated))
 
 
 # 截断返空时就地重发用的额度倍数。1.5 是够用的经验值：deepseek 档配 32000，抬到
 # 48000 足以让推理链跑完还剩下正文的量；给更大只是多烧钱（真不够时抬两倍也救不回来，
 # 那属于提示词/模型选择问题，见 EmptyContentTruncated 的注释）。
 _RETRY_TOKEN_SCALE = 1.5
+
+# 【finish_reason="stop" 且正文空】另一码事：模型正常收尾却什么都没说，不是额度被
+# 推理链吃光。2026-08-26 阶段⑦ 分色选图（8 张图）实测 completion_tokens=101、
+# max_tokens=32000，额度根本没用完。原先这条只抛 ValueError 交给退避重试，日志里留
+# 一行看不出根因的 "Validation error"，那次白等 18 秒才靠重试救回来。
+#
+# 就地重发一次而不是直接交退避：这类返空多半是单次抖动，重发即可，省掉一轮退避。
+# 顺带把额度翻倍——理由不是「不够用」（明显够），而是有些端点在额度充裕时反而更愿意
+# 产出正文，且翻倍不花额外的钱（没用到的额度不计费，只有真产出的 token 才计）。
+# 抬过一次仍空就交给退避重试：那时才可能是提示词问题，与截断那条的处置刻意不同
+# （截断抛 EmptyContentTruncated 直接放弃，因为额度确实是瓶颈、重发必然同样结果）。
+_EMPTY_STOP_TOKEN_SCALE = 2.0
 
 
 def _is_truncated_empty(response) -> bool:
@@ -420,14 +437,36 @@ class LLM:
         self.update_token_count(usage.get("input_tokens", 0),
                                 usage.get("output_tokens", 0))
         if not text:
-            # 空正文最常见的原因就是 max_output_tokens 被 reasoning 吃光，
-            # 把 reasoning_tokens 一并报出来，免得又去怀疑提示词
+            # 【这条协议同样要就地抬额度重发一次】chat/completions 那两条路都做了
+            # （见 _RETRY_TOKEN_SCALE / _EMPTY_STOP_TOKEN_SCALE），而这里原先只抛
+            # ValueError 交退避重试——偏偏本协议是 grok 网关专用，而 grok 是发布管线的
+            # 默认档（publish.llm._DEFAULT_CHOICE），等于默认配置反而没有这层保护。
+            #
+            # 倍数取 _EMPTY_STOP_TOKEN_SCALE（翻倍）而不是 1.5：Responses 协议下拿不到
+            # finish_reason，分不清「被 reasoning 吃光」还是「模型没话说」，只能按更宽的
+            # 那个来。翻倍不额外花钱——没用到的额度不计费。
+            bigger = int(self.max_tokens * _EMPTY_STOP_TOKEN_SCALE)
             det = usage.get("output_tokens_details") or {}
-            raise ValueError(
+            logger.warning(
                 f"Responses API 返回空正文（output_tokens={usage.get('output_tokens')}, "
-                f"reasoning_tokens={det.get('reasoning_tokens')}）；"
-                f"多半是 max_tokens 给小了被推理占满"
+                f"reasoning_tokens={det.get('reasoning_tokens')}）"
+                f"，把额度翻倍到 {bigger} 就地重发一次"
             )
+            resp = await self.client.responses.create(
+                **{**params, "max_output_tokens": bigger})
+            text = self._from_response_output(resp)
+            usage2 = (resp.model_dump() if hasattr(resp, "model_dump")
+                      else resp).get("usage") or {}
+            self.update_token_count(usage2.get("input_tokens", 0),
+                                    usage2.get("output_tokens", 0))
+            if not text:
+                det2 = usage2.get("output_tokens_details") or {}
+                raise ValueError(
+                    f"Responses API 抬高额度后仍返回空正文"
+                    f"（output_tokens={usage2.get('output_tokens')}, "
+                    f"reasoning_tokens={det2.get('reasoning_tokens')}, "
+                    f"max_output_tokens={bigger}）；多半是提示词或模型选择问题"
+                )
         return text
 
     def count_tokens(self, text: str) -> int:
@@ -674,10 +713,24 @@ class LLM:
                         )
 
                 if not response.choices or not response.choices[0].message.content:
-                    raise ValueError(
-                        "Empty or invalid response from LLM: "
-                        + _empty_response_detail(response, self.max_tokens)
+                    # 正常收尾却返空：就地把额度翻倍重发一次再说
+                    # （见 _EMPTY_STOP_TOKEN_SCALE）
+                    bigger = int(self.max_tokens * _EMPTY_STOP_TOKEN_SCALE)
+                    logger.warning(
+                        f"正文为空但并非被截断（"
+                        f"{_empty_response_detail(response, self.max_tokens)}）"
+                        f"，把额度翻倍到 {bigger} 就地重发一次"
                     )
+                    key = ("max_completion_tokens" if self.model in REASONING_MODELS
+                           else "max_tokens")
+                    response = await self.client.chat.completions.create(
+                        **{**params, key: bigger}, stream=False
+                    )
+                    if not response.choices or not response.choices[0].message.content:
+                        raise ValueError(
+                            "Empty or invalid response from LLM: "
+                            + _empty_response_detail(response, bigger)
+                        )
 
                 # 更新 token 计数
                 self.update_token_count(
@@ -855,15 +908,66 @@ class LLM:
 
             # 处理非流式请求
             if not stream:
+                # 截断返空时就地抬额度重发一次，与 ask 同一套判据与倍数
+                # （见 _RETRY_TOKEN_SCALE）。【为什么带图这条路也必须有】看图判断的
+                # 输出通常比纯文本短，原以为不会被推理链挤空，2026-08-26 实测
+                # 阶段⑦ 分色选图（deepseek 视觉档，8 张图）照样返空——只是那次是
+                # finish_reason=stop 走了退避重试。带图请求重发一次要重新上传整批
+                # base64（阶段⑬ 单次 11 张图），走满 6 次退避的代价比纯文本更高，
+                # 故能就地对症解决的先在这里解决。
                 response = await self.client.chat.completions.create(**params)
+                used_tokens = self.max_tokens
+                if _is_truncated_empty(response):
+                    bigger = int(self.max_tokens * _RETRY_TOKEN_SCALE)
+                    logger.warning(
+                        f"带图请求正文被推理链挤空（"
+                        f"{_empty_response_detail(response, self.max_tokens)}）"
+                        f"，就地把额度抬到 {bigger} 重发一次"
+                    )
+                    key = ("max_completion_tokens" if self.model in REASONING_MODELS
+                           else "max_tokens")
+                    response = await self.client.chat.completions.create(
+                        **{**params, key: bigger}
+                    )
+                    used_tokens = bigger
+                    if _is_truncated_empty(response):
+                        # 抬过一次仍空是确定性失败，抛专用类型让退避重试跳过它
+                        # （重发只会再白传一遍图、再烧一遍推理链）
+                        raise EmptyContentTruncated(
+                            "抬高 max_tokens 后带图请求正文仍为空: "
+                            + _empty_response_detail(response, bigger)
+                        )
 
                 if not response.choices or not response.choices[0].message.content:
-                    raise ValueError(
-                        "Empty or invalid response from LLM: "
-                        + _empty_response_detail(response, self.max_tokens)
+                    # 正常收尾却返空：同 ask 那条，就地把额度翻倍重发一次
+                    # （2026-08-26 阶段⑦ 分色选图报的正是这个，见
+                    # _EMPTY_STOP_TOKEN_SCALE 的实测记录）
+                    bigger = int(used_tokens * _EMPTY_STOP_TOKEN_SCALE)
+                    logger.warning(
+                        f"带图请求正文为空但并非被截断（"
+                        f"{_empty_response_detail(response, used_tokens)}）"
+                        f"，把额度翻倍到 {bigger} 就地重发一次"
                     )
+                    key = ("max_completion_tokens" if self.model in REASONING_MODELS
+                           else "max_tokens")
+                    response = await self.client.chat.completions.create(
+                        **{**params, key: bigger}
+                    )
+                    used_tokens = bigger
+                    if not response.choices or not response.choices[0].message.content:
+                        raise ValueError(
+                            "Empty or invalid response from LLM: "
+                            + _empty_response_detail(response, bigger)
+                        )
 
-                self.update_token_count(response.usage.prompt_tokens)
+                # 【completion_tokens 必须一起记】原先只传 prompt_tokens，于是发布
+                # 管线所有视觉阶段的日志都显示 Completion=0（2026-08-26 实测那批
+                # 11 张描述图的质检调用无一例外），对耗时/花费账时会误判成「看图不
+                # 花输出 token」，也让 reset_token_counters 清的那份累计量失真。
+                self.update_token_count(
+                    response.usage.prompt_tokens,
+                    getattr(response.usage, "completion_tokens", 0) or 0,
+                )
                 return response.choices[0].message.content
 
             # 处理流式请求

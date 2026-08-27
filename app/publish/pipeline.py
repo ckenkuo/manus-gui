@@ -39,7 +39,7 @@ from app.publish.browser import (
     J,
     BrowserSession,
 )
-from app.publish.upload import upload_image
+from app.publish.upload import upload_image, upload_video
 
 # 编辑页右侧锚点导航的 7 个区块 ID（用 getElementById 定位比文本匹配稳定）
 SECTION_IDS = {
@@ -1675,21 +1675,25 @@ def _brand_words(brand: str, src_title: str) -> list:
     return words
 
 
-async def set_titles(session: BrowserSession, info_path: str) -> dict:
-    """阶段⑤：LLM 生成中英文标题并填写；产地一律填广东省。
+async def generate_titles(info: dict) -> dict:
+    """只生成中英文标题，不碰页面。返回 {"status": "ok", "generated": {...}} 或 error。
 
     标题生成规则（实测沉淀）：
       - 英文标题 40-70 字符（确保手机端完整显示），纯 ASCII（禁 emoji/特殊符号）
       - 中文标题重写（不照抄源标题），突出卖点，≤60 字
       - 品牌红线：属性里的品牌值（过滤掉「无功能保暖」这类描述性假品牌）
         + 源标题开头的英文商标 token，见 _brand_words
-      - 多候选兜底：LLM 一次生成 10 个英文标题，按推荐序取第一个合规的
+      - 多候选兜底：一次生成 3 个英文标题，按推荐序取第一个合规的
     生成失败时最多重试一次（喂上次不合格的原因）；两次都不合格才报错。
+
+    【为什么从 set_titles 里抽出来】它的输入只有 product-info.json 的字段
+    （title/attributes/skus/imageUnderstanding），与店小秘页面无关，因此可以在
+    ② 认领打开编辑页之前就先跑（见 service._run_prewarm）。抽的是【同一份实现】而不是
+    另写一套：合规闸（品牌/年份/价格宣称、40-70 字符）都留在这里，预热与现场走的是
+    完全相同的判定，否则两条路的产出会漂移。
     """
     from app.publish.llm import ask_json
 
-    with open(info_path, encoding="utf-8") as f:
-        info = json.load(f)
     src_attrs = json.dumps(info.get("attributes", {}), ensure_ascii=False)
     img_sum = json.dumps(info.get("imageUnderstanding", {}), ensure_ascii=False)
     skus_sum = json.dumps(info.get("skus", {}), ensure_ascii=False)[:600]
@@ -1855,6 +1859,26 @@ async def set_titles(session: BrowserSession, info_path: str) -> dict:
             gen_err = str(e)
     if not titles:
         return {"status": "error", "reason": "title-generation-failed", "err": gen_err}
+    return {"status": "ok", "generated": titles}
+
+
+async def set_titles(session: BrowserSession, info_path: str,
+                     generated: Optional[dict] = None) -> dict:
+    """阶段⑤：把中英文标题填进表单；产地一律填广东省。
+
+    generated 给了就直接用（service 层的提前预热产物，见 _run_prewarm），否则现场
+    调 generate_titles 生成。两条路进来的都是同一个函数的产物、过的是同一套合规闸，
+    故此处不再复检——复检一遍等于把闸的判据抄第二份，两份迟早漂移。
+    """
+    if generated is None:
+        with open(info_path, encoding="utf-8") as f:
+            info = json.load(f)
+        gen = await generate_titles(info)
+        if gen.get("status") != "ok":
+            return gen
+        titles = gen["generated"]
+    else:
+        titles = generated
 
     result = {"status": "ok", "generated": titles}
     # 填写中文标题
@@ -2390,7 +2414,8 @@ def _check_pack_est(est: dict, need_dims: bool, need_weight: bool) -> list:
 
 async def set_variant(session: BrowserSession, info_path: str,
                       price: str = "", dims: Optional[str] = None,
-                      weight: Optional[str] = None, cat_path=None) -> dict:
+                      weight: Optional[str] = None, cat_path=None,
+                      pack_est: Optional[dict] = None) -> dict:
     """阶段⑩：变种信息批量填写（申报价/尺寸/重量/建议售价）。
 
     规则（2026-08-18 定，2026-08-25 按用户结论修订申报价与尺寸）：
@@ -2402,6 +2427,8 @@ async def set_variant(session: BrowserSession, info_path: str,
     - 建议售价 = 申报价 ÷ 7（币种列保持页面默认 USD）
 
     cat_path：编辑页已生效的类目路径，用来判服装类；为空退到标题判定。
+    pack_est：提前预热的包装估算结果（见 service._run_prewarm）。命中就省掉本阶段
+    的 LLM 调用；它是按超集问的，用前仍过一遍 _check_pack_est 确认本次要的字段都在。
     """
     from app.publish.llm import ask_json
 
@@ -2429,42 +2456,19 @@ async def set_variant(session: BrowserSession, info_path: str,
     elif pack.get("dimsCm"):
         d_list = [str(x) for x in pack["dimsCm"]]
 
-    # LLM 预估兜底
+    # LLM 预估兜底（预热命中就不再问，见 estimate_pack 的说明）
     if not w_g or not d_list:
-        prompt = (
-            f"你是跨境电商打包专家。商品：{title}。\n"
-            "请预估单个包裹打包后的"
-            + ("尺寸 长x宽x高（cm）" if not d_list else "")
-            + ("和" if (not d_list and not w_g) else "")
-            + ("重量（g）" if not w_g else "")
-            + "。\n"
-            # 【包装形式不能写死成快递袋】原提示词固定写「opp袋/快递袋」，而走到
-            # 这里的都已是非服装类（服装走 _APPAREL_DIMS 固定值）：玩具/鞋类/家居
-            # 用品多数带彩盒或硬壳，按袋装估会把高估成 3~5cm，与实际体积差一截。
-            "要求：先判断这个品类的真实包装形式（快递袋、彩盒、纸箱、含注塑外壳等），"
-            "再按商品本体的实际体积给出含包装的外尺寸；有刚性包装的不得按压平袋装估。"
-            "数值为整数。\n"
-            # 【不许写「偏紧凑」】原提示词这么写，是系统性向下偏置：申报尺寸/重量
-            # 低报会压低体积重运费，属虚假申报。要的是准，不是小。
-            "不要刻意压小或放大，低报运费属虚假申报、高报自己吃亏。\n"
-            '只输出严格JSON：{"长":x,"宽":y,"高":z,"重量":w}'
-        )
-        est = await ask_json(prompt, what="包装尺寸重量估算", stage="variant")
-        # 量级闸：原先无任何范围校验，模型返回 {"长":1,"宽":1,"高":1} 会原样填进
-        # 申报字段。全自动路线下不转人工，越界就回喂问题重试一次。
-        bad = _check_pack_est(est, need_dims=not d_list, need_weight=not w_g)
-        if bad:
-            logger.warning("包装估算越界，重生成一次：" + "；".join(bad))
-            est2 = await ask_json(
-                prompt + "\n\n上次输出不合理：" + "；".join(bad)
-                + "\n请按真实快递包裹尺度重新给值。",
-                what="包装尺寸重量估算(重试)", stage="variant",
-            )
-            if not _check_pack_est(est2, need_dims=not d_list, need_weight=not w_g):
-                est = est2
+        est = None
+        if pack_est:
+            # 预热结果按【本次实际要哪些字段】校验一遍再用：预热时 cat_path 还没有，
+            # 服装判定可能与此刻不同，故不能假定它一定备齐了本次要用的字段。
+            if not _check_pack_est(pack_est, need_dims=not d_list, need_weight=not w_g):
+                est = pack_est
+                logger.info("包装尺寸重量沿用提前预热的估算结果，跳过本阶段 LLM 调用")
             else:
-                logger.warning("包装估算重试后仍越界，按通用快递包裹常识兜底")
-                est = {**est2, **_PACK_FALLBACK}
+                logger.info("预热的包装估算不满足本次所需字段，现场重新估算")
+        if est is None:
+            est = await estimate_pack(info, need_dims=not d_list, need_weight=not w_g)
         if not d_list:
             d_list = [str(est["长"]), str(est["宽"]), str(est["高"])]
         if not w_g:
@@ -2485,6 +2489,59 @@ async def set_variant(session: BrowserSession, info_path: str,
             "price": price, "dims": d_list, "weight": w_g, "msrp": msrp,
             "rowCount": res.get("count"), "bad": res.get("bad"),
             "sample": res.get("sample")}
+
+
+async def estimate_pack(info: dict, need_dims: bool = True,
+                        need_weight: bool = True) -> dict:
+    """让模型估算包裹尺寸/重量，返回 {"长","宽","高","重量"}（越界已兜底）。
+
+    【为什么从 set_variant 里抽出来】输入只有 title，与店小秘页面无关，可以在
+    ② 认领之前就先跑（见 service._run_prewarm）。量级闸与越界重试原样留在这里，
+    预热与现场共用同一份判定——另写一套简版必然与这里漂移。
+
+    need_dims / need_weight 说明本次要哪些字段：它们决定提示词措辞与
+    _check_pack_est 的校验范围。预热时【一律按超集问】（那时 cat_path 还没有，
+    服装类是否走固定尺寸判不了），现场再按实际所需校验一遍：多问的字段不用即可，
+    真缺字段才补问一次。
+    """
+    from app.publish.llm import ask_json
+
+    title = info.get("title", "")
+    prompt = (
+            f"你是跨境电商打包专家。商品：{title}。\n"
+            "请预估单个包裹打包后的"
+            + ("尺寸 长x宽x高（cm）" if need_dims else "")
+            + ("和" if (need_dims and need_weight) else "")
+            + ("重量（g）" if need_weight else "")
+            + "。\n"
+            # 【包装形式不能写死成快递袋】原提示词固定写「opp袋/快递袋」，而走到
+            # 这里的都已是非服装类（服装走 _APPAREL_DIMS 固定值）：玩具/鞋类/家居
+            # 用品多数带彩盒或硬壳，按袋装估会把高估成 3~5cm，与实际体积差一截。
+            "要求：先判断这个品类的真实包装形式（快递袋、彩盒、纸箱、含注塑外壳等），"
+            "再按商品本体的实际体积给出含包装的外尺寸；有刚性包装的不得按压平袋装估。"
+            "数值为整数。\n"
+            # 【不许写「偏紧凑」】原提示词这么写，是系统性向下偏置：申报尺寸/重量
+            # 低报会压低体积重运费，属虚假申报。要的是准，不是小。
+            "不要刻意压小或放大，低报运费属虚假申报、高报自己吃亏。\n"
+            '只输出严格JSON：{"长":x,"宽":y,"高":z,"重量":w}'
+    )
+    est = await ask_json(prompt, what="包装尺寸重量估算", stage="variant")
+    # 量级闸：原先无任何范围校验，模型返回 {"长":1,"宽":1,"高":1} 会原样填进
+    # 申报字段。全自动路线下不转人工，越界就回喂问题重试一次。
+    bad = _check_pack_est(est, need_dims=need_dims, need_weight=need_weight)
+    if bad:
+        logger.warning("包装估算越界，重生成一次：" + "；".join(bad))
+        est2 = await ask_json(
+            prompt + "\n\n上次输出不合理：" + "；".join(bad)
+            + "\n请按真实快递包裹尺度重新给值。",
+            what="包装尺寸重量估算(重试)", stage="variant",
+        )
+        if not _check_pack_est(est2, need_dims=need_dims, need_weight=need_weight):
+            est = est2
+        else:
+            logger.warning("包装估算重试后仍越界，按通用快递包裹常识兜底")
+            est = {**est2, **_PACK_FALLBACK}
+    return est
 
 
 # ---- 阶段⑪ 库存与SKU分类（set_stock）---------------------------------------
@@ -2624,8 +2681,32 @@ _JS_FILL_STOCK_CAT = r"""(async () => {
 })()"""
 
 
+async def judge_sku_category(info: dict) -> dict:
+    """判 SKU 分类，返回 {"skuCat","qty","unit","reason"}（页面无关，可提前跑）。
+
+    【为什么从 set_stock 里抽出来】它只看标题与套装件数/类型，与仓库、库存那两步
+    的页面状态无关，因此可以在 ② 认领之前先跑（见 service._run_prewarm）。
+    选项编码（1/2/3）的含义与 _JS_FILL_STOCK_CAT 的下拉序号绑定，改这里必须同步改那边。
+    """
+    from app.publish.llm import ask_json
+
+    title = info.get("title", "")
+    attrs = info.get("attributes") or {}
+    prompt = (
+        "你是跨境电商 Listing 专家。店小秘 Temu 半托管发布时需要为每个 SKU 填写「SKU分类」。\n\n"
+        f"商品信息：\n- 标题：{title}\n- 套装件数：{attrs.get('套装件数', '单件')}"
+        f"\n- 套装类型：{attrs.get('套装类型', '无')}\n\n"
+        "SKU分类选项：1=单品（一个SKU只含一件商品） 2=同款多件（多件相同商品） 3=混合套装（多件不同商品组合）\n"
+        "单位选项：1=件 2=双 3=包\n\n"
+        "请判断这个商品的 SKU分类（含数量、单位）。\n"
+        '只输出严格JSON：{"skuCat":"1|2|3","qty":数字,"unit":"1|2|3","reason":"一句话理由"}'
+    )
+    return await ask_json(prompt, what="SKU分类判断", stage="stock")
+
+
 async def set_stock(session: BrowserSession, info_path: str,
-                    stock: str = "100", warehouse: str = "飞特COL仓库") -> dict:
+                    stock: str = "100", warehouse: str = "飞特COL仓库",
+                    sku_judge: Optional[dict] = None) -> dict:
     """阶段⑪：仓库/库存/SKU分类批量填写。
 
     完整流程（2026-08-18用户确认）：
@@ -2633,13 +2714,12 @@ async def set_stock(session: BrowserSession, info_path: str,
     2. 填库存：统一值（默认100），等仓库勾选后 input[name=stock] 出现
     3. SKU分类：按标题+套装件数交 LLM 判断（单品/同款多件/混合套装 + 数量 + 单位）
     4. 包装清单：判断是否需要配件（暂未实现，留「请选择配件」不动）
-    """
-    from app.publish.llm import ask_json
 
+    sku_judge：提前预热的 SKU 分类判断结果（见 service._run_prewarm），给了就不再
+    问模型。它的输入与页面无关（只有标题和套装件数），故预热与现场同值。
+    """
     with open(info_path, encoding="utf-8") as f:
         info = json.load(f)
-    title = info.get("title", "")
-    attrs = info.get("attributes") or {}
 
     # 1. 选择仓库
     wh = await session.eval_json(_JS_WH_STATE)
@@ -2661,17 +2741,10 @@ async def set_stock(session: BrowserSession, info_path: str,
     if st.get("err") or st.get("bad"):
         return {"status": "error", "stage": "stock", **st}
 
-    # 3. SKU分类：交 LLM 判断
-    prompt = (
-        "你是跨境电商 Listing 专家。店小秘 Temu 半托管发布时需要为每个 SKU 填写「SKU分类」。\n\n"
-        f"商品信息：\n- 标题：{title}\n- 套装件数：{attrs.get('套装件数', '单件')}"
-        f"\n- 套装类型：{attrs.get('套装类型', '无')}\n\n"
-        "SKU分类选项：1=单品（一个SKU只含一件商品） 2=同款多件（多件相同商品） 3=混合套装（多件不同商品组合）\n"
-        "单位选项：1=件 2=双 3=包\n\n"
-        "请判断这个商品的 SKU分类（含数量、单位）。\n"
-        '只输出严格JSON：{"skuCat":"1|2|3","qty":数字,"unit":"1|2|3","reason":"一句话理由"}'
-    )
-    judge = await ask_json(prompt, what="SKU分类判断", stage="stock")
+    # 3. SKU分类：交 LLM 判断（预热命中就直接用，见 judge_sku_category）
+    judge = sku_judge or await judge_sku_category(info)
+    if sku_judge:
+        logger.info("SKU分类沿用提前预热的判断结果，跳过本阶段 LLM 调用")
     cat, qty, unit = str(judge.get("skuCat", "1")), str(judge.get("qty", 1)), str(judge.get("unit", "1"))
 
     res = await session.eval_json(_JS_FILL_STOCK_CAT
@@ -5082,21 +5155,210 @@ _JS_PICK_FROM_SPACE = r"""(async () => {
         const i = it.querySelector('img'); return i ? (i.src || '').slice(-40) : null;})});
   }
   hit.click();
-  await sleep(900);
-
-  // 确认选中状态：ant 系一般加 -selected/-active 类，但店小秘这个弹窗是自绘的，
-  // 故不硬依赖类名，只把类名回传供排查，真正的判据是确定后素材图 src 变化。
+  // 【选中态有明确信号，不必靠固定等待】2026-08-26 真站探查：item 的 class 完全不变，
+  // 变的是 .img-check 的文本（「点击选择」↔「取消选中」）与弹窗顶部的「已选择N张图片」
+  // 计数。故轮询等这个文本翻转，比硬等 900ms 既快又真的验证了「点中了」——原实现
+  // 等完根本没校验选中态，点空了也照样去点确定（表现为确定后行内图数不变）。
+  let selected = false;
+  for (let i = 0; i < 30; i++) {
+    const chk = hit.querySelector('.img-check');
+    if (chk && /取消选[择中]/.test(chk.textContent || '')) { selected = true; break; }
+    await sleep(100);
+  }
   const cls = String(hit.className || '');
+  if (!selected) {
+    return JSON.stringify({stage: 'pick', err: '点了图但选中态没生效（3s 内未翻转）',
+                           itemClass: cls});
+  }
   const ok = Array.from(modal.querySelectorAll('button'))
     .find(b => (b.textContent || '').trim() === '确定');
   if (!ok) return JSON.stringify({stage: 'confirm', err: '找不到确定按钮', itemClass: cls});
   ok.click();
-  await sleep(1800);
-  const stillOpen = Array.from(document.querySelectorAll('.ant-modal'))
-    .some(m => m.offsetHeight > 0 &&
-      ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+  // 弹窗关闭即完成，轮询等它消失（原硬等 1800ms）
+  let stillOpen = true;
+  for (let i = 0; i < 100; i++) {
+    stillOpen = Array.from(document.querySelectorAll('.ant-modal'))
+      .some(m => m.offsetHeight > 0 &&
+        ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+    if (!stillOpen) break;
+    await sleep(100);
+  }
   return JSON.stringify({stage: 'ok', picked: true, itemClass: cls, stillOpen});
 })()"""
+
+
+# 在【一次】空间弹窗里按 fileId 勾选多张图并点确定。
+#
+# 【弹窗支持累积多选——2026-08-26 真站探查证实】_probe_skc_space_modal.py 连点前 3 张，
+# 弹窗顶部计数逐次变成「已选择1/2/3张图片」，且每个 .img-item 的角标从「点击选择」变成
+# 「取消选中」后【保持不变】（点第 2 张时第 1 张仍是「取消选中」）。故这是累积语义，
+# 一次弹窗可以选完一整批，不必每张开关一次弹窗。
+#
+# 【为什么值得】逐张挂图时每张都要走「瞄点 → CDP 点行按钮 → 开菜单 → 开弹窗 → 选 1 张
+# → 确定 → 关弹窗」整轮，2026-08-26 实测 29 张图花 402s。改成批量后一批只走一轮。
+#
+# 【选中态判据是 .img-check 的文本，不是 class】探查确认 item 的 className 完全不变
+# （恒为 "img-item"），变的是内层 .img-check 的文本。别改回按 class 判——那会恒判未选中。
+#
+# 【空间里图片多时要翻页/搜索】弹窗带 vxe-pager 分页与搜索框（探查实测每页 20 张）。
+# 本函数只在【当前页】找：调用方刚上传的图必然在第一页（按上传时间倒序），
+# 找不到就如实报错并回传当前页的 src 尾巴，不静默跳过。
+# 在空间弹窗里点【一张】图（按 fileId 定位），并回报点击前后的选中态。
+#
+# 【为什么点一张就返回，不在 JS 里连点多张】见 _pick_many_from_space 的 docstring：
+# 连点版在真站上四次都出现「诊断说已选中、轮询判据恒 false」的自相矛盾。每张一次独立
+# 往返后，每次 eval 都在全新上下文里重新 querySelector，与探查脚本里可用的路径一致。
+#
+# 选中态判据是 .img-check 的文本（「点击选择」↔【「取消选中」】）。两处要点：
+# 1. 【文案是「取消选中」不是「取消选择」】2026-08-26 差这一个字，正则永不匹配，
+#    表现为每张都报「点了但没翻转」、整行换不了图，而页面上其实已经选上了。
+#    排查绕了五次真站验证，因为终端 GBK 把两词的乱码显示得一模一样——读诊断输出
+#    必须 PYTHONIOENCODING=utf-8，否则中文对比毫无意义。故正则写成兼容两种写法。
+# 2. 别改成按 class 判：
+# 2026-08-26 真站探查确认 .img-item 的 className 恒定不变，按 class 会恒判未选中。
+_JS_SPACE_CLICK_ONE = r"""(() => {
+  const modal = Array.from(document.querySelectorAll('.ant-modal'))
+    .find(m => m.offsetHeight > 0 &&
+      ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+  if (!modal) return JSON.stringify({err: '空间图片弹窗没打开'});
+  const items = Array.from(modal.querySelectorAll('.img-item'));
+  const chk = it => {
+    const c = it.querySelector('.img-check');
+    return c ? (c.textContent || '').trim() : '';
+  };
+  // 【取全部匹配项】同一内容的图在空间里可能有多份记录（重传、历史跑批留下的），
+  // 只看第一个会出现「点了 A 去读 B」。选中判据是其中任一为选中。
+  const hits = items.filter(it => Array.from(it.querySelectorAll('img'))
+    .some(i => (i.src || '').includes(__FID__)));
+  if (!hits.length) {
+    return JSON.stringify({err: '弹窗里找不到这张图', itemCount: items.length,
+      firstSrcs: items.slice(0, 3).map(it => {
+        const i = it.querySelector('img'); return i ? (i.src || '').slice(-40) : null;})});
+  }
+  const before = hits.map(chk);
+  if (before.some(t => /取消选[择中]/.test(t))) {
+    return JSON.stringify({already: true, before: before});
+  }
+  hits[0].click();          // 点第一个未选中的
+  return JSON.stringify({clicked: true, before: before});
+})()"""
+
+
+# 只读回报某张图当前的选中态（点击后另起一次 eval 来确认，不与点击共用上下文）。
+_JS_SPACE_CHECK_ONE = r"""(() => {
+  const modal = Array.from(document.querySelectorAll('.ant-modal'))
+    .find(m => m.offsetHeight > 0 &&
+      ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+  if (!modal) return JSON.stringify({err: '空间图片弹窗没打开'});
+  const items = Array.from(modal.querySelectorAll('.img-item'));
+  const hits = items.filter(it => Array.from(it.querySelectorAll('img'))
+    .some(i => (i.src || '').includes(__FID__)));
+  const checks = hits.map(it => {
+    const c = it.querySelector('.img-check');
+    return c ? (c.textContent || '').trim() : '';
+  });
+  // 计数元素不一定存在（不同弹窗实例不同），拿不到就回 null，由调用方跳过该校验
+  const t = Array.from(modal.querySelectorAll('*'))
+    .filter(el => el.childElementCount === 0)
+    .map(el => (el.textContent || '').trim())
+    .find(x => /已选择\s*\d+\s*张图片/.test(x));
+  return JSON.stringify({matched: hits.length, checks: checks,
+    selected: checks.some(c => /取消选[择中]/.test(c)),
+    counted: t ? parseInt(t.match(/\d+/)[0], 10) : null});
+})()"""
+
+
+# 点弹窗的「确定」，并轮询等它关闭。
+_JS_SPACE_CONFIRM = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const getModal = () => Array.from(document.querySelectorAll('.ant-modal'))
+    .find(m => m.offsetHeight > 0 &&
+      ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+  const m = getModal();
+  if (!m) return JSON.stringify({err: '空间图片弹窗没打开'});
+  const btn = Array.from(m.querySelectorAll('button'))
+    .find(b => (b.textContent || '').trim() === '确定');
+  if (!btn) return JSON.stringify({err: '找不到确定按钮'});
+  btn.click();
+  let stillOpen = true;
+  for (let i = 0; i < 100; i++) {
+    await sleep(100);
+    stillOpen = !!getModal();
+    if (!stillOpen) break;
+  }
+  return JSON.stringify({confirmed: true, stillOpen: stillOpen});
+})()"""
+
+
+async def _pick_many_from_space(session: BrowserSession, file_ids: list) -> dict:
+    """在已打开的空间弹窗里勾选多张图并确定（每张一次独立往返，见上方 JS 的注释）。
+
+    file_ids 传直传返回的 fileId 列表，内部只取文件名部分匹配（弹窗里是缩略图地址，
+    前缀与直传返回的 URL 不同，同 _pick_from_space）。
+
+    返回 {"stage": "ok", "picked": [...], "counted": N} 或带 err 的失败结构。
+    失败时【不点确定】，弹窗留在打开状态交调用方决定（关掉重试还是报人工）——
+    半选状态点确定会挂上数量不对的图，比直接失败糟。
+
+    【每张分成「点一次 + 另起一次 eval 确认」两个往返】而不是在一段 JS 里连点：
+    连点版在真站上四次都出现「诊断说已选中、判据恒 false」的自相矛盾（详见
+    _JS_SPACE_CLICK_ONE 上方那段）。分开后每次 eval 都是全新上下文，与探查脚本里
+    实测可用的路径一致。
+    """
+    fids = [f.rsplit("/", 1)[-1] for f in file_ids]
+    picked, missing, diag = [], [], []
+
+    for fid in fids:
+        r = await session.eval_json(
+            _JS_SPACE_CLICK_ONE.replace("__TITLE__", J(SPACE_MODAL_TITLE))
+            .replace("__FID__", J(fid)))
+        if r.get("err"):
+            # 弹窗不在是致命的（后面每张都会一样），立刻收工而不是逐张重试
+            return {"stage": "pick", "err": r["err"], "picked": picked,
+                    "itemCount": r.get("itemCount"), "firstSrcs": r.get("firstSrcs")}
+        if r.get("already"):
+            picked.append(fid)
+            continue
+
+        # 点完另起一次 eval 确认选中态，最多等 3s
+        ok = False
+        last: dict = {}
+        for _ in range(15):
+            await asyncio.sleep(0.2)
+            last = await session.eval_json(
+                _JS_SPACE_CHECK_ONE.replace("__TITLE__", J(SPACE_MODAL_TITLE))
+                .replace("__FID__", J(fid)))
+            if last.get("selected"):
+                ok = True
+                break
+        if not ok:
+            diag.append({"fid": fid, "matched": last.get("matched"),
+                         "checks": last.get("checks")})
+            missing.append(fid)
+            continue
+        picked.append(fid)
+
+    if missing:
+        return {"stage": "pick", "err": "有图没能选中", "missing": missing,
+                "picked": picked, "diag": diag}
+
+    # 计数回读：「已选择N张图片」是平台自己维护的，比逐项判更权威。数字对不上就别点
+    # 确定——那意味着有点击没被组件收到，确定后行内图数会与预期不符。
+    # 计数元素不一定存在（不同弹窗实例不同），拿不到就跳过这道校验而不是报错。
+    st = await session.eval_json(
+        _JS_SPACE_CHECK_ONE.replace("__TITLE__", J(SPACE_MODAL_TITLE))
+        .replace("__FID__", J(fids[0])))
+    cnt = st.get("counted")
+    if cnt is not None and cnt != len(fids):
+        return {"stage": "count", "err": "已选计数与预期不符",
+                "expected": len(fids), "counted": cnt}
+
+    cf = await session.eval_json(
+        _JS_SPACE_CONFIRM.replace("__TITLE__", J(SPACE_MODAL_TITLE)))
+    if cf.get("err"):
+        return {"stage": "confirm", "err": cf["err"], "counted": cnt}
+    return {"stage": "ok", "picked": picked, "counted": cnt,
+            "stillOpen": cf.get("stillOpen")}
 
 
 async def _pick_from_space(session: BrowserSession, file_id: str) -> dict:
@@ -5246,18 +5508,40 @@ async def _close_space_modal(session: BrowserSession) -> dict:
 # 建立不了行绑定，空间弹窗会把图挂到别的行（驼色行的图挂进了卡其行）。故行内
 # 【任何时刻都不能为空】：删旧图必须在挂了新图之后。
 #
-# 【一挂一删地交替，不是「先全挂再全删」——2026-08-24 改】原实现挂完 N 张再删 N 张，
-# 峰值 = 旧图数 + 新图数，6 旧 + 6 新 = 12 直接超上限 10，于是不得不在开头「预删」
-# 2 张腾位置。预删是个坏补丁：预删完若挂图失败，行内图数就【净减少】（实测咖啡色行
-# 6 张预删 2 张后 open-space 失败，只剩 4 张），反复重跑会一路把行削到下限以下、
-# 换出另一种保存报错。
-# 改成交替后峰值只有 max(旧, 新) + 1：
-#     6 旧 → 挂 new-01（7）→ 删第 1 张（6）→ 挂 new-02（7）→ 删（6）…
-# 既不触顶也不破下限，预删整个不需要了。旧图恒在前列这个不变式没变（新图都挂在行末），
-# 所以仍是「固定删第 1 张」，不必处理索引位移。
-# 【行已满 10 张时这一轮要先删后挂】否则先挂就变 11 张、挂不进去（离线穷举
+# 【挂一批删一批地交替，不是「先全挂再全删」——2026-08-24 定序、2026-08-26 改批】
+# 原实现挂完 N 张再删 N 张，峰值 = 旧图数 + 新图数，6 旧 + 6 新 = 12 直接超上限 10，
+# 于是不得不在开头「预删」2 张腾位置。预删是个坏补丁：预删完若挂图失败，行内图数就
+# 【净减少】（实测咖啡色行 6 张预删 2 张后 open-space 失败，只剩 4 张），反复重跑会
+# 一路把行削到下限以下、换出另一种保存报错。
+# 改成交替后不再需要预删：每批只挂「行内当前余量」那么多张，挂完删掉同等数量旧图。
+#     6 旧 → 挂 4 张（10，触顶不超）→ 删 4 张（6）→ 挂 2 张（8）→ 删 2 张（6）
+# 既不触顶也不破下限。旧图恒在前列这个不变式没变（新图都挂在行末），所以仍是
+# 「固定删第 1 张」，不必处理索引位移。
+# 【行已满 10 张时先删一张腾位再挂】否则先挂就变 11 张、挂不进去（离线穷举
 # 0..10 旧 × 1..10 新发现的反例，见 tests/test_publish_skc_order.py）。此时行内
 # 从 10 掉到 9 再回到 10，【始终非空】，开头那条「不能删空」的约束仍然成立。
+#
+# 【为什么按批而不是逐张——2026-08-26 提速改造】空间弹窗支持【累积多选】：
+# workspace/_probe_skc_space_modal.py 对 rowid 173539495455603009 真站探查，连点 3 张
+# 后弹窗顶部计数逐次变成「已选择1/2/3张图片」，且每个 .img-item 的角标从「点击选择」
+# 变成「取消选中」后【保持不变】。故一次弹窗可以勾完一整批。
+# 逐张版每张都要走整轮「瞄点 → CDP 点行按钮 → 开菜单 → 开弹窗 → 选 1 张 → 确定 →
+# 关弹窗」，实测（logs/20260826110756.log）6 行 29 张花 402s、每张 13.9s。
+#
+# 【选中态判据是 .img-check 的文本，不是 class】探查确认 item 的 className 恒为
+# "img-item" 完全不变。别改回按 class 判——那会恒判未选中、整行换不了图。
+#
+# 【固定 sleep 一律改轮询——同次改造】同一份实测把每张 13.9s 拆开看：真实网络只占
+# 1.1s（上传 0.8s + 回读 0.3s），其余约 11s 全是写死的等待。而探查测得的真实就绪时间：
+#   - CDP 点击 → SKC 菜单出现：0ms（同步渲染），原硬等 1600ms
+#   - 点「空间图片」→ 弹窗连图列表就绪：106ms，原硬等 3000ms
+# 故等菜单/等弹窗/等删除回读/等滚动停稳四处都改成「轮询到就绪信号即走，超时才报错」。
+# 别为了「稳」把 sleep 加回去：轮询的上限比原来的固定值更宽容，只是命中时不白等
+# （tests/test_publish_speedup.py 有一条测试专门守这个）。
+#
+# 【上传可以并发，挂图必须串行】upload_image 只是三次 HTTP（取签名/PUT/登记），不碰
+# 页面、彼此无关；而挂图要动 DOM。故整批图先并发传进图床，再逐批挂。并发数复用生图
+# 那个用户旋钮（service.get_image_concurrency）：本质都是「同时开多少路网络」。
 #
 # 【行按钮必须 CDP 真实点击，JS click 无效——2026-08-20 亲自踩坑复现】
 # 一开始以为 JS btn.click() 够用：菜单确实展开了。但那展开的是【素材图的菜单实例】
@@ -5326,11 +5610,18 @@ _JS_SKC_DEL_FIRST = r"""(async () => {
   const del = cells[0].querySelector('a.icon_delete, .icon_delete');
   if (!del) return JSON.stringify({err: '第 1 张图上找不到删除图标'});
   del.click();
-  await sleep(1200);
-  // 回读：删除无二次确认框，直接生效
-  const after = Array.from(row.querySelectorAll('.single-image'))
+  // 【轮询回读而不是硬等 1200ms】删除无二次确认框、直接生效，DOM 重排通常几十毫秒。
+  // 判据就是原来的回读（行内图数减少），只是不再等满 1.2s——一行 6 张要删 6 次，
+  // 硬等在这一处每行就白花约 7s。上限 6s 兜住重渲染慢的极端情况。
+  const count = () => Array.from(row.querySelectorAll('.single-image'))
     .filter(c => Array.from(c.querySelectorAll('img'))
       .some(im => (im.currentSrc || im.src || '').startsWith('http'))).length;
+  let after = before;
+  for (let i = 0; i < 60; i++) {
+    await sleep(100);
+    after = count();
+    if (after < before) break;
+  }
   return JSON.stringify({deleted: after < before, before, after});
 })()"""
 
@@ -5453,11 +5744,26 @@ _JS_SKC_CLICK_SPACE = r"""(async () => {
     .find(i => (i.textContent || '').trim() === '空间图片');
   if (!item) return JSON.stringify({err: 'SKC 菜单里没有「空间图片」项'});
   item.click();
-  await sleep(3000);
-  const opened = Array.from(document.querySelectorAll('.ant-modal'))
-    .some(m => m.offsetHeight > 0 &&
+  // 【轮询而不是硬等 3s】2026-08-26 真站实测（_probe_skc_space_modal.py）：弹窗连同
+  // 图片列表一起在 106ms 就绪，硬等 3s 等于每张图白等 2.9s——SKC 一行 6 张、一个商品
+  // 6 行时白等 104s。上限给 15s（远宽于实测，网络抖动时才会用到），到点仍未出现才报错。
+  // 判据要等到 .img-item 出现而不是只等弹窗容器：容器先挂载、列表异步渲染，
+  // 只等容器时下一步 _pick_from_space 会因「弹窗里找不到刚上传的图」失败。
+  let opened = false, items = 0, waitedMs = 0;
+  const t0 = performance.now();
+  for (let i = 0; i < 150; i++) {
+    const m = Array.from(document.querySelectorAll('.ant-modal')).find(m =>
+      m.offsetHeight > 0 &&
       ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
-  return JSON.stringify({opened});
+    if (m) {
+      opened = true;
+      items = m.querySelectorAll('.img-item').length;
+      if (items) break;
+    }
+    await sleep(100);
+  }
+  waitedMs = Math.round(performance.now() - t0);
+  return JSON.stringify({opened, itemCount: items, waitedMs});
 })()"""
 
 
@@ -5566,8 +5872,10 @@ async def _skc_aim_row_button(session: BrowserSession, row_keyword: str) -> dict
             .replace("__BLOCK__", J(block)))
         if sc.get("err"):
             return {"err": sc["err"], "stage": "scroll"}
-        # 等平滑滚动停稳再读坐标：动画中途的坐标会点偏到隔壁行
-        await asyncio.sleep(1.2)
+        # 【轮询等滚动停稳，不再硬等 1.2s】平滑滚动动画中途读坐标会点偏到隔壁行，
+        # 这个约束没变；变的是判据——改成「连续两次读到的按钮 top 相同」即认为停稳，
+        # 通常 200~300ms 就满足。一行 6 张图要瞄点 6 次，硬等在这一处每行白花约 6s。
+        await _wait_scroll_settled(session, row_keyword)
         bp = await session.eval_json(_JS_SKC_BTN_POS.replace("__KEY__", J(row_keyword)))
         if bp.get("err"):
             return {"err": bp["err"], "stage": "locate"}
@@ -5584,6 +5892,100 @@ async def _skc_aim_row_button(session: BrowserSession, row_keyword: str) -> dict
             logger.info(f"行按钮被浮层遮挡（落在 {bp.get('atText')!r}），"
                         f"已尝试收浮层 parked={parked.get('parked')}，换位重瞄")
     return last
+
+
+# 轮询等平滑滚动停稳：连续两帧读到同一个 top 就算停稳。
+#
+# 【为什么判据是「位置不再变」而不是固定时长】scrollIntoView({behavior:'smooth'})
+# 的动画时长由浏览器定，硬等 1.2s 既可能不够（长页面）又通常过头（实测多数 200~300ms
+# 就停了）。位置稳定是这件事的真实判据，也正是后续 CDP 点击所依赖的前提——原注释说的
+# 「动画中途的坐标会点偏到隔壁行」，指的就是位置还在变。
+_JS_SCROLL_SETTLED = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const sec = document.getElementById('skuAttrsInfo');
+  if (!sec) return JSON.stringify({err: '找不到变种属性区块'});
+  const row = Array.from(sec.querySelectorAll('tr'))
+    .find(tr => (tr.textContent || '').includes(__KEY__));
+  if (!row) return JSON.stringify({err: '找不到颜色行'});
+  const top = () => Math.round(row.getBoundingClientRect().top);
+  const t0 = performance.now();
+  let last = top(), same = 0;
+  // 上限 3s：比原来的硬等 1.2s 更宽容（长页面平滑滚动可能超过 1.2s，原实现那种情况
+  // 下反而是坐标没稳就去点，正是「落在隔壁行」的成因之一）
+  for (let i = 0; i < 30; i++) {
+    await sleep(100);
+    const now = top();
+    if (now === last) {
+      // 连续两次相同才认停稳：单次相同可能撞上动画的匀速平台期
+      if (++same >= 2) {
+        return JSON.stringify({settled: true, top: now,
+                               waitedMs: Math.round(performance.now() - t0)});
+      }
+    } else {
+      same = 0;
+    }
+    last = now;
+  }
+  return JSON.stringify({settled: false, top: last,
+                         waitedMs: Math.round(performance.now() - t0)});
+})()"""
+
+
+async def _wait_scroll_settled(session: BrowserSession, row_keyword: str) -> dict:
+    """等某颜色行的平滑滚动停稳（best-effort：读不到就当停稳，交后续瞄点校验兜住）。
+
+    停不稳也不报错：后面 _JS_SKC_BTN_POS 会做 elementFromPoint 校验，坐标不对时那层
+    会判未命中并换 block 重瞄——本函数只是让「多数情况快得多」，不是新增一道闸。
+    """
+    try:
+        r = await session.eval_json(
+            _JS_SCROLL_SETTLED.replace("__KEY__", J(row_keyword)))
+        if r.get("err"):
+            # 行找不到是真问题，但报错留给紧随其后的 _JS_SKC_BTN_POS（它的错误信息更全）
+            await asyncio.sleep(0.6)
+        return r
+    except Exception as e:
+        logger.warning(f"等滚动停稳失败（按固定等待兜底）：{e}")
+        await asyncio.sleep(1.2)
+        return {"err": str(e)}
+
+
+# 轮询等 SKC 菜单出现（判据同 _JS_SKC_CLICK_SPACE：必须含「应用到所有颜色」，
+# 否则会认成素材图那个菜单实例——那会把图挂到素材图上，见本节开头的踩坑记录）。
+_JS_WAIT_SKC_MENU = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const t0 = performance.now();
+  const hit = () => Array.from(document.querySelectorAll('.ant-dropdown')).some(d => {
+    if (/display:\s*none/.test(d.getAttribute('style') || '')) return false;
+    const txt = Array.from(d.querySelectorAll('.ant-dropdown-menu-item'))
+      .map(i => (i.textContent || '').trim());
+    return txt.includes('空间图片') && txt.includes(__EXTRA__);
+  });
+  for (let i = 0; i < 80; i++) {
+    if (hit()) return JSON.stringify({ready: true,
+                                      waitedMs: Math.round(performance.now() - t0)});
+    await sleep(100);
+  }
+  // 超时把当前可见菜单报出来，便于判断是不是拿到了素材图那个实例（同原错误信息的取向）
+  const seen = Array.from(document.querySelectorAll('.ant-dropdown'))
+    .filter(d => !/display:\s*none/.test(d.getAttribute('style') || ''))
+    .map(d => Array.from(d.querySelectorAll('.ant-dropdown-menu-item'))
+      .map(i => (i.textContent || '').trim()));
+  return JSON.stringify({ready: false, visibleMenus: seen});
+})()"""
+
+
+async def _wait_skc_menu(session: BrowserSession) -> dict:
+    """轮询等 CDP 点击后新建的 SKC 菜单就绪（上限 8s）。
+
+    实测菜单同步渲染（0ms），这层只为兜住偶发的慢一拍，代价是命中时几乎零等待。
+    """
+    r = await session.eval_json(
+        _JS_WAIT_SKC_MENU.replace("__EXTRA__", J(SKC_MENU_EXTRA_ITEM)))
+    if r.get("ready"):
+        return r
+    return {"err": f"CDP 点击后 8s 内没出现 SKC 菜单（含「{SKC_MENU_EXTRA_ITEM}」）",
+            "visibleMenus": r.get("visibleMenus")}
 
 
 async def _skc_open_space(session: BrowserSession, row_keyword: str) -> dict:
@@ -5606,7 +6008,13 @@ async def _skc_open_space(session: BrowserSession, row_keyword: str) -> dict:
 
     # CDP 真实点击三连（JS click 不会新建 SKC 菜单，见本节开头）
     await _cdp_click_xy(session, bp["x"], bp["y"])
-    await asyncio.sleep(1.6)
+    # 【轮询等菜单，不再硬等 1.6s】2026-08-26 真站实测（_probe_skc_space_modal.py）：
+    # 菜单是同步渲染的，CDP 点击返回时就已在 DOM 里（menuReadyMs=0）。硬等 1.6s 是
+    # 纯浪费——一个商品 6 行 29 张图就白等 46s。仍留轮询而不是直接不等：菜单由真实
+    # 事件触发，理论上可能慢一拍，等到了就走、没等到由下一步报「SKC 菜单不在」。
+    waited = await _wait_skc_menu(session)
+    if waited.get("err"):
+        return {"err": waited["err"], "stage": "menu"}
 
     return await session.eval_json(
         _JS_SKC_CLICK_SPACE
@@ -5732,54 +6140,96 @@ async def skc_replace_row(session: BrowserSession, row_keyword: str, img_dir: st
     remaining_old = old_count      # 还没删掉的旧图数，恒在行内最前面
     deleted = 0
 
-    for fname in files:
-        ctx = {"attached": [a["file"] for a in attached], "deletedOld": deleted,
-               "file": fname}
-        # 行已满时这一轮先删后挂：先挂会变 11 张挂不进去。此时行内从上限掉 1 张再回来，
-        # 【始终非空】，「删空丢行绑定」那条约束仍然成立。
-        if remaining_old + len(attached) >= SKC_ROW_MAX_IMAGES and remaining_old > 0:
-            err = await _del_first("delete-old", ctx)
+    # 【先并发把整批图传进图床，再逐批挂】上传只是三次 HTTP（取签名/PUT/登记），不碰
+    # 页面、彼此无关，故可以并发；而挂图要动页面，必须串行。2026-08-26 实测每张上传
+    # 0.8s，一行 6 张串行就是 5s 白等。并发数用与生图同一个用户旋钮：都是「同时开多少
+    # 路网络」，链路差时该一起调小（见 service.get_image_concurrency）。
+    from app.publish.service import get_image_concurrency
+
+    sem = asyncio.Semaphore(get_image_concurrency())
+
+    async def _up(fname: str) -> dict:
+        async with sem:
+            path = os.path.join(img_dir, fname)
+            r = await upload_image(session, path, full_cid=full_cid)
+            return {"file": fname, **r}
+
+    ups = await asyncio.gather(*(_up(f) for f in files))
+    bad = [u for u in ups if u.get("status") != "ok"]
+    if bad:
+        return {"status": "error", "stage": "upload", "upload": bad[0],
+                "attached": [], "deletedOld": 0, "file": bad[0]["file"]}
+    logger.info(f"整批 {len(ups)} 张已传入图床（并发上传），开始分批挂图")
+
+    # 【分批而不是逐张：一次弹窗能勾多张——2026-08-26 真站探查证实】每批的大小由
+    # 两条真站约束夹出来（与逐张版完全相同的约束，只是现在按批算）：
+    #   - 行内不能超 SKC_ROW_MAX_IMAGES：本批能挂 上限 - 当前行内图数 张；
+    #   - 行内不能为空：旧图只能在挂了新图【之后】删，故每批挂完才删同等数量。
+    # 行已满时先删一张腾位（同逐张版的「行满则先删后挂」，理由见本节开头注释）。
+    idx = 0
+    while idx < len(ups):
+        in_row = remaining_old + len(attached)
+        room = SKC_ROW_MAX_IMAGES - in_row
+        if room <= 0:
+            # 行已满：先删一张腾位。此时从上限掉 1 张再挂回来，【始终非空】。
+            if remaining_old <= 0:
+                # 不该发生（新图数已在入口按上限校验过），但真到了就如实报错而不是死循环
+                return {"status": "error", "stage": "no-room",
+                        "err": f"行内已满 {in_row} 张且无旧图可删，无法继续挂图",
+                        "attached": [a["file"] for a in attached], "deletedOld": deleted}
+            err = await _del_first("delete-old",
+                                   {"attached": [a["file"] for a in attached],
+                                    "deletedOld": deleted})
             if err:
                 return err
             remaining_old -= 1
             deleted += 1
+            continue
 
-        path = os.path.join(img_dir, fname)
-        up = await upload_image(session, path, full_cid=full_cid)
-        if up.get("status") != "ok":
-            return {"status": "error", "stage": "upload", "upload": up, **ctx}
+        batch = ups[idx:idx + room]
+        ctx = {"attached": [a["file"] for a in attached], "deletedOld": deleted,
+               "file": batch[0]["file"], "batch": [b["file"] for b in batch]}
+
         opened = await _skc_open_space(session, row_keyword)
         if opened.get("err") or not opened.get("opened"):
             return {"status": "error", "stage": "open-space", "detail": opened, **ctx}
-        picked = await _pick_from_space(session, up["fileId"])
+        picked = await _pick_many_from_space(session, [b["fileId"] for b in batch])
         if picked.get("err"):
+            # 半选状态绝不点确定（_pick_many_from_space 已保证没点），关掉弹窗再报错：
+            # 留着开着会盖住后续所有操作（同 ensure_desc_closed 那类踩坑）
             await _close_space_modal(session)
             return {"status": "error", "stage": "pick", "detail": picked, **ctx}
-        # 逐张回读校验挂到了【本行】：菜单实例全页共用，挂错行时本行数量不增却不报错
+
+        # 回读校验这一批都挂到了【本行】：菜单实例全页共用，挂错行时本行数量不增却不报错
         st = await _skc_row_state(session, row_keyword)
-        fid = up["fileId"].rsplit("/", 1)[-1]
-        landed = any(fid in x for x in (st.get("srcs") or []))
-        if not landed:
-            logger.error(f"图 {fname} 挂载后未出现在「{row_keyword}」行，可能挂到了别的行")
-            return {"status": "error", "stage": "verify-row", "rowState": st, **ctx}
-        attached.append({"file": fname, "fileId": up["fileId"]})
-        # 【每挂完一张就主动收菜单，不要等下一张被挡了再救】菜单是 position:fixed 停在
+        srcs = st.get("srcs") or []
+        missed = [b["file"] for b in batch
+                  if not any(b["fileId"].rsplit("/", 1)[-1] in x for x in srcs)]
+        if missed:
+            logger.error(f"图 {missed} 挂载后未出现在「{row_keyword}」行，可能挂到了别的行")
+            return {"status": "error", "stage": "verify-row", "rowState": st,
+                    "missed": missed, **ctx}
+        attached.extend({"file": b["file"], "fileId": b["fileId"]} for b in batch)
+        idx += len(batch)
+
+        # 【每批挂完就主动收菜单，不要等下一批被挡了再救】菜单是 position:fixed 停在
         # 视口中段，而下一行按钮也会被滚到视口中段，几何上正好重叠——事后补救要靠
         # 换滚动位置绕（见 _skc_aim_row_button），成本远高于这里顺手收一次。
         # best-effort：收不掉也继续，瞄点那一层还有退让。
         await _park_image_menus(session)
 
-        # 挂成功后立刻删掉一张旧图，把位置还回去——这是交替的核心
-        if remaining_old > 0:
+        # 挂成功后把同等数量的旧图删掉，位置还回去——这是交替的核心（按批版）
+        for _ in range(min(len(batch), remaining_old)):
             err = await _del_first("delete-old",
                                    {"attached": [a["file"] for a in attached],
-                                    "deletedOld": deleted, "file": fname})
+                                    "deletedOld": deleted})
             if err:
                 return err
             remaining_old -= 1
             deleted += 1
-        logger.info(f"已挂 {fname}（行内现 {len(attached) + remaining_old} 张，"
-                    f"待删旧图 {remaining_old} 张）")
+        logger.info(f"已挂 {len(batch)} 张（{'、'.join(b['file'] for b in batch)}）"
+                    f"，行内现 {len(attached) + remaining_old} 张，"
+                    f"待删旧图 {remaining_old} 张")
 
     # 新图比旧图少时（如 6 旧换 3 新）还有剩余旧图，收尾删干净
     while remaining_old > 0:
@@ -6500,15 +6950,46 @@ _JS_DESC_BOX_POS = r"""(() => {
     srcBefore: img ? (img.currentSrc || img.src || '') : null});
 })()"""
 
-# 读右侧面板「更换图片」链接的坐标（点模块图后才出现）
+# 读右侧面板「更换图片」链接的坐标（点模块图后才出现）。
+# 【这个坐标要校验 elementFromPoint，与模块图相反】模块图那边不校验是因为编辑器是
+# 全屏 modal、任何坐标都会命中编辑器内的 IMG（见本节开头说明）；而这里要点的是一个
+# 具体的小链接，点偏了就什么都不会发生——正是「菜单未展开」那条报错的一种成因。
+# 校验不通过时把实际命中的元素报出来，好分清「被浮层盖住」还是「链接被滚出视口」。
 _JS_DESC_REPLACE_LINK = r"""(() => {
   const m = __MODAL__;
   if (!m) return JSON.stringify({err: '编辑器不在'});
   const a = Array.from(m.querySelectorAll('.smt-content-right a'))
     .find(x => (x.textContent || '').trim() === '更换图片');
   if (!a) return JSON.stringify({err: '右侧面板没有「更换图片」链接（模块图可能没点中）'});
-  const r = a.getBoundingClientRect();
-  return JSON.stringify({x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2)});
+  let r = a.getBoundingClientRect();
+  if (r.top < 0 || r.bottom > innerHeight) {
+    a.scrollIntoView({block: 'center'});
+    r = a.getBoundingClientRect();
+  }
+  const x = Math.round(r.x + r.width / 2), y = Math.round(r.y + r.height / 2);
+  const hit = document.elementFromPoint(x, y);
+  return JSON.stringify({x, y,
+    onLink: !!hit && (hit === a || a.contains(hit) || hit.contains(a)),
+    hitTag: hit ? hit.tagName : null,
+    hitAt: hit ? (hit.className || '').toString().slice(0, 60) : null});
+})()"""
+
+# 描述专属菜单是否已展开（判据与 _JS_DESC_PICK_SPACE 里那段完全一致，故共用
+# __ITEMS__ 占位符）。单独抽出来【为了改成轮询而不是固定 sleep】：
+# 2026-08-26 实测（925861971282 描述区第 3 张）报 `描述专属菜单未展开, visibleMenus: []`
+# ——整页连一个可见 .ant-dropdown 都没有，而紧接着的第 4 张同一条代码路径就成功了。
+# 这类「上一张成功、下一张挂、再下一张又成功」的失败不是结构问题，是时序：
+# 固定等 1.8s 有时不够，且 ant 的 rc-trigger 在页面已有打开浮层时会把第一次真实
+# mousedown 用来【关掉旧浮层】而不是打开新的（与 _park_image_menus 处理的是同一类
+# 事实）。轮询 + 补一次点击才是对症的处置。
+_JS_DESC_MENU_STATE = r"""(() => {
+  const vis = Array.from(document.querySelectorAll('.ant-dropdown'))
+    .filter(x => !/display:\s*none/.test(x.getAttribute('style') || ''));
+  const texts = vis.map(d => Array.from(d.querySelectorAll('.ant-dropdown-menu-item'))
+    .map(i => (i.textContent || '').trim()));
+  return JSON.stringify({
+    found: texts.some(t => __ITEMS__.every(w => t.includes(w))),
+    visibleMenus: texts});
 })()"""
 
 
@@ -6573,9 +7054,58 @@ async def desc_replace(session: BrowserSession, pos: int, image_path: str,
     lp = await session.eval_json(_JS_DESC_REPLACE_LINK.replace("__MODAL__", _JS_DESC_MODAL))
     if lp.get("err"):
         return {"status": "error", "stage": "replace-link", **lp}
-    # 2. 点「更换图片」，展开描述专属菜单
-    await _cdp_click_xy(session, lp["x"], lp["y"])
-    await asyncio.sleep(1.8)
+    if not lp.get("onLink"):
+        # 瞄点没落在链接上（被浮层盖住之类）。先收一次残留图片菜单再重读一次坐标——
+        # 那批菜单是 position:fixed，正好停在右侧面板这条带上（同 _skc_aim_row_button
+        # 处理的遮挡）。收不掉也继续往下走：轮询那步会给出确切的失败信息。
+        logger.info(f"「更换图片」瞄点落在 {lp.get('hitTag')}"
+                    f"（{lp.get('hitAt')}）上，先收残留浮层再重试")
+        await _park_image_menus(session)
+        lp2 = await session.eval_json(
+            _JS_DESC_REPLACE_LINK.replace("__MODAL__", _JS_DESC_MODAL))
+        if not lp2.get("err"):
+            lp = lp2
+    # 2. 点「更换图片」，展开描述专属菜单。
+    # 【轮询而不是固定 sleep，且点不出来要补点一次】原实现点完固定等 1.8s 就去找菜单，
+    # 2026-08-26 实测第 3 张图报「菜单未展开、visibleMenus 为空」而前后两张都正常
+    # ——那是时序（等短了）与 rc-trigger 的「第一次真实 mousedown 先关旧浮层」两种
+    # 成因，都靠重点一次 + 等到为止解决，见 _JS_DESC_MENU_STATE 上方的实测记录。
+    menu_js = _JS_DESC_MENU_STATE.replace("__ITEMS__", J(list(DESC_MENU_ITEMS)))
+    # 【点之前先确认没有残留的描述菜单开着】否则轮询会立刻看到 found=true，而那可能是
+    # 上一张图留下的旧实例——更糟的是这一次点击恰好把它 toggle 关掉，于是下一步
+    # _JS_DESC_PICK_SPACE 又找不到菜单，回到原来那条「菜单未展开」。
+    # 注意【不能指望 _park_image_menus 收掉它】：那个函数的判据是菜单里含「空间图片」
+    # （素材图/SKC 那套 4~5 项菜单），而描述菜单的对应项叫「空间【上传】」，两套文案
+    # 不同（见 DESC_MENU_ITEMS 上方 2026-08-20 的实测记录），它对描述菜单完全不生效。
+    pre = await session.eval_json(menu_js)
+    if pre.get("found"):
+        logger.info("点「更换图片」前已有描述菜单开着（上一张的残留），先点空白处收掉")
+        bp2 = await session.eval_json(_JS_BLANK_POINT)
+        if not bp2.get("err"):
+            await _cdp_click_xy(session, bp2["x"], bp2["y"])
+            await asyncio.sleep(0.5)
+        else:
+            logger.warning(f"没找到安全空白点，无法收起残留描述菜单：{bp2['err']}")
+    ms = {}
+    for click_round in range(2):
+        await _cdp_click_xy(session, lp["x"], lp["y"])
+        for _ in range(8):                       # 最多轮询 8×0.4s = 3.2s
+            await asyncio.sleep(0.4)
+            ms = await session.eval_json(menu_js)
+            if ms.get("found"):
+                break
+        if ms.get("found"):
+            if click_round:
+                logger.info("描述专属菜单在补点一次后展开（首次点击被 rc-trigger 吃掉）")
+            break
+        logger.warning(f"描述专属菜单未展开（第 {click_round + 1} 次点击），"
+                       f"当前可见菜单：{ms.get('visibleMenus')}")
+    if not ms.get("found"):
+        return {"status": "error", "stage": "menu",
+                "err": "描述专属菜单未展开（已重点一次并轮询 3.2s）",
+                "visibleMenus": ms.get("visibleMenus"),
+                "linkAim": {k: lp.get(k) for k in ("x", "y", "onLink", "hitTag", "hitAt")},
+                "upload": up}
 
     # 3+4. 点「空间上传」并在弹窗里选图确定（同一 evaluate，菜单会自动收起）
     picked = await session.eval_json(
@@ -6600,3 +7130,403 @@ async def desc_replace(session: BrowserSession, pos: int, image_path: str,
             "countAfter": after.get("count"),
             "note": "" if landed else "位置对不上，可能替换到了别的模块",
             "hint": "改动尚未生效，需再调 desc_save 保存" if landed else ""}
+
+
+# ==================== 阶段⑥b 产品视频（比例合规化后回填）====================
+# 【为什么需要这个阶段】视频不是我们传的，是阶段② 认领 1688 商品时平台连带搬来的
+# （edit.json 响应里的 videoUrl，指向淘宝 CDN）。1688 商品视频绝大多数是 9:16 竖屏，
+# 而 Temu 只收 1:1 / 3:4 / 16:9，于是发布时被打回：
+#     上传视频接口报错:get video result response error :
+#     Video ratio should be 1:1 or 3:4 or 16:9, recommended ratio 1:1 or 3:4
+# 这个报错出现在阶段⑮ 发布之后——前 14 个阶段全绿、save 也落库了，最后一步才被弹回，
+# 且回执不说是哪个视频。故必须在发布【之前】把关。几何处理见 app/publish/video.py。
+#
+# 【走「网络上传」而不是「本地上传」——2026-08-26 前端 chunk 溯源 + 真站探查】
+# 「重新上传」下拉只有两项：本地上传、网络上传（没有素材图那样的「空间图片」弹窗）。
+#   - 本地上传：唤起【原生文件选择框】。CDP 下要么 DOM.setFileInputFiles（店小秘的
+#     上传控件是自绘的、拿不到真 input），要么模拟键盘敲路径（时序脆）——与图片侧
+#     当初避开文件框的理由完全相同。
+#   - 网络上传：弹一个「视频地址」输入框，填 URL 点确定即可，纯 DOM 操作。
+# 故这里先把合规化后的视频直传图床（upload.upload_video，走 smtmedia bucket），
+# 拿到 CDN 地址后再用「网络上传」把地址填回去。两步都不碰原生文件框。
+#
+# 【这个下拉是 hover 触发，且 Escape 关不掉】与素材图的悬停菜单同类但有两处不同：
+# 收起必须派发 mouseleave/mouseout（Escape 无效），且离场有动画要等。
+#
+# 【判菜单项可点必须用 rect，不能用 offsetHeight】2026-08-26 实测：hover 后菜单项的
+# offsetHeight 立刻就是 32，但 getBoundingClientRect 全 0、浮层还停在
+# ant-slide-up-enter-prepare、opacity:0、top 是 2527px 的陈旧停靠位（视口高仅 1313）。
+# 根因是窗口被遮挡时 rAF 被节流到约 1.7 帧/秒（此时 visibilityState 仍是 visible、
+# hasFocus() 仍是 true，fix_hidden_tab 那两个 CDP 开关修不了），而 antd CSSMotion
+# 每跳一个阶段要一个 rAF。故固定 sleep 会误判，须轮询 rect 且【等待期间每轮补派发
+# mouseover/mousemove】——否则 antd 的 hover 判定会超时把菜单自己收掉。
+# 这与记忆 dianxiaomi-publish-dropdown-hover-anim 是同一条坑。
+
+# 「重新上传」下拉的两个菜单项（popTemu 只有这两项；第三项「从速卖通视频库选择」
+# 是 smt 平台的，popTemu 传进来的 menu 里没有）
+VIDEO_MENU_ITEMS = ("本地上传", "网络上传")
+# 「网络上传」弹窗的标题（2026-08-26 实测原文，严格等值匹配）
+VIDEO_MODAL_TITLE = "视频地址"
+
+# 展开「重新上传」下拉并点「网络上传」，打开地址输入弹窗。
+#
+# 【整段放在一个 evaluate 里】与空间图片弹窗同一个理由：hover 菜单会因失焦自动收起，
+# 分成多次往返时中间那一步可能落在已消失的 DOM 上。
+_JS_OPEN_VIDEO_NET_MODAL = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const op = document.querySelector('.video-operate');
+  if (!op) return JSON.stringify({stage: 'locate', err: '找不到视频区块 .video-operate'});
+
+  // 「重新上传」按钮：文本可能是「重新上传」（已有视频）或「添加视频」（没有视频），
+  // 由组件按当前有没有视频决定，故两种都认
+  const btn = Array.from(op.querySelectorAll('button')).find(b => {
+    const t = (b.textContent || '').trim();
+    return t === '重新上传' || t === '添加视频';
+  });
+  if (!btn) return JSON.stringify({stage: 'locate',
+    err: '视频区里找不到「重新上传」/「添加视频」按钮',
+    btns: Array.from(op.querySelectorAll('button')).map(b => (b.textContent || '').trim())});
+
+  btn.scrollIntoView({block: 'center'});
+  await sleep(300);
+
+  const want = __ITEMS__;
+  // 在众多 dropdown 实例里按【菜单项集合】认出视频那个菜单，排除 display:none 的
+  const findMenu = () => Array.from(document.querySelectorAll('.ant-dropdown')).find(d => {
+    if (/display:\s*none/.test(d.getAttribute('style') || '')) return false;
+    const txt = Array.from(d.querySelectorAll('.ant-dropdown-menu-item'))
+      .map(i => (i.textContent || '').trim());
+    return want.every(w => txt.includes(w));
+  });
+  const hover = () => ['mouseenter', 'mouseover', 'mousemove'].forEach(t =>
+    btn.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+
+  // 轮询等菜单项真正可点：判据是 rect 有尺寸且落在视口内（见上方注释，
+  // offsetHeight 会在入场动画中途就通过）。每轮补派发 hover 维持 antd 的悬停态。
+  let menu = null, item = null, rect = null;
+  for (let i = 0; i < 40; i++) {
+    hover();
+    menu = findMenu();
+    if (menu) {
+      item = Array.from(menu.querySelectorAll('.ant-dropdown-menu-item'))
+        .find(x => (x.textContent || '').trim() === '网络上传');
+      if (item) {
+        const r = item.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 && r.top >= 0 && r.top < window.innerHeight) {
+          rect = {w: Math.round(r.width), h: Math.round(r.height), y: Math.round(r.top)};
+          break;
+        }
+      }
+    }
+    await sleep(150);
+  }
+  if (!menu) return JSON.stringify({stage: 'menu', err: 'hover 后视频下拉未展开'});
+  if (!item) return JSON.stringify({stage: 'menu', err: '下拉里没有「网络上传」项',
+    items: Array.from(menu.querySelectorAll('.ant-dropdown-menu-item'))
+      .map(x => (x.textContent || '').trim())});
+  if (!rect) return JSON.stringify({stage: 'menu',
+    err: '「网络上传」项 6s 内没进入可点状态（入场动画未完成，页面可能被遮挡）'});
+
+  item.click();
+
+  // 轮询等弹窗出现。
+  //
+  // 【可见性判据：标题匹配 + 内层 textarea 有真实尺寸。三个看着更自然的判据都不行】
+  // 2026-08-26 逐帧采样取证（workspace/_diag_video_modal_{open,close}.py）：
+  //   - inline display:none —— 离场动画整段都不出现，关闭判定会一直以为还开着；
+  //   - getComputedStyle(wrap).display —— 同样整段是 block，同上；
+  //   - offsetParent !== null —— 【恒为 false】。.ant-modal-wrap 是 position:fixed，
+  //     而 fixed 元素的 offsetParent 按规范就是 null，与它可不可见无关。
+  //     用它判「已打开」会永远判不到（实测：弹窗完全可操作、textarea 552×199，
+  //     offsetParent 仍是 false）。
+  // 真正跟随实际状态的是【内层控件的 rect】：开着时 textarea 有尺寸，
+  // 关闭时整个节点被移除（约 1s），rect 自然消失。这也正是我们真正关心的东西——
+  // 「能不能往里填字」，而不是「某个 style 属性长什么样」。
+  //
+  // 【另外绝不能取第一个】实测同一时刻页面上有 2 个标题都是「视频地址」的 wrap
+  // （上一轮遗留的隐藏节点 + 本次新建的），故必须逐个验 rect 再挑。
+  const liveModal = () => Array.from(document.querySelectorAll('.ant-modal-wrap'))
+    .map(w => w.querySelector('.ant-modal'))
+    .find(m => {
+      if (!m) return false;
+      if (((m.querySelector('.ant-modal-title') || {}).textContent || '').trim() !== __TITLE__)
+        return false;
+      const ta = m.querySelector('textarea');
+      return !!ta && ta.getBoundingClientRect().height > 0;
+    });
+  const findModal = liveModal;
+  let modal = null;
+  for (let i = 0; i < 60; i++) {
+    modal = findModal();
+    if (modal) break;
+    await sleep(100);
+  }
+  if (!modal) return JSON.stringify({stage: 'modal',
+    err: '点了「网络上传」但「' + __TITLE__ + '」弹窗 6s 内没出现',
+    titles: Array.from(document.querySelectorAll('.ant-modal-wrap'))
+      .map(w => (((w.querySelector('.ant-modal-title')) || {}).textContent || '').trim())});
+  return JSON.stringify({stage: 'ok', opened: true, itemRect: rect});
+})()"""
+
+# 在「视频地址」弹窗里填 URL 并点确定。
+#
+# 【输入控件是 <textarea> 不是 <input>】2026-08-26 真站探查纠正：
+# `.ant-modal input` 命中 0 个，唯一命中的是 .ant-modal-body textarea
+# （class 是 ant-input，无 id 无 name）。按 input 找会永远找不到、报成「弹窗结构变了」。
+#
+# 【必须派发 input 事件】Vue 的 v-model 靠 input 事件同步，只设 value 属性
+# 页面状态不会变，点确定会被当成空值、弹「请输入视频地址」。
+#
+# 【确定按钮不能按位置取】footer 里 DOM 顺序是【取消在前、确定在后】（视觉上确定在
+# 左边），按 nth-child 或第一个 button 会点到取消——那会静默放弃本次设置。
+# 故按按钮文本严格等值定位。
+_JS_FILL_VIDEO_URL = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // 判据：标题匹配 + textarea 有真实尺寸（详见 _JS_OPEN_VIDEO_NET_MODAL 里那段长注释；
+  // inline/computed display 与 offsetParent 三者都不可用）。
+  // 这里尤其关键——本函数正是靠「弹窗消失」判断 beforeCheck 有没有放行。
+  const findModal = () => Array.from(document.querySelectorAll('.ant-modal-wrap'))
+    .map(w => w.querySelector('.ant-modal'))
+    .find(m => {
+      if (!m) return false;
+      if (((m.querySelector('.ant-modal-title') || {}).textContent || '').trim() !== __TITLE__)
+        return false;
+      const t = m.querySelector('textarea');
+      return !!t && t.getBoundingClientRect().height > 0;
+    });
+  const modal = findModal();
+  if (!modal) return JSON.stringify({stage: 'modal', err: '「' + __TITLE__ + '」弹窗没打开'});
+
+  const ta = modal.querySelector('.ant-modal-body textarea')
+    || modal.querySelector('textarea');
+  if (!ta) return JSON.stringify({stage: 'input',
+    err: '弹窗里找不到地址输入框（textarea）——弹窗结构可能变了'});
+
+  // v-model 要靠 input 事件同步；只设 value 不派发事件，点确定会被当成空值
+  ta.focus();
+  ta.value = __URL__;
+  ta.dispatchEvent(new Event('input', {bubbles: true}));
+  ta.dispatchEvent(new Event('change', {bubbles: true}));
+  await sleep(120);
+  const filled = ta.value;
+
+  // 【按文本定位确定，别按位置】footer 里取消在前、确定在后
+  const ok = Array.from(modal.querySelectorAll('.ant-modal-footer button'))
+    .find(b => (b.textContent || '').trim() === '确定');
+  if (!ok) return JSON.stringify({stage: 'confirm', err: '找不到「确定」按钮',
+    btns: Array.from(modal.querySelectorAll('.ant-modal-footer button'))
+      .map(b => (b.textContent || '').trim())});
+  ok.click();
+
+  // beforeCheck 不通过时【弹窗不关、输入不清空】，故「弹窗消失」就是校验通过的信号。
+  // 校验失败的三档文案（请输入视频地址 / 视频地址必须以http或https开头！/
+  // 视频地址格式不支持）由 browser.py 的 toast 哨兵打进日志，这里只判弹窗是否关掉。
+  let stillOpen = true;
+  for (let i = 0; i < 60; i++) {
+    stillOpen = !!findModal();
+    if (!stillOpen) break;
+    await sleep(100);
+  }
+  return JSON.stringify({stage: 'ok', filled: filled, stillOpen: stillOpen,
+    accepted: !stillOpen});
+})()"""
+
+# 关掉「视频地址」弹窗（点取消）。best-effort，但必须尽力关：
+# 遮罩留着会挡住后续所有点击，让下一个阶段莫名其妙全部失败。
+_JS_CLOSE_VIDEO_MODAL = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // 判据：标题匹配 + textarea 有真实尺寸（理由见 _JS_OPEN_VIDEO_NET_MODAL 里那段长注释）
+  const findModal = () => Array.from(document.querySelectorAll('.ant-modal-wrap'))
+    .map(w => w.querySelector('.ant-modal'))
+    .find(m => {
+      if (!m) return false;
+      if (((m.querySelector('.ant-modal-title') || {}).textContent || '').trim() !== __TITLE__)
+        return false;
+      const t = m.querySelector('textarea');
+      return !!t && t.getBoundingClientRect().height > 0;
+    });
+  const modal = findModal();
+  if (!modal) return JSON.stringify({wasOpen: false});
+  const btn = Array.from(modal.querySelectorAll('.ant-modal-footer button'))
+    .find(b => (b.textContent || '').trim() === '取消')
+    || modal.querySelector('.ant-modal-close');
+  if (!btn) return JSON.stringify({wasOpen: true, clicked: false, stillOpen: true});
+  btn.click();
+  // 轮询等它真的不可见（实测离场动画约 1s，rAF 被节流时更久），别用固定 sleep
+  let open = true;
+  for (let i = 0; i < 40; i++) {
+    open = !!findModal();
+    if (!open) break;
+    await sleep(100);
+  }
+  return JSON.stringify({wasOpen: true, clicked: true, stillOpen: open});
+})()"""
+
+# 收起「重新上传」下拉：Escape 关不掉（实测），必须派发 mouseleave/mouseout。
+_JS_CLOSE_VIDEO_MENU = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const op = document.querySelector('.video-operate');
+  if (!op) return JSON.stringify({ok: false, err: '找不到视频区块'});
+  const btn = Array.from(op.querySelectorAll('button')).find(b => {
+    const t = (b.textContent || '').trim();
+    return t === '重新上传' || t === '添加视频';
+  });
+  const want = __ITEMS__;
+  const visible = () => Array.from(document.querySelectorAll('.ant-dropdown')).some(d => {
+    if (/display:\s*none/.test(d.getAttribute('style') || '')) return false;
+    const txt = Array.from(d.querySelectorAll('.ant-dropdown-menu-item'))
+      .map(i => (i.textContent || '').trim());
+    return want.every(w => txt.includes(w));
+  });
+  if (btn) {
+    ['mouseleave', 'mouseout'].forEach(t =>
+      btn.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+  }
+  // 离场有动画，轮询等 display:none
+  let open = true;
+  for (let i = 0; i < 30; i++) {
+    open = visible();
+    if (!open) break;
+    await sleep(100);
+  }
+  return JSON.stringify({ok: !open, stillOpen: open});
+})()"""
+
+# 回读视频区当前状态：判「地址填进去了没有」的取证依据。
+#
+# 【不能按「有没有 img」判】组件的封面容器里始终有一张 img——没视频时是内嵌 base64
+# 的播放器占位图（2026-08-26 探查确认）。可靠信号是「播放」链接是否可见：
+# 组件按当前有没有视频地址来控制它的显隐。
+_JS_VIDEO_STATE = r"""(() => {
+  const op = document.querySelector('.video-operate');
+  if (!op) return JSON.stringify({err: '找不到视频区块'});
+  const links = Array.from(op.querySelectorAll('a')).map(a => ({
+    text: (a.textContent || '').trim(),
+    shown: !/display:\s*none/.test(a.getAttribute('style') || ''),
+  }));
+  const nameEl = op.querySelector('.video-name');
+  return JSON.stringify({
+    hasPlay: links.some(l => l.text === '播放' && l.shown),
+    hasDelete: links.some(l => l.text === '删除' && l.shown),
+    videoName: nameEl ? (nameEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 80) : '',
+    links: links,
+  });
+})()"""
+
+
+async def set_video(session: BrowserSession, video_path: str,
+                    full_cid: Optional[str] = None) -> dict:
+    """阶段⑥b：把【已合规化】的本地视频直传图床，再用「网络上传」把地址填回表单。
+
+    video_path 应当是 video.normalize_video 出的产物（比例已在 1:1/3:4/16:9 之内）。
+    本函数不代做合规化——那是纯本地的确定性变换，由 service 层先做好再传进来，
+    与素材图（square_image 在外面做）保持同一分工，失败时分得清是哪一层的问题。
+    upload_video 内部仍有一道比例闸门兜底，绕不过去。
+
+    不导航：与其它写入阶段一致，须在编辑页当前会话执行。
+
+    【成果到 ⑭ save 才落库】本阶段只改页面上的 Vue 状态，与 ⑤~⑬ 同性质。
+    """
+    up = await upload_video(session, video_path, full_cid=full_cid)
+    if up.get("status") != "ok":
+        return {"status": "error", "stage": "upload", "upload": up}
+
+    before = await session.eval_json(_JS_VIDEO_STATE)
+
+    opened = await session.eval_json(
+        _JS_OPEN_VIDEO_NET_MODAL
+        .replace("__ITEMS__", J(list(VIDEO_MENU_ITEMS)))
+        .replace("__TITLE__", J(VIDEO_MODAL_TITLE))
+    )
+    if opened.get("err") or not opened.get("opened"):
+        # 菜单可能还展开着挡住后续操作，尽力收起（best-effort）
+        await session.eval_json(
+            _JS_CLOSE_VIDEO_MENU.replace("__ITEMS__", J(list(VIDEO_MENU_ITEMS))))
+        return {"status": "error", "stage": "open-modal", "detail": opened, "upload": up}
+
+    filled = await session.eval_json(
+        _JS_FILL_VIDEO_URL
+        .replace("__TITLE__", J(VIDEO_MODAL_TITLE))
+        .replace("__URL__", J(up["url"]))
+    )
+    if filled.get("err") or not filled.get("accepted"):
+        # 校验没过弹窗不会关，必须关掉——遮罩留着会让后续阶段全挂
+        closed = await _close_video_modal(session)
+        return {"status": "error", "stage": filled.get("stage") or "fill",
+                "detail": filled, "closed": closed, "upload": up,
+                "note": "地址被弹窗校验拒了（看日志里的页面提示找原因）"}
+
+    after = await session.eval_json(_JS_VIDEO_STATE)
+    # 成功判据：弹窗已关（accepted）+「播放」入口可见（组件按有没有视频地址控制它）
+    ok = bool(after.get("hasPlay"))
+    if not ok:
+        logger.error(f"视频地址填完后「播放」入口仍不可见：before={before} after={after}")
+    else:
+        logger.info(f"产品视频已替换为 {os.path.basename(video_path)}（{up['url'][:80]}）")
+    return {"status": "ok" if ok else "error",
+            "stage": "" if ok else "readback",
+            "upload": up, "url": up["url"], "videoId": up.get("videoId"),
+            "stateBefore": before, "stateAfter": after,
+            "hint": "改动尚未落库，需走阶段⑭ save" if ok else ""}
+
+
+async def _close_video_modal(session: BrowserSession) -> dict:
+    """关掉「视频地址」弹窗（点取消）。best-effort：关不掉只记警告不抛。
+
+    但必须尽力关：遮罩会挡住后续一切点击，留着它会让下一个阶段莫名其妙地全部失败
+    （与 _close_space_modal 同一取向）。
+    """
+    try:
+        r = await session.eval_json(
+            _JS_CLOSE_VIDEO_MODAL.replace("__TITLE__", J(VIDEO_MODAL_TITLE)))
+        if r.get("stillOpen"):
+            killed = await session.kill_stuck_modals()
+            r["killedStuck"] = killed.get("removed")
+        return r
+    except Exception as e:
+        logger.warning(f"关视频地址弹窗失败（不影响主流程判定）：{e}")
+        return {"err": str(e)}
+
+
+async def read_video_url(session: BrowserSession, rowid: str) -> dict:
+    """只读：从详情接口取当前商品的 videoUrl 一族字段。
+
+    【为什么读接口而不读 DOM】视频区 DOM 里【没有】真实地址——封面是内嵌 base64
+    的播放器占位图，Vue 3 的 setupState 也被编译隐藏，扒不到（2026-08-26 探查确认）。
+    地址只在 /api/popTemuProduct/edit.json 的响应里。
+
+    页面内 fetch 而不在 Python 侧发：这个接口靠登录 cookie 鉴权，页面内天然带 cookie。
+
+    【字段在 data.product 下，不在顶层——必须递归找】2026-08-26 实测：只扫顶层键会
+    得到空结果，于是每个商品都被报成「没有视频」、⑬b 整段静默跳过，等于这一步白做，
+    而表面上一切正常（skipped 不是错误）。故这里递归下钻，并回报命中路径便于排查。
+    """
+    js = r"""(async () => {
+      const r = await fetch('/api/popTemuProduct/edit.json?id=' + encodeURIComponent(__ID__),
+        {credentials: 'include'});
+      const j = await r.json();
+      const d = j.data || j;
+      // 递归找含 video 的键：实测挂在 data.product 下，但别写死路径——
+      // 换个平台/版本层级可能变，递归对两种都成立
+      const pick = {};
+      const paths = {};
+      const walk = (o, path, depth) => {
+        if (!o || typeof o !== 'object' || depth > 4) return;
+        for (const k of Object.keys(o)) {
+          const v = o[k];
+          if (/^video|^dxmVideo|^detailVideo/i.test(k) && !(k in pick)) {
+            pick[k] = v;
+            paths[k] = path + '.' + k;
+          }
+          if (v && typeof v === 'object' && !Array.isArray(v)) walk(v, path + '.' + k, depth + 1);
+        }
+      };
+      walk(d, 'data', 0);
+      return JSON.stringify({code: j.code, fields: pick, paths: paths});
+    })()""".replace("__ID__", J(rowid))
+    r = await session.eval_json(js)
+    fields = r.get("fields") or {}
+    return {"status": "ok" if r.get("code") == 0 else "error",
+            "videoUrl": fields.get("videoUrl") or "",
+            "dxmVideoId": fields.get("dxmVideoId"),
+            "fields": fields, "paths": r.get("paths") or {}}

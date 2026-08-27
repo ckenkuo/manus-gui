@@ -16,11 +16,16 @@ resolve_packy_key），没配就直接报错让用户去配，不留内置密钥
 必须保留 curl.exe 子进程的理由（别顺手改成 httpx/requests）：Packy 的 Cloudflare
 按 TLS 指纹拦截 urllib/requests，返回 403 error 1010（2026-08-14 实测）。这不是加请求头
 能绕的，只有系统 curl 的指纹能过。同理不要加文档示例里的 Host 头，加了反而 403。
+
+/images/edits 的请求形状是实测锁死的（2026-08-26），改前先读 _edits_post_with_retry
+上方那段注释：只能 multipart 传 image 文件，不能传 input_fidelity，报错里让你改用
+image_url 的那条建议是坏渠道吐的、照做会被网关前置校验打回。
 """
 import json
 import os
 import subprocess
 import tempfile
+import time
 from typing import Optional
 
 from app.logger import logger
@@ -41,22 +46,40 @@ MATERIAL_TARGET = 1785
 API_BASE = "https://cf.api.fan/v1"
 MODEL = "gpt-image-2"
 
+# 【必须显式点出中文标点】只说「中文文字」时模型会把汉字译干净、却把中日韩标点原样留下
+# （2026-08-26 实测：一张图译成了 `『Dino Back Strap Overalls and Top Set』`，
+# 书名号还在，被 vision.check_cleaned 判「残留中文书名号」退回原图，那张图于是又撞回
+# 1340×1785 尺寸闸门）。标点也算中文字符，提示词里要单独列出来。
+_NO_CJK_PUNCT = (
+    "中文标点（『』「」、，。！？；：（）《》～等）也必须一并去掉或换成对应英文标点，"
+    "不能留在图上"
+)
 DEFAULT_CLEAN_PROMPT = (
-    "移除图片中所有中文文字、水印和 logo，保持商品主体、配色和构图完全不变，"
-    "被遮挡处按周围内容自然补全。"
+    "移除图片中所有中文文字、水印和 logo，" + _NO_CJK_PUNCT + "，"
+    "保持商品主体、配色和构图完全不变，被遮挡处按周围内容自然补全。"
 )
 DEFAULT_TRANSLATE_PROMPT = (
     "把图片中的中文文字翻译成简洁的英文并原位替换，字体风格、字号和排版尽量保持一致，"
-    "商品主体、配色和构图完全不变。"
+    + _NO_CJK_PUNCT + "，商品主体、配色和构图完全不变。"
 )
 
 # API 允许的尺寸集合 → (宽, 高)。文档要求：16 的倍数、最长边 ≤3840、宽高比 ≤3:1、
 # 总像素 655360~8294400。"auto" 不参与自动选择（用户要求显式指定，不用 auto）。
+#
+# 【这份清单不是服务端白名单，只是精选档位】2026-08-26 实测传 2064x1792、2608x1792
+# 都正常出图且服务端【严格按请求尺寸返回】，非清单尺寸完全可用。故下面 _gate_size
+# 敢按闸门算出定制档，不必受这几个档位限制。
 ALLOWED_SIZES = {
     "1024x1024": (1024, 1024), "1536x1024": (1536, 1024), "1024x1536": (1024, 1536),
     "1536x864": (1536, 864), "2048x2048": (2048, 2048), "2048x1152": (2048, 1152),
     "3840x2160": (3840, 2160), "2160x3840": (2160, 3840),
 }
+
+# 服务端尺寸约束（文档四条，_gate_size 生成定制档时必须逐条满足）
+SIZE_MULTIPLE = 16          # 宽高都要是 16 的倍数
+SIZE_MAX_RATIO = 3.0        # 宽高比 ≤3:1
+SIZE_MIN_PIXELS = 655360
+SIZE_MAX_PIXELS = 8294400
 
 
 def resolve_packy_key() -> str:
@@ -300,6 +323,44 @@ def compress(path: str, max_dim: int = MAX_DIM, quality: int = 80,
     return out
 
 
+def _gate_size(w: int, h: int, min_w: int = CLOTH_MIN_W,
+               min_h: int = CLOTH_MIN_H) -> Optional[str]:
+    """按原图比例算一个【不低于 1340×1785 闸门】的出图尺寸，算不出返回 None。
+
+    【为什么需要这个】原先 pick_size 只按比例在 8 个档位里挑最接近的，挑出来的档
+    普遍小于闸门：790×684 挑中 1024x1024、749×513 挑中 1536x1024，出图后一律被
+    compress 插值放大 1.31~1.74 倍才够过闸门（2026-08-26 实测，7 张描述图无一例外）。
+    等于每张图都先降采样生成、再拉大，两次重采样把细节磨掉——尤其伤这类「面料细节」
+    特写图，纹理糊掉正好毁掉它要展示的东西。
+
+    直接让服务端按目标尺寸生成就不必放大。服务端不限于 ALLOWED_SIZES 那几档
+    （见其上方注释的实测），只需满足四条约束：16 的倍数、比例 ≤3:1、
+    长边 ≤MAX_DIM、像素在 SIZE_MIN_PIXELS~SIZE_MAX_PIXELS。
+
+    保持原图比例而不是硬套 3:4：描述图是长图混排，比例被改就会变形；SKC 图要 3:4
+    是另一条规则，由 fit_34 负责，不在这里做。
+    """
+    if w <= 0 or h <= 0:
+        return None
+    ratio = w / h
+    if ratio > SIZE_MAX_RATIO or 1 / ratio > SIZE_MAX_RATIO:
+        return None            # 比例本身越界，交给 pick_size 走原路
+    # 等比放到同时不低于两条下限，再向上取整到 16 的倍数（取整只会变大，不会跌破）
+    sc = max(min_w / w, min_h / h, 1.0)
+    tw = int(-(-round(w * sc) // SIZE_MULTIPLE) * SIZE_MULTIPLE)
+    th = int(-(-round(h * sc) // SIZE_MULTIPLE) * SIZE_MULTIPLE)
+    # 取整后仍要保证不低于下限（极端窄边可能因取整方向差 1 个像素）
+    while tw < min_w:
+        tw += SIZE_MULTIPLE
+    while th < min_h:
+        th += SIZE_MULTIPLE
+    if max(tw, th) > MAX_DIM or not (SIZE_MIN_PIXELS <= tw * th <= SIZE_MAX_PIXELS):
+        return None            # 放大后越界（超长图/超大图），退回原路由 compress 兜
+    if tw / th > SIZE_MAX_RATIO or th / tw > SIZE_MAX_RATIO:
+        return None
+    return f"{tw}x{th}"
+
+
 def pick_size(w: int, h: int, no_downscale: bool = False) -> str:
     """按原图宽高比选最接近的 API 允许尺寸（不用 auto）。
 
@@ -326,26 +387,71 @@ def pick_size(w: int, h: int, no_downscale: bool = False) -> str:
     return (min if fit else max)(pool, key=lambda s: ALLOWED_SIZES[s][0] * ALLOWED_SIZES[s][1])
 
 
-def pick_size_for_file(image_path: str, no_downscale: bool = False) -> str:
-    """读原图尺寸并 pick_size；读不到尺寸退回 1024x1024。"""
+def pick_size_for_file(image_path: str, no_downscale: bool = False,
+                      gate_aware: bool = True) -> str:
+    """读原图尺寸并选出图尺寸；读不到尺寸退回 1024x1024。
+
+    gate_aware=True（默认）优先用 _gate_size 直接生成不低于 1340×1785 闸门的尺寸，
+    省掉出图后那次 compress 插值放大（实测 7 张描述图放大 1.31~1.74 倍，纹理明显糊）。
+    算不出（比例越界/放大后超上限）才退回 pick_size 的档位挑选。
+
+    gate_aware=False 保留纯档位行为，给不需要过服装闸门的调用方留口子。
+    """
     wh = image_size(image_path)
-    return pick_size(*wh, no_downscale=no_downscale) if wh else "1024x1024"
+    if not wh:
+        return "1024x1024"
+    if gate_aware:
+        gs = _gate_size(*wh)
+        if gs:
+            return gs
+    return pick_size(*wh, no_downscale=no_downscale)
 
 
 # ---- AI 编辑（Packy gpt-image-2，必须走 curl.exe）--------------------------
 
+# curl 退出码里属于「链路瞬时故障」的那些：重发一次很可能就过，值得重试。
+# 6 DNS 解析失败 / 7 连不上 / 16 HTTP2 帧错 / 18 传输被截断 / 28 超时 /
+# 35 TLS 握手失败 / 52 服务端没回内容 / 55 发送失败 / 56 接收失败（连接重置）。
+# 【为什么必须按码白名单，不能「非 0 就重试」】curl 的确定性失败也会给非 0：
+# 3 URL 格式错、26 读本地文件失败（图片路径不对）、重试多少次都是同样的错。
+# 更要紧的是 HTTP 400/500 这类【业务错误 curl 是 rc=0】、响应体照常返回，
+# 走的是下面 JSON 解析那条路，压根不经过这里——所以参数错（input_fidelity）
+# 不会被误当成抖动重试，这是这个白名单能成立的前提。
+_CURL_TRANSIENT_RC = frozenset({6, 7, 16, 18, 28, 35, 52, 55, 56})
+
+
+class TransientNetError(RuntimeError):
+    """链路瞬时故障（curl 退出码在 _CURL_TRANSIENT_RC 里），调用方可重试。
+
+    单开一个异常类型而不是让调用方去 parse 错误字符串：文案会被截断也会变，
+    按类型判是唯一稳的判据（同 service._resolve_desc_pos 用 navigatedAway 标志
+    而不是错误文案的理由）。
+    """
+
+
 def _curl_json(args: list, timeout: int = 280) -> dict:
-    """用 curl.exe 发请求并把 stdout 解析为 JSON。出错时抛带响应体的异常。"""
+    """用 curl.exe 发请求并把 stdout 解析为 JSON。出错时抛带响应体的异常。
+
+    链路瞬时故障抛 TransientNetError（可重试），其余抛 RuntimeError（别重试）。
+    """
     cmd = ["curl.exe", "-s", "--max-time", str(timeout), *args]
-    r = subprocess.run(cmd, capture_output=True, timeout=timeout + 20)
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout + 20)
+    except subprocess.TimeoutExpired as e:
+        # 子进程整体超时（curl 自己的 --max-time 没生效住）也是瞬时故障
+        raise TransientNetError(f"curl 子进程超时（{timeout + 20}s）") from e
     text = r.stdout.decode("utf-8", "replace")
     if r.returncode != 0:
-        raise RuntimeError(
-            f"curl 失败 rc={r.returncode}: {r.stderr.decode('utf-8', 'replace')[:200]}"
-        )
+        err = r.stderr.decode("utf-8", "replace")[:200]
+        msg = f"curl 失败 rc={r.returncode}: {err}"
+        raise (TransientNetError if r.returncode in _CURL_TRANSIENT_RC
+               else RuntimeError)(msg)
     try:
         return json.loads(text)
     except json.JSONDecodeError:
+        # 空响应/被中途掐断也算抖动：正常的业务错误一定是完整 JSON
+        if not text.strip():
+            raise TransientNetError("API 返回空响应（连接可能被中断）")
         raise RuntimeError(f"API 返回非 JSON（可能被拦截）: {text[:300]}")
 
 
@@ -403,7 +509,6 @@ def _save_result(resp_json: dict, out_path: str) -> str:
     重试；超长签名 URL 用 -K 配置文件传，避免 WinError 206（命令行过长）。
     """
     import base64
-    import time
 
     data = (resp_json.get("data") or [{}])[0]
     if data.get("url"):
@@ -443,6 +548,90 @@ def _save_result(resp_json: dict, out_path: str) -> str:
     raise RuntimeError(f"响应中没有图片: {json.dumps(resp_json, ensure_ascii=False)[:300]}")
 
 
+# 网关坏渠道的错误签名（2026-08-26 实测）：cf.api.fan 后面挂了多个 gpt-image-2 上游，
+# 其中一部分不接 multipart 上传，命中时返 HTTP 500 + code=convert_request_failed，
+# 文案是「does not accept multipart file upload; please provide a public URL via
+# 'image_url' form field instead」。
+#
+# 【这条建议不能照做，照做必然更糟】按它说的改传 image_url 会被网关【前置校验】直接
+# 打回：只传 image_url 报 missing_required_parameter「Missing required parameter:
+# 'image'」，image 与 image_url 同传报 unknown_parameter「Unknown parameter:
+# 'image_url'」，image 传 URL 字符串报 invalid_type「expected one of an array of
+# files or file, but got a string instead」。也就是说网关只认 multipart 文件，
+# 这句建议是坏渠道自己吐的、与网关契约矛盾。同理走 JSON body 传 data URL 也不行
+# （报「does not accept base64 image upload」）。唯一能出图的形状就是现在这个。
+#
+# 【所以只能重试换渠道】分流是随机的、不粘连：同一张图同一个 key，重试立刻就能落到
+# 好渠道（实测 3 并发 3/3 一发即中；6 并发 6/6；12 并发 10/12；命中坏渠道时约 35s
+# 就返回，比出图的 45~55s 还快，重试代价可接受）。故这里只对这一个错误签名重试，
+# 别扩大成「所有错误都重试」——参数错（如 input_fidelity）重试多少次都是同样的错，
+# 白等几分钟还把真错误埋掉（见 [[publish-vision-400-no-retry]] 同类教训）。
+_BAD_CHANNEL_CODE = "convert_request_failed"
+_BAD_CHANNEL_MARK = "does not accept"
+# 重试次数：单发命中坏渠道约 35s。按实测最差档（12 并发 83% 成功）算，4 发全落坏渠道
+# 的概率极低；给 4 次上限，最坏也就多等约 105s，不至于把整个阶段拖垮。
+#
+# 【坏渠道与网络抖动共用这一份预算】两者都靠「重发一次」解决，各记一套次数会叠乘成
+# 最坏 16 发、十几分钟，把阶段拖死。共用后无论怎么交替失败，总发数都不超过 4。
+EDIT_BAD_CHANNEL_RETRY = 4
+# 抖动重试的退避基数（秒）：第 n 次失败后睡 n × 这个值。
+# 【为什么抖动要退避、坏渠道不要】坏渠道是随机分流、与时间无关，等待纯属浪费；
+# 而抖动往往是链路一小段时间的劣化（VPN 抖、CDN 拥塞，见
+# [[packy-image-response-format-and-vpn]] 那次 260 倍速度差），立刻重发很可能
+# 撞上同一段劣化，隔几秒成功率明显更高。退避短是因为并发 30 时几十秒的睡眠会
+# 累积成可观的墙钟。
+EDIT_TRANSIENT_BACKOFF = 3
+
+
+def _is_bad_channel(resp_json: dict) -> bool:
+    """判响应是否为「坏渠道拒收 multipart」——只有这种错值得重试换渠道。"""
+    err = resp_json.get("error")
+    if not isinstance(err, dict):
+        return False
+    return (err.get("code") == _BAD_CHANNEL_CODE
+            and _BAD_CHANNEL_MARK in str(err.get("message") or ""))
+
+
+def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = 280,
+                           tries: int = EDIT_BAD_CHANNEL_RETRY) -> dict:
+    """发 /images/edits，对【坏渠道】与【链路抖动】两类瞬时失败重试。
+
+    两类失败的判据与取舍见上方 _BAD_CHANNEL_CODE / _CURL_TRANSIENT_RC 注释；
+    共用同一份 tries 预算（理由见 EDIT_BAD_CHANNEL_RETRY），退避只给抖动
+    （理由见 EDIT_TRANSIENT_BACKOFF）。
+
+    【只有这两类重试，别扩大】确定性失败（参数错、图片路径错、被 Cloudflare 拦）
+    一律原样抛出：重试多少次都是同样的错，白等还把真错误埋成一串重试噪音
+    （见 [[publish-vision-400-no-retry]]）。这也是抖动必须按 curl 退出码白名单
+    判、而不是「有异常就重试」的原因。
+
+    抖动重试到最后一次仍失败时把异常抛出去（而不是返回坏响应），交由上层
+    best-effort 兜住——⑤b 清理与⑬ 备料都会把单张失败降级成「保留原图」。
+    """
+    last_resp = None
+    for attempt in range(1, tries + 1):
+        try:
+            resp = _multipart_post(f"{API_BASE}/images/edits", fields,
+                                   {"image": image_path}, timeout=timeout)
+        except TransientNetError as e:
+            if attempt >= tries:
+                raise
+            logger.warning(
+                f"gpt-image-2 链路抖动（{attempt}/{tries}），{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试："
+                f"{os.path.basename(image_path)} {e}"
+            )
+            time.sleep(EDIT_TRANSIENT_BACKOFF * attempt)
+            continue
+        if not _is_bad_channel(resp):
+            return resp
+        last_resp = resp
+        logger.warning(
+            f"gpt-image-2 命中坏渠道（{attempt}/{tries}），换渠道重试："
+            f"{os.path.basename(image_path)}"
+        )
+    return last_resp
+
+
 def edit_image(image_path: str, prompt: Optional[str] = None,
                out_path: Optional[str] = None, size: Optional[str] = None,
                quality: str = "low", target: Optional[str] = None,
@@ -466,11 +655,9 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
         "prompt": prompt or DEFAULT_CLEAN_PROMPT,
         "size": size or pick_size_for_file(image_path, no_downscale=no_downscale),
         "quality": quality,
-        "input_fidelity": "high",   # 保主体不走形
         "n": 1,
     }
-    resp = _multipart_post(f"{API_BASE}/images/edits", fields, {"image": image_path},
-                           timeout=timeout)
+    resp = _edits_post_with_retry(fields, image_path, timeout=timeout)
     saved = _save_result(resp, out_path)
     if target:
         tw, th = (int(x) for x in target.lower().split("x"))

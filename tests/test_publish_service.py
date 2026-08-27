@@ -653,7 +653,10 @@ async def test_实况显示表单还在时不重复重跑(tmp_path, monkeypatch)
                                   "Pawly", on_progress=_collect(events))
 
     assert r["status"] == "ok"
-    assert calls == ["open_edit", "save"]       # 只补开编辑页 + 重试保存
+    # ⑬b video 无条件进重跑集：videoUrl 不在 DOM 里、live_state 读不到它，
+    # 故由阶段自己读接口判跳过（没视频/已合规都是 skipped，只花几秒）。
+    # 见 service._stale_form_stages 末尾那段与 test_publish_video_stage.py。
+    assert calls == ["open_edit", "video", "save"]
 
 
 @pytest.mark.asyncio
@@ -674,7 +677,7 @@ async def test_尺码勾选丢了连带重跑尺码表变种库存(tmp_path, mon
                               "Pawly", on_progress=_collect(events))
 
     assert [c for c in calls if c != "open_edit"] == [
-        "fix_sizes", "sizechart", "sku_code", "variant", "stock", "save"]
+        "fix_sizes", "sizechart", "sku_code", "variant", "stock", "video", "save"]
     assert "titles" not in calls and "skc" not in calls
 
 
@@ -710,7 +713,7 @@ async def test_显式from_stage不被实况覆盖(tmp_path, monkeypatch):
     await service.publish_one(None, {"rowid": "104", "info_path": "x.json"}, "Pawly",
                               on_progress=_collect(events), from_stage="shipping")
 
-    assert calls == ["open_edit", "shipping", "desc", "save", "publish"]
+    assert calls == ["open_edit", "shipping", "desc", "video", "save", "publish"]
 
 
 @pytest.mark.asyncio
@@ -925,7 +928,7 @@ async def test_货号是中文时单独重跑货号阶段(tmp_path, monkeypatch)
     await service.publish_one(None, {"rowid": "103", "info_path": "x.json"},
                               "Pawly", on_progress=_collect(events))
 
-    assert [c for c in calls if c != "open_edit"] == ["sku_code", "save"]
+    assert [c for c in calls if c != "open_edit"] == ["sku_code", "video", "save"]
     # 贵阶段（图片/属性）不该被连带
     assert "skc" not in calls and "clean_images" not in calls
 

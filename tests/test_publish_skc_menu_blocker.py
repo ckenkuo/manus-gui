@@ -90,18 +90,28 @@ class _FakeSession:
 
     def __init__(self, **queues):
         self.q = {k: list(v) for k, v in queues.items()}
+        # 两个轮询步骤给默认值：它们是「等就绪」的辅助往返，各用例关心的是瞄点/收浮层
+        # 的分支走向，不必每处都显式声明。要测它们自己的失败分支时显式传参覆盖即可。
+        self.q.setdefault("settled", [{"settled": True, "top": 400, "waitedMs": 200}])
+        self.q.setdefault("waitmenu", [{"ready": True, "waitedMs": 0}])
         self.calls = []
         self.clicks = []
 
     async def eval_json(self, code, **kw):
+        # 顺序有讲究：先认特征最独占的几段，最后才落到 menu（开弹窗那一步）。
+        # settled/waitmenu 是 2026-08-26 把固定 sleep 改成轮询后新增的两次往返。
         if "Escape" in code:
             kind = "park"
         elif "可安全点击" in code:
             kind = "blank"
+        elif "getBoundingClientRect().top" in code and "settled" in code:
+            kind = "settled"          # _JS_SCROLL_SETTLED：轮询等平滑滚动停稳
         elif "elementFromPoint" in code:
             kind = "pos"
         elif "scrollIntoView" in code:
             kind = "scroll"
+        elif "ready" in code and "visibleMenus" in code:
+            kind = "waitmenu"         # _JS_WAIT_SKC_MENU：轮询等 SKC 菜单就绪
         else:
             kind = "menu"
         self.calls.append(kind)
@@ -266,12 +276,18 @@ def test_收浮层异常不影响主判定(monkeypatch):
     assert ses.calls.count("scroll") == 5    # 收浮层炸掉不该打断换位重试
 
 
-def test_每挂完一张就主动收菜单(monkeypatch):
+def test_每挂完一批就主动收菜单(monkeypatch):
     """预防优于事后救：菜单停在视口中段，下一行按钮也滚到中段，几何上必然重叠。
 
     2026-08-25 复盘 663641923103：整行反复断在 open-space，且换行后仍复现——说明
-    上一张/上一行留下的菜单一直没收。故 skc_replace_row 每挂成功一张就收一次。
+    上一张/上一行留下的菜单一直没收。故 skc_replace_row 每挂成功一批就收一次。
+
+    【判据不绑具体写法】原先按 `attached.append(` 切源码，2026-08-26 改按批挂图后
+    那行变成 attached.extend(...)，测试就失效了——而它要守的性质完全没变。改成按
+    「收菜单发生在回读校验之后、删旧图之前」这个位置关系判，对写法不敏感。
     """
     src = inspect.getsource(P.skc_replace_row)
-    body = src.split('attached.append(')[1]
-    assert "_park_image_menus" in body, "挂载成功后没有主动收菜单"
+    i_park = src.find("_park_image_menus")
+    i_verify = src.find("verify-row")
+    assert i_park > 0, "挂载成功后没有主动收菜单"
+    assert i_verify > 0 and i_park > i_verify, "收菜单应当在挂载回读校验通过之后"

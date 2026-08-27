@@ -91,10 +91,17 @@ def stub_steps(monkeypatch):
     async def fake_open_space(session, row_keyword):
         return {"opened": True}
 
-    async def fake_pick(session, file_id):
-        # 真站语义：从空间弹窗选中图 → 追加到行末
-        session.row.attach(file_id.rsplit("/", 1)[-1])
-        return {"picked": True}
+    async def fake_pick_many(session, file_ids):
+        """真站语义：一次弹窗勾选多张 → 按勾选顺序【依次追加到行末】。
+
+        2026-08-26 真站探查证实弹窗是累积多选（计数逐次 +1、角标保持「取消选择」），
+        故这里按批追加；行满时 FakeRow.attach 会静默失败并记 overflow_attempts，
+        穷举断言就是靠它抓「批太大导致触顶」的反例。
+        """
+        for fid in file_ids:
+            session.row.attach(fid.rsplit("/", 1)[-1])
+        return {"stage": "ok", "picked": [f.rsplit("/", 1)[-1] for f in file_ids],
+                "counted": len(file_ids)}
 
     async def no_sleep(_seconds):
         """删图后的 0.4s 等待是真站 DOM 重排需要的，离线穷举 88 个组合会累积到分钟级。"""
@@ -102,7 +109,7 @@ def stub_steps(monkeypatch):
 
     monkeypatch.setattr(pl, "upload_image", fake_upload)
     monkeypatch.setattr(pl, "_skc_open_space", fake_open_space)
-    monkeypatch.setattr(pl, "_pick_from_space", fake_pick)
+    monkeypatch.setattr(pl, "_pick_many_from_space", fake_pick_many)
     monkeypatch.setattr(pl.asyncio, "sleep", no_sleep)
 
 
@@ -142,14 +149,23 @@ async def test_invariants_over_all_combinations(tmp_path, stub_steps, old_count,
 
 @pytest.mark.asyncio
 async def test_no_predelete_in_typical_case(tmp_path, stub_steps):
-    """6 旧换 6 新（日志里那个真实场景）：不再有开头的预删，第一步就是挂图。"""
+    """6 旧换 6 新（日志里那个真实场景）：不再有开头的预删，第一步就是挂图。
+
+    【峰值 10 是按批版的正常值，不是回归】2026-08-26 起一次弹窗勾多张（真站探查证实
+    弹窗支持累积多选），每批就把行内余量用满：6 旧 + 挂 4 张 = 10（触到上限但不超）
+    → 删 4 张回 6 → 挂剩下 2 张 = 8 → 删 2 张回 6。
+    逐张版峰值是 7，但那是「每张都开关一次弹窗」换来的——29 张图 402s 的主要成因。
+    真正要守的两条（不超上限、不删空）仍由下面两条断言把住，穷举测试
+    test_invariants_over_all_combinations 覆盖全部 0..10 x 1..10 组合。
+    """
     row = FakeRow(6)
     r = await pl.skc_replace_row(FakeSession(row), "图色", _imgs(tmp_path, 6))
     assert r["status"] == "ok"
     assert row.ops[0].startswith("add:"), f"第一步应当是挂图而不是删图：{row.ops[:3]}"
-    # 交替后峰值只有 7（旧实现峰值 10，且需要预删 2 张）
-    assert max(row.trace) == 7, row.trace
-    assert min(row.trace) == 6, row.trace
+    assert max(row.trace) <= pl.SKC_ROW_MAX_IMAGES, f"峰值超上限：{row.trace}"
+    assert min(row.trace) >= 6, f"行内曾低于初始值 6：{row.trace}"
+    # 按批的收益：开关弹窗次数应当远少于图片张数（6 张只需 2 批）
+    assert row.ops.count("del") == 6, row.ops
 
 
 @pytest.mark.asyncio
@@ -220,8 +236,10 @@ async def test_failure_midway_never_drops_below_start(tmp_path, stub_steps, monk
     calls = {"n": 0}
 
     async def flaky_open(session, row_keyword):
+        # 【第 2 批失败，不是第 3 张】按批后 6 旧换 6 新只需 2 批（4 张 + 2 张），
+        # 原先按「第 3 次调用」写会永远等不到那一次、测不到失败路径。
         calls["n"] += 1
-        if calls["n"] == 3:              # 第 3 张时失败
+        if calls["n"] == 2:
             return {"err": "空间弹窗打不开（模拟）"}
         return {"opened": True}
 
