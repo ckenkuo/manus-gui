@@ -200,8 +200,10 @@ async def test_只缺像素的图走放大不烧生图(tmp_path, monkeypatch):
     """needsUpscale 的图内容本来就干净，重画一遍既贵又可能改坏内容。"""
     calls = {}
     _prep_env(tmp_path, monkeypatch, calls)
+    # 2026-08-28 起 _prepare_desc_image 会传描述图下限（min_w/min_h，见
+    # images.check_desc_size），假 compress 的签名要跟上，否则 TypeError → ok=False
     monkeypatch.setattr(service.images, "compress",
-                        lambda p, quality=88: p)
+                        lambda p, quality=88, min_w=None, min_h=None: p)
     monkeypatch.setattr(service.images, "image_size", lambda p: (1340, 1785))
     got = await service._prepare_desc_image(
         str(tmp_path), {"pos": 1, "url": "https://cdn/a.jpg",
@@ -429,15 +431,23 @@ def test_从raw读描述模块并标出尺寸不达标(tmp_path):
     from PIL import Image
 
     (tmp_path / "raw.json").write_text(
-        json.dumps({"descImages": ["https://cdn/1.jpg", "https://cdn/2.jpg"]},
+        json.dumps({"descImages": ["https://cdn/1.jpg", "https://cdn/2.jpg",
+                                   "https://cdn/3.jpg", "https://cdn/4.jpg"]},
                    ensure_ascii=False), encoding="utf-8")
-    # 第 1 张达标、第 2 张不达标（服装红线 1340x1785，见 images.CLOTH_MIN_*）
+    # 【判据是描述图自己那套，不是服装 1340x1785】2026-08-28 用户截图取证后改：
+    # 描述图只要「比例 0.5~2 且两边 >= 480」，见 images.check_desc_size。
+    # 第 1 张 1400x1900 合格；第 2 张 900x1200 按服装红线是不达标，但按描述图口径
+    # 【同样合格】（比例 0.75、两边都 >= 480）——原先正是这类图被误判后白烧生图。
     Image.new("RGB", (1400, 1900)).save(tmp_path / "desc-01.jpg")
     Image.new("RGB", (900, 1200)).save(tmp_path / "desc-02.jpg")
+    # 真正不合格的：短边不足 480 / 比例超界
+    Image.new("RGB", (300, 300)).save(tmp_path / "desc-03.jpg")
+    Image.new("RGB", (1200, 400)).save(tmp_path / "desc-04.jpg")
 
     mods = service._desc_modules_from_raw(str(tmp_path))
-    assert [m["pos"] for m in mods] == [1, 2]
-    assert mods[0]["tooSmall"] is False and mods[1]["tooSmall"] is True
+    assert [m["pos"] for m in mods] == [1, 2, 3, 4]
+    assert mods[0]["tooSmall"] is False and mods[1]["tooSmall"] is False
+    assert mods[2]["tooSmall"] is True and mods[3]["tooSmall"] is True
 
 
 def test_从raw读不到文件时不标尺寸不达标(tmp_path):

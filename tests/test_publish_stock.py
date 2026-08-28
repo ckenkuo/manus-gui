@@ -49,25 +49,22 @@ def test_js_syntax():
 
 
 def test_sku_category_prompt():
-    """验证 SKU 分类 LLM prompt 包含关键信息。"""
-    # 模拟 set_stock 中的 prompt 构造
-    title = "2026春夏新款儿童套装男童休闲运动服三件套"
-    attrs = {"套装件数": "三件套", "套装类型": "上衣+裤子+外套"}
+    """验证 SKU 分类 prompt 包含关键信息。
 
-    prompt = (
-        "你是跨境电商 Listing 专家。店小秘 Temu 半托管发布时需要为每个 SKU 填写「SKU分类」。\n\n"
-        f"商品信息：\n- 标题：{title}\n- 套装件数：{attrs.get('套装件数', '单件')}"
-        f"\n- 套装类型：{attrs.get('套装类型', '无')}\n\n"
-        "SKU分类选项：1=单品（一个SKU只含一件商品） 2=同款多件（多件相同商品） 3=混合套装（多件不同商品组合）\n"
-        "单位选项：1=件 2=双 3=包\n\n"
-        "请判断这个商品的 SKU分类（含数量、单位）。\n"
-        '只输出严格JSON：{"skuCat":"1|2|3","qty":数字,"unit":"1|2|3","reason":"一句话理由"}'
-    )
+    【2026-08-27 改成读真实现】原先这里把 prompt 抄了一份在测试里断言，等于测自己抄的
+    那段字符串——真实现改了（比如加包装清单）它照样绿，起不到守护作用。改成读
+    judge_sku_category 的源码断言关键片段在场。
+    """
+    import inspect
 
-    assert "三件套" in prompt
-    assert "上衣+裤子+外套" in prompt
-    assert "1=单品" in prompt and "3=混合套装" in prompt
-    assert "只输出严格JSON" in prompt
+    from app.publish.pipeline import judge_sku_category
+
+    src = inspect.getsource(judge_sku_category)
+    assert "套装件数" in src and "套装类型" in src
+    assert "1=单品" in src and "3=混合套装" in src
+    assert "只输出严格JSON" in src
+    # 包装清单与 SKU分类同一次问（件数和必须与 qty 相等，平台强校验）
+    assert "packing" in src
 
 
 def test_warehouse_flow():

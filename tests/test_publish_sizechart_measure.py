@@ -27,7 +27,12 @@ class _FakeSession:
         self.tpl_name = None
 
     async def eval_json(self, js: str):
-        if "skuAttrSizeChart" in js and "opened" in js:
+        # 【分派特征跟着实现改】2026-08-27 定位方式由 .skuAttrSizeChart 类改成按 label
+        # 文字取 form-item（套装商品有两张表，那个类只挂在第一张上，见
+        # pipeline._JS_SIZECHART_LOCATE）。原先按 "skuAttrSizeChart" 分派的这一支于是
+        # 再也匹配不上，开弹窗恒返回 {}，7 个用例全报「添加尺码表弹窗未打开」——
+        # 假会话没跟上实现的锅，不是实现回归。改用 span.link（点入口这个动作的特征）。
+        if "span.link" in js and "opened" in js:
             return {"opened": True}
         if "closed" in js and "ant-modal-close" in js:
             return {"closed": 0}

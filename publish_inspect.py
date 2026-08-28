@@ -144,6 +144,9 @@ async def main() -> int:
     p.add_argument("--category", default=None,
                    help="尺码分类关键词（默认跟随平台按已选类目预选的值，一般不用给）")
     p.add_argument("--name", help="模板名称（默认：商品标题前10字+尺码表）")
+    p.add_argument("--which", type=int, default=0, choices=(0, 1),
+                   help="填第几张表：0=「尺码表」（默认），1=「尺码表2」"
+                        "（套装商品平台要求两张都填，否则发布被打回）")
     p = sub.add_parser("set-shipping", help="发货时效+运费模板（写入）")
     p.add_argument("rowid")
     p.add_argument("--deadline", default="", help="承诺发货时效（如'15个工作日内发货'，不指定则选最长）")
@@ -358,7 +361,8 @@ async def main() -> int:
         elif args.cmd == "add-sizechart":
             await open_edit(session, args.rowid)
             await asyncio.sleep(2)
-            r = await add_sizechart(session, args.info_json, args.category, args.name)
+            r = await add_sizechart(session, args.info_json, args.category, args.name,
+                                    which=args.which)
             print(json.dumps(r, ensure_ascii=False, indent=2))
             if r.get("status") == "ok":
                 if r.get("skipped"):

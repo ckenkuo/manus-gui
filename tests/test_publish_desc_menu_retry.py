@@ -116,8 +116,12 @@ async def test_始终不展开时报错带上瞄点诊断(monkeypatch, _patched)
     s = _FakeSession(menu_ready_after_clicks=99)
     r = await pipeline.desc_replace(s, 1, "x.jpg", expect_url="https://cdn/a.jpg")
     assert r["status"] == "error" and r["stage"] == "menu"
-    assert "轮询" in r["err"]
+    # 钉住「带得动诊断」这件事本身，不钉具体措辞（措辞随处置手段增补而变）
     assert r["linkAim"]["x"] == 100 and r["linkAim"]["onLink"] is True
+    # 遮挡诊断三件套必须在：链接上沿、遮挡带下沿、容器 scrollTop——2026-08-28 那次
+    # 6 张全挂就是因为报错里没有它们，只能反复回真站探测才看出是顶栏压住了链接
+    for k in ("linkTop", "blockerBottom", "bodyScrollTop", "fixTried"):
+        assert k in r["linkAim"], f"报错必须带遮挡诊断 {k}"
     assert s.clicks >= 3, "两轮点击都要打（模块图 1 次 + 更换图片 2 次）"
 
 

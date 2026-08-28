@@ -83,6 +83,10 @@ class TargetClosedError(RuntimeError):
     """页面/浏览器已关闭（页签被关、Chrome 退出或页面崩溃）——不可重试，须重建会话。"""
 
 
+# evaluate/eval_json 的「没传参」哨兵：None 是合法的 JS 参数（null），不能拿它判断
+_NO_ARG = object()
+
+
 # ---- 页面 toast 哨兵 --------------------------------------------------------
 # 【为什么要常驻监听，而不是在需要时查一次】店小秘的错误提示是浮层 toast，2~3 秒自动
 # 消失。2026-08-24 排查 890843533224 时，编辑页弹的「该分类已在平台删除！」就是这么
@@ -212,32 +216,40 @@ class BrowserSession:
         self._toast_pages.clear()
 
     # ---- 6 个原语（签名照抄 skill）------------------------------------------
-    async def evaluate(self, code: str, timeout: int = 90) -> dict:
+    async def evaluate(self, code: str, timeout: int = 90, arg: Any = _NO_ARG) -> dict:
         """执行 JS，返回 {"ok": bool, "data": {"value": ...}} —— 结构与 WebBridge 一致。
 
         保持这个包了一层的返回结构（而不是直接返回值），是为了让原脚本里
         `resp.get("ok")` / `resp["data"]["value"]` 的判断能原样搬过来。
+
+        arg 给了就走 Playwright 的传参调用（此时 code 必须是箭头函数/函数表达式）。
+        【为什么用哨兵而不是 arg=None 判断】None 是合法的 JS 参数（null），拿它当
+        「没传参」会让 `evaluate(fn, arg=None)` 静默变成无参调用、JS 侧收到 undefined。
         """
         try:
-            value = await asyncio.wait_for(
-                self.page.evaluate(code), timeout=timeout
-            )
+            coro = (self.page.evaluate(code) if arg is _NO_ARG
+                    else self.page.evaluate(code, arg))
+            value = await asyncio.wait_for(coro, timeout=timeout)
             return {"ok": True, "data": {"value": value}}
         except asyncio.TimeoutError:
             return {"ok": False, "err": f"JS 执行超时（{timeout}s）"}
         except Exception as e:
             return {"ok": False, "err": str(e)}
 
-    async def eval_json(self, code: str, timeout: int = 90, retries: int = 3) -> dict:
+    async def eval_json(self, code: str, timeout: int = 90, retries: int = 3,
+                        arg: Any = _NO_ARG) -> dict:
         """执行 JS 并解析 JSON 返回值，对瞬时错误自动重试。
 
         原脚本的 113 处 JS 全部以 `JSON.stringify(...)` 收尾，故返回值是字符串、这里再
         json.loads。但 Playwright 的 evaluate 会把 JS 值直接反序列化成 Python 对象，
         若某段 JS 返回的已是对象（新写的代码），这里直接放行，不强行再 loads。
+
+        arg 给了就把它作为参数传给 code（code 须是箭头函数），语义见 evaluate。
+        新写的 JS 推荐走这条路：比 fill_js 的字面量替换少一层转义、且参数是结构化值。
         """
         last_err: Any = None
         for attempt in range(1, retries + 1):
-            resp = await self.evaluate(code, timeout)
+            resp = await self.evaluate(code, timeout, arg=arg)
             if resp.get("ok"):
                 val = resp.get("data", {}).get("value")
                 if val is None or val == "":
@@ -310,6 +322,43 @@ class BrowserSession:
         # 由 expose_binding 持久注册，只有页面内那段 JS 要重跑）
         await self.install_toast_watch()
         return {"ok": True, "url": self.page.url}
+
+    async def adopt_open_page(self, must_include: str) -> dict:
+        """把会话切到【已打开且 URL 含 must_include】的页签，不导航。
+
+        【为什么需要它：有些来源站重新导航就丢数据】2026-08-27 实测 Temu 买家页：
+        用户已打开的商品页 window.rawData.store 完整（goodsId/goods/sku 全有），但对
+        同一个 URL 执行 page.goto 会被 302 到 login.html?login_scene=2，SSR 数据压根
+        不注入。也就是说那个页面所处的会话上下文是【导航不可复现】的——它是用户从站内
+        点进去的，带着一整套 referer/session 状态。
+
+        对这类站唯一可靠的取数方式就是「用户开着，我们只读」。这与本项目 CDP 接管
+        真实浏览器的取向一致（见模块头），也是采集侧一贯的做法：不模拟登录、不重放
+        会话，直接用人已经登进去的那个窗口。
+
+        返回 {"ok", "url"}；没有匹配页签时 ok=False，由调用方决定是否退回 navigate。
+        【不改 self._page 以外的东西】cdp 会话要跟着换页签重建，否则后续 cdp() 还打在
+        旧页签上（素材图悬停菜单那类操作会点错窗口）。
+        """
+        try:
+            ctx = self._browser.contexts[0]
+            cands = [p for p in ctx.pages
+                     if must_include in (p.url or "") and not p.is_closed()]
+        except Exception as e:
+            return {"ok": False, "err": f"枚举页签失败：{e}"}
+        if not cands:
+            return {"ok": False, "err": f"没有已打开的页签匹配 {must_include!r}"}
+        page = cands[0]
+        self._page = page
+        self._watch_page(page)
+        try:
+            self._cdp = await ctx.new_cdp_session(page)
+        except Exception as e:
+            logger.warning(f"切页签后重建 CDP 会话失败（忽略）：{e}")
+        await self.fix_hidden_tab()
+        await self.install_toast_watch()
+        logger.info(f"复用已打开的页签（不导航）：{(page.url or '')[:100]}")
+        return {"ok": True, "url": page.url}
 
     async def mouse_click(self, selector: str, timeout: int = 15) -> dict:
         """真实鼠标点击（Playwright locator.click 底层走 Input.dispatchMouseEvent）。

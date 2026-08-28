@@ -1101,6 +1101,108 @@ async def publish_batch_events(job_id: str):
     )
 
 
+# ---- 采集箱定时扫描（发布页顶部的开关 + 未编辑商品清单）-----------------------
+# 定时器跑在服务端（app/publish/collectbox.py），故开关状态是【后端 prefs 的事实】而不是
+# localStorage：换个浏览器标签页看到的必须是同一个状态。默认关闭（用户明确要求），
+# 由页面顶部那个开关开启。
+#
+# 【扫的是采集箱 draft 里「已认领但没编辑过」的行】offline（页面文案「待发布」）里躺的
+# 是已经编辑过的商品，不是本功能的目标。「编辑过没有」判不了列表接口，只能逐个 rowid
+# 查 edit.json——判据与那一堆被证伪的候选判据都记在 collectbox.py 的模块 docstring 里。
+#
+# 【扫描只读】这几个接口不点任何按钮、不改店小秘任何状态：只导航列表页 + 页面内 fetch
+# 读接口。真正的发布仍走 /publish/batch——用户在清单里勾选、选好店铺站点后再发起，
+# 定时器本身永远不会自己发布任何东西。
+#
+# 【与发布作业互斥】扫描与发布抢同一个 CDP 页面，故把「有作业在跑」的判据注入给定时器，
+# 让它在作业期间跳过这一轮（见 collectbox.set_busy_checker 与 _tick 的说明）。
+
+from app.publish import collectbox as publish_collectbox
+
+
+def _publish_job_busy() -> bool:
+    """当前是否有发布作业在跑（定时器据此跳过这一轮扫描）。
+
+    只看未完成的 job：publish_jobs 里的条目跑完不删（SSE 断线重连要能取到 summary），
+    故不能拿字典非空当判据。
+    """
+    return any(not j.done for j in publish_jobs.values())
+
+
+publish_collectbox.set_busy_checker(_publish_job_busy)
+
+
+@app.on_event("startup")
+async def _start_collectbox_timer():
+    """进程启动时按设置决定是否起定时器（默认关，故全新环境什么都不发生）。
+
+    放在 startup 而不是模块导入时：定时器是 asyncio 任务，要有运行中的事件循环才能建。
+    """
+    from app.logger import logger
+
+    try:
+        if publish_collectbox.start_if_enabled():
+            logger.info("采集箱定时扫描按上次设置自动启动")
+    except Exception as e:
+        # best-effort：定时器起不来不该让整个 Web 服务起不来
+        logger.warning(f"采集箱定时扫描启动失败（忽略）：{e}")
+
+
+@app.get("/publish/collectbox")
+async def collectbox_state():
+    """定时器现状 + 上次扫到的清单，供发布页顶部开关与清单表格渲染。
+
+    【为什么现状与清单一个接口给】页面要同时显示「开关状态/下次扫描时间」和清单，
+    分两个接口只会让前端自己去对齐两次往返的时序（清单来了但开关还没渲染完）。
+    清单读的是磁盘缓存、不触发扫描，故这个接口很快且无副作用。
+    """
+    st = publish_collectbox.status()
+    scan = publish_collectbox.load_scan()
+    return {**st, "items": scan.get("items") or [],
+            "states": [{"id": k, "label": v["label"]}
+                       for k, v in publish_collectbox.DXM_STATES.items()],
+            "intervalMin": publish_collectbox.INTERVAL_MIN,
+            "intervalMax": publish_collectbox.INTERVAL_MAX,
+            "intervalDefault": publish_collectbox.INTERVAL_DEFAULT}
+
+
+@app.post("/publish/collectbox/settings")
+async def collectbox_settings(enabled: Optional[bool] = Body(None, embed=True),
+                              intervalMinutes: Optional[int] = Body(None, embed=True),
+                              state: Optional[str] = Body(None, embed=True),
+                              onlyUnedited: Optional[bool] = Body(None, embed=True)):
+    """改定时器设置（开关/间隔/扫哪个列表/是否只列未编辑）。只改传了的项。
+
+    开关变更当场生效（开→起定时器、关→停），其余项由循环下一轮自动读到。
+    越界值由 set_settings 拒掉、原样转 400——那是页面上填错了，不是服务端故障。
+    """
+    try:
+        return await publish_collectbox.apply_settings(
+            enabled=enabled, interval_minutes=intervalMinutes, state=state,
+            only_unedited=onlyUnedited)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/publish/collectbox/scan")
+async def collectbox_scan_now(state: str = Body("", embed=True)):
+    """立刻扫一次（页面上的「立即扫描」按钮）。返回现状 + 新清单。
+
+    与定时器共用 collectbox 内部的扫描锁，故点这个按钮不会与定时轮次撞在一起。
+    有发布作业在跑时拒掉：扫描会把那个 CDP 页面导航走，等于毁掉正在填的表单
+    （15 阶段共用一个 page，见 app/publish/browser.py 的会话模型）。
+    """
+    if _publish_job_busy():
+        raise HTTPException(409, "有发布作业正在跑，扫描会抢占编辑页；请等作业结束后再扫")
+    cfg = publish_collectbox.get_settings()
+    r = await publish_collectbox.scan_once(state or cfg["state"])
+    if r.get("error") and not r.get("items"):
+        raise HTTPException(503, f"扫描失败：{r['error']}")
+    publish_collectbox.save_scan(r)
+    st = publish_collectbox.status()
+    return {**st, "items": r.get("items") or []}
+
+
 @app.exception_handler(Exception)
 async def generic_exception_handler(request: Request, exc: Exception):
     return JSONResponse(

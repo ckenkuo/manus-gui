@@ -1,4 +1,12 @@
-"""1688 商品源页信息提炼（发布管线阶段①）：抓页面内嵌数据 + 下载主图/详情图。
+"""商品源页信息提炼（发布管线阶段①）：抓页面数据 + 下载主图/详情图 + 落盘。
+
+【2026-08-27 起支持多来源】原先只做 1688；实测采集箱 200 条草稿里非 1688 源占 76 条
+（拼多多 42 / Temu 30 / 亚马逊 4），它们在 GUI 上一条都跑不通。现在按 URL 域名分派到
+app/publish/sources/ 下的平台适配器，本模块只保留【与平台无关】的那半：下图、
+main-NN.jpg 命名、成分解析、素材图合规判断、product-info.json 落盘、视觉回填。
+1688 的取数逻辑仍在本模块（_JS_EXTRACT / _JS_DETAIL / parse_attrs /
+wait_human_verify），由 sources/alibaba1688.py 薄包装调用——那些是对真站逐个试出来
+的、且已有单测覆盖，搬动只有风险没有收益。新增平台不必碰本模块。
 
 从 skill 的 scripts/extract_1688.py 移植。改动只有三处，其余（两段 JS、属性切分、
 SKU 透视、素材图合规判断）原样保留——那些 JS 选择器和键名表是对真站实测出来的，
@@ -12,7 +20,7 @@ SKU 透视、素材图合规判断）原样保留——那些 JS 选择器和键
 改动三：输出目录走 config.get_output_dir("publish")，落到桌面 manus输出/ 分类目录下，
     不再是原脚本写死的 D:\\KimiData\\kimi\\workspace（换机器即失效）。
 
-产出（工作目录 product-<offerId>/）：
+产出（工作目录 product-<id>/，非 1688 源为 product-<平台>-<id>/，见 workdir_for）：
     raw.json           页面原始抽取结果，留档便于排查
     product-info.json  结构化商品信息，后续 11 个阶段都读它
     main-NN.jpg        轮播主图
@@ -31,6 +39,14 @@ from app.config import config, get_output_dir
 from app.logger import logger
 from app.publish.browser import J, BrowserSession
 from app.publish import images
+from app.publish.sources import get_adapter
+from app.publish.sources.base import (
+    UnsupportedSourceError,
+    detect_platform,
+    normalize_url,
+    platform_name,
+    source_id,
+)
 
 # 1688 商品参数常见键名（按长度降序匹配，避免 "主面料成分" 截获 "主面料成分含量"）。
 # 这张表是对真实商品页面攒出来的，缺键会导致该属性并进上一个键的值里，别精简。
@@ -108,14 +124,21 @@ _IMG_HEADERS = {
 }
 
 
-def workdir_for(offer_id: str) -> str:
-    r"""单品工作目录：桌面 manus输出/商品发布/product-<offerId>/。
+def workdir_for(product_id: str, platform: str = "1688") -> str:
+    r"""单品工作目录：桌面 manus输出/商品发布/product-<id>/（非 1688 源带平台前缀）。
 
     走 get_output_dir 而非写死路径：原脚本的 D:\KimiData\kimi\workspace 是作者机器的
     路径，换机器/换账号第一次跑就报文件不存在。get_output_dir 本身 best-effort
     （桌面不可写会退到项目 workspace/输出），坏不了主流程。
+
+    【1688 刻意不带前缀】既有目录全是 product-<offerId>/ 这个形态，加前缀会让所有
+    历史工作目录与状态文件里的 workdir 失配（续跑时找不到已下好的图，白重下一遍）。
+    新平台带前缀（product-pdd-<goodsId>/）则是必须的——不同平台的商品 ID 可能撞号
+    （拼多多 goods_id 与 1688 offerId 都是纯数字，位数也重叠），撞了就是两个商品
+    共用一个目录、图互相覆盖。
     """
-    return str(get_output_dir("publish") / f"product-{offer_id}")
+    slug = f"{product_id}" if platform == "1688" else f"{platform}-{product_id}"
+    return str(get_output_dir("publish") / f"product-{slug}")
 
 
 def parse_attrs(attr_text: Optional[str]) -> dict:
@@ -203,13 +226,24 @@ def parse_main_composition(attrs: dict) -> dict:
 
 
 def pivot_skus(sku_map: list) -> tuple[dict, list, list]:
-    """'6633-灰色>100码' → {'100码': {'6633-灰色': 29.8}} + 颜色/尺码列表。"""
+    """'6633-灰色>100码' → {'100码': {'6633-灰色': 29.8}} + 颜色/尺码列表。
+
+    【不含 `>` 的 spec 仍然丢，但必须出声】spec 的两维形状由各适配器保证
+    （见 sources/base.py 的 SourceProduct 契约与 alibaba1688.norm_spec）。这里不再
+    补一份归一——两处各归一一遍，改规则时必然只改一边。
+    但静默丢是 2026-08-28 那次排查的真正代价：offer 1014675972015（手工编织摆件）
+    6 条单维 spec 被这个 continue 全吃掉，落盘成 skus={} / colors=[] / sizes=[]，
+    直到阶段⑦ 报「视觉未给出任何颜色行选图」、阶段⑧ 报「无 skus 数据」才暴露，
+    而那两条提示都指不回「源 SKU 形状不对」。故丢弃时打 warning 点出具体 spec。
+    """
     pivot: dict = {}
     colors: list = []
     sizes: list = []
+    dropped: list = []
     for s in sku_map:
         spec = s.get("spec", "")
         if ">" not in spec:
+            dropped.append(spec)
             continue
         color, size = spec.rsplit(">", 1)
         color, size = color.strip(), size.strip()
@@ -218,6 +252,11 @@ def pivot_skus(sku_map: list) -> tuple[dict, list, list]:
         if size not in sizes:
             sizes.append(size)
         pivot.setdefault(size, {})[color] = float(s["price"]) if s.get("price") else None
+    if dropped:
+        logger.warning(
+            f"skuMap 有 {len(dropped)} 条 spec 不含「>」被丢弃（适配器未归一成"
+            f"「颜色>尺码」两维？）：{dropped[:6]}；"
+            "这会让 skus/colors/sizes 落成空值，阶段⑦⑧ 随后必挂")
     return pivot, colors, sizes
 
 
@@ -489,7 +528,11 @@ async def extract_product(
     enrich: bool = False,
     on_manual: Optional[Callable[[str], Any]] = None,
 ) -> dict:
-    """提炼 1688 商品信息 + 下图，产出 raw.json / product-info.json，返回摘要。
+    """提炼来源平台商品信息 + 下图，产出 raw.json / product-info.json，返回摘要。
+
+    支持 1688 / 拼多多 / Temu / 亚马逊四个来源（见 app/publish/sources/）：平台按
+    URL 域名识别，取数交对应适配器，本函数只管【下图与落盘】——那部分与平台无关，
+    下游 11 个阶段也只认落盘后的这份结构。认不出的域名抛 UnsupportedSourceError。
 
     session 为空则自建并在结束时关闭；调用方传入则复用、由调用方负责关闭
     （沿用 collect 侧 run_batch 对 agent 的同一套所有权约定）。
@@ -498,74 +541,57 @@ async def extract_product(
     确定性步骤且已真站验证，视觉判断要花钱、要几十秒、还可能因模型/额度失败，
     不该绑进必经路径。开了也不会因回填失败作废整次抓取（产物已落盘）。
 
-    on_manual 是人工提示通道：1688 弹滑块/安全验证时用它通知人（见 wait_human_verify），
-    不给也照样等、只是提示仅进日志。
+    on_manual 是人工提示通道：源站弹滑块/验证码时用它通知人（1688 会原地等人拖滑块，
+    另三家只报错交人处理，见各适配器），不给也照样跑、只是提示仅进日志。
 
-    只读操作：只导航 1688 详情页 + 页面内 fetch 详情接口 + 下载图片，不写任何店小秘数据。
+    只读操作：只导航源商品页 + 页面内 fetch + 下载图片，不写任何店小秘数据。
     """
-    m = re.search(r"(\d{6,})", offer)
-    if not m:
-        raise ValueError(f"无法从输入解析 offerId: {offer}")
-    offer_id = m.group(1)
-    url = offer if offer.startswith("http") else f"https://detail.1688.com/offer/{offer_id}.html"
-    outdir = os.path.abspath(outdir or workdir_for(offer_id))
+    platform = detect_platform(offer) if offer.startswith("http") else "1688"
+    if platform == "1688":
+        # 兼容既有用法：offer 可以只给 offerId 数字（CLI 与老状态文件里都有这种形态）
+        m = re.search(r"(\d{6,})", offer)
+        if not m:
+            raise ValueError(f"无法从输入解析 offerId: {offer}")
+        product_id = m.group(1)
+        url = offer if offer.startswith("http") else \
+            f"https://detail.1688.com/offer/{product_id}.html"
+    else:
+        product_id = source_id(offer, platform)
+        if not product_id:
+            raise ValueError(
+                f"{platform_name(platform)}链接里抽不出商品 ID：{offer}"
+                f"（需要形如 goods_id=<数字> / -g-<数字>.html / /dp/<ASIN>）")
+        # 【导航一律用原始 URL，不用归一后的】2026-08-27 实测两个反例：
+        #   Temu   丢掉 URL 里的标题 slug（.../girls-dresses-g-<id>.html → .../g-<id>.html）
+        #          会被重定向到 login.html，页面数据压根不注入
+        #   拼多多 只留 goods_id、丢掉 _oak_rcto 等参数后导航，initDataObj 也不注入
+        # 归一形态只适合当「同一商品的稳定标识」（日志、目录名、状态键），不适合拿去
+        # 访问——平台把那些参数当会话/来源凭证用。故这里 url 保持原样，商品 ID 单独抽。
+        url = offer
+
+    # 工作目录名带平台前缀（1688 保持原样不带，见 workdir_for 的说明）
+    outdir = os.path.abspath(outdir or workdir_for(product_id, platform))
     os.makedirs(outdir, exist_ok=True)
 
+    adapter = get_adapter(platform)
     own_session = session is None
     session = session or BrowserSession()
     try:
         if own_session:
-            await session.open(url_hint="https://detail.1688.com")
-        # 1. 打开页面并等内嵌数据就绪。1688 详情页是服务端注入 window.context，
-        #    但首屏渲染完成前该对象可能还没挂上，故轮询等 found。
-        logger.info(f"打开 1688 详情页提取：{url}")
-        r = await session.navigate(url, new_tab=own_session is False)
-        if not r.get("ok"):
-            raise RuntimeError(f"导航失败: {r}")
-        # 反爬闸门放在等数据【之前】：被拦时 window.context 压根不存在，先干等 40s 再
-        # 报「数据未就绪」纯属浪费——那 40s 里人本来就能把滑块拖完（见 wait_human_verify）
-        await wait_human_verify(session, url, on_manual=on_manual)
-        data = await session.wait_for(
-            _JS_EXTRACT, lambda d: d.get("found"), timeout=40
-        )
-        if not data.get("found"):
-            # 滑块也可能在首屏之后才弹（导航时那一刻还干净），故这里再判一次：
-            # 等到人工过关后重读一次数据，而不是直接把阶段① 判失败。
-            if await wait_human_verify(session, url, on_manual=on_manual):
-                data = await session.wait_for(
-                    _JS_EXTRACT, lambda d: d.get("found"), timeout=40
-                )
-            if not data.get("found"):
-                raise RuntimeError("页面数据未就绪（未登录或被拦截？）")
-        logger.info(f"页面数据就绪：{data.get('subject')}")
-
-        # 2. 详情接口拿描述长图（best-effort：拿不到就没有描述图，不阻断提取）
-        #    先页面内 fetch（新形态 detailUrl 走这条即可），失败或抠不到图再 Python
-        #    直连——老形态 detailUrl 没有 CORS 头，页面内 fetch 必抛 Failed to fetch，
-        #    详见 _fetch_desc_imgs_direct 的注释。
-        desc_imgs: list = []
-        if data.get("detailUrl"):
-            detail_url = data["detailUrl"]
-            try:
-                d = await session.eval_json(_JS_DETAIL.replace("__URL__", J(detail_url)))
-                desc_imgs = d.get("imgs", [])
-                if not desc_imgs:
-                    logger.warning(f"详情接口页面内 fetch 未抠到图（status={d.get('status')} "
-                                   f"len={d.get('len')}），改直连重试")
-            except Exception as e:
-                logger.warning(f"详情接口页面内 fetch 失败：{e}；改直连重试")
-            if not desc_imgs:
-                try:
-                    desc_imgs = _fetch_desc_imgs_direct(detail_url)
-                    logger.info(f"详情接口直连成功：描述图 {len(desc_imgs)} 张")
-                except Exception as e:
-                    logger.warning(f"详情接口直连也失败（描述图为空）：{e}")
+            await session.open(url_hint=getattr(adapter, "URL_HINT", url))
+        # 取数全权交适配器：各平台的挂载点、等待判据、反爬形态都不同
+        # （详见各适配器模块的 docstring）
+        prod = await adapter.fetch(session, url, on_manual=on_manual)
     finally:
         if own_session:
             await session.close()
 
-    # 3. 下载图片（脱离浏览器会话，纯 requests）
-    main_imgs = [u for u in (data.get("images") or []) if isinstance(u, str)]
+    if not prod.title:
+        raise RuntimeError(f"{platform_name(platform)}提取到的标题为空（页面改版？）")
+
+    # 下载图片（脱离浏览器会话，纯 requests）
+    main_imgs = [u for u in (prod.mainImages or []) if isinstance(u, str)]
+    desc_imgs = [u for u in (prod.descImages or []) if isinstance(u, str)]
     downloaded: dict = {"main": [], "desc": []}
     if with_images:
         logger.info(f"下载图片：主图 {len(main_imgs)} 张 + 详情图 {len(desc_imgs)} 张")
@@ -582,23 +608,34 @@ async def extract_product(
                     downloaded[prefix].append({"url": u, "error": str(e)})
                     logger.warning(f"{prefix}-{i:02d} 下载失败：{e}")
 
-    # 4. 结构化提炼并落盘
+    # 结构化提炼并落盘（这段与来源平台无关：适配器已把差异吃掉）
     material_check = check_material_image(downloaded["main"])
-    attrs = parse_attrs(data.get("attrText"))
+    attrs = dict(prod.attributes or {})
     main_comp = parse_main_composition(attrs)
-    pivot, colors, sizes = pivot_skus(data.get("skuMap") or [])
+    pivot, colors, sizes = pivot_skus(prod.skuMap or [])
 
-    raw = {"offerId": offer_id, "url": url, **data, "descImages": desc_imgs}
+    raw = {"offerId": product_id, "productId": product_id, "url": url,
+           **prod.as_raw(), "descImages": desc_imgs}
     with open(os.path.join(outdir, "raw.json"), "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
     info = {
-        "source": {"platform": "1688", "url": url, "offerId": offer_id},
-        "title": data.get("subject"),
+        # 【offerId 保留】它是 1688 时代的键名，人工排查与既有 product-info.json 都在用；
+        # 新增 productId 与 platformName 而不是改名，免得动下游任何一处读法
+        # （实测下游没人读 source，但人在看的时候读，见 sources/__init__ 的说明）。
+        # url 记【原始链接】（就是实际访问的那个）；canonicalUrl 记归一形态，供人工
+        # 复现与跨批次对照。两个都留是因为原始链接里的会话参数会过期（拼多多的
+        # 搜索词参数失效后跳首页），而归一形态不能直接访问（见 normalize_url 的说明）。
+        "source": {"platform": prod.platform or platform,
+                   "platformName": platform_name(prod.platform or platform),
+                   "url": url,
+                   "canonicalUrl": normalize_url(url, prod.platform or platform),
+                   "offerId": product_id, "productId": product_id},
+        "title": prod.title,
         "attributes": attrs,
-        # 主面料成分/含量：阶段④成分行按它做确定性覆盖，解析不出时为 {}
+        # 主面料成分/含量：阶段④成分行按它做确定性覆盖，解析不出时按默认纤维兜
         "mainComposition": main_comp,
-        "packInfo": {"unitWeightKg": data.get("unitWeight")},
+        "packInfo": {"unitWeightKg": prod.unitWeightKg},
         "skus": pivot,
         "colors": colors,
         "sizes": sizes,
@@ -622,10 +659,14 @@ async def extract_product(
     result = {
         "status": "ok", "outdir": outdir, "infoPath": info_path,
         "title": info["title"], "attrCount": len(attrs),
+        "platform": prod.platform or platform,
+        "platformName": platform_name(prod.platform or platform),
+        "productId": product_id,
         "mainComposition": main_comp,
-        "skuCount": len(data.get("skuMap") or []),
+        "skuCount": len(prod.skuMap or []),
         "colors": colors, "sizes": sizes,
-        "unitWeightKg": data.get("unitWeight"),
+        "unitWeightKg": prod.unitWeightKg,
+        "videoUrl": prod.videoUrl or "",
         "mainImgs": len(downloaded["main"]), "descImgs": len(downloaded["desc"]),
         "materialCheck": material_check,
     }

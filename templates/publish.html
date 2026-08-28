@@ -93,6 +93,22 @@
           <i class="bi bi-cloud-upload me-1"></i> 商品发布
           <small class="text-muted fs-6">店小秘 Temu 半托管</small>
         </span>
+        <!-- 采集箱定时扫描开关：放在顶栏而不是折叠区里——它是【服务端常驻定时器】的
+             总闸，用户要能一眼看出「现在是不是在自动扫」。状态来自后端 prefs
+             （不是 localStorage）：定时器跑在服务端，换个标签页看到的必须是同一个状态。
+             默认关闭，由用户在这里开启。 -->
+        <div class="ms-3 d-flex align-items-center gap-2">
+          <div class="form-check form-check-inline form-switch small mb-0 me-0">
+            <input class="form-check-input" type="checkbox" id="chkScanTimer" />
+            <label
+              class="form-check-label"
+              for="chkScanTimer"
+              title="开启后按下方间隔定时扫描店小秘采集箱，找出「已认领但还没编辑过」的商品列在下面供勾选批量发布。扫描只读（不点任何按钮、不会自动发布），发布作业跑着时这一轮会自动跳过以免抢占编辑页"
+              >定时扫描采集箱</label
+            >
+          </div>
+          <span id="scanTimerHint" class="text-muted small"></span>
+        </div>
         <div class="ms-auto">
           <a href="/collect" class="btn btn-sm btn-outline-secondary me-1">
             <i class="bi bi-box-seam"></i> 批量采集
@@ -117,6 +133,124 @@
       <div id="publishHint" class="alert alert-warning py-2" role="alert">
         <i class="bi bi-shield-exclamation"></i>
         <span id="publishHintText"></span>
+      </div>
+
+      <!-- 采集箱清单：定时扫描扫到的【已认领但还没编辑过】的商品，勾选后批量填进任务框。
+           【为什么排在任务表单之前】它是任务的来源——先在这里挑，再到下面选店铺/站点点开始。
+           【为什么勾选后是填进 textarea 而不是直接发布】发布是不可逆动作，且店铺/站点/
+           申报价/自动发布这些参数都在下面那张表单上。填进去让用户复核一眼再点「开始发布」，
+           比在这里另开一条发布入口安全，也不必把那套参数在两处各维护一份。
+           【编辑进度怎么来的】列表接口判不出「编辑过没有」，是逐个 rowid 查 edit.json
+           得到的（判据见 app/publish/collectbox.py 的模块 docstring）。 -->
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center py-2">
+          <span
+            class="small cache-toggle"
+            role="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#scanCollapse"
+            aria-expanded="true"
+            aria-controls="scanCollapse"
+          >
+            <i class="bi bi-chevron-down"></i>
+            <i class="bi bi-inboxes"></i> 采集箱待编辑清单
+            <span id="scanSummary" class="text-muted ms-2"></span>
+          </span>
+          <span class="d-flex align-items-center gap-2">
+            <!-- 只列未编辑：默认开（本功能的用途就是找出还没编辑的去发布）。
+                 关掉则连「编辑了一半」「已编辑完」的一起列出来对照。它只影响呈现，
+                 不用重扫——扫描本来就把整页都探过了。 -->
+            <div class="form-check form-check-inline form-switch small mb-0 me-0">
+              <input class="form-check-input" type="checkbox" id="chkOnlyUnedited" />
+              <label
+                class="form-check-label text-muted"
+                for="chkOnlyUnedited"
+                title="只列「已认领但还没编辑过」的行（本功能的目标）。关掉会把「编辑了一半」和「已编辑完」的也列出来做对照——那两类不该重新走全流程，要用「从阶段续跑」"
+                >只看未编辑</label
+              >
+            </div>
+            <!-- 扫哪个列表：默认 draft（采集箱）。offline（页面文案「待发布」）里是
+                 已经编辑过的商品，留着只为对照，别当默认。 -->
+            <select
+              id="selScanState"
+              class="form-select form-select-sm"
+              style="width: auto"
+              title="扫哪个列表。「采集箱」= /pageList/draft（已认领待编辑，本功能的目标）；「待发布」= /pageList/offline（已编辑过的，仅供对照）"
+            ></select>
+            <div class="input-group input-group-sm" style="width: 140px">
+              <input
+                id="inputScanInterval"
+                type="number"
+                min="5"
+                max="1440"
+                class="form-control form-control-sm"
+                title="扫描间隔（分钟），默认 30。采集箱是人工采集攒出来的，攒够一批是小时级节奏，扫太勤只是白占那个 CDP 页面"
+              />
+              <span class="input-group-text">分钟</span>
+            </div>
+            <button
+              id="btnScanNow"
+              class="btn btn-outline-secondary btn-sm text-nowrap"
+              title="立刻扫一次（不必等定时器）。有发布作业在跑时会拒绝——扫描要导航那个页面，会毁掉正在填的表单"
+            >
+              <span
+                id="scanSpinner"
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+              ></span>
+              <i class="bi bi-arrow-clockwise"></i> 立即扫描
+            </button>
+          </span>
+        </div>
+        <div id="scanCollapse" class="collapse show">
+          <div class="card-body py-2">
+            <div id="scanEmpty" class="text-muted small">
+              尚未扫描。打开顶部「定时扫描采集箱」开关，或点右上角「立即扫描」。
+            </div>
+            <div id="scanBody" class="d-none">
+              <!-- 批量操作条：全选/反选 + 已选计数 + 填入任务框。
+                   全选只勾【当前显示的行】（受「只看未编辑」过滤），不会把隐藏的已编辑行
+                   一起勾上——那正是这个筛选存在的意义。 -->
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <div class="form-check form-check-inline small mb-0">
+                  <input class="form-check-input" type="checkbox" id="chkScanAll" />
+                  <label class="form-check-label text-muted" for="chkScanAll"
+                    >全选本页</label
+                  >
+                </div>
+                <button id="btnScanInvert" class="btn btn-outline-secondary btn-sm">
+                  反选
+                </button>
+                <span id="scanSelCount" class="text-muted small"></span>
+                <span class="flex-grow-1"></span>
+                <button
+                  id="btnScanToTasks"
+                  class="btn btn-primary btn-sm"
+                  title="把勾选的行填进下方任务框，并把店铺/站点带过去，复核后点「开始发布」"
+                >
+                  <i class="bi bi-arrow-down"></i> 填入任务框
+                </button>
+              </div>
+              <div class="table-responsive" style="max-height: 420px; overflow-y: auto">
+                <table class="table table-sm table-hover align-middle mb-0">
+                  <thead class="sticky-top bg-body">
+                    <tr class="text-muted small">
+                      <th style="width: 34px"></th>
+                      <th style="width: 54px">图</th>
+                      <th>产品标题</th>
+                      <th style="width: 96px">编辑状态</th>
+                      <th style="width: 110px">店铺</th>
+                      <th style="width: 90px">站点</th>
+                      <th style="width: 130px">来源</th>
+                      <th style="width: 120px">采集时间</th>
+                    </tr>
+                  </thead>
+                  <tbody id="scanBodyRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- 任务表单 -->
@@ -274,14 +408,15 @@
             </div>
           </div>
           <label class="form-label small text-muted mb-1">
-            任务（每行一个）：1688 链接，或
-            <code>rowid|info_path</code>（采集认领已建行的续跑格式）
+            任务（每行一个）：商品链接（1688 / 拼多多 / Temu / 亚马逊）、
+            <code>链接|rowid</code>（草稿已认领，提炼但不重复认领）、或
+            <code>rowid|info_path</code>（自带 product-info.json 的续跑格式）
           </label>
           <textarea
             id="inputTasks"
             class="form-control form-control-sm font-monospace"
             rows="6"
-            placeholder="https://detail.1688.com/offer/123456.html&#10;rowid123|C:\...\product_info.json"
+            placeholder="https://detail.1688.com/offer/123456.html&#10;https://mobile.pinduoduo.com/goods.html?goods_id=985357680144&#10;https://www.temu.com/co-en/xxx-g-605936466903004.html|173539495456771263&#10;rowid123|C:\...\product-info.json"
           ></textarea>
         </div>
       </div>
@@ -820,6 +955,362 @@
       loadStores();
       $("inputPrice").value = localStorage.getItem(LS_PRICE) || "";
 
+      // ---- 采集箱定时扫描：顶部开关 + 清单 + 批量操作 ----
+      // 【状态的唯一真相在后端】开关/间隔/扫哪个列表都存服务端 prefs，因为定时器跑在
+      // 服务端。故这里每次操作后都用后端返回的 status 回填控件，不在前端另存一份
+      // （与「自动发布」开关记 localStorage 的取向刻意相反：那个是「本次点开始用什么
+      // 参数」，属于前端选择）。
+      let scanItems = [];
+      const scanChecked = new Set(); // 勾选的 rowid：重渲染后要保住勾选
+
+      // 编辑进度四档的呈现。stage 由后端按 edit.json 的 6 个标记算出，
+      // 语义与依据见 app/publish/collectbox.py 的 _edit_progress。
+      const STAGE_BADGE = {
+        none: ["text-bg-success", "未编辑", "认领后还没编辑过——这批正是要走发布流程的"],
+        partial: [
+          "text-bg-warning",
+          "编辑了一半",
+          "产地/运输已填，尺码表或变种信息还没到：别重新全跑，用「从阶段续跑」接着做",
+        ],
+        full: [
+          "text-bg-secondary",
+          "已编辑",
+          "该填的都填了（尺码表/产地/运输/变种全有），不需要再跑一遍",
+        ],
+        unknown: [
+          "text-bg-light text-muted",
+          "查不到",
+          "详情接口没读到编辑状态，无法判断；宁可标出来也不猜（避免把已编辑的行当没编辑重跑一遍）",
+        ],
+      };
+
+      // 来源平台的徽章配色。键是后端给的 platform（英文），值是 bootstrap 配色类。
+      // 【为什么要分色】一批草稿常常混着几个来源，而不同来源的成本口径与货币都不同
+      // （Temu 源给的是站点币种、拼多多是拼团价），扫一眼能分出来比逐行读链接快。
+      // 认不出的平台走默认灰（text-bg-secondary），不需要在这里列。
+      const PLATFORM_BADGE = {
+        1688: "text-bg-warning",
+        pdd: "text-bg-danger",
+        temu: "text-bg-primary",
+        amazon: "text-bg-dark",
+      };
+
+      // 当前显示的行（受「只看未编辑」过滤）。全选/反选/填入都只作用于这批，
+      // 否则「只看未编辑」这个筛选就形同虚设。
+      function visibleScanItems() {
+        if (!$("chkOnlyUnedited").checked) return scanItems;
+        // 未知也留着：它可能是没编辑的，藏掉等于让用户永远看不到（后端刻意不猜，理由同上）
+        return scanItems.filter((i) => i.stage === "none" || i.stage === "unknown");
+      }
+
+      function renderScanStatus(d) {
+        $("chkScanTimer").checked = !!d.enabled;
+        if (d.onlyUnedited != null) $("chkOnlyUnedited").checked = !!d.onlyUnedited;
+        if (d.states && !$("selScanState").options.length) {
+          $("selScanState").innerHTML = d.states
+            .map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`)
+            .join("");
+        }
+        if (d.state) $("selScanState").value = d.state;
+        if (d.intervalMinutes) $("inputScanInterval").value = d.intervalMinutes;
+
+        // 顶栏提示：开着就报下次扫描时间，关着只报上次扫到多少（可能是上次进程留下的）。
+        // 【报的是「未编辑多少条」而不是总条数】用户关心的是「还有多少个可发」。
+        const bits = [];
+        if (d.enabled) {
+          bits.push(d.nextAt ? `下次 ${d.nextAt.slice(11, 16)}` : "已开启");
+        }
+        const pg = d.progress || {};
+        if (d.scannedAt) {
+          bits.push(`上次 ${d.scannedAt.slice(5, 16)} 扫到未编辑 ${pg.none || 0} 条`);
+        }
+        if (d.skipped) bits.push(`跳过 ${d.skipped} 轮`);
+        if (d.lastError) bits.push(`⚠ ${d.lastError.slice(0, 40)}`);
+        $("scanTimerHint").textContent = bits.join(" · ");
+
+        // 清单卡片头的摘要：四档进度 + 采集箱/待发布两个列表的总数。
+        // 两个列表的条数都标出来最省误解——offline 与 draft 的名字极易搞反。
+        const c = d.counts || {};
+        const parts = [];
+        if (d.scannedAt) {
+          parts.push(`${esc(d.scannedLabel || d.stateLabel || "")} 取 ${d.count} 条`);
+          if (d.total > d.count) parts.push(`共 ${d.total}`);
+          parts.push(
+            `未编辑 ${pg.none || 0} · 半编辑 ${pg.partial || 0} · 已编辑 ${pg.full || 0}` +
+              (pg.unknown ? ` · 查不到 ${pg.unknown}` : "")
+          );
+        }
+        if (c.draftNum != null) parts.push(`采集箱共 ${c.draftNum}`);
+        if (c.waitPublish != null) parts.push(`待发布 ${c.waitPublish}`);
+        $("scanSummary").textContent = parts.length ? "（" + parts.join(" · ") + "）" : "";
+      }
+
+      function renderScanRows() {
+        const shown = visibleScanItems();
+        const has = shown.length > 0;
+        $("scanEmpty").classList.toggle("d-none", has);
+        $("scanBody").classList.toggle("d-none", !has);
+        if (!has) {
+          // 扫过但过滤后为空 ≠ 没扫过，两种情况的文案必须不同：
+          // 前者是「都编辑过了」（好消息），后者是「还没开始扫」（要去点开关）。
+          $("scanEmpty").textContent = scanItems.length
+            ? `本次扫到 ${scanItems.length} 条，但没有「未编辑」的——它们都已编辑过或编辑了一半。关掉「只看未编辑」可以看全部。`
+            : "尚未扫描。打开顶部「定时扫描采集箱」开关，或点右上角「立即扫描」。";
+          return;
+        }
+        $("scanBodyRows").innerHTML = shown
+          .map((it) => {
+            // 来源列：四个平台（1688/拼多多/Temu/亚马逊）都能走 ①提炼全流程，
+            // 故有 offerId 就渲染成可点链接并标平台名。认不出的域名才只能按 rowid 续跑。
+            // 【2026-08-27 改】原先只认 1688，其余一律显示「非 1688 源」——实测采集箱
+            // 38% 的行是那样，全都在 GUI 上跑不通（见 app/publish/collectbox.py 头部）。
+            const src = it.offerId
+              ? `<a href="${esc(it.sourceUrl)}" target="_blank" class="text-decoration-none" title="${esc(it.sourceUrl)}"><span class="badge ${
+                  PLATFORM_BADGE[it.platform] || "text-bg-secondary"
+                } me-1">${esc(it.platformName || it.platform)}</span>${esc(it.offerId)}</a>`
+              : it.sourceUrl
+              ? `<span class="text-muted" title="${esc(it.sourceUrl)}">未知源</span>`
+              : '<span class="text-muted">—</span>';
+            const [badgeCls, badgeText, badgeTip] =
+              STAGE_BADGE[it.stage] || STAGE_BADGE.unknown;
+            const tip =
+              badgeTip +
+              (it.marks && it.marks.length ? `\n已填：${it.marks.join("、")}` : "") +
+              (it.probeError ? `\n${it.probeError}` : "");
+            return `<tr>
+              <td><input class="form-check-input scan-pick" type="checkbox" value="${esc(it.rowid)}" ${
+                scanChecked.has(it.rowid) ? "checked" : ""
+              }></td>
+              <td>${
+                it.img
+                  ? `<img src="${esc(it.img)}" alt="" style="width:40px;height:40px;object-fit:cover;border-radius:.25rem">`
+                  : ""
+              }</td>
+              <td class="small cell-ellipsis" title="${esc(it.title)}&#10;${esc(it.cat)}">${esc(
+                it.title
+              )}</td>
+              <td><span class="badge ${badgeCls}" title="${esc(tip)}">${esc(
+                badgeText
+              )}</span></td>
+              <td class="small">${esc(it.shop || it.shopId)}</td>
+              <td class="small">${esc(it.site || it.siteValue || "")}</td>
+              <td class="small">${src}</td>
+              <td class="small text-muted">${esc(it.createdAt)}</td>
+            </tr>`;
+          })
+          .join("");
+        syncScanSelCount();
+      }
+
+      function syncScanSelCount() {
+        const shown = visibleScanItems();
+        const n = [...scanChecked].filter((r) =>
+          shown.some((i) => i.rowid === r)
+        ).length;
+        $("scanSelCount").textContent = n ? `已选 ${n} 条` : "";
+        $("chkScanAll").checked = n > 0 && n === shown.length;
+        $("chkScanAll").indeterminate = n > 0 && n < shown.length;
+      }
+
+      function applyScanState(d) {
+        renderScanStatus(d);
+        if (d.items) {
+          scanItems = d.items;
+          // 清单换了以后，已勾但已不在清单里的 rowid 要丢掉（那行可能已被发布掉了）
+          const alive = new Set(scanItems.map((i) => i.rowid));
+          [...scanChecked].forEach((r) => {
+            if (!alive.has(r)) scanChecked.delete(r);
+          });
+        }
+        renderScanRows();
+      }
+
+      // 「只看未编辑」：纯前端过滤（扫描时整页都探过了，切开关不必重扫），
+      // 但状态要存后端——它属于「定时器的呈现配置」，换标签页应看到同一份。
+      $("chkOnlyUnedited").addEventListener("change", () => {
+        // 切换过滤后，被隐藏的行不该留在勾选集里（否则「填入任务框」会带上看不见的行）
+        const visible = new Set(visibleScanItems().map((i) => i.rowid));
+        [...scanChecked].forEach((r) => {
+          if (!visible.has(r)) scanChecked.delete(r);
+        });
+        renderScanRows();
+        postScanSettings({ onlyUnedited: $("chkOnlyUnedited").checked });
+      });
+
+      async function loadScanState() {
+        try {
+          const r = await fetch("/publish/collectbox");
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyScanState(d);
+        } catch (e) {
+          $("scanTimerHint").textContent = "（状态读取失败）";
+        }
+      }
+
+      async function postScanSettings(payload) {
+        try {
+          const r = await fetch("/publish/collectbox/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyScanState(d);
+          return d;
+        } catch (e) {
+          showToast("设置失败", String(e).replace(/^Error:\s*/, ""), "danger");
+          loadScanState(); // 回填后端真实状态，别让控件停在用户以为生效的位置
+        }
+      }
+
+      $("chkScanTimer").addEventListener("change", async () => {
+        const on = $("chkScanTimer").checked;
+        const d = await postScanSettings({ enabled: on });
+        if (d)
+          showToast(
+            "定时扫描",
+            on
+              ? `已开启：每 ${d.intervalMinutes} 分钟扫一次${d.stateLabel}列表`
+              : "已关闭",
+            on ? "success" : "secondary"
+          );
+      });
+      $("selScanState").addEventListener("change", () =>
+        postScanSettings({ state: $("selScanState").value })
+      );
+      $("inputScanInterval").addEventListener("change", () =>
+        postScanSettings({ intervalMinutes: parseInt($("inputScanInterval").value, 10) })
+      );
+
+      $("btnScanNow").addEventListener("click", async () => {
+        $("btnScanNow").disabled = true;
+        $("scanSpinner").classList.remove("d-none");
+        try {
+          const r = await fetch("/publish/collectbox/scan", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ state: $("selScanState").value }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyScanState(d);
+          showToast(
+            "扫描完成",
+            `${d.scannedLabel || d.stateLabel} 扫到 ${d.count} 条` +
+              (d.total > d.count ? `（共 ${d.total} 条，只取前 ${d.count} 条）` : ""),
+            d.count ? "success" : "secondary"
+          );
+        } catch (e) {
+          showToast("扫描失败", String(e).replace(/^Error:\s*/, ""), "danger");
+        } finally {
+          $("btnScanNow").disabled = false;
+          $("scanSpinner").classList.add("d-none");
+        }
+      });
+
+      // 勾选：事件委托挂在 tbody 上（行是重渲染出来的，逐个绑会在每次渲染后丢）
+      $("scanBodyRows").addEventListener("change", (e) => {
+        const box = e.target.closest(".scan-pick");
+        if (!box) return;
+        if (box.checked) scanChecked.add(box.value);
+        else scanChecked.delete(box.value);
+        syncScanSelCount();
+      });
+      $("chkScanAll").addEventListener("change", () => {
+        const on = $("chkScanAll").checked;
+        // 只作用于当前显示的行（DOM 里就只有这些），隐藏的已编辑行不该被顺手勾上
+        document.querySelectorAll(".scan-pick").forEach((b) => {
+          b.checked = on;
+          if (on) scanChecked.add(b.value);
+          else scanChecked.delete(b.value);
+        });
+        syncScanSelCount();
+      });
+      $("btnScanInvert").addEventListener("click", () => {
+        document.querySelectorAll(".scan-pick").forEach((b) => {
+          b.checked = !b.checked;
+          if (b.checked) scanChecked.add(b.value);
+          else scanChecked.delete(b.value);
+        });
+        syncScanSelCount();
+      });
+
+      // 「填入任务框」：把勾选行写成管线认的任务行，并把店铺/站点带到下方下拉。
+      // 【为什么填源链接而不是 rowid】rowid 模式会跳过 ①extract，但那样就没有
+      // product-info.json，管线在 ④ 属性阶段直接报错（rowid|info_path 里的 info_path
+      // 是 ① 的产物，此刻还不存在）。填源链接则走完整 ①→⑮，与手工粘链接等价。
+      // 那会不会重复采集认领、凭空多一条草稿？不会——阶段② 判据是任务带不带 rowid，
+      // 而这里同时把 rowid 也带上（见下面的 lines：源链接 + "|" + rowid 两段式）。
+      // 【四个平台都填源链接】2026-08-27 起 ①extract 支持 1688/拼多多/Temu/亚马逊
+      // （见 app/publish/sources/），故只有认不出平台的行才退回纯 rowid。
+      $("btnScanToTasks").addEventListener("click", () => {
+        // 只取【当前显示且勾中】的行：受「只看未编辑」过滤，避免把隐藏的已编辑行带进去
+        const shown = visibleScanItems();
+        const picked = shown.filter((i) => scanChecked.has(i.rowid));
+        if (!picked.length) {
+          showToast("无法填入", "请先勾选要发布的商品", "warning");
+          return;
+        }
+        // 已编辑过的行不该重新走全流程（会把已填的覆盖掉），故勾到了就提醒一句。
+        // 【不硬拦】用户可能确实想重跑（比如上次填错了），拦死反而多一道解释不清的墙。
+        const edited = picked.filter((i) => i.stage === "full" || i.stage === "partial");
+        // 认得出平台的填「源链接|rowid」（跑①提炼、跳②认领，见 parseTasks 的说明），
+        // 认不出的只能填纯 rowid（跑不通，下面会提示）。
+        const lines = picked.map((i) =>
+          i.offerId ? `${i.sourceUrl}|${i.rowid}` : i.rowid
+        );
+        const ta = $("inputTasks");
+        const prev = ta.value.trim();
+        ta.value = (prev ? prev + "\n" : "") + lines.join("\n");
+
+        // 店铺/站点：勾中的行都属于同一店铺站点时自动带过去（这些行已认领到那里，
+        // 换成别的店会在 ② 认领阶段又建一条草稿）。混选多个店铺时不猜，提示用户自己选。
+        const shops = [...new Set(picked.map((i) => i.shop).filter(Boolean))];
+        const sites = [...new Set(picked.map((i) => i.site).filter(Boolean))];
+        const msgs = [`已填入 ${lines.length} 行`];
+        if (shops.length === 1) {
+          const opt = [...$("selStore").options].find((o) => o.value === shops[0]);
+          if (opt) {
+            $("selStore").value = shops[0];
+            localStorage.setItem(LS_STORE, shops[0]);
+            // 站点下拉要按店铺重载，加载完再回填站点（loadSites 内部会优先选
+            // localStorage 里的值，故先写进去再让它加载）
+            if (sites.length === 1) localStorage.setItem(LS_SITE, sites[0]);
+            loadSites(shops[0]);
+            msgs.push(`店铺=${shops[0]}`);
+            if (sites.length === 1) msgs.push(`站点=${sites[0]}`);
+          }
+        } else if (shops.length > 1) {
+          msgs.push(`勾中 ${shops.length} 个店铺（${shops.join("、")}），请自行选定`);
+        }
+        const noOffer = picked.filter((i) => !i.offerId).length;
+        if (noOffer)
+          msgs.push(
+            `其中 ${noOffer} 行来源平台认不出，已按 rowid 填入：这类行需自带 ` +
+              "product-info.json，请补成 rowid|info_path 或改从对应阶段续跑"
+          );
+        // 来源分布：混着几个平台时说一声——成本口径与币种按平台不同（拼多多是拼团价、
+        // Temu 是站点币种），一批混采时值得知道。
+        const srcNames = [
+          ...new Set(picked.map((i) => i.platformName).filter(Boolean)),
+        ];
+        if (srcNames.length > 1) msgs.push(`来源：${srcNames.join("、")}`);
+        if (edited.length)
+          msgs.push(
+            `注意 ${edited.length} 行已编辑过（或编辑了一半），重新全跑会覆盖已填内容；` +
+              "这类行建议用「从阶段续跑」"
+          );
+        showToast(
+          "已填入任务框",
+          msgs.join("；"),
+          noOffer || edited.length ? "warning" : "success"
+        );
+      });
+
+      loadScanState();
+
       // 自动发布开关：状态回填 + 顶部提示条随开关切换文案。
       // 提示条两种措辞刻意分色：开＝danger（这一趟会真上架，不可逆），
       // 关＝warning（只落库，还要人工去发）。写死一种会让人看错当前会发生什么。
@@ -873,7 +1364,16 @@
         box.scrollTop = box.scrollHeight;
       }
 
-      // 解析任务输入：含 | 的行 -> {rowid, info_path}，否则 -> {url}
+      // 解析任务输入，三种形态：
+      //   <源链接>                 -> {url}            全流程 ①→⑮（会采集认领建草稿）
+      //   <源链接>|<rowid>         -> {url, rowid}     跑①提炼、跳②认领（草稿已存在）
+      //   <rowid>|<info_path>      -> {rowid, info_path} 跳①②（自带 product-info.json）
+      // 【第二种是采集箱清单专用】那些行在店小秘已经是认领好的草稿，既需要 ① 产出
+      // product-info.json（否则 ④ 属性阶段缺它报错），又不能再认领一次（会凭空多一条
+      // 草稿，认领不可逆）。管线的两个判据本来就是独立的——① 看 info_path、② 看
+      // rowid（见 app/publish/service.py 的 _st_extract 与 _st_claim），故 url+rowid
+      // 同时给就正好是「提炼但不认领」。
+      // 区分靠第一段是不是 URL：rowid 是纯数字，源链接一律 http 开头，不会歧义。
       function parseTasks(text) {
         return text
           .split("\n")
@@ -881,8 +1381,11 @@
           .filter(Boolean)
           .map((l) => {
             if (l.includes("|")) {
-              const [rowid, ...rest] = l.split("|");
-              return { rowid: rowid.trim(), info_path: rest.join("|").trim() };
+              const [first, ...rest] = l.split("|");
+              const head = first.trim();
+              const tail = rest.join("|").trim();
+              if (/^https?:\/\//i.test(head)) return { url: head, rowid: tail };
+              return { rowid: head, info_path: tail };
             }
             return { url: l };
           });
@@ -1059,7 +1562,11 @@
       async function startBatch() {
         const tasks = parseTasks($("inputTasks").value);
         if (!tasks.length) {
-          showToast("无法开始", "任务列表为空：每行填一个 1688 链接或 rowid|info_path", "warning");
+          showToast(
+            "无法开始",
+            "任务列表为空：每行填一个商品链接（1688/拼多多/Temu/亚马逊）、链接|rowid，或 rowid|info_path",
+            "warning"
+          );
           return;
         }
         // 店铺/站点在前端就拦住，不靠后端 aborted 事件：那要先建 job、连 SSE、

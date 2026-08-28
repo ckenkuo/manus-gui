@@ -42,6 +42,45 @@ MAX_DIM = 3840
 # 素材图目标边长：1785 同时满足素材图 ≥800×800 和服装类 ≥1340×1785 两条规则
 MATERIAL_TARGET = 1785
 
+# ---- 描述长图（产品描述里的「图片模块」）的规则，与 SKC/素材图【完全不同】-------
+# 2026-08-28 用户截图取证：描述图模块弹窗自带说明——
+#   「0.5 <= [图片宽 + 图片高] <= 2，宽度 >= 480，高度 >= 480，
+#     上传图片大小限制在 10M 以内，发布到 temu 后台时请压缩至 3M 以内」
+# 说明里的「图片宽 + 图片高」按其取值范围（0.5~2）只能是【宽高比】，不是相加。
+#
+# 【为什么必须与 CLOTH_MIN_W/H 分开】原先描述图也套服装 SKC 的 1340x1785 硬红线，
+# 于是 1000x1000（比例 1.0、两边都 >= 480，本来完全合格）被判成「低于 1340x1785」，
+# 触发放大甚至重新生图——每跑一次白烧一轮生图，而平台压根没这个要求。
+# 服装那条红线是「服装类图片尺寸/比例」校验，只管颜色图与素材图，不管描述图。
+DESC_MIN_W = 480
+DESC_MIN_H = 480
+DESC_RATIO_MIN = 0.5
+DESC_RATIO_MAX = 2.0
+# 体积上限取 temu 后台口径（3M）而不是上传口径（10M）：上传时不拦、发布到 temu
+# 才被拦的话要回到这一步重做，代价比一开始就压到 3M 内高。
+DESC_MAX_BYTES = 3 * 1024 * 1024
+
+
+def check_desc_size(w, h, size_bytes=None) -> dict:
+    """描述长图合规判断：比例 0.5~2、两边 >= 480、体积 <= 3M。
+
+    返回 {"ok": bool|None, "reasons": [...]}。宽高读不到时 ok=None，交调用方按
+    「读不到」处理——把未知判成不合格会触发无谓的放大/重新生图，正是这次要避免的。
+    """
+    if not w or not h:
+        return {"ok": None, "reasons": ["宽高读取失败"]}
+    reasons = []
+    if w < DESC_MIN_W or h < DESC_MIN_H:
+        reasons.append(f"{w}x{h} 小于 {DESC_MIN_W}x{DESC_MIN_H}")
+    ratio = w / h
+    if not (DESC_RATIO_MIN <= ratio <= DESC_RATIO_MAX):
+        reasons.append(f"宽高比 {ratio:.3f} 超出 {DESC_RATIO_MIN}~{DESC_RATIO_MAX}")
+    if size_bytes and size_bytes > DESC_MAX_BYTES:
+        reasons.append(f"体积 {size_bytes / 1024 / 1024:.1f}M 超过 "
+                       f"{DESC_MAX_BYTES // 1024 // 1024}M")
+    return {"ok": not reasons, "reasons": reasons}
+
+
 # ---- AI 编辑（Packy gpt-image-2）------------------------------------------
 API_BASE = "https://cf.api.fan/v1"
 MODEL = "gpt-image-2"
@@ -636,16 +675,21 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
                out_path: Optional[str] = None, size: Optional[str] = None,
                quality: str = "low", target: Optional[str] = None,
                do_compress: bool = True, no_downscale: bool = False,
-               timeout: int = 280) -> dict:
+               timeout: int = 280, desc_mode: bool = False) -> dict:
     """AI 编辑单张图（去中文/去水印/英化）。
 
     prompt 缺省用 DEFAULT_CLEAN_PROMPT，但【建议调用方按图定制】：先看图定位具体问题
     （什么文字、在哪个位置），针对性给提示词，效果远好于笼统的「移除所有文字」。
     size 缺省按原图宽高比自动选允许尺寸；quality 默认 low（够用且快）。
-    出图后默认 compress（≥1340×1785、长边 ≤3840、JPEG q80）控体积。
+    出图后默认 compress（>=1340x1785、长边 <=3840、JPEG q80）控体积。
 
     no_downscale=True 让自动选档不小于原图（见 pick_size 注释），素材图用。
     timeout 可压短：批量清理时一张卡住不该拖住整批（阶段⑥前置清理给 90s）。
+
+    desc_mode=True 走【描述长图】的尺寸口径（两边 >= 480、比例 0.5~2，见
+    check_desc_size）：不按服装闸门挑出图尺寸、收尾 compress 也不放大到 1340x1785。
+    2026-08-28 用户明确：描述图不需要 1700+，套服装红线只会白插值放大、糊掉画面，
+    还让本来合格的 1000x1000 被判不达标而重烧生图。
     """
     if not os.path.exists(image_path):
         raise FileNotFoundError(image_path)
@@ -653,7 +697,9 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
     fields = {
         "model": MODEL,
         "prompt": prompt or DEFAULT_CLEAN_PROMPT,
-        "size": size or pick_size_for_file(image_path, no_downscale=no_downscale),
+        # 描述图不过服装闸门：按原图比例挑档即可，不必为「够 1340x1785」而放大出图
+        "size": size or pick_size_for_file(image_path, no_downscale=no_downscale,
+                                           gate_aware=not desc_mode),
         "quality": quality,
         "n": 1,
     }
@@ -665,7 +711,8 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
         with Image.open(saved) as im:
             im.convert("RGB").resize((tw, th), Image.LANCZOS).save(saved)
     if do_compress:
-        saved = compress(saved)
+        saved = (compress(saved, min_w=DESC_MIN_W, min_h=DESC_MIN_H)
+                 if desc_mode else compress(saved))
     return {"status": "ok", "input": image_path, "output": saved,
             "size": fields["size"], "outSize": "x".join(map(str, image_size(saved) or ()))}
 

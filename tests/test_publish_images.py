@@ -234,7 +234,9 @@ async def test_desc_save_尺寸不达标也判validation_error():
     r = await pipeline.desc_save(_S())
     assert r["status"] == "validation-error"
     assert len(r["tooSmall"]) == 2
-    assert "1340x1785" in r["note"]
+    # 2026-08-28 起结论按【描述图自己的口径】写（比例 0.5~2、两边 >= 480），
+    # 不再提服装的 1340x1785——那条只管 SKC/素材图（见 images.check_desc_size）
+    assert "480" in r["note"] and "1340x1785" not in r["note"]
 
 
 @pytest.mark.asyncio
@@ -258,9 +260,11 @@ def test_desc_save_js_带尺寸下限占位符():
     from app.publish.pipeline import _JS_DESC_SAVE
 
     assert "__MINW__" in _JS_DESC_SAVE and "__MINH__" in _JS_DESC_SAVE
+    # 2026-08-28 起还要注入比例上下限：描述图的规则是「比例 0.5~2 且两边 >= 480」
+    assert "__RMIN__" in _JS_DESC_SAVE and "__RMAX__" in _JS_DESC_SAVE
     assert "naturalWidth" in _JS_DESC_SAVE
     # 未加载完（0）不能当成不达标，否则会误报一堆
-    assert "if (w && h" in _JS_DESC_SAVE
+    assert "if (!w || !h) return;" in _JS_DESC_SAVE
 
 
 # ---- 描述编辑器必须让出屏幕 --------------------------------------------------
