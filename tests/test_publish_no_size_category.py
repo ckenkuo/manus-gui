@@ -262,3 +262,83 @@ def test_有尺码列时仍按两维拼():
     r = asyncio.run(P.fix_sku_codes(s))
     assert r["status"] == "ok"
     assert [p["code"] for p in s.plan] == ["Gray-100", "Gray-110"]
+
+
+# ---- 5) ⑦ SKC：本类目没有颜色图位时跳过 ---------------------------------------
+#
+# 2026-08-29 真站取证（草稿 173539495451708963，类目仿真花）+ 用户截图：
+# 该类目变种属性区【没有任何图片位】——行内 http 图 0、「选择图片」按钮 0、
+# .single-image 图格 0、连 <tr> 都没有（颜色是复选框列表，界面上只有勾选框和铅笔）。
+# 于是 _skc_row_state 按「tr + textContent 含颜色名」找行必然报
+# 「找不到颜色行: 【心想事橙】橙子花筒（life盆）」，⑦ 六行全失败（0/6 行完成）。
+# 那不是定位写错，是平台按类目决定不支持按颜色配图——与⑧⑨ 同一性质。
+
+class _SkcSupportSession:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def eval_json(self, js, **kw):
+        if "pickBtns" in js:
+            return self.payload
+        return {}
+
+
+def test_无图片位时判不支持():
+    """仿真花的真实现场：6 个颜色复选框、三个图片位信号全 0。"""
+    s = _SkcSupportSession({"section": True, "rows": 0, "imgs": 0, "pickBtns": 0,
+                            "imageCells": 0, "checkboxes": 6})
+    r = asyncio.run(P.skc_image_support(s))
+    assert r["supported"] is False
+
+
+def test_有图片位时判支持():
+    """服装类目：行内有 .single-image 图格与「选择图片」按钮，必须照旧走原路。"""
+    s = _SkcSupportSession({"section": True, "rows": 4, "imgs": 12, "pickBtns": 4,
+                            "imageCells": 12, "checkboxes": 8})
+    r = asyncio.run(P.skc_image_support(s))
+    assert r["supported"] is True
+
+
+def test_区块未渲染时不判不支持():
+    """连复选框都没有 = 还没渲染完，证据不足。
+
+    判成「不支持」会让服装商品静默跳过 SKC 换图、带着 1688 原图发出去——
+    这个方向的误判代价远大于多跑一轮。
+    """
+    for bad in ({"section": False},
+                {"section": True, "checkboxes": 0, "imgs": 0, "pickBtns": 0,
+                 "imageCells": 0}):
+        r = asyncio.run(P.skc_image_support(_SkcSupportSession(bad)))
+        assert r["supported"] is None, bad
+
+
+def test_只要有一个图片位信号就算支持():
+    """三个信号任一非 0 即支持：换过图的行有 imgs、没换过的至少有按钮或图格。"""
+    for one in ("imgs", "pickBtns", "imageCells"):
+        p = {"section": True, "rows": 4, "imgs": 0, "pickBtns": 0,
+             "imageCells": 0, "checkboxes": 8}
+        p[one] = 3
+        r = asyncio.run(P.skc_image_support(_SkcSupportSession(p)))
+        assert r["supported"] is True, one
+
+
+def test_阶段七不支持时跳过且不发视觉请求(monkeypatch):
+    """跳过要发生在 plan_skc 之前——那是一次视觉调用，白烧没有意义。"""
+    events = []
+
+    async def emit(ev):
+        events.append(ev)
+
+    async def boom(*a, **kw):
+        raise AssertionError("不支持颜色图时不该调 plan_skc（白烧一次视觉请求）")
+
+    async def fake_support(session):
+        return {"supported": False, "checkboxes": 6}
+
+    monkeypatch.setattr(S, "skc_image_support", fake_support)
+    monkeypatch.setattr(S.vision, "plan_skc", boom)
+    monkeypatch.setattr(S, "_load_info", lambda p: {"colors": ["a", "b"]})
+    r = asyncio.run(S._st_skc({"info_path": "x", "workdir": "y"}, None, emit))
+    assert r["status"] == "skipped"
+    assert "颜色图位" in r["note"]
+    assert any("不支持按颜色配图" in (e.get("message") or "") for e in events)

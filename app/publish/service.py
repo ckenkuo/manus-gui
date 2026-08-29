@@ -145,6 +145,7 @@ from app.publish.pipeline import (
     set_titles,
     set_variant,
     set_video,
+    skc_image_support,
     skc_replace_row,
     read_video_url,
     SKC_ROW_MIN_IMAGES,
@@ -1129,6 +1130,18 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
 
 async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
     info = _load_info(ctx["info_path"])
+    # 【先问页面支不支持按颜色配图】2026-08-29 真站取证（1014675972015 仿真花）：
+    # 该类目变种属性区没有任何图片位（无 tr、无「选择图片」按钮、无 .single-image），
+    # 颜色只是一列复选框。此时 ⑦ 无事可做，六行全报「找不到颜色行」纯属噪音，
+    # 还会白烧一次 plan_skc 的视觉调用与整轮补图。与 ⑧⑨ 同一性质，见
+    # pipeline.skc_image_support 上方的取证记录。
+    sup = await skc_image_support(session)
+    if sup.get("supported") is False:
+        await emit({"type": "log", "stage": "skc",
+                    "message": f"本类目变种属性区不支持按颜色配图"
+                               f"（{sup.get('checkboxes')} 个颜色复选框、无图片位），"
+                               "跳过 SKC 颜色图"})
+        return {"status": "skipped", "note": "本类目无 SKC 颜色图位"}
     plan = await vision.plan_skc(info, ctx["workdir"])
     rows = plan.get("rows") or []
     colors = [c for c in (info.get("colors") or []) if c]

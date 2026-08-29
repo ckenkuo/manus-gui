@@ -6851,6 +6851,51 @@ def _skc_row_matches(state: dict, file_ids: list, expect_count: int) -> dict:
     return {"done": True, "reason": f"页面上就是上一轮挂的 {len(file_ids)} 张图"}
 
 
+# 变种属性区有没有「按颜色配图」这个功能。
+#
+# 【为什么要单独探这个】2026-08-29 真站取证（草稿 173539495451708963，类目仿真花）：
+# 该类目的变种属性区【没有任何图片位】——行内 http 图 0、「选择图片」按钮 0、
+# .single-image 图格 0，连 <tr> 都没有（颜色是复选框列表，界面上只有勾选框和一个
+# 铅笔改名图标，见用户截图）。于是 _skc_row_state 按「tr + textContent 含颜色名」
+# 找行必然报「找不到颜色行: 【心想事橙】橙子花筒（life盆）」，⑦ 六行全失败。
+# 那不是定位写错，是这个类目压根不支持按颜色配图——与⑧ 无尺码维、⑨ 无尺码表栏
+# 同一性质：平台按类目决定有没有这个功能，没有就该 skipped 而不是 fail。
+#
+# 判据取【图片位的三个结构信号】而不是「找不到行就算没有」：后者会把
+# 「颜色名对不上」（真的定位问题，比如平台改了名字）也判成「本类目不支持」，
+# 那种情况必须暴露出来，否则服装商品的 SKC 换图会静默跳过、发出去全是 1688 原图。
+_JS_SKC_IMAGE_SUPPORT = r"""(() => {
+  const sec = document.getElementById('skuAttrsInfo');
+  if (!sec) return JSON.stringify({section: false});
+  const httpImg = el => (el.currentSrc || el.src || '').startsWith('http');
+  return JSON.stringify({
+    section: true,
+    rows: sec.querySelectorAll('tr').length,
+    imgs: Array.from(sec.querySelectorAll('img')).filter(httpImg).length,
+    pickBtns: Array.from(sec.querySelectorAll('button'))
+      .filter(b => (b.textContent || '').includes('选择图片')).length,
+    imageCells: sec.querySelectorAll('.single-image').length,
+    // 复选框数非 0 说明区块确实渲染完了（无图片位的类目这些是颜色复选框）
+    checkboxes: sec.querySelectorAll('label.d-checkbox').length,
+  });
+})()"""
+
+
+async def skc_image_support(session: BrowserSession) -> dict:
+    """变种属性区是否支持按颜色配图。返回 {"supported": bool|None, ...}。
+
+    supported=False：区块已渲染（有复选框）但三个图片位信号全为 0 → 本类目不支持，
+    调用方应当 skipped。
+    supported=None：区块没渲染完（连复选框都没有）→ 证据不足，别当成「不支持」，
+    照旧走原路让真失败暴露出来。
+    """
+    st = await session.eval_json(_JS_SKC_IMAGE_SUPPORT)
+    if not st.get("section") or not st.get("checkboxes"):
+        return {"supported": None, **st}
+    has_slot = bool(st.get("imgs") or st.get("pickBtns") or st.get("imageCells"))
+    return {"supported": has_slot, **st}
+
+
 async def skc_replace_row(session: BrowserSession, row_keyword: str, img_dir: str,
                           full_cid: Optional[str] = None) -> dict:
     """阶段⑦ 整行替换某颜色的 SKC 图（服装类需 3:4 且不小于 1340×1785）。
