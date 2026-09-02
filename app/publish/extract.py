@@ -101,17 +101,83 @@ _JS_EXTRACT = """(() => {
 # 描述长图不在页面 DOM 里，要拉 description.detailUrl 那个接口再正则抠图片 URL。
 # 在页面上下文里 fetch（而不是 Python 直连）是因为该接口认来源；credentials:'omit'
 # 是原脚本实测的写法，带 cookie 反而可能被拒。
+#
+# 【也要把纯文字带回来】2026-09-01 取证（offer 971999094281 韩系牛仔外套）：这个商家
+# 把整张尺码表直接打在详情文字里而不是做成图——响应体里就是「S 衣长59 胸围118 袖长57
+# 肩宽52 / M … / L …」三行明文。原先这里只 match 图片 URL，文字整段丢弃，于是
+# sizeMeasurements 落成空表、阶段⑨ 的四个参数全靠模型凭空估算，而准确值本来就在手上。
+# 抽样 16 个 sizeMeasurements 为空的 1688 商品：多数确实是纯图详情（文字里只有
+# offer-type 之类的排版残渣），但这种文字形态真实存在，且它的数据比识图更可信
+# （商家白纸黑字写的，没有 OCR 这道误差）。
 _JS_DETAIL = """(async () => {
   const r = await fetch(__URL__, {credentials: 'omit'});
   const t = await r.text();
   const m = t.match(/https?:\\/\\/[^"'\\s\\\\]+\\.(jpg|jpeg|png|webp)/gi);
   const imgs = m ? [...new Set(m)] : [];
-  return JSON.stringify({status: r.status, len: t.length, imgs: imgs});
+  return JSON.stringify({status: r.status, len: t.length, imgs: imgs, html: t});
 })()"""
 
 # 描述图 URL 的抠取规则，与上面 JS 里那条正则保持一字不差：两条取图路径
 # （页面内 fetch / Python 直连）必须抠出同一批图，否则同一商品换条路径结果就变。
 _RE_DESC_IMG = re.compile(r"""https?://[^"'\s\\]+\.(?:jpg|jpeg|png|webp)""", re.I)
+
+# 详情响应体里的排版残渣：剥标签后会剩下这些，它们既不是商品信息也干扰下游判「有没有
+# 文字」。逐条都是真站样本里实际出现过的（见 desc_text_of 的取证）：
+#   var offer_details={"content": —— 响应体本身是个 JS 赋值语句，不是纯 HTML
+#   {"styleType":"offer-type-1","items":"946015259959,…"} —— 关联推荐位的配置 JSON
+#   null / &nbsp; / &quot; —— 空占位与实体
+_RE_DESC_JUNK = re.compile(
+    r"""var\s+offer_details\s*=\s*\{\s*"content"\s*:\s*"?"""
+    r"""|\{&quot;styleType&quot;.*?\}"""
+    r"""|\{"styleType".*?\}"""
+    r"""|&nbsp;|&quot;|^null$""",
+    re.I | re.M | re.S)
+
+_RE_TAG = re.compile(r"<[^>]+>")
+
+# 详情文字里「可能有尺码表」的信号词：一个都不命中就不必问模型（见 enrich_desc_text
+# 的关键词闸）。取的是量法名与尺码写法两类——多数纯文字详情写的是发货/洗涤/售后说明，
+# 那些文字里这些词一个都不会出现。宁可放宽也不收紧：漏判等于白丢一份现成的准确数据，
+# 误判只是多花一次极短的文本调用。
+_RE_SIZE_HINT = re.compile(
+    r"衣长|胸围|肩宽|袖长|裤长|裙长|腰围|臀围|摆长|裆|脚口|领围|尺码|尺寸"
+    r"|建议身高|参考身高|适合身高|净重|体重"
+    r"|\b\d{2,3}\s*cm\b|\b\d{1,2}\s*-\s*\d{1,2}\s*[my]\b",
+    re.I)
+
+
+def desc_text_of(html: str) -> str:
+    """把详情接口响应体剥成可读纯文字；没有可读内容时返回空串。
+
+    【为什么要这个函数】2026-09-01 取证（offer 971999094281）：有商家把整张尺码表打在
+    详情文字里（「S 衣长59 胸围118 袖长57 肩宽52」三行明文），而两条取数路径原先都只
+    正则抠 <img>、文字整段丢掉，于是那份现成的准确数据白白丢失、阶段⑨ 改凭空估算。
+
+    与 _RE_DESC_IMG 同一条约定：两条取数路径（页面内 fetch / Python 直连）必须得出
+    同一份文字，故剥法收在这一个函数里，两边都调它，不各写一遍。
+
+    做的事只有「剥标签 + 去排版残渣 + 压空白」，【不做任何尺码语义解析】——那是
+    enrich_desc_text 的职责。这里多做一步就等于把「取数」和「理解」搅在一起，
+    而取数必须是确定性的（同一个响应体永远得出同一份文字）。
+
+    返回空串的两种情形都当「这个商品没有文字详情」处理：响应体全是图与排版残渣
+    （抽样里的多数商品就是这样），或者压根没取到响应体。
+    """
+    t = str(html or "")
+    if not t.strip():
+        return ""
+    # 标签在残渣之前剥：残渣里的 {"styleType"…} 本身不带标签，而 <img> 等标签的属性里
+    # 可能含 & 实体，先剥标签能少一批误伤
+    t = _RE_TAG.sub("\n", t)
+    t = _RE_DESC_JUNK.sub("\n", t)
+    t = t.replace("\\r", "\n").replace("\\n", "\n").replace("\\t", " ")
+    # 逐行去空白后丢空行：源里满是 \r\n + 大段缩进（真站样本一屏几十个空行）
+    lines = [re.sub(r"[ \t　]+", " ", ln).strip() for ln in t.split("\n")]
+    # 尾行常是赋值语句的收尾（`"};`）、有时前面还粘着 null（真站样本 997982969709
+    # 剥完就剩 `null"};`）。整行只由这些符号与 null 组成才丢，含真实文字的行不动。
+    lines = [ln for ln in lines
+             if ln and not re.fullmatch(r"(?:null|true|false|[\"'};,\s\]\[]|)+", ln)]
+    return "\n".join(lines).strip()
 
 # 图片 CDN 的 bot 拦截规避（同 collect 侧的坑）：裸请求会连接重置或 403。
 _IMG_HEADERS = {
@@ -327,6 +393,9 @@ def _download_image(url: str, dst_path: str, retries: int = 3) -> int:
     与 collect 侧同一个坑（见 app/collect/pipeline._download_main_image）：CDN 对
     无 UA/Referer 的请求做 bot 拦截，表现为连接重置或 403。原脚本只带裸 UA + 零重试，
     一次瞬时重置就丢一张图。这里补齐浏览器头 + 指数退避重试。
+
+    【404 容错】源站图片删除/失效时返回 404，属于上游数据质量问题；遇到 404 时记录
+    警告并返回 0，不中断整个流程（调用方会跳过该图）。
     """
     import time
     import requests
@@ -344,15 +413,24 @@ def _download_image(url: str, dst_path: str, retries: int = 3) -> int:
             return len(r.content)
         except Exception as e:
             last_err = e
+            # 404 属于源站数据问题，不值得重试，直接跳过
+            if "404" in str(e) or "Not Found" in str(e):
+                logger.warning(f"图片源站 404，跳过：{url}")
+                return 0
             if attempt < retries:
                 wait = (0, 1, 3)[min(attempt, 2)]
                 logger.warning(f"图片下载失败（{attempt}/{retries}）：{e}；{wait}s 后重试")
                 time.sleep(wait)
-    raise RuntimeError(f"重试 {retries} 次仍失败：{last_err}")
+    # 非 404 错误重试后仍失败才抛异常
+    logger.warning(f"图片下载重试 {retries} 次仍失败，跳过：{url}（{last_err}）")
+    return 0
 
 
 def _fetch_desc_imgs_direct(detail_url: str, retries: int = 3) -> list:
     """Python 直连详情接口抠描述图 URL（页面内 fetch 被 CORS 拦下时走这条）。
+
+    只返回图；文字要一起拿时用 _fetch_desc_direct（本函数是它的薄封装，保留是因为
+    test_publish_desc_cors_fallback.py 等单测直接 import 了这个名字）。
 
     2026-08-26 实测：detailUrl 有两种形态，老形态不带 CORS 头，页面内 fetch 必挂——
         新 https://itemcdn.tmall.com/1688offer/icoss<hash>          有 access-control-allow-origin: *
@@ -362,8 +440,22 @@ def _fetch_desc_imgs_direct(detail_url: str, retries: int = 3) -> list:
     老端点【不认来源】：无 UA、无 Referer、无 cookie 裸请求也是 200，所以直连能拿到，
     上面 _JS_DETAIL 那句「该接口认来源」的注释只对新端点成立。
 
-    编码按 GB18030 而非 UTF-8（老端点响应头就是 charset=GB18030，按 UTF-8 解会乱码），
-    但只用来抠 ASCII 的图片 URL，故解码 errors='ignore' 足够、不影响结果。
+    编码见 _fetch_desc_direct 的说明。
+    """
+    return _fetch_desc_direct(detail_url, retries=retries)[0]
+
+
+def _fetch_desc_direct(detail_url: str, retries: int = 3) -> tuple:
+    """Python 直连详情接口，返回（描述图 URL 列表, 纯文字）。
+
+    【编码要按响应头判，不能一律 GB18030】老端点响应头是 charset=GB18030，新端点是
+    UTF-8。原先写死 gb18030 + errors='ignore' 是成立的——那时只抠 ASCII 的图片 URL，
+    中文解错也不影响结果。现在要把中文文字也带回来（尺码表可能就是明文，见
+    desc_text_of），解错编码会让「衣长」变成乱码，而下游是拿它做尺码解析的。
+    故改成：先按响应头声明的编码解，没声明或解不动再按另一种试，取解出可读中文的那份。
+
+    图仍用 dict.fromkeys 保序（描述图顺序即详情页排版顺序），与 _RE_DESC_IMG 上方
+    那条「两条路径必须抠出同一批图」的约定不变。
     """
     import time
 
@@ -374,9 +466,13 @@ def _fetch_desc_imgs_direct(detail_url: str, retries: int = 3) -> list:
         try:
             r = requests.get(detail_url, headers=_IMG_HEADERS, timeout=(10, 30))
             r.raise_for_status()
-            text = r.content.decode("gb18030", errors="ignore")
+            # 声明编码用 getattr 取：requests 的 encoding 可能是 None（响应头没带
+            # charset），而 apparent_encoding 会触发一次全量字节嗅探（慢），故只在
+            # 前者为空时才退到它。两个都取不到就交 _decode_desc 自己按结构判。
+            declared = getattr(r, "encoding", None) or getattr(r, "apparent_encoding", None)
+            text = _decode_desc(r.content, declared)
             # dict.fromkeys 而非 set：保持接口返回顺序，描述图顺序即详情页排版顺序
-            return list(dict.fromkeys(_RE_DESC_IMG.findall(text)))
+            return list(dict.fromkeys(_RE_DESC_IMG.findall(text))), desc_text_of(text)
         except Exception as e:
             last_err = e
             if attempt < retries:
@@ -384,6 +480,39 @@ def _fetch_desc_imgs_direct(detail_url: str, retries: int = 3) -> list:
                 logger.warning(f"详情接口直连失败（{attempt}/{retries}）：{e}；{wait}s 后重试")
                 time.sleep(wait)
     raise RuntimeError(f"直连重试 {retries} 次仍失败：{last_err}")
+
+
+def _decode_desc(raw: bytes, declared: Optional[str] = None) -> str:
+    """把详情响应体解成文本：先按声明编码，再在 utf-8 / gb18030 间挑解得通的那个。
+
+    【判据不能只数替换符】GB18030 几乎不会 strict 失败：它把 UTF-8 的中文字节静默解成
+    乱码汉字（实测「衣长」→「琛ｉ暱」），既不抛异常也不产生 U+FFFD，只数替换符时这份
+    乱码会与正解并列、再按顺序被声明编码抢先选中。故判据是「先严格解、能过的才算候选」：
+    UTF-8 的编码结构很严，一段 GB18030 中文按 UTF-8 严格解基本必败；反过来 UTF-8 中文
+    按 GB18030 严格解虽能过，但此时 UTF-8 那份也过了且排在更前，正解仍胜出。
+    两种都严格解不过（响应体本身混着坏字节）才退到 errors='replace' 数替换符。
+    """
+    order, seen = [], set()
+    for enc in ("utf-8", declared, "gb18030"):
+        key = (enc or "").lower().replace("_", "-")
+        if key and key not in seen:
+            seen.add(key)
+            order.append(enc)
+    for enc in order:
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    cands = []
+    for enc in order:
+        try:
+            t = raw.decode(enc, errors="replace")
+        except Exception:
+            continue
+        cands.append((t, t.count("�")))
+    if not cands:
+        return raw.decode("utf-8", errors="ignore")
+    return min(cands, key=lambda c: c[1])[0]
 
 
 # ---- 阶段① 反爬人工验证闸门 -------------------------------------------------
@@ -600,9 +729,19 @@ async def extract_product(
                 fn = os.path.join(outdir, f"{prefix}-{i:02d}.jpg")
                 try:
                     size = _download_image(u, fn)
+                    # 404 或其它失败时 _download_image 返回 0，跳过该图
+                    if size == 0:
+                        logger.warning(f"{prefix}-{i:02d} 下载失败或源站 404，跳过")
+                        continue
                     entry = {"file": os.path.basename(fn), "bytes": size}
                     if prefix == "main":
-                        entry.update(image_dims(fn))  # w/h 供素材图合规判断
+                        dims = image_dims(fn)
+                        entry.update(dims)  # w/h 供素材图合规判断
+                        # 【服装类图片尺寸预检】平台要求 ≥1340×1785px，提前标记不达标的
+                        w, h = dims.get("w", 0), dims.get("h", 0)
+                        if w > 0 and h > 0 and (w < 1340 or h < 1785):
+                            entry["sizeWarning"] = f"尺寸 {w}×{h} 不达标（服装类要求 ≥1340×1785）"
+                            logger.warning(f"{prefix}-{i:02d} {entry['sizeWarning']}")
                     downloaded[prefix].append(entry)
                 except Exception as e:
                     downloaded[prefix].append({"url": u, "error": str(e)})
@@ -639,9 +778,15 @@ async def extract_product(
         "skus": pivot,
         "colors": colors,
         "sizes": sizes,
-        # 以下四个是【看图占位】，enrich_vision 回填，也可人工补（见 SKILL.md 阶段①看图要点）
+        # 详情描述里的纯文字（多数商品是纯图详情，故常为空串）。留着是因为有商家把整张
+        # 尺码表打成明文，enrich_desc_text 从这里抽 sizeMeasurements——那份数据比识图
+        # 更可信（商家白纸黑字写的，没有 OCR 误差）。取证见 desc_text_of。
+        "descText": prod.descText or "",
+        # 以下五个是【看图占位】，enrich_vision 回填，也可人工补（见 SKILL.md 阶段①看图要点）
         "sizeChart": {},
         "sizeMeasurements": {},
+        # 套装的分件实测表（源图按「部件：上衣/连衣裙」分开给时用），结构见 _VISION_PROMPT
+        "sizeMeasurementsByPart": [],
         "imageUnderstanding": {},
         "complianceNotes": {},
         "images": {"dir": os.path.basename(outdir),
@@ -680,6 +825,18 @@ async def extract_product(
         except Exception as e:
             result["visionError"] = str(e)
             logger.warning(f"视觉回填失败（提取产物已保留，可用 enrich-vision 单独重跑）：{e}")
+
+    # 阶段①b 详情文字尺码表：排在视觉【之后】跑，因为文字优先——商家白纸黑字写的实测值
+    # 比识图可信（没有 OCR 误差），故它覆盖视觉的同名字段（见 enrich_desc_text）。
+    # 不受 with_images 约束：这条路径压根不看图，纯图详情商品也只是 descText 为空、
+    # 直接 skipped 而已。同样 best-effort 吞异常，不让它作废已落盘的提取产物。
+    if enrich:
+        try:
+            result["descText"] = await enrich_desc_text(info_path)
+        except Exception as e:
+            result["descTextError"] = str(e)
+            logger.warning(f"详情文字尺码回填失败（产物已保留，可用 enrich-desc-text "
+                           f"单独重跑）：{e}")
 
     return result
 
@@ -735,6 +892,27 @@ _VISION_PROMPT = """商品标题：{title}
    {{"<尺码>": {{"<参数名>": <数值>}}}}。同样不带「码」字，值只填数字不带单位。
    全围类参数按图里写法照抄参数名，不要自己换算半围/全围。
    图里没有实测尺寸表就返回 {{}}——【不许按经验估算】，估算有后续阶段专门做。
+   注意：图里表格常有「供应商尺寸」「跳码规则」「允差」这类【非尺码列】，
+   要取的是各尺码对应的【成品尺寸】那几列，不要把跳码规则/允差当成某个尺码的值。
+
+3a. 表格【没有尺码那一列】时（只有「衣长 胸围 肩宽 重量」这样的参数表头 +
+   几行纯数值，行首不写 100/110/S/M）：不要因为凑不出尺码键就整表丢掉——
+   这种表商家是靠行序对应尺码的。改填 sizeMeasurementsRows：
+   {{"params": ["<表头参数名，按列序照抄>"],
+     "rows": [[<第一行各列数值，按同一列序>], [<第二行…>]]}}
+   行序【严格照图里从上到下】，一行都不要跳过、不要重排。
+   参数名照抄表头原文（含「重量」这类非长度列也照抄，下游自己挑）。
+   这种情况 sizeMeasurements 仍返回 {{}}，两个字段不要同时填。
+
+3b. sizeMeasurementsByPart —— 套装商品【按部件分开给】的实测表：
+   源图上常见「(主) 部件：连衣裙」「(主) 部件：上衣」这样的小标题，各自带一张表，
+   两件的测量部位完全不同（上衣量肩宽/袖长/胸围，裙子量裙长/腰围）。
+   出现这种分件表时，逐件输出：
+   [{{"part": "<部件名，照抄图里的写法，如 上衣/连衣裙/裤子>",
+      "measurements": {{"<尺码>": {{"<参数名>": <数值>}}}}}}]
+   只有一张表（非套装，或套装只给了一张合表）时返回 []。
+   这个字段【很重要】：填平台尺码表时套装要填两张，两张的数值必须各按自己那件来，
+   混用会给买家一份错尺码表。sizeMeasurements 仍照上面填（多张表时取第一张即可）。
 
 4. complianceNotes —— 逐张标注合规风险（Temu 不接受中文/水印/他人 logo）：
    "files"：[{{"file": "<文件名>", "chinese": true/false, "watermark": true/false,
@@ -744,7 +922,9 @@ _VISION_PROMPT = """商品标题：{title}
    （阶段⑥ 挑素材图、阶段⑪ 删描述图直接读这个字段）。
 
 只输出 JSON：{{"imageUnderstanding": {{...}}, "sizeChart": {{...}},
-"sizeMeasurements": {{...}}, "complianceNotes": {{"files": [...]}}}}"""
+"sizeMeasurements": {{...}}, "sizeMeasurementsRows": {{...}},
+"sizeMeasurementsByPart": [...],
+"complianceNotes": {{"files": [...]}}}}"""
 
 
 def dedup_images(outdir: str) -> tuple[list, dict]:
@@ -860,7 +1040,282 @@ def _dedup_near(paths: list) -> tuple[list, dict]:
     return uniq, dupes
 
 
-def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
+# 单调性判据只看【长度类】参数列：这些量随尺码递增是裁剪的物理必然。
+# 重量列刻意排除——「重量大概克重g」通常也递增，但克重受填充量影响可能持平甚至反向，
+# 拿它当判据会把好表判成乱序；而「允差」「跳码」这类列压根不随尺码变。
+_LEN_PARAM_HINT = re.compile(
+    r"衣长|身长|胸围|肩宽|袖长|裤长|裙长|腰围|臀围|摆长|脚口|领围|全围|身高|头围|"
+    r"总长|背长|下摆")
+
+
+def _rows_direction(rows: list, params: list) -> int:
+    """判表格各行的数值走向：1=随行递增，-1=随行递减，0=不单调（判不出）。
+
+    这是本地定序那条路的取证环节：尺码名只给出候选次序，还要确认表格行序与它同向。
+    多数商家把小码写在上面（递增），但大码在前的排版真实存在，故两个方向都认、
+    只有乱序才交给模型判断。
+
+    【为什么按列投票而不是要求全列一致】同一张表里个别列持平很常见（如童装肩宽
+    26/26/27/28），要求全列严格单调会把这种正常表判成乱序。故逐列判方向后投票，
+    多数列同向即采信；平票返回 0 —— 那种表的行序确实没有可信的方向。
+    持平列不投票（它对方向没有信息量）。
+
+    只统计长度类参数列（见 _LEN_PARAM_HINT）；一列长度类都没有时退化为看全部列，
+    免得参数名写法生僻时白丢。
+    """
+    if len(rows) < 2:
+        # 单行表无从谈走向，按正序处理（一行一档，正倒序等价）
+        return 1
+    cols = [p for p in params if _LEN_PARAM_HINT.search(p)] or list(params)
+    up = down = 0
+    for p in cols:
+        seq = [r[p] for r in rows if p in r]
+        if len(seq) < 2:
+            continue
+        diffs = [b - a for a, b in zip(seq, seq[1:])]
+        if all(d >= 0 for d in diffs) and any(d > 0 for d in diffs):
+            up += 1
+        elif all(d <= 0 for d in diffs) and any(d < 0 for d in diffs):
+            down += 1
+    if up > down:
+        return 1
+    if down > up:
+        return -1
+    return 0
+
+
+# ---- 无尺码列行表的尺码对应（本地定序 + LLM 兜底）--------------------------
+#
+# 【为什么本地定序之后还要留一条 LLM 路径】数值码（100/110）与月龄码（6m/9m）本地取数字
+# 就能排，但字母码 S/M/L 的 norm_size 返回的就是字母，字典序会把 L 排到 S 前面——
+# 实测 S/M/L 配 59/60/61 会对齐成 L=59、M=60、S=61，整份表首尾颠倒。
+# 原先这种情况整表放弃，交阶段⑨ 凭空估算。但那是浪费：手上已经有衣长/胸围/肩宽这些
+# 数值，尺码名里还常带「建议身高70厘米左右」，这些信息足以判断哪行配哪档——
+# 而且这正是模型擅长的语义配对（身高 70cm 配衣长 34cm 是合理的婴幼童尺寸，配 40cm 不是），
+# 不是本地正则能做的事。故字母码等本地排不出的形态改交 LLM，不再放弃。
+#
+# 【为什么不是一律交 LLM】数值码本地排是确定性的、零成本、零失败源，没有理由多发一次
+# 调用去问一个已经确定的答案。LLM 只补本地定不了的那部分——这与项目「确定性步骤不
+# agent 化」的取向一致。
+#
+# 【LLM 的答案仍要过校验】模型给的映射一律回到本地校验：档数必须齐、不许重复用同一行、
+# 行号必须在范围内。校验不过就放弃（回到原先的行为），不接受一份看着合理却错位的表。
+
+_ROWMAP_SYSTEM = (
+    "你是跨境电商商品资料整理助手，正在把一张【没有尺码列】的服装尺码表对应到商品的各个尺码。"
+    "你的输出会直接填进平台的尺码表，买家按它下单，所以【只做有依据的对应】："
+    "依据不足时明确说不知道，绝对不要硬凑。"
+    "只输出 JSON，不要加 ``` 围栏、不要任何解释文字。"
+)
+
+_ROWMAP_PROMPT = """商品标题：{title}
+
+这个商品有 {n} 个尺码（原文照录，注意尺码名里可能已经带了身高/年龄提示）：
+{sizes}
+
+商家的尺码表【没有尺码那一列】，只有参数表头和 {m} 行数值（按图里从上到下的顺序）：
+表头：{params}
+{rows}
+
+请判断【每一行数值对应哪个尺码】。可用的判断依据：
+- 尺码名里自带的身高/年龄/月龄提示（如「建议身高70厘米左右」「6-9个月」），
+  与表里的身高/体重/衣长数值是否吻合；
+- 服装尺码的固有次序（XS<S<M<L<XL<2XL；月龄 3m<6m<9m；身高码 100<110<120），
+  配合各列数值的走向——衣长/胸围/肩宽这类尺寸一定随尺码递增；
+- 注意商家【可能把大码写在上面】，此时行序与尺码序相反，别假定第一行就是最小码。
+
+输出每个尺码对应的行号（行号从 1 开始，就是上面列出的顺序）：
+{{"mapping": {{"<尺码原文>": <行号>}}, "reason": "<20字内说明依据>"}}
+
+硬性要求：
+- {n} 个尺码【全部】都要给出行号，且行号两两不同（一行只能配一个尺码）；
+- 依据不足、或行数与尺码数对不上导致无法一一对应时，返回 {{"mapping": {{}},
+  "reason": "<说明为什么定不了>"}}——【留空是可接受的答案，硬凑不是】。
+
+只输出 JSON：{{"mapping": {{...}}, "reason": "..."}}"""
+
+
+async def _ask_row_mapping(title: str, sizes: list, params: list,
+                           rows: list) -> tuple[dict, str]:
+    """问 LLM「哪一行配哪个尺码」，返回（{尺码: 行索引0基}, 依据说明）。
+
+    定不了时返回（{}, 原因）——调用方按「放弃对齐」处理，不造兜底值。
+
+    【为什么校验这么严】模型返回的映射会直接决定填进平台的尺码表数值。校验三条都是
+    能客观判定的硬条件：档数齐、行号在范围内、行号不重复。任一不过就整体放弃，
+    不做「部分采纳」——半份对齐比没有更难排查，而且缺档的那几个尺码仍要走估算，
+    等于同一张表里混了两种来源的数值。
+    """
+    from app.publish.llm import ask_json
+
+    listing = "\n".join(
+        f"第{i} 行：" + "、".join(f"{p}={r.get(p)}" for p in params if p in r)
+        for i, r in enumerate(rows, 1))
+    data = await ask_json(
+        _ROWMAP_PROMPT.format(
+            title=title or "（无）", n=len(sizes), m=len(rows),
+            sizes="\n".join(f"- {s}" for s in sizes),
+            params="、".join(params), rows=listing,
+        ),
+        what="无尺码列实测表的尺码对应", stage="extract_text",
+    )
+
+    raw = data.get("mapping")
+    reason = str(data.get("reason") or "").strip()
+    if not isinstance(raw, dict) or not raw:
+        return {}, reason or "模型未给出对应关系"
+
+    # 尺码键按原文匹配；模型可能回带空格或截断的写法，故做一次宽松归位
+    by_size = {}
+    for k, v in raw.items():
+        key = str(k or "").strip()
+        match = next((s for s in sizes if str(s) == key), None)
+        if match is None:
+            match = next((s for s in sizes
+                          if str(s).startswith(key) or key.startswith(str(s))), None)
+        if match is None:
+            return {}, f"模型给的尺码「{key[:20]}」不在源尺码里"
+        try:
+            idx = int(v) - 1
+        except (TypeError, ValueError):
+            return {}, f"尺码「{key[:20]}」的行号不是整数"
+        if not 0 <= idx < len(rows):
+            return {}, f"尺码「{key[:20]}」的行号 {v} 超出 1~{len(rows)}"
+        by_size[match] = idx
+
+    if len(by_size) != len(sizes):
+        return {}, f"只给了 {len(by_size)}/{len(sizes)} 档的对应"
+    if len(set(by_size.values())) != len(by_size):
+        return {}, "同一行被配给了多个尺码"
+    return by_size, reason
+
+
+async def _rows_to_measurements(rows_obj, sizes: list,
+                                title: str = "") -> tuple[dict, str]:
+    """把「无尺码列」的纯数值行表对应到源尺码，返回（实测表, 对齐说明）。
+
+    【为什么需要这条路径】2026-09-02 取证 offer 1075672160285（儿童棉马甲）：商家那张
+    尺码表（desc-04.jpg）表头只有「衣长 胸围 肩宽 重量」四个参数，四行数值 34/33/25/123
+    起，【行首一个尺码都没写】。视觉模型准确认出了这张表（imageUnderstanding 里写着
+    「尺码表，粉底表头含衣长、胸围、肩宽、重量」），但 sizeMeasurements 的结构是
+    {尺码: {参数: 值}}，凑不出尺码键，于是整表返回 {} ——数据明明在手上，被结构卡掉了。
+    表现是 sizeChart / sizeMeasurements 双空，阶段⑨ 四个参数全靠模型凭空估算。
+    模型的行为其实是对的（提示词写着不许推测），欠的是一个能表达这种表的字段。
+
+    【两级定序：本地优先，LLM 兜底】
+    先本地按 norm_size 排——数值码（100/110/120/130）与年龄码（3m/6m/2y）都能取到数字。
+    这条路是确定性的、零成本、零失败源，没理由多发一次调用去问一个已经确定的答案。
+    【比大小必须带单位】只抠数字会让 6m/12m/2y/3y 排成 2y→3y→6m→12m（2 岁配最小衣长、
+    6 个月配最大），故岁换算成月再比；月龄与岁可换算（都是时间），但身高码与年龄码
+    无换算关系（80cm 与 2y 无从比大小），混用时判为本地定不了、交 LLM。
+    区间码（3-6m、2-3y）取下界定序——区间不重叠时下界序与区间序一致。
+
+    本地排不出时（字母码 S/M/L 的 norm_size 返回的就是字母，字典序会把 L 排到 S 前面）
+    交给 LLM：手上已有衣长/胸围/肩宽数值，尺码名里还常带「建议身高70厘米左右」，
+    这些信息足以判断哪行配哪档，而这正是模型擅长的语义配对（身高 70cm 配衣长 34cm
+    合理、配 40cm 不合理），不是本地正则能做的事。见 _ask_row_mapping。
+
+    【行数必须与档数相等】不等说明这张表与本商品的尺码档位对不上（可能是别款的表、
+    或含合计行），本地与 LLM 两条路都不做对齐——错位填出去的是一份看着合理却每档都错
+    的尺码表，买家按它下单，比留空更坏。
+
+    【本地那条路仍要表格数值作证】尺码序只是候选，还要确认表格行序与它同向：
+    多数长度列递增=正序，递减=倒序（商家把大码写在上面，真实存在），乱序则放弃。
+    """
+    if not isinstance(rows_obj, dict) or not sizes:
+        return {}, ""
+    params = [str(p).strip() for p in (rows_obj.get("params") or [])
+              if str(p or "").strip()]
+    raw_rows = rows_obj.get("rows")
+    if not params or not isinstance(raw_rows, list):
+        return {}, ""
+
+    rows = []
+    for r in raw_rows:
+        if not isinstance(r, list):
+            continue
+        vals = {}
+        for name, v in zip(params, r):
+            try:
+                num = float(str(v).strip())
+            except (TypeError, ValueError):
+                continue
+            vals[name] = int(num) if num == int(num) else num
+        if vals:
+            rows.append(vals)
+    if not rows:
+        return {}, ""
+
+    if len(rows) != len(sizes):
+        logger.warning(
+            f"识到无尺码列的实测表 {len(rows)} 行，与源尺码 {len(sizes)} 档不等，"
+            f"不做对齐（避免错位）")
+        return {}, ""
+
+    from app.publish.pipeline import norm_size
+
+    # 第一级：本地按数值排。数值码与月龄码走这条，确定性、不花钱。
+    # 【必须带单位一起比，不能只抠数字】2026-09-02 实测反例：源 6m/12m/2y/3y 四档，
+    # 只抠数字得到 6/12/2/3，排序成 2y→3y→6m→12m —— 2 岁被配给最小的衣长、
+    # 6 个月配给最大的，婴儿穿得比 2 岁孩子大，整份表错乱。
+    # norm_size 刻意保留了 m/y 单位正是为了区分这两档（见其 docstring 的月龄碰撞取证），
+    # 这里丢掉单位等于把它的努力作废。故按单位换算到统一量纲（月）再比：
+    # 身高码（无单位纯数字，80~150）与年龄码不可换算，两类混用时判为本地定不了、交 LLM。
+    keyed, local_ok = [], True
+    has_age, has_height = False, False  # 年龄码（m/y）与身高码（无单位）是两类
+    for s in sizes:
+        n = norm_size(str(s))
+        m = re.match(r"^(\d+(?:\.\d+)?)(?:\s*-\s*(\d+(?:\.\d+)?))?\s*([my]?)$", n, re.I)
+        if not m:
+            local_ok = False
+            break
+        # 区间码取【下界】定序：区间不重叠时下界的序与区间序一致（3-6m < 6-9m < 9-12m）
+        lo = float(m.group(1))
+        unit = (m.group(3) or "").lower()
+        if unit in ("m", "y"):
+            has_age = True
+        else:
+            has_height = True
+        # 岁换算成月，与月龄码同量纲；身高码保持原值（同类内部可比）
+        keyed.append((lo * 12 if unit == "y" else lo, str(s)))
+    if local_ok and has_age and has_height:
+        # 身高码与年龄码混用（如 80cm 与 2y）：两者无换算关系，本地排不出可信序
+        logger.warning(
+            "无尺码列的实测表：源尺码混用了身高码与年龄码（无换算关系），交模型判断")
+        local_ok = False
+    # 位次撞车（如 6M/6Y 若未按单位换算就会撞、或商家给了两个同值档）时本地也定不了
+    if local_ok and len({v for v, _ in keyed}) != len(keyed):
+        local_ok = False
+
+    if local_ok:
+        direction = _rows_direction(rows, params)
+        if direction == 0:
+            logger.warning(
+                "无尺码列的实测表：各列数值既不单调递增也不单调递减，"
+                "本地定不出行序方向，交模型判断")
+        else:
+            ordered = [s for _, s in sorted(keyed)]
+            if direction < 0:
+                ordered = list(reversed(ordered))
+            out = {sz: rows[i] for i, sz in enumerate(ordered)}
+            note = ("表无尺码列，按尺码数值序对齐"
+                    + ("（表格大码在前，已倒序）" if direction < 0 else "")
+                    + "：" + "、".join(ordered))
+            return out, note
+
+    # 第二级：本地定不了（字母码、位次撞车、数值不单调）交 LLM 做语义配对
+    mapping, reason = await _ask_row_mapping(title, list(sizes), params, rows)
+    if not mapping:
+        logger.warning(f"无尺码列的实测表放弃对齐：{reason or '模型也定不出对应关系'}")
+        return {}, ""
+    out = {str(sz): rows[idx] for sz, idx in mapping.items()}
+    note = (f"表无尺码列，由模型判定尺码对应（{reason[:40]}）："
+            + "、".join(f"{sz}→第{idx + 1}行" for sz, idx in mapping.items()))
+    logger.info(f"无尺码列的实测表由模型定对应：{len(out)} 档（{reason[:40]}）")
+    return out, note
+
+
+async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
     """把视觉判断结果并进 info 的四个字段，返回回填统计。
 
     只填【原本为空】的字段：手工补过或上一轮已填的值优先，不被新一轮覆盖——
@@ -869,6 +1324,9 @@ def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
     重复图（dupes）在这里补齐：模型只看了唯一图，重复文件要继承首见文件的标注，
     并额外标 duplicate=true / clean=false。标 clean=false 是刻意的：重复图对
     阶段⑥⑦⑪ 来说等于「不该再用的图」，让它进不了候选，比留 clean=true 更安全。
+
+    【为什么是 async】无尺码列行表那一支在本地定不出尺码对应时要问一次 LLM
+    （见 _rows_to_measurements）。其余各支都是纯本地的字典搬运。
     """
     stat = {}
     for key in ("imageUnderstanding", "sizeChart", "sizeMeasurements"):
@@ -876,6 +1334,36 @@ def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
         if isinstance(got, dict) and got and not info.get(key):
             info[key] = got
         stat[key] = len(info.get(key) or {})
+
+    # 表格没有尺码列时走行表那一支（见 _rows_to_measurements）。排在直填之后：
+    # 有尺码键的表是原生更可靠的形态，只在它没填上时才推对应关系。
+    if not info.get("sizeMeasurements"):
+        rows_meas, note = await _rows_to_measurements(
+            vision.get("sizeMeasurementsRows"), info.get("sizes") or [],
+            title=info.get("title") or "")
+        if rows_meas:
+            info["sizeMeasurements"] = rows_meas
+            # 留取证痕迹：阶段⑨ 填出去的数值配的是推来的键，人工排查要能看出这一点
+            info["sizeMeasurementsSource"] = "visionRows"
+            info["sizeMeasurementsNote"] = note
+            stat["sizeMeasurements"] = len(rows_meas)
+            logger.info(f"无尺码列实测表已定出尺码对应：{len(rows_meas)} 档（{note}）")
+
+    # 分件实测表是 list（不是 dict），单独一支：结构不合格的条目直接丢，
+    # 别让脏结构流到阶段⑨——那边按 part/measurements 两个键取值，缺键会静默取空。
+    parts = vision.get("sizeMeasurementsByPart")
+    if isinstance(parts, list) and parts and not info.get("sizeMeasurementsByPart"):
+        clean = [
+            {"part": str(e.get("part") or "").strip(), "measurements": e["measurements"]}
+            for e in parts
+            if isinstance(e, dict) and isinstance(e.get("measurements"), dict)
+            and e.get("measurements") and str(e.get("part") or "").strip()
+        ]
+        # 【只有一件时不留】分件表的唯一用途是给套装的两张表各自取数，一件等于没分件，
+        # 留着反而让下游多一条要判空的路径。
+        if len(clean) >= 2:
+            info["sizeMeasurementsByPart"] = clean
+    stat["sizeMeasurementsByPart"] = len(info.get("sizeMeasurementsByPart") or [])
 
     notes = vision.get("complianceNotes") or {}
     files = notes.get("files") if isinstance(notes, dict) else None
@@ -901,9 +1389,9 @@ def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
 
 
 async def enrich_vision(
-    info_path: str, max_images: int = 12, overwrite: bool = False
+    info_path: str, max_images: int = 20, overwrite: bool = False
 ) -> dict:
-    """视觉回填阶段①的四个空占位字段，原地更新 product-info.json，返回统计。
+    """视觉回填阶段①的看图空占位字段，原地更新 product-info.json，返回统计。
 
     可单独触发（publish_inspect.py enrich-vision / extract_product(enrich=True)），
     不在提取必经路径上——理由见本节开头。
@@ -913,6 +1401,13 @@ async def enrich_vision(
     对），所以宁可一次多传。上限存在只为兜住极端长图商品（几十张详情图）撑爆 token；
     截断时保留 main（dedup_images 已按 main 优先排序，轮播主图信息密度高于详情图），
     并在返回里报 truncated。
+
+    【2026-09-02 上限从 12 提到 20】取证 offer 1075672160285（儿童棉马甲）：30 个文件
+    去重后 16 张唯一图，前 12 张恰好是 7 张 main 加 desc-01..05，而商家把尺码表打在
+    desc-06/07/09/11 里——截断掉的 4 张正是它们。表现是 sizeChart / sizeMeasurements
+    双空表，日志只报「尺码参考 0 | 实测尺寸 0」，看不出是模型没认出来还是压根没看到
+    （complianceNotes 里那 4 个文件名一条标注都没有，事后才反推出来）。
+    截断是静默的，故一并补了 warning 日志把被丢的文件名打出来。
 
     overwrite=True 才会重填已有值：默认不覆盖，人工补过的标注比模型的可靠。
     """
@@ -925,6 +1420,7 @@ async def enrich_vision(
     if overwrite:
         for k in ("imageUnderstanding", "sizeChart", "sizeMeasurements", "complianceNotes"):
             info[k] = {}
+        info["sizeMeasurementsByPart"] = []
 
     uniq, dupes = dedup_images(outdir)
     if not uniq:
@@ -934,6 +1430,12 @@ async def enrich_vision(
         # dedup_images 已按 main 优先返回，直接截尾即保留信息密度最高的轮播主图
         truncated = [os.path.basename(p) for p in uniq[max_images:]]
         uniq = uniq[:max_images]
+        # 2026-09-02 增强日志：记录被截断的图片，方便排查尺码表识别问题
+        logger.warning(
+            f"唯一图 {len(uniq) + len(truncated)} 张超过上限 {max_images}，"
+            f"截断后 {len(truncated)} 张：{', '.join(truncated[:5])}"
+            + (f" 等 {len(truncated)} 张" if len(truncated) > 5 else "")
+        )
 
     names = [os.path.basename(p) for p in uniq]
     listing = "\n".join(f"第{i} 张：{n}" for i, n in enumerate(names, 1))
@@ -948,7 +1450,7 @@ async def enrich_vision(
         prompt, uniq, what="阶段①视觉回填", system=_VISION_SYSTEM, stage="extract"
     )
 
-    stat = _merge_vision(info, vision, dupes)
+    stat = await _merge_vision(info, vision, dupes)
     with open(info_path, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
 
@@ -959,7 +1461,166 @@ async def enrich_vision(
     logger.info(
         f"视觉回填完成：唯一图 {len(names)}/{len(names) + len(dupes)} 张 | "
         f"颜色理解 {stat['imageUnderstanding']} | 尺码参考 {stat['sizeChart']} | "
-        f"实测尺寸 {stat['sizeMeasurements']} | 合规标注 {stat['complianceNotes']} "
+        f"实测尺寸 {stat['sizeMeasurements']}"
+        + (f"（分件 {stat['sizeMeasurementsByPart']} 件）"
+           if stat.get('sizeMeasurementsByPart') else "")
+        + f" | 合规标注 {stat['complianceNotes']} "
         f"（干净图 {stat['cleanFiles']}）"
     )
     return result
+
+
+# ---- 阶段①b 详情文字里的尺码表（enrich_desc_text）----------------------------
+#
+# 【为什么要单独一条路径、不并进视觉回填】2026-09-01 取证（offer 971999094281 韩系牛仔
+# 外套）：这个商家把整张尺码表直接打在详情文字里而不是做成图，详情接口响应体里就是
+#     S 衣长59 胸围118 袖长57 肩宽52
+#     M 衣长60 胸围122 袖长58 肩宽53
+#     L 衣长61 胸围128 袖长59 肩宽54
+# 三行明文。而 sizeMeasurements 落成了空表，阶段⑨ 四个参数全靠模型凭空估算——准确值
+# 一直在手上，只是取数时把文字整段丢了（见 desc_text_of）。
+#
+# 这条路径【不看图】：输入就是已经取到的纯文字，故比视觉回填快一个量级、也便宜得多，
+# 且没有 OCR 误差。抽样 16 个 sizeMeasurements 为空的 1688 商品，多数是纯图详情
+# （descText 为空，本阶段直接跳过、一次调用都不发），这种文字形态是少数但真实存在。
+#
+# 【为什么用模型而不是正则】文字排版由商家随手写，实测这一单是「尺码 参数名+数值」
+# 紧贴成串（「衣长59」没有分隔符），而别家可能是表格制表符、可能带「建议身高」混排、
+# 也可能一行写多个尺码。正则要覆盖这些形态就得堆一串互相打补丁的分支，而这里的输入
+# 极短（几十到几百字），交文本模型抽一次的代价远低于维护那串正则。
+
+_DESC_TEXT_SYSTEM = (
+    "你是跨境电商商品资料整理助手，正在从 1688 商品详情的纯文字里提取尺码表。"
+    "【只提取文字里真正写了的数值】文字里没有的一律留空，绝对不要推测、估算或补全——"
+    "估算有后续专门的阶段做，你补的假数据会被当成商家实测值直接填进平台。"
+    "只输出 JSON，不要加 ``` 围栏、不要任何解释文字。"
+)
+
+_DESC_TEXT_PROMPT = """商品标题：{title}
+源商品尺码（SKU 里的尺码，仅供对照，不必强行凑齐）：{sizes}
+
+下面是该商品详情描述里的纯文字内容：
+----
+{text}
+----
+
+请从这段文字里提取两样东西，合并成一个 JSON 返回：
+
+1. sizeMeasurements —— 各尺码的【平铺实测尺寸】（衣长/胸围/袖长/肩宽/裤长等，单位 cm）：
+   {{"<尺码>": {{"<参数名>": <数值>}}}}
+   - 尺码键用文字里的写法但【不要带「码」字】（如 "120" 或 "120cm"，不要 "120码"）；
+   - 参数名照抄文字里的写法，【不要自己换算半围/全围】、不要改名；
+   - 值只填数字、不带单位；
+   - 文字里常见「S 衣长59 胸围118」这种参数名与数值紧贴的写法，按参数名切开即可。
+
+2. sizeChart —— 尺码的【身高体重参考】（如「建议身高100-110cm」「体重20-25斤」）：
+   {{"<尺码>": "<身高/体重参考原文>"}}
+
+注意：
+- 这段文字里可能压根没有尺码表（只有洗涤说明、发货说明、店铺宣传之类），
+  那就两个字段都返回 {{}}，【不要硬凑】；
+- 文字里若出现「跳码规则」「允差」「供应商尺寸」这类非尺码列，不要把它们
+  当成某个尺码的值；
+- 只有一个尺码时也照样返回（那就是单尺码商品）。
+
+只输出 JSON：{{"sizeMeasurements": {{...}}, "sizeChart": {{...}}}}"""
+
+
+def _clean_meas(raw) -> dict:
+    """把模型给的实测表清成 {尺码: {参数名: 数值}}，脏条目直接丢。
+
+    过滤而不是修补：这份数据会被当成商家实测值直接填进平台表单（优先级高于模型估算），
+    结构可疑的条目留着比丢掉危险。判据只留能客观判定的三条——尺码键非空、参数名非空、
+    值能转成数。
+
+    尺码键【不在这里过 norm_size】：下游 add_sizechart 两侧都会自己归一（源键与页面
+    尺码文本各归一后再比，见 pipeline.norm_size），这里提前归一反而会让
+    product-info.json 里的键与源文字写法脱节，人工排查时对不上原文。
+    """
+    out = {}
+    for sz, row in (raw or {}).items():
+        key = str(sz or "").strip()
+        if not key or not isinstance(row, dict):
+            continue
+        vals = {}
+        for p, v in row.items():
+            name = str(p or "").strip()
+            if not name:
+                continue
+            try:
+                num = float(str(v).strip())
+            except (TypeError, ValueError):
+                continue
+            # 整数就写整数：源写「衣长59」时落 59 而不是 59.0，与视觉回填的形态一致
+            vals[name] = int(num) if num == int(num) else num
+        if vals:
+            out[key] = vals
+    return out
+
+
+async def enrich_desc_text(info_path: str, overwrite: bool = True) -> dict:
+    """从 descText（详情纯文字）里抽 sizeMeasurements / sizeChart，原地更新 info。
+
+    【与视觉回填的关系：文字优先】descText 里抽到的是商家白纸黑字写的实测值，没有
+    OCR 这道误差，故它【可以覆盖】视觉回填的同名字段——这与项目既有的「源实测优于
+    模型估算」是同一条取向（见 pipeline.add_sizechart 的取数顺序）。但只覆盖本次真正
+    抽到内容的那个字段：抽到空表时绝不拿空去清掉视觉已填好的值。
+
+    人工补过的值仍然优先：`_merge_vision` 那条「不覆盖已有值」的规矩针对的是模型之间，
+    而人工标注比任何模型都可靠。本函数无从分辨某个值是人填的还是视觉填的，故提供
+    overwrite 开关，默认 True 语义仅限「文字覆盖视觉」——真要保住人工值就传 False。
+
+    descText 为空（多数商品是纯图详情）时直接返回 skipped，【一次 LLM 调用都不发】。
+
+    本函数按主流程语义抛异常（同 enrich_vision）：抽错的尺码会一路填进平台表单。
+    但调用方（extract_product 的开关处）按补充增强 best-effort 吞掉。
+    """
+    from app.publish.llm import ask_json
+
+    with open(info_path, encoding="utf-8") as f:
+        info = json.load(f)
+
+    text = (info.get("descText") or "").strip()
+    if not text:
+        return {"status": "skipped", "reason": "详情描述没有文字内容（纯图详情）",
+                "infoPath": info_path}
+
+    # 关键词闸：文字里连一个尺码相关词都没有时不必问模型。多数纯文字详情写的是发货/
+    # 洗涤/售后说明，发一次调用只为得到两个空表，纯属白花钱。
+    if not _RE_SIZE_HINT.search(text):
+        return {"status": "skipped", "reason": f"详情文字 {len(text)} 字里没有尺码相关词",
+                "infoPath": info_path, "textLen": len(text)}
+
+    data = await ask_json(
+        _DESC_TEXT_PROMPT.format(
+            title=info.get("title") or "（无）",
+            sizes=json.dumps(info.get("sizes") or [], ensure_ascii=False),
+            text=text[:4000],   # 兜住极长文字详情；尺码表都在开头，截尾不影响
+        ),
+        what="阶段①b 详情文字尺码表", stage="extract_text",
+    )
+
+    meas = _clean_meas(data.get("sizeMeasurements"))
+    ref = {str(k).strip(): str(v).strip()
+           for k, v in (data.get("sizeChart") or {}).items()
+           if str(k or "").strip() and str(v or "").strip()} \
+        if isinstance(data.get("sizeChart"), dict) else {}
+
+    filled = {}
+    for key, got in (("sizeMeasurements", meas), ("sizeChart", ref)):
+        if got and (overwrite or not info.get(key)):
+            info[key] = got
+            filled[key] = len(got)
+        else:
+            filled[key] = 0
+    if filled["sizeMeasurements"]:
+        info["sizeMeasurementsSource"] = "descText"
+
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(info, f, ensure_ascii=False, indent=2)
+
+    logger.info(f"详情文字尺码回填：实测尺寸 {len(meas)} 档 / 身高体重参考 {len(ref)} 档"
+                f"（文字 {len(text)} 字）"
+                + ("" if filled["sizeMeasurements"] else "；未写入（抽到空表或已有值）"))
+    return {"status": "ok", "infoPath": info_path, "textLen": len(text),
+            "measurements": meas, "sizeChart": ref, "filled": filled}
