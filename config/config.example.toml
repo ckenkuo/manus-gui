@@ -426,3 +426,15 @@ declare_price = "168"
 stock = "100"
 # 仓库名（变种信息页勾选，只勾这一个）
 warehouse = "飞特COL仓库"
+
+# ---- 发布流程中断告警（app/publish/alert.py）------------------------------------
+# 发布是长流程作业（单商品 19 阶段、批次动辄几小时），人不守着页面，中断要主动推。
+# 只发三类：批次中止（CDP 掉线等）、单商品失败、批次收尾有失败；阶段内的 manual_check
+# 刻意不发（数量多、大多不阻断，会把群刷成日志流）。
+# webhook 取法：飞书群 → 设置 → 群机器人 → 添加「自定义机器人」，复制它的 webhook 地址。
+# 是凭证，别提交进版本库（真实值只写进 gitignored 的 config.toml）；
+# 临时切群可用环境变量 PUBLISH_ALERT_WEBHOOK 覆盖。留空即整个告警静默跳过。
+# 自检：python publish_run.py --test-alert
+[publish.alert]
+enabled = true
+webhook = ""

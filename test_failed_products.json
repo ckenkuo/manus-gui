@@ -1,0 +1,9 @@
+[
+  {"url": "https://detail.1688.com/offer/654598552346.html", "title": "CDN 404 测试商品1"},
+  {"url": "https://detail.1688.com/offer/1050437682789.html", "title": "CDN 404 测试商品2"},
+  {"url": "https://detail.1688.com/offer/932932019668.html", "title": "基本信息校验失败测试1"},
+  {"url": "https://detail.1688.com/offer/1076150668635.html", "title": "基本信息校验失败测试2"},
+  {"url": "https://detail.1688.com/offer/1006632984034.html", "title": "图片尺寸不达标测试"},
+  {"url": "https://detail.1688.com/offer/1073657478172.html", "title": "图片尺寸不达标测试2"},
+  {"url": "https://detail.1688.com/offer/1068202595605.html", "title": "基本信息校验失败测试3"}
+]

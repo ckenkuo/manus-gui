@@ -30,7 +30,8 @@ app/collect/service.py：_emit 回调制事件、aborted 统一出口、队列/S
     ⑨ sizechart  尺码表              ⑩ variant   变种信息
     ⑪ stock      仓库/库存/SKU分类    ⑫ shipping  运输信息（选最长时效）
     ⑬ desc       描述长图（视觉规划→删/换→desc_save）
-    ⑬b video     产品视频（比例裁到 1:1/3:4/16:9 后回填，纯增益、从不 fail）
+    ⑬b video     产品视频（保留则比例裁到 1:1/3:4/16:9 后回填；批次开关关掉则
+                 直接点「删除」丢弃。纯增益、从不 fail）
     ⑭ save       保存落库
 
 【⑤b 为什么插在⑥ 之前而不是并进⑥】清理产物要被⑥素材图与⑦SKC颜色图共用，
@@ -46,6 +47,12 @@ app/collect/service.py：_emit 回调制事件、aborted 统一出口、队列/S
 它是纯增益路径：没视频/已合规则 skipped，下载或转码或回填失败一律报 manual_check
 但仍返回 ok——视频只是加分项，为它让整个商品 fail 不值得（失败的实际后果只是
 「带着不合规视频去发布被打回」，人工删掉视频即可发布）。
+
+【keep_video 批次开关（2026-08-29 加）】上面那套「下载→ffmpeg 转码→直传→回填」
+每个商品要花几十秒到几分钟，而视频只是加分项。故给批次一个开关：keep_video=True
+（默认）走上述比例审核；keep_video=False 就在编辑页直接点视频区的「删除」，
+连读接口和下载都省掉（见 pipeline.delete_video）。开关不进状态文件——「这批要不要
+视频」属于本次运行的决定。
 
 【生图产物一律落盘复用，重跑不重烧】gpt-image-2 是全流程最贵的调用，而 ⑤~⑬ 的
 成果 save 前一重载就丢（见下方续跑那段），重跑很常见。两处生图都做了产物复用：
@@ -113,7 +120,7 @@ import time
 from typing import Awaitable, Callable, Optional, Union
 
 from app.logger import logger
-from app.publish import cache, extract, images, video as videolib, vision
+from app.publish import alert, cache, extract, images, video as videolib, vision
 from app.publish.sources import base as sources_base
 from app.publish.browser import BrowserSession, ensure_cdp_alive
 from app.publish.claim import collect_and_claim
@@ -123,10 +130,11 @@ from app.publish.pipeline import (
     _size_category_for,
     auto_cat,
     check_attrs,
+    drop_accessory_colors,
+    accessory_colors_from_rows,
     desc_delete,
     desc_map,
-    desc_text_apply,
-    desc_text_map,
+    desc_text_delete_all,
     desc_replace,
     desc_save,
     ensure_desc_closed,
@@ -147,7 +155,11 @@ from app.publish.pipeline import (
     set_video,
     skc_image_support,
     skc_replace_row,
+    sku_preview_replace_row,
+    sku_preview_state,
     read_video_url,
+    delete_video,
+    PREVIEW_MIN_SIDE,
     SKC_ROW_MIN_IMAGES,
     _skc_row_matches,
     _skc_row_state,
@@ -186,7 +198,9 @@ STAGES = [
     ("titles", "⑤ 标题产地"),
     ("clean_images", "⑤b 图片清理"),
     ("material", "⑥ 素材图"),
+    ("drop_acc", "⑦a 剔配件色"),
     ("skc", "⑦ SKC颜色图"),
+    ("sku_preview", "⑦b SKU预览图"),
     ("fix_sizes", "⑧ 尺码勾选"),
     ("sizechart", "⑨ 尺码表"),
     ("sku_code", "⑩a SKU货号"),
@@ -223,7 +237,7 @@ _CAT_STAGES = ["auto_cat", "attrs"]
 
 # ⑤ 起的纯表单阶段（类目有效时只有这些需要按实况逐项细判）
 _FORM_STAGES_AFTER_CAT = [
-    "titles", "clean_images", "material", "skc", "fix_sizes",
+    "titles", "clean_images", "material", "drop_acc", "skc", "sku_preview", "fix_sizes",
     "sizechart", "sku_code", "variant", "stock", "shipping", "desc", "video",
 ]
 
@@ -240,6 +254,60 @@ async def _emit(on_progress: ProgressCB, event: dict) -> None:
             await r
     except Exception as e:
         logger.warning(f"进度回调异常（忽略）：{e}")
+
+
+def _alert_hook(on_progress: ProgressCB, store: str, site: str,
+                total: int) -> ProgressCB:
+    """在事件流上挂飞书告警，返回包装后的回调（原回调照常收到全部事件）。
+
+    【为什么挂在事件流上而不是逐处插 send】「中断」在本文件里有十来个出口：
+    aborted 有 6 处（未知阶段/清单空/缺店铺/缺站点/CDP 不通/连不上中止/重连失败），
+    商品 fail 则散在 publish_one 的多个 return 里。逐处加 await alert.xxx 既容易漏、
+    又把告警关注点摊到整个编排逻辑里。而这三类中断【都已经有对应事件】，
+    在事件流上判一次 type 就全覆盖了，新增出口自动纳入。
+
+    只认三类事件，与 alert 模块的取向一致（详见 app/publish/alert.py 开头）：
+      aborted      → 批次中止，立刻报
+      product_done + status=fail → 单商品失败，逐条报
+      batch_done + fail>0        → 收尾汇总（全绿不发）
+    stage_done 的 fail 不单独报：它紧接着就会让商品 fail 出 product_done，
+    报两遍是噪音。manual_check 也不报（数量多、大多不阻断，会把群刷成日志流）。
+
+    【告警是 await 在回调里同步发的，不 create_task】一发约 300ms，相对单商品
+    数分钟的耗时可以忽略；而 fire-and-forget 的任务在批次收尾、事件循环即将关闭时
+    会被取消，最该发出去的那条 batch_done 汇总恰好最容易丢。
+    """
+    stat = {"done": 0, "failures": []}
+
+    async def cb(event: dict) -> None:
+        await _emit(on_progress, event)
+        t = event.get("type")
+        try:
+            if t == "aborted":
+                await alert.alert_batch_aborted(
+                    event.get("reason") or "", store=store, site=site,
+                    done=stat["done"], total=total)
+            elif t == "product_done":
+                stat["done"] += 1
+                if event.get("status") == "fail":
+                    stage_name = dict(STAGES).get(event.get("failed_stage") or "", "")
+                    stat["failures"].append((event.get("offer") or "", stage_name))
+                    await alert.alert_product_fail(
+                        offer=event.get("offer") or "", title=event.get("title") or "",
+                        stage=stage_name, note=event.get("note") or "",
+                        store=store, site=site, rowid=event.get("rowid"),
+                        index=event.get("index") or 0, total=event.get("total") or total,
+                        elapsed_s=event.get("elapsed_s") or 0.0)
+            elif t == "batch_done" and int(event.get("fail") or 0) > 0:
+                await alert.alert_batch_done(
+                    ok=int(event.get("ok") or 0), fail=int(event.get("fail") or 0),
+                    elapsed_s=event.get("elapsed_s") or 0.0,
+                    store=store, site=site, failures=stat["failures"])
+        except Exception as e:
+            # 告警属辅助路径：发不出去只告警，绝不能反过来打断发布批次
+            logger.warning(f"飞书告警钩子异常（忽略）：{e}")
+
+    return cb
 
 
 def _install_log_bridge(on_progress: ProgressCB) -> int:
@@ -453,6 +521,21 @@ def _stale_form_stages(live: dict) -> list:
             stale.append("sku_code")
         if not live.get("skuFilledRows"):
             stale += ["variant", "stock"]
+    # ⑦b SKU 预览图：【与 skuRowCount 那个分支平级，不放进 else】——它读的是变种
+    # 【信息】表第一列，与 ⑥⑦ 看的 attrImg*（变种【属性】区）是两处不同的图，
+    # 两处正交（2026-08-30 玩具类那单就是 ⑦ 合理跳过、⑦b 从未跑过而被平台拒）。
+    # 也不该挂在 skuRowCount 非空的前提下：变种表 0 行时预览图列同样不存在，
+    # 那种情况由 previewBad 自己为 0 兜住，不必再套一层分支。
+    # previewCount 为 0 时不判 stale：那说明该类目没有这一列，交阶段自己 skipped。
+    if live.get("previewBad"):
+        stale.append("sku_preview")
+    # ⑦a 剔配件色：变种表里只要还有「单行有源数据」的颜色就得重跑。反选只改未保存
+    # 表单，save 没成功过时页面会回到认领时的全勾状态（与 ⑤~⑬ 其它表单阶段同理）。
+    # 判据完全取页面实况（源颜色名与页面色板名对不上，见 _JS_VARIANT_ROW_FILL），
+    # variantByColor 读不到时不判 stale：交阶段自己 skipped。
+    if live.get("variantByColor"):
+        if accessory_colors_from_rows(live["variantByColor"]):
+            stale.append("drop_acc")
     if not live.get("shippingSet"):
         stale.append("shipping")
     # ⑬ 描述：图全是 1688 外链（alicdn）说明删图/英化成果没了。
@@ -765,15 +848,22 @@ async def _st_claim(ctx: dict, session: BrowserSession, emit) -> dict:
 
 
 async def _st_auto_cat(ctx: dict, session: BrowserSession, emit) -> dict:
-    title = ctx.get("title")
-    if not title and ctx.get("info_path"):
-        title = _load_info(ctx["info_path"]).get("title")
+    # info 整份读进来（不只取 title）：类目判断除了标题还要年龄段/尺码线索，
+    # 见 pipeline.cat_clues 上方的 2026-08-29 取证。读不到就只用标题，不失败。
+    info = None
+    if ctx.get("info_path"):
+        try:
+            info = _load_info(ctx["info_path"])
+        except Exception as e:
+            logger.warning(f"读 product-info.json 取类目线索失败（只用标题判类目）：{e}")
+    title = ctx.get("title") or (info or {}).get("title")
     if not title:
         return {"status": "fail", "note": "缺商品标题（LLM 判断类目要用）"}
     ctx["title"] = title
     r = await auto_cat(session, ctx["rowid"], title,
                        use_cache=ctx.get("use_cache", True),
-                       site=ctx.get("site") or "")  # 失败抛异常，交外层
+                       site=ctx.get("site") or "",
+                       info=info)  # 失败抛异常，交外层
     # 阶段④的属性缓存要按类目路径取，这里把它落进 ctx（并经回写元组进状态文件，
     # 续跑 from attrs 时才拿得到）
     ctx["cat_path"] = r.get("pathList") or []
@@ -1073,7 +1163,9 @@ async def _skc_size_fallback(ctx: dict, session: BrowserSession, emit,
         for i, u in enumerate(urls, 1):
             dst = os.path.join(prep, f"{i:02d}.jpg")
             try:
-                extract._download_image(u, dst)
+                if not extract._download_image(u, dst):
+                    logger.warning(f"「{kw}」行第 {i} 张源站取不到（404 等），跳过该张")
+                    continue
                 images.fit_34(dst, out_path=dst)   # 3:4 + ≥1340×1785，两条硬规则一起满足
                 ok_files += 1
             except Exception as e:
@@ -1113,6 +1205,11 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
     if len(picked) >= SKC_ROW_MIN_IMAGES:
         return picked, []
     notes = vision._notes_by_file(info)
+    # 阶段①已把不达标的主图标了 sizeWarning，补图时优先躲开它们：
+    # batch_fit34 能放大到达标，但放大会掉画质，有原生达标图就别用小图
+    size_bad = {e.get("file") for e in
+                (((info or {}).get("images") or {}).get("mainDetail") or [])
+                if isinstance(e, dict) and e.get("sizeWarning") and e.get("file")}
 
     def _note(path: str) -> dict:
         return notes.get(os.path.basename(path)) or {}
@@ -1122,10 +1219,46 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
              if p not in have
              and not _note(p).get("duplicate")
              and (_note(p).get("kind") or "") not in vision._SKIP_KINDS]
-    # 干净图优先，其余按脏度——与 plan_skc 单色分支同一套排序取向
-    cands.sort(key=lambda p: (not _note(p).get("clean"), vision._dirty_score(_note(p))))
+    # 干净图优先，其余按脏度——与 plan_skc 单色分支同一套排序取向；
+    # 尺寸不达标的排在最后（只有达标图不够时才轮到它们，由 batch_fit34 放大兜底）
+    cands.sort(key=lambda p: (os.path.basename(p) in size_bad,
+                              not _note(p).get("clean"),
+                              vision._dirty_score(_note(p))))
     added = cands[:SKC_ROW_MIN_IMAGES - len(picked)]
     return picked + added, [os.path.basename(p) for p in added]
+
+
+async def _st_drop_acc(ctx: dict, session: BrowserSession, emit) -> dict:
+    """⑦a 剔配件色：源里只有单一尺码的颜色（头饰/配件之类）直接反选，不发它的 SKC/SKU。
+
+    【为什么排在 ⑦ 之前】反选让平台重建变种表，该色的 SKC 图位与 SKU 行一起消失，
+    于是 ⑦/⑦b 天然不会碰它——不必在那两个阶段各自判「这个颜色跳不跳」。
+
+    判据与取证见 pipeline._JS_VARIANT_ROW_FILL 上方注释：源颜色名与页面色板名永远
+    对不上（源「紫精灵头纱」↔ 页面「红色」），故只能按变种表里「哪些行有源数据」认。
+    只认「别的颜色都是多行齐全、只有它是单行」，各色齐平的商品一个都不剔。
+    """
+    r = await drop_accessory_colors(session)
+    if r.get("status") == "ok":
+        await emit({"type": "log", "stage": "drop_acc",
+                    "message": f"已剔除配件色 {r['dropped']}（只有单一尺码，"
+                               f"不发其 SKC/SKU），变种表剩 {r.get('rowCount')} 行"})
+        note = f"已反选配件色 {'、'.join(r['dropped'])}"
+        if r.get("missed"):
+            # 部分没剔掉：主流程照走，但要让人知道页面上还留着哪些
+            await emit({"type": "manual_check", "stage": "drop_acc",
+                        "message": f"配件色 {r['missed']} 未能反选（页面颜色："
+                                   f"{r.get('pageColors')}），需人工确认是否要发"})
+            note += f"；{len(r['missed'])} 个未能反选"
+        return {"status": "ok", "note": note}
+    if r.get("status") == "skipped":
+        return {"status": "skipped", "note": r.get("reason") or ""}
+    # error：源颜色名与页面对不上，或反选没生效。这不该拦整单——配件色多发一个
+    # 不影响其它 SKU 的正确性，故报 manual_check 后按 skipped 放行（best-effort 取向）。
+    await emit({"type": "manual_check", "stage": "drop_acc",
+                "message": f"配件色剔除未完成：{r.get('reason')}"
+                           f"（页面颜色：{r.get('pageColors')}），需人工确认"})
+    return {"status": "skipped", "note": f"未剔除：{r.get('reason')}"}
 
 
 async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
@@ -1242,6 +1375,133 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
     return {"status": "ok", "note": note}
 
 
+async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
+    """阶段⑦b SKU 预览图：把变种信息表每行不合规的预览图就地合规化后换回。
+
+    【为什么单独成一个阶段，而不并进 ⑦】两者的容器与语义都不同：⑦ 是
+    #skuAttrsInfo（变种属性区）每颜色 3~10 张的展示图，⑦b 是 #skuDataInfo
+    （变种信息表）第一列每 SKU 一张的预览图。玩具类那单证实了两者正交——
+    ⑦ 因该类目无图位而正确 skipped，⑦b 却被平台拒（详见 pipeline 里
+    「阶段⑦b SKU 预览图」段落开头的取证记录）。
+
+    【不重判归属，只补几何】认领时店小秘已按 SKU 把每行图带过来了，归属本来就对。
+    这里下载该行现有的图、square_image 成 1:1 后原位换回：画面一张不换、行序一动
+    不动。与 _skc_size_fallback 同一取向，零 LLM 调用。
+
+    只在【纯增益】方向动手：读不到尺寸、行本来就达标、下载或合规化失败，一律保持
+    原样并报人工确认，绝不把行搞成空的。
+    """
+    st = await sku_preview_state(session)
+    if st.get("supported") is False:
+        await emit({"type": "log", "stage": "sku_preview",
+                    "message": "变种信息表没有预览图可换（无行内 trigger），跳过"})
+        return {"status": "skipped", "note": "本类目变种表无预览图入口"}
+    if st.get("supported") is None:
+        # 表没渲染完或压根没有预览图列：证据不足，不当成「不支持」也不报失败
+        await emit({"type": "log", "stage": "sku_preview",
+                    "message": f"变种信息表预览图列读不到（{st.get('err') or '零行'}），跳过"})
+        return {"status": "skipped", "note": st.get("err") or "变种表未渲染或无预览图列"}
+
+    rows = st.get("rows") or []
+    prev_idx, color_idx = st.get("previewIdx"), st.get("colorIdx")
+    bad = [r for r in rows if r.get("bad") and r.get("url")]
+    # 空图位（本行有换图入口却一张图都没有）：平台会拒「请上传预览图」，是确定性的
+    # 不合格。这里【没有源图可下载合规化】——认领本该把每行的图带过来，没带过来时
+    # 本阶段无从凭空造图，故只能如实判 fail 让人处理，绝不能算进「均已满足」。
+    # 2026-09-01 两单（1067271196776、1051827161006）就是被静默放过后，
+    # 到 ⑭ 才以「保存可能未生效」暴露，排查方向被带偏。
+    empty = [r for r in rows if r.get("empty")]
+    unknown = [r for r in rows
+               if not r.get("bad") and not r.get("empty")
+               and not (r.get("w") and r.get("h"))]
+    if unknown:
+        # 尺寸未知的行不动，但要说出来：保存被拦时能立刻想到这里（同 _skc_size_fallback）
+        await emit({"type": "manual_check", "stage": "sku_preview",
+                    "message": f"{len(unknown)} 行预览图读不到尺寸（图未加载完），"
+                               "未做合规化，若发布报预览图尺寸请人工确认"})
+    if empty and not bad:
+        tags = "、".join(
+            f"第 {r['i'] + 1} 行" + (f"「{r.get('color')}」" if r.get("color") else "")
+            for r in empty[:8])
+        await emit({"type": "manual_check", "stage": "sku_preview",
+                    "message": f"{len(empty)} 行预览图是空的（{tags}），"
+                               "认领未带图、本阶段无源图可合规化，"
+                               "保存会被平台拒「请上传预览图」，需人工补图"})
+        return {"status": "fail",
+                "note": f"{len(empty)}/{len(rows)} 行预览图为空（{tags}），"
+                        "认领未带图，保存必被拒「请上传预览图」"}
+    if not bad:
+        note = (f"{len(rows)} 行预览图均已满足 1:1 且不小于 "
+                f"{PREVIEW_MIN_SIDE}x{PREVIEW_MIN_SIDE}")
+        if empty:
+            note += f"（另有 {len(empty)} 行为空，已随不合规行一并处理）"
+        return {"status": "skipped", "note": note}
+
+    await emit({"type": "log", "stage": "sku_preview",
+                "message": f"{len(rows)} 行预览图里 {len(bad)} 行不合规"
+                           f"（非 1:1 或小于 {PREVIEW_MIN_SIDE}x{PREVIEW_MIN_SIDE}），"
+                           "逐行下载后做 1:1 合规化再换回"})
+
+    prep = os.path.join(ctx["workdir"], "sku-preview")
+    shutil.rmtree(prep, ignore_errors=True)
+    os.makedirs(prep, exist_ok=True)
+
+    ok_rows, fail_rows = [], []
+    for r in bad:
+        i, color = r["i"], r.get("color") or ""
+        tag = f"第 {i + 1} 行" + (f"「{color}」" if color else "")
+        raw = os.path.join(prep, f"row{i:02d}-raw.jpg")
+        out = os.path.join(prep, f"row{i:02d}.jpg")
+        try:
+            if not extract._download_image(r["url"], raw):
+                logger.warning(f"预览图 {tag} 源站取不到（404 等），保持原样")
+                await emit({"type": "manual_check", "stage": "sku_preview",
+                            "message": f"{tag} 预览图 {r['w']}x{r['h']} 不合规，"
+                                       f"但源图已从源站失效、取不到，仍是原图"
+                                       f"（发布会被拦，请人工换图）"})
+                fail_rows.append(tag)
+                continue
+            sq = images.square_image(raw, out_path=out)
+        except Exception as e:
+            # 下载或合规化失败：该行保持原样（原图还挂着，不会变空）
+            logger.warning(f"预览图 {tag} 合规化失败，保持原样：{e}")
+            await emit({"type": "manual_check", "stage": "sku_preview",
+                        "message": f"{tag} 预览图 {r['w']}x{r['h']} 不合规，"
+                                   f"但合规化失败、仍是原图（发布会被拦）：{str(e)[:80]}"})
+            fail_rows.append(tag)
+            continue
+        rep = await sku_preview_replace_row(
+            session, i, sq["output"], prev_idx,
+            color_idx=color_idx, expect_color=color)
+        if rep.get("status") == "ok":
+            ok_rows.append(tag)
+            logger.info(f"预览图 {tag} 已换成 {sq['outSize']}（原 {r['w']}x{r['h']}）")
+        else:
+            fail_rows.append(tag)
+            # 【失败必须落日志，不能只发 manual_check 事件】2026-09-01 排查
+            # 890185900190（4 行「红色」全失败）时，manual_check 既不写日志文件也不
+            # 进告警（刻意的，见 alert 那处：manual_check 会刷屏），于是事后只知道
+            # 「0/4 行已合规化」，拿不到 rep 里的 stage —— 到底是 open-space、pick
+            # 还是 readback 无从判断，只能重跑一次才能定位。
+            # 替换失败是整单发布会被拦的硬问题，值一条 warning。
+            logger.warning(
+                f"预览图 {tag} 替换失败[{rep.get('stage') or '?'}]："
+                f"{rep.get('err') or rep.get('detail') or ''} "
+                f"| fileId={(rep.get('fileId') or '')[-40:]} "
+                f"| srcBefore={(rep.get('srcBefore') or '')[-40:]} "
+                f"| srcAfter={(rep.get('srcAfter') or '')[-40:]}")
+            await emit({"type": "manual_check", "stage": "sku_preview",
+                        "message": f"{tag} 预览图替换失败[{rep.get('stage')}]："
+                                   f"{str(rep)[:120]}"})
+
+    note = f"{len(ok_rows)}/{len(bad)} 行预览图已合规化"
+    if fail_rows:
+        note += f"（失败：{'、'.join(fail_rows)}）"
+    # 一行都没成功时判 fail：预览图不合规是平台硬校验，发布必被拒，
+    # 报 ok 会让状态文件说谎（同 ⑦ 的取向：拦下的与真失败要分得开）
+    return {"status": "ok" if ok_rows else "fail", "note": note}
+
+
 async def _st_fix_sizes(ctx: dict, session: BrowserSession, emit) -> dict:
     """⑧ 尺码勾选。非服装类目没有尺码维，此时 fix_sizes 返回 skipped 而不是失败。
 
@@ -1259,8 +1519,25 @@ async def _st_fix_sizes(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "skipped", "note": (r.get("reason") or "")[:200]}
     if r.get("status") != "ok":
         return {"status": "fail", "note": (r.get("reason") or "")[:200]}
-    return {"status": "ok",
-            "note": f"源尺码 {len(r.get('wantedSizes') or [])} 个 | SKU 表 {r.get('rowCount')} 行"}
+    wanted = r.get("wantedSizes") or []
+    note = f"源尺码 {len(wanted)} 个 | SKU 表 {r.get('rowCount')} 行"
+    # 【部分源尺码在页面没有对应框：要报出来，不能只进返回值】fix_sizes 的
+    # warning 原先被这里整个丢掉，note 只写「源尺码 5 个 | SKU 表 4 行」——
+    # 少的那个尺码是谁、少没少，全靠人去对这两个数字。
+    # 2026-08-29 实测（草稿 173539495458370139）：类目从「女婴裤套装」被改成
+    # 「女童长裤套装」后，页面最小月龄档从 6-9M 抬到 9-12M，源尺码 6-9m 无框可勾，
+    # SKU 表少一行；⑧ 照常 ok 一路走到 ⑭，缺的尺码只能人工核对时才发现。
+    # 缺失往往意味着【类目选得不对】（同一件商品换个类目尺码档位就全了），故
+    # 走 manual_check 让它在进度里显式停一下，而不是继续只当 note 附注。
+    missing = r.get("missing") or []
+    if missing:
+        note += f"（源尺码 {'、'.join(missing)} 在页面无对应选项，未勾上）"
+        await emit({"type": "manual_check", "stage": "fix_sizes",
+                    "message": f"源尺码 {'、'.join(missing)} 在本类目的尺码选项里不存在，"
+                               f"这 {len(missing)} 个尺码不会进 SKU 表（SKU 表 "
+                               f"{r.get('rowCount')} 行）。常见成因是类目选得比商品实际年龄段"
+                               f"偏大/偏小，请核对类目是否正确"})
+    return {"status": "ok", "note": note}
 
 
 async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
@@ -1281,6 +1558,19 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
     「女童装-半身裙」，跟随预选会让两张表的测量参数都是裙长/腰围全围——数量校验能过，
     但上衣那件量的是衣长/胸围，等于给买家一份错尺码表。包装清单已经把件别判出来了
     （便服上衣 + 半身裙），拿它去选分类正好，见 pipeline._size_category_for。
+
+    【分类分了还不够，数值也要分】2026-08-29 商品 1058585588864（T恤+牛仔背带裙）：
+    上面那轮只让两张表的【分类】分了工，取值仍共用同一份 sizeMeasurements，于是两张表
+    填出完全相同的测量值。源图其实按「部件：上衣/连衣裙」分开给了两张表，现由
+    pipeline._pick_part_measurements 按分类配对取数，这里只负责把用了哪个部件报出来、
+    并在两张仍然同值时提醒人工核对。
+
+    【同款多件两张相同是对的，不能一并告警】skuCat=2 是「多件相同商品」，两件同款、
+    尺码维度本就一样，同值是正确结果。只有混合套装（skuCat=3）同值才是可疑的。
+
+    【三件以上平台装不下】平台只有「尺码表」「尺码表2」两栏（label 正则
+    /^尺码表2?$/，见 pipeline._JS_SIZECHART_LOCATE），第 3 件起没有位置。丢弃是平台
+    结构决定的事实，但不能静默——否则人工复核时看不出「有 3 件、只进了 2 件」。
     """
     judge = await _await_prewarm(ctx, "stock") or {}
     # skuCat 2=同款多件 3=混合套装 都算套装（平台按「不止一件」判，不区分同款与否）
@@ -1309,11 +1599,23 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
         est = r.get("estimated") or []
         note = (f"模板 {r.get('tplName')} | 分类 {r.get('category')}"
                 f" | 参数 {len(r.get('params') or [])} 项")
+        # 套装分件取数时点出用了源图哪一件：两张表数值必须分开，这是人工复核的第一眼
+        if r.get("partUsed"):
+            note += f" | 源部件 {r.get('partUsed')}"
         if est:
             note += f" | 模型估算 {'、'.join(est)}"
 
     if not is_set:
         return {"status": "ok", "note": note}
+
+    # 【三件以上先报出来】平台只有两栏，第 3 件起填不进去。放在补第二张表【之前】发，
+    # 是为了让这条提示排在尺码表结果前面——人先看到「有几件装不下」，再看两张表填了什么。
+    if len(packing) > 2:
+        await emit({"type": "manual_check", "stage": "sizechart",
+                    "message": f"包装清单有 {len(packing)} 件（{'、'.join(packing)}），"
+                               f"但平台只有「尺码表」「尺码表2」两栏，第 3 件起的尺码表"
+                               f"填不进去。请人工确认这几件是否共用同一套尺码，"
+                               f"或改小 SKU分类件数"})
 
     # 套装：补第二张表（分类取清单第二件；同款多件时两件相同，跟随第一件）
     cat2 = cats[1] if len(cats) > 1 else (cats[0] if cats else None)
@@ -1327,8 +1629,29 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
         await emit({"type": "manual_check", "stage": "sizechart",
                     "message": f"尺码表2 未加成（套装商品平台会打回）：{r2.get('reason')}"})
         return {"status": "fail", "note": f"尺码表2 失败：{(r2.get('reason') or '')}"[:200]}
-    note += (f" | 尺码表2 已存在：{r2.get('current')}" if r2.get("skipped")
-             else f" | 尺码表2 模板 {r2.get('tplName')}")
+    if r2.get("skipped"):
+        note += f" | 尺码表2 已存在：{r2.get('current')}"
+    else:
+        note += f" | 尺码表2 模板 {r2.get('tplName')}"
+        if r2.get("partUsed"):
+            note += f"（源部件 {r2.get('partUsed')}）"
+        # 【第二张表的估算列也要记】原先只有第一张表记 estimated，于是套装商品的状态
+        # 文件通篇没有「模型估算」字样，看起来像两张表都用了源实测值。2026-09-01
+        # 取证（999389808041 连体裤）第二张表两列全是估算值、且量级失真近一倍，
+        # 而这条信息在状态文件与 UI 上完全不可见——人工复核该先看哪几列都无从下手。
+        if r2.get("estimated"):
+            note += f" | 尺码表2 模型估算 {'、'.join(r2['estimated'])}"
+        # 混合套装两张表填出同一组数值 = 买家拿到一份错尺码表（真站坑，见
+        # pipeline._pick_part_measurements）。源只给了一张合表时无从分开，故只告警、
+        # 不判失败。skuCat=2（同款多件）两件本就同款，同值是正确结果，不在此列。
+        if (str(judge.get("skuCat", "1")) == "3"
+                and r.get("data") and r2.get("data")
+                and r.get("data") == r2.get("data")):
+            await emit({"type": "manual_check", "stage": "sizechart",
+                        "message": "混合套装的两张尺码表填出了完全相同的测量值，"
+                                   "请核对源商品是否分件给了尺码表（上衣量衣长胸围、"
+                                   "裙裤量裙长腰围），必要时人工改第二张"})
+            note += " | 两张数值相同(待复核)"
     return {"status": "ok", "note": note}
 
 
@@ -1422,6 +1745,86 @@ def _desc_cache_paths(workdir: str, url: str) -> tuple:
     return os.path.join(base, f"{h}.jpg"), os.path.join(base, f"{h}-en.jpg")
 
 
+async def _rehost_desc_keeps(ctx: dict, session: BrowserSession, mods: list,
+                             keep_pos: list, emit) -> dict:
+    """把判 keep 的描述图【原图转存到店小秘图床】，返回 {"done", "failed", "skipped"}。
+
+    【为什么必须做这一步】认领时平台把 1688 的描述图【按外链原样】挂在描述区，只有
+    被我们替换过的那几张才落到店小秘图床。于是判 keep 的图一直是 cbu01.alicdn.com
+    外链，desc_save 回读必然报「仍有外链图未转存」——2026-08-30 实测取证
+    （rowid 173539495458369319）：描述区 10 张图【全部】在 cbu01，而当轮计划只删 3
+    换 1，剩下 6 张 keep 的外链谁都不会去动，那条告警于是每轮必现。
+    原先的解释「未转存＝有图替换失败」只对「替换失败」那一种成因成立，keep 的图从来
+    没人管过，属于漏了一条链路，不是替换失败的连带现象。
+
+    转存＝下载原图 + 直传图床 + desc_replace 换成图床地址，【画面一个像素都不动】：
+    这些图模型判过是干净的，走生图既贵又可能改坏内容（同 needsUpscale 走纯几何放大
+    的取向）。产物落 desc-edit/<url哈希>.jpg 复用同一套缓存键，重跑不重复下载。
+
+    尺寸不达标的不在这里处理：plan_desc 已把它们改判 replace + needsUpscale，走
+    放大分支（那条路本来就会转存）。这里只碰真正 keep 的图；万一原图尺寸破线，
+    upload_image 的闸门会拒掉，按 best-effort 记一笔保留原样，不拖垮本阶段。
+    """
+    by_pos = {m.get("pos"): m for m in mods if m.get("pos")}
+    todo = [by_pos[p] for p in keep_pos
+            if p in by_pos and by_pos[p].get("url")
+            and not by_pos[p].get("onDxmHost")]
+    if not todo:
+        return {"done": 0, "failed": [], "skipped": 0}
+    logger.info(f"描述图转存：{len(todo)} 张 keep 的图仍是外链，逐张下载后重挂到店小秘图床")
+
+    # 【下载可以并发，替换必须串行】与 _prewarm_desc_images / _replace_round 同一个
+    # 分工：下载不碰页面，desc_replace 要现查 pos。
+    conc = get_image_concurrency()
+    sem = asyncio.Semaphore(conc)
+
+    async def _fetch(mod: dict) -> tuple:
+        local, _en = _desc_cache_paths(ctx["workdir"], mod["url"])
+        async with sem:
+            if os.path.exists(local) and os.path.getsize(local) > 0:
+                return mod["url"], local, ""
+            try:
+                os.makedirs(os.path.dirname(local), exist_ok=True)
+                n = await asyncio.to_thread(extract._download_image, mod["url"], local)
+                if not n:
+                    return mod["url"], "", "源站取不到原图（404 等），保留页面上的外链图"
+            except Exception as e:
+                return mod["url"], "", f"下载原图失败：{e}"[:150]
+            return mod["url"], local, ""
+
+    got = dict()
+    for url, path, err in await asyncio.gather(*(_fetch(m) for m in todo)):
+        got[url] = (path, err)
+
+    done, failed = 0, []
+    for mod in todo:
+        path, err = got.get(mod["url"], ("", "备料结果缺失"))
+        if not path:
+            failed.append({"url": mod["url"], "why": err})
+            continue
+        cur_pos, perr, fatal = await _resolve_desc_pos(session, mod["url"])
+        if perr:
+            # 页签被导航走对后续每一张都成立，立刻收工（同 _replace_round 的取向）
+            if fatal:
+                failed.append({"url": mod["url"], "why": perr})
+                await emit({"type": "manual_check", "stage": "desc",
+                            "message": f"{perr}；剩余 keep 图未转存，请恢复编辑页后续跑"})
+                break
+            failed.append({"url": mod["url"], "why": perr})
+            continue
+        rr = await desc_replace(session, cur_pos, path, expect_url=mod["url"])
+        if rr.get("status") == "ok":
+            done += 1
+        else:
+            failed.append({"url": mod["url"], "why": str(rr)[:150]})
+    if failed:
+        logger.warning(f"描述图转存：{done} 张成功，{len(failed)} 张仍是外链"
+                       f"（保留原图）：{str(failed[:2])[:200]}")
+    else:
+        logger.info(f"描述图转存完成：{done} 张 keep 的图已落店小秘图床")
+    return {"done": done, "failed": failed, "skipped": 0}
+
+
 async def _resolve_desc_pos(session: BrowserSession, url: str) -> tuple:
     """按源 URL 查它在描述区【当前】的序号，返回 (pos, err, fatal)。
 
@@ -1467,8 +1870,22 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
     """
     local, en_path = _desc_cache_paths(workdir, rep["url"])
     if os.path.exists(en_path) and os.path.getsize(en_path) > 0:
-        # 缓存命中不再重复质检：check_cleaned 也是一次视觉调用，而落盘的前提就是它已通过
-        return {"ok": True, "path": en_path, "how": "cached"}
+        # 缓存命中不再重复质检：check_cleaned 也是一次视觉调用，而落盘的前提就是它已通过。
+        # 【但尺寸要复查一次】质检管的是画面内容（残留中文/乱码/主体改坏），管不到
+        # 像素数。2026-08-29 实测：源图 80×80 的图英化后落盘 480×480，恰好卡在
+        # 描述图下限上——够 480 但比源图放大 6 倍，且历史产物可能是更早的口径出的。
+        # 尺寸不达标就当缓存未命中往下走（needsUpscale 分支会放大），而不是把不合格
+        # 的产物交给替换去撞上传闸门、最后以「保留原图 + 页面留 1688 外链」收场。
+        # 【读不出尺寸时仍按命中处理】把「未知」判成不合格会触发无谓的放大/重新
+        # 生图，正是 images.check_desc_size 那段注释要避免的；只有确实读到了
+        # 且低于下限才作废。
+        sz = images.image_size(en_path)
+        if sz and (sz[0] < images.DESC_MIN_W or sz[1] < images.DESC_MIN_H):
+            logger.warning(
+                f"描述图落盘产物尺寸不达标（{sz[0]}x{sz[1]}，要求两边 >= "
+                f"{images.DESC_MIN_W}），当缓存未命中重做：{os.path.basename(en_path)}")
+        else:
+            return {"ok": True, "path": en_path, "how": "cached"}
 
     if rep.get("needsUpscale"):
         # 【只缺像素的图走纯几何放大，不烧生图】plan_desc 判 needsUpscale 的图内容
@@ -1477,7 +1894,9 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 去重画一遍画面既贵又可能改坏内容。也因此不需要 check_cleaned 质检——
         # 画面根本没动过。
         try:
-            await asyncio.to_thread(extract._download_image, rep["url"], local)
+            n = await asyncio.to_thread(extract._download_image, rep["url"], local)
+            if not n:
+                return {"ok": False, "why": "放大失败：源站取不到原图（404 等）"}
             # 【产物必须落到 en_path】那是缓存键（见 _desc_cache_paths）。若就地
             # 改 local，重跑时 cached 判定看不到产物，每轮都要重新下载再放大一次。
             shutil.copy(local, en_path)
@@ -1488,13 +1907,18 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
                 images.compress, en_path, quality=88,
                 min_w=images.DESC_MIN_W, min_h=images.DESC_MIN_H)
         except Exception as e:
+            # 【单张图下载失败时返回失败而不抛异常】2026-09-02：原先 upscale 分支的
+            # _download_image 调用没有被 try-except 包裹，一张 404 就让整个商品失败。
+            # 改为返回失败状态，由上层 _replace_round continue 跳过该图、继续处理其余图。
             return {"ok": False, "why": f"放大失败：{e}"[:150]}
         return {"ok": True, "path": out, "how": "upscaled",
                 "note": f"{rep.get('reason')} -> {images.image_size(out)}"}
 
     try:
         # 同包复用，带过浏览器头的下载
-        await asyncio.to_thread(extract._download_image, rep["url"], local)
+        n = await asyncio.to_thread(extract._download_image, rep["url"], local)
+        if not n:
+            return {"ok": False, "why": "英化失败：源站取不到原图（404 等）"}
     except Exception as e:
         return {"ok": False, "why": f"英化失败：下载原图 {e}"[:150]}
 
@@ -1588,45 +2012,83 @@ async def _prewarm_desc_images(workdir: str, replace_plan: list, emit) -> dict:
     return out
 
 
+def _size_evidence(info: dict, texts: list) -> str:
+    """⑬ 删文字模块前给尺码留取证：返回疑似写着尺码的原文摘要，没有则返回空串。
+
+    【为什么需要这道闸】①b（extract.enrich_desc_text）已在采集阶段把详情纯文字里的
+    尺码抽进 product-info.json，⑨ 也已据此填完平台尺码表（⑨ 在 ⑬ 之前跑），故页面上
+    这些文字模块只是冗余副本、删掉不丢尺码。但 ①b 有两道跳过闸——descText 为空的纯图
+    详情、文字里没命中 _RE_SIZE_HINT——命中时 info 里没有实测值、⑨ 全靠模型估算。
+    那种情况下模块原文若真写着尺码，删掉就等于把唯一的准确来源丢在页面上没人看见。
+
+    【只取证、不阻拦】用户 2026-09-01 明确要求文字板块一律移除，故这里不改变删除行为，
+    只把原文记进日志 + manual_check 留追溯线索（原文另有一份在 info 的 descText 里，
+    见 extract.py 的 descText 落盘）。判据复用 ①b 那套尺码信号词，不另造一套。
+    """
+    if info.get("sizeMeasurements"):
+        return ""                          # ①b 或视觉已抽到实测值，无需取证
+    hit = [t for t in texts
+           if extract._RE_SIZE_HINT.search((t.get("text") or ""))]
+    if not hit:
+        return ""
+    detail = "；".join(f"idx={t.get('idx')}：{(t.get('text') or '')[:200]}"
+                      for t in hit[:3])
+    logger.warning(f"描述文字模块疑似写着尺码、而源数据里没有实测尺寸"
+                   f"（⑨ 尺码表已按模型估算填过）：{detail}")
+    return detail
+
+
 async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     m = await desc_map(session, ctx["info_path"])
     if m.get("status") != "ok":
         return {"status": "fail", "note": (m.get("err") or "desc_map 失败")[:200]}
     mods = m.get("modules") or []
     # 【不能在这里因「无图片」就跳过】mods 只统计图片模块，而描述区可能只放了文字
-    # （尺码对照表之类）。原先在这里 return skipped，会让那种商品的文字完全不被处理：
-    # 采集残留的垃圾 JSON 留在页面上、中文尺码表原样发到海外站。
-    # 故图片为空只跳过图片处理，文字照跑；两者都没有才是真的 skipped（见下方护栏）。
+    # （尺码对照表之类）。原先在这里 return skipped，会让那种商品的文字完全不被清除：
+    # 采集残留的垃圾 JSON、中文尺码表原样发到海外站。
+    # 故图片为空只跳过图片处理，文字照删；两者都没有才是真的 skipped（见下方护栏）。
     info_for_desc = _load_info(ctx["info_path"])
 
     # 【先处理文字模块，再处理图片】描述区是图文混排的，删文字模块会让 data-idx
     # 重排；而图片侧按源 URL 现查 pos（_resolve_desc_pos）、删除时内部重建 idx
     # 映射，不受影响。反序则要多读一遍 data-idx。
-    # 文字模块两类真实样本：1688 关联商品 JSON 残留（删）、尺码对照表（英化）。
-    text_note = ""
+    #
+    # 【文字模块一律删除，不再英化保留】2026-09-01 用户明确要求：描述区所有文字板块
+    # 全部移除。此前是交 LLM 判「采集残留 JSON 删 / 尺码对照表英化保留」，现在不再
+    # 分类——尺码值早在 ①b 就抽进 product-info.json、⑨ 已据此填完平台尺码表（⑨ 在 ⑬
+    # 之前跑），描述区那份纯文本只是冗余副本，且是中文残留的高发处；顺带省掉一次 LLM
+    # 调用。
+    #
+    text_note, n_text_deleted = "", 0
     try:
-        tm = await desc_text_map(session)
-        if tm.get("status") == "ok" and tm.get("texts"):
-            tplan = await vision.plan_desc_text(tm["texts"], info_for_desc)
-            acts = tplan.get("plan") or []
-            if any(p.get("action") in ("translate", "delete") for p in acts):
-                tr = await desc_text_apply(session, acts)
-                n_tr = len(tr.get("translated") or [])
-                n_del = len(tr.get("deleted") or [])
-                text_note = f"文字模块 英化 {n_tr} / 删 {n_del}"
-                if tr.get("failed"):
-                    text_note += f" / 失败 {len(tr['failed'])}"
-                    await emit({"type": "manual_check", "stage": "desc",
-                                "message": f"文字模块处理有 {len(tr['failed'])} 项未成功"
-                                           f"（已保留原文）：{str(tr['failed'])[:150]}"})
-                logger.info(f"描述文字模块处理完成：{text_note}")
+        tr = await desc_text_delete_all(session)
+        if tr.get("status") == "error":
+            logger.warning(f"文字模块枚举失败（保留原文，继续图片处理）：{str(tr)[:150]}")
+            text_note = "文字模块处理异常"
+        elif tr.get("found"):
+            n_text_deleted = len(tr.get("deleted") or [])
+            text_note = f"文字模块 删 {n_text_deleted}"
+            ev = _size_evidence(info_for_desc, tr.get("texts") or [])
+            if ev:
+                text_note += " / 疑似尺码原文已记日志"
+                await emit({"type": "manual_check", "stage": "desc",
+                            "message": f"描述文字模块写着尺码、但源数据里没有实测尺寸"
+                                       f"（⑨ 尺码表是模型估算的），请核对："
+                                       f"{ev[:200]}"})
+            if tr.get("failed"):
+                text_note += f" / 失败 {len(tr['failed'])}"
+                await emit({"type": "manual_check", "stage": "desc",
+                            "message": f"文字模块删除有 {len(tr['failed'])} 项未成功"
+                                       f"（原文仍留在页面上）：{str(tr['failed'])[:150]}"})
+            logger.info(f"描述文字模块处理完成：{text_note}")
     except Exception as e:
-        # 文字模块不是必填内容，处理不了就保留原文，不能拖垮整个描述阶段
+        # 文字模块不是必填内容，删不掉就留着，不能拖垮整个描述阶段
         logger.warning(f"文字模块处理异常（保留原文，继续图片处理）：{e}")
         text_note = "文字模块处理异常"
 
     # 文字模块删除后图片模块的 data-idx 已重排，故 desc_map 要重读一次拿最新状态
-    if text_note and "删 0" not in text_note and "异常" not in text_note:
+    # （判据用实际删除数，不再匹配 text_note 文案——文案一改判断就失效）
+    if n_text_deleted:
         m2 = await desc_map(session, ctx["info_path"])
         if m2.get("status") == "ok" and m2.get("modules"):
             mods = m2["modules"]
@@ -1746,8 +2208,19 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             if got is None:
                 got = await _prepare_desc_image(ctx["workdir"], rep)
             if not got.get("ok"):
+                # 【图片下载失败时检查尺码上下文】2026-09-02：单张描述图下载失败（如404）
+                # 不应让整个商品失败。如果该图可能是尺码表且已有文本或实测尺寸，提示影响较小。
+                why = got.get('why') or '未知原因'
+                hint = ""
+                if "下载" in why or "404" in why:
+                    # 检查是否有尺码上下文：descText 或 sizeMeasurements 存在时，
+                    # 单张图失败的影响较小（尺码信息已从其他渠道获取）
+                    has_size_context = (info_for_desc.get("descText") or
+                                       info_for_desc.get("sizeMeasurements"))
+                    if has_size_context:
+                        hint = "；已有文本尺码信息，影响较小"
                 await emit({"type": "manual_check", "stage": "desc",
-                            "message": f"{tag}{got.get('why')}（保留原图）"})
+                            "message": f"{tag}{why}（保留原图）{hint}"})
                 continue
             out_img = got["path"]
             how = got.get("how")
@@ -1783,7 +2256,29 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             if closed.get("status") != "ok":
                 logger.warning(f"重试前关闭编辑器失败，仍尝试重试：{closed.get('reason')}")
             await _replace_round(retry)
-    if not deleted and not replaced:
+
+    # ---- keep 的图也要转存到店小秘图床 --------------------------------------
+    # 【这是「仍有外链图未转存」的真正成因】认领时平台按外链原样挂 1688 图，只有被
+    # 替换过的才落图床；判 keep 的图从来没人动过，于是 desc_save 每轮都报外链未转存
+    # （2026-08-30 实测：10 张描述图全在 cbu01，而当轮只删 3 换 1）。放在替换轮之后：
+    # 替换过的图已经在图床上，这里只捡剩下的 keep 图，不重复劳动。
+    # fatal_hit（页签被导航走）时跳过——页面已经不在编辑页，转存同样无从下手。
+    rehosted = 0
+    if not fatal_hit:
+        try:
+            rh = await _rehost_desc_keeps(ctx, session, mods, plan.get("keep") or [],
+                                         emit)
+            rehosted = rh.get("done") or 0
+            if rh.get("failed"):
+                await emit({"type": "manual_check", "stage": "desc",
+                            "message": f"{len(rh['failed'])} 张 keep 的描述图未能转存"
+                                       f"（保留 1688 外链）：{str(rh['failed'][:2])[:150]}"})
+        except Exception as e:
+            # best-effort：转存不成只是外链留着（保存时是告警而非硬错误），
+            # 绝不能让它把已经换好的那些图连坐掉
+            logger.warning(f"描述图转存异常（保留外链，继续收尾）：{e}")
+
+    if not deleted and not replaced and not rehosted:
         # 【这条早退路径也必须先关编辑器】2026-08-28 实测（1014675972015 仿真花）：
         # 9 张描述图全部替换失败（描述专属菜单未展开），走到这里 return skipped，
         # 把描述编辑器【留在页面上】。它是全屏 modal，于是 ⑭ save 点下去后：
@@ -1821,13 +2316,20 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             parts.append(f"仍有图不符合描述图要求（比例 {images.DESC_RATIO_MIN}~"
                          f"{images.DESC_RATIO_MAX}、两边 >= {images.DESC_MIN_W}）："
                          f"{s['tooSmall']}")
-        # 【把成因一起报出来】这两条校验几乎从不是独立故障：本阶段每有一张图没换成，
-        # 它的 1688 原始外链就还挂在页面上，于是「未转存」与「尺寸破线」必然同时出现
+        # 【把成因一起报出来】替换失败会连带这两条：本阶段每有一张图没换成，它的
+        # 1688 原始外链就还挂在页面上，「未转存」与「尺寸破线」于是同时出现
         # （2026-08-26 那批：3 张失败 → 恰好 3 张破线 + cbu01.alicdn.com 外链）。
         # 只报校验结果会让人去查转存链路，而真正要看的是上面那几条替换失败的原因。
+        #
+        # 【但「未转存」不止这一个成因】判 keep 的图本来也全是 1688 外链，与替换成败
+        # 无关（2026-08-30 取证，见 _rehost_desc_keeps）。那条链路已在上面补了转存，
+        # 故这里的归因只在【确有替换失败】时才给，替换全成功却仍报外链时不要乱指方向。
         if kept_original := len(plan["replace"]) - replaced:
             parts.append(f"根因很可能是本阶段有 {kept_original} 张图未替换成功"
                          f"（它们的 1688 原始外链仍在页面上），请看上面各张的失败原因")
+        elif s.get("foreignHosts"):
+            parts.append("本阶段计划内的图都已处理完，外链应来自 keep 图转存未成功"
+                         "，请看上面的转存失败原因")
         await emit({"type": "manual_check", "stage": "desc",
                     "message": "描述保存后 " + ("；".join(parts) or str(s)[:120])})
         # 【尺寸不合规必须让本阶段 fail，不能只报一条提示就放行】2026-08-28 实测
@@ -1847,13 +2349,15 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     elif s.get("status") != "ok":
         return {"status": "fail", "note": f"desc_save 失败：{str(s)[:150]}"}
     return {"status": "ok", "note": _desc_note(deleted, replaced, text_note,
-                                               upscaled, reused)}
+                                               upscaled, reused, rehosted)}
 
 
 def _desc_note(deleted: int, replaced: int, text_note: str,
-               upscaled: int, reused: int) -> str:
+               upscaled: int, reused: int, rehosted: int = 0) -> str:
     """拼阶段⑬ 的结论文案（抽出来只为让 _st_desc 的收尾路径不重复这段拼接）。"""
     note = f"删 {deleted} 张 / 替换 {replaced} 张"
+    if rehosted:
+        note += f" / 转存 {rehosted} 张"
     if text_note:
         note += f" | {text_note}"
     extra = []
@@ -1876,6 +2380,7 @@ async def _st_video(ctx: dict, session: BrowserSession, emit) -> dict:
     哪个视频。故必须在发布前把关（2026-08-26 那批失败品实测：720×1280，比例 0.5625）。
 
     【纯增益路径，从不 fail】与 ⑤b 图片清理同一取向：
+      - 批次开关 keep_video=False → 直接点「删除」丢弃视频，不做任何审核；
       - 没有视频 → skipped（大多数 1688 商品其实没视频）；
       - 视频已合规 → skipped，绝不重编码（重编码必然掉画质，对本来就合规的是倒扣分）；
       - 下载/转码/上传任一步失败 → 报 manual_check 但仍返回 ok，让流程继续走到 save。
@@ -1886,6 +2391,22 @@ async def _st_video(ctx: dict, session: BrowserSession, emit) -> dict:
     【为什么读接口而不读页面】视频区 DOM 里没有真实地址（封面是内嵌 base64 占位图，
     Vue 3 的 setupState 也扒不到），只有 edit.json 的响应里有，见 read_video_url。
     """
+    # 【批次级开关：不保留视频就直接删，连接口和下载都不用碰】keep_video=False 时
+    # 用户已经决定整批不要视频，那么读 videoUrl / 下载 / 转码 / 直传全是白工——
+    # 页面上有没有视频看 DOM 就知道（封面块的显隐），比读接口还快一个来回。
+    if not ctx.get("keep_video", True):
+        r = await delete_video(session)
+        if r.get("status") != "ok":
+            # 与本阶段其余分支同取向：从不 fail，报 manual_check 让人决定
+            await emit({"type": "manual_check", "stage": "video",
+                        "message": f"按批次开关要删视频但没删掉[{r.get('stage')}]："
+                                   f"{r.get('err')}——页面上视频仍在，"
+                                   f"发布时可能被平台按比例打回"})
+            return {"status": "ok", "note": f"删除失败[{r.get('stage')}]，视频原样保留"}
+        if r.get("already"):
+            return {"status": "skipped", "note": "该商品没有视频，无需删除"}
+        return {"status": "ok", "note": "按批次开关已删除产品视频（不做比例审核）"}
+
     rowid = ctx.get("rowid") or ""
     if not rowid:
         return {"status": "skipped", "note": "没有 rowid，读不到视频字段"}
@@ -2004,7 +2525,9 @@ _STAGE_FUNCS = {
     "titles": _st_titles,
     "clean_images": _st_clean_images,
     "material": _st_material,
+    "drop_acc": _st_drop_acc,
     "skc": _st_skc,
+    "sku_preview": _st_sku_preview,
     "fix_sizes": _st_fix_sizes,
     "sizechart": _st_sizechart,
     "sku_code": _st_sku_code,
@@ -2032,6 +2555,7 @@ async def publish_one(
     use_cache: bool = True,
     do_publish: bool = False,
     price: str = "",
+    keep_video: bool = True,
 ) -> dict:
     """按 STAGES 顺序跑一个商品，返回 {"status", "rowid", "failed_stage", "note", "elapsed_s"}。
 
@@ -2040,12 +2564,25 @@ async def publish_one(
     """
     key = _task_key(task)
     state = load_state(key)
+    # 【workdir 必须能从 info_path 反推，不能只靠状态文件】它原先只在 ① extract 里
+    # 赋值，而 --from-stage 会跳过 ①（_should_run 对 from_idx 之前一律 False）。
+    # rowid 模式的状态键是 rowid-<rowid>（与 offer 键的那份是两个文件，见
+    # publish-resume-state-key 的结论），那份状态里 workdir 为 null，于是
+    # ctx["workdir"] 一路是 None，⑬ 描述图转存 _desc_cache_paths(None, url) 抛
+    # 「expected str, bytes or os.PathLike object, not NoneType」，被 best-effort
+    # 吞成 warning：5 张 keep 图全部没转存，商品带着 1688 外链就发出去了
+    # （2026-09-01 实跑取证）。info_path 与 workdir 本是同一目录的两种说法，
+    # 能反推就不该等 ① 来填。
+    workdir = state.get("workdir")
+    info_path = task.get("info_path") or state.get("info_path")
+    if not workdir and info_path:
+        workdir = os.path.dirname(os.path.abspath(info_path))
     ctx = {
         "url": task.get("url"),
         "title": task.get("title") or state.get("title"),
         "rowid": task.get("rowid") or state.get("rowid"),
-        "info_path": task.get("info_path") or state.get("info_path"),
-        "workdir": state.get("workdir"),
+        "info_path": info_path,
+        "workdir": workdir,
         "store": store,
         "site": site,
         # 类目路径：阶段③写入，阶段④拿它当属性缓存的键；续跑时从状态文件回填
@@ -2063,6 +2600,10 @@ async def publish_one(
         # ⑩ 申报价：批次级参数（UI 输入框/CLI --price），空串＝用管线默认 188.88。
         # 与 use_cache 一样不进状态文件——定价属于本次运行的决定，续跑不该继承旧价。
         "price": price,
+        # ⑬b 视频去留：批次级开关。True 走原来的比例合规化回填，False 直接点「删除」。
+        # 与 use_cache/price 一样不进状态文件——「这批要不要视频」属于本次运行的决定，
+        # 续跑不该继承上次的取向（上次删掉了，这次开着开关重跑就该重新处理）。
+        "keep_video": keep_video,
         # ⑮ 要核 ⑭ save 的终态做前置判断，故把状态字典本身透给阶段函数
         # （同一个对象，主循环写完 stages[sid] 后 ⑮ 读到的就是最新值）
         "state": state,
@@ -2222,6 +2763,7 @@ async def run_batch(
     use_cache: bool = True,
     do_publish: bool = False,
     price: str = "",
+    keep_video: bool = True,
 ) -> dict:
     """批量发布编排入口，返回 {"ok", "fail", "batch"}。
 
@@ -2247,6 +2789,10 @@ async def run_batch(
     store = store or prefs.get("store") or ""
     site = site or prefs.get("site") or ""
     batch = int(time.time())
+    # 【告警包装放在这里而不是函数开头】它要带上店铺/站点进卡片，而这两个值刚由
+    # prefs 回填定下来；放前面就只能报空。包装之后本函数与 publish_one 都用这个
+    # on_progress，故前置校验的 aborted 也在告警覆盖范围内（那些正是最该报的中断）。
+    on_progress = _alert_hook(on_progress, store, site, len(tasks or []))
 
     if from_stage and from_stage not in _STAGE_IDS:
         await _emit(on_progress, {"type": "aborted",
@@ -2274,6 +2820,12 @@ async def run_batch(
                               "store": store, "site": site, "batch": batch})
     await _emit(on_progress, {"type": "log", "level": "info",
                               "message": f"本次使用模型：{active_llm_label()}"})
+    # 视频取向要在跑之前就报出来：这两条路线耗时差几十秒到几分钟每个商品，
+    # 事后从阶段结论里反推不如开跑就写明（与「本次使用模型」同一处）
+    await _emit(on_progress, {
+        "type": "log", "level": "info",
+        "message": ("本次保留产品视频：按比例合规化后回填" if keep_video
+                    else "本次丢弃产品视频：编辑页直接删除，不做比例审核")})
     # 报一下缓存现状：类目/属性缓存命中与否直接决定阶段③④的耗时，跑之前就让人看见
     if use_cache:
         st = cache.cache_stats()
@@ -2326,7 +2878,7 @@ async def run_batch(
                     publish_one(session, task, store, site, on_progress,
                                 index=i, total=total, from_stage=from_stage,
                                 use_cache=use_cache, do_publish=do_publish,
-                                price=price),
+                                price=price, keep_video=keep_video),
                     timeout=PRODUCT_TIMEOUT)
             except asyncio.TimeoutError:
                 r = {"status": "fail", "rowid": task.get("rowid"), "failed_stage": "",
@@ -2341,6 +2893,10 @@ async def run_batch(
                 fail += 1
             await _emit(on_progress, {"type": "product_done", "index": i, "total": total,
                                       "offer": key, "rowid": r.get("rowid"),
+                                      # title 原先只在 product_start 里（前端自己记着）。
+                                      # 告警卡片要在一条消息里说清是哪个商品，故这里带上，
+                                      # 前端多收一个字段无影响。
+                                      "title": task.get("title") or "",
                                       "status": r["status"],
                                       "elapsed_s": r.get("elapsed_s", 0.0),
                                       "note": r.get("note") or "",

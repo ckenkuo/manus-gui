@@ -28,14 +28,16 @@ import asyncio
 import json
 import os
 import re
+import time
 from typing import Optional
 
 from app.logger import logger
-from app.publish import cache, images
+from app.publish import browser, cache, images
 from app.publish.browser import (
     DRAFT_LIST_URL,
     EDIT_URL,
     ONLINE_LIST_URL,
+    PUBLISH_FAIL_LIST_URL,
     J,
     BrowserSession,
 )
@@ -224,7 +226,10 @@ async def list_images(session: BrowserSession, rowid: str,
                 break
         path = os.path.join(outdir, name + ext)
         try:
-            _download_image(url, path)
+            if not _download_image(url, path):
+                failed.append({"url": url[:120], "err": "源站取不到（404 等），已跳过"})
+                logger.warning(f"{name} 源站取不到，跳过")
+                return
             files.append(path)
         except Exception as e:
             failed.append({"url": url[:120], "err": str(e)})
@@ -355,6 +360,53 @@ async def read_current_category(session: BrowserSession) -> Optional[str]:
     return r.get("snippet")
 
 
+# ---- 类目判断的辅助线索（年龄段 / 尺码档位）----------------------------------
+# 【为什么标题不够】见 size_tier 上方的 2026-08-29 取证：1688 标题把「女」和「宝宝」
+# 并列，模型在第 2 级把婴幼童读成女士。而同一份 product-info.json 里躺着三个比标题
+# 措辞硬得多的信号，此前一个都没喂给类目判断：
+#   1. attributes 的「适合年龄段」——1688 卖家自己填的枚举值
+#   2. sizes 的写法档位——月龄码/岁码与成人码互斥（size_tier）
+#   3. 「适合身高」里的厘米区间
+# 故把它们拼成一段线索附在标题后面。刻意【只做提示不做否决】：线索为空时提示词退化
+# 成原样，判断质量不受影响；线索存在时它是硬约束（提示词规则 2 里写明）。
+_AGE_ATTR_KEYS = ("适合年龄段", "适用年龄", "年龄段", "适合身高", "适用身高")
+
+
+def cat_clues(info: Optional[dict]) -> str:
+    """从 product-info.json 内容里凑出一段年龄/尺码线索，供类目提示词用。
+
+    拿不到任何线索就返回空串（调用方据此整段省掉，不给模型留空占位诱导它编）。
+    best-effort：info 结构不符预期一律当没线索，绝不让类目阶段因此失败。
+    """
+    if not isinstance(info, dict):
+        return ""
+    bits = []
+    try:
+        attrs = info.get("attributes") or {}
+        for k in _AGE_ATTR_KEYS:
+            v = str((attrs.get(k) or "")).strip()
+            if not v:
+                continue
+            # 1688 的「适合身高」常把后面几个属性黏进同一个值里（实测 1055568943470：
+            # `6-9m,...,2-3y主要下游平台ebay,亚马逊...主要销售地区非洲,欧洲...`）。
+            # extract 那边按已知键名切不开这种连写，这里在黏连处再切一刀，免得噪音
+            # 把年龄信号淹掉（单纯按长度硬截会把 ebay/亚马逊 留在线索里）。
+            v = re.split(r"主要下游平台|主要销售地区|下游平台|销售地区", v)[0].strip(" ,，")
+            if v:
+                bits.append(f"{k}: {v[:40]}")
+        sizes = info.get("sizes") or list((info.get("skus") or {}).keys())
+        if sizes:
+            shown = "、".join(str(s) for s in list(sizes)[:8])
+            tier = size_tier(sizes)
+            note = {"baby": "（月龄码/岁码/身高码 = 婴幼童，不可能是成人商品）",
+                    "adult": "（成人字母码）"}.get(tier, "")
+            bits.append(f"源商品尺码: {shown}{note}")
+    except Exception as e:
+        logger.warning(f"提取类目年龄线索失败（不影响类目判断）：{e}")
+        return ""
+    return "；".join(bits)
+
+
 # 类目选择提示词：前四条规则是原 skill 踩出来的（套装优先、性别年龄段必须一致、
 # "其他"类目只在全都不符时才选），第 5 条是本项目 2026-08-19 实测补的——
 # 见 _lookahead_children 的注释：只看本级名字会选错分支。
@@ -363,13 +415,13 @@ _CAT_PROMPT = """你是跨境电商类目分类助手。根据商品标题，从
 
 规则：
 1. 若商品标题表明是套装类商品（含"套装""两件套""三件套""套裙"等），候选中有套装/两件套类类目时，必须优先选套装类类目，而不是按单品材质/上衣/裤子归类。
-2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致。
+2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时，商品必为婴幼童/童装，禁止选女士/男士等成人分支；源尺码是 S/M/L/XL 等成人字母码时，禁止选婴儿/女童/男童分支。
 3. "其他（...）"类目只有在所有其他候选都语义不符时才能选；只要存在更具体的候选（如按裙/长裤/短裤、开衫/套头衫区分），就必须选最具体匹配的那个，依据标题中的实体信息判断（如"牛仔裤"=长裤下装）。
 4. 商品的风格属性（运动/休闲/正装/居家）要与类目分支一致：运动风商品（含"运动""卫衣""POLO""卫裤""速干"等）应优先进"运动服/休闲运动"这类分支。
 5. 【重要】选择时必须综合本级名字和它的子类目：若某候选本身不如另一个贴切，但其子类目里有明显更匹配商品的项，应选它。反之，某候选名字看着匹配但子类目全都不符，则不该选。
 
 商品标题：{title}
-已选路径：{path}
+{clues}已选路径：{path}
 候选类目：
 {options}
 
@@ -414,11 +466,15 @@ async def _lookahead_children(session: BrowserSession, col_idx: int,
 
 
 async def _pick_category(title: str, options: list, path: list,
-                         children: Optional[dict] = None) -> tuple:
+                         children: Optional[dict] = None,
+                         clues: str = "") -> tuple:
     """让 LLM 从候选类目里选一个，返回 (index, reason)。
 
     children 给出每个候选的子类目清单（前瞻结果），会拼进提示词。
     子类目多时只取前 12 个——提示词太长反而稀释重点，12 个足够看出分支性质。
+
+    clues 是 cat_clues() 产出的年龄段/尺码线索（见其上方的 2026-08-29 取证）。
+    为空时整行省掉，不给模型留空占位——空占位会诱导模型自己编线索。
     """
     from app.publish.llm import ask_json
 
@@ -435,6 +491,7 @@ async def _pick_category(title: str, options: list, path: list,
     data = await ask_json(
         _CAT_PROMPT.format(
             title=title,
+            clues=(f"商品线索：{clues}\n" if clues else ""),
             path=" > ".join(path) or "（根级）",
             options="\n".join(lines),
         ),
@@ -466,14 +523,14 @@ _CAT_FROM_CACHE_PROMPT = """你是跨境电商类目分类助手。下面是本�
 
 规则：
 1. 若商品标题表明是套装类商品（含"套装""两件套""三件套""套裙"等），清单中有套装/两件套类叶子类目时，必须优先选它，而不是按单品材质/上衣/裤子归类。
-2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致。路径中任何一级的性别或年龄段与商品不符，这条路径就不能选。
+2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。路径中任何一级的性别或年龄段与商品不符，这条路径就不能选。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时商品必为婴幼童/童装，成人分支的路径一概不能选；反之成人字母码（S/M/L/XL）不能选婴儿/童装分支。
 3. "其他（...）"类叶子类目只有在清单里所有更具体的候选都语义不符时才能选。
 4. 商品的风格属性（运动/休闲/正装/居家）要与路径分支一致：运动风商品（含"运动""卫衣""POLO""卫裤""速干"等）应走"运动服/休闲运动"这类分支。
 5. 【重要】要逐级复核整条路径，不是只看叶子名。叶子名看着匹配但中间某一级（品类大类、性别、年龄段、风格分支）与商品不符的，不能选。
 6. 【最重要】拿不准就选「以上都不匹配」。选错一条路径会让商品发布到错误类目、必须人工回滚；选「不匹配」只是让程序多花约两分钟重新走一遍类目树，代价小得多。只有当某条路径的每一级都与商品相符、且叶子类目就是这件商品该去的地方时才选它；仅仅是"大类相同"（都是女装、都是童装）远远不够。
 
 商品标题：{title}
-已知类目路径：
+{clues}已知类目路径：
 {paths}
 
 只输出JSON: {{"index": <序号>, "reason": "<一句话理由：说明是依据哪一级判断的，或为什么都不匹配>"}}"""
@@ -503,7 +560,8 @@ def _format_cached_paths(known: list) -> str:
     return "\n".join(lines)
 
 
-async def _pick_cached_category(title: str, known: list) -> tuple:
+async def _pick_cached_category(title: str, known: list,
+                                clues: str = "") -> tuple:
     """让 LLM 从已知路径里选一条，返回 (path_or_None, reason)。
 
     与 _pick_category 的关键差异：这里【答不出来是合法答案】，非法/越界 index 一律
@@ -518,7 +576,8 @@ async def _pick_cached_category(title: str, known: list) -> tuple:
 
     data = await ask_json(
         _CAT_FROM_CACHE_PROMPT.format(
-            title=title, paths=_format_cached_paths(known)),
+            title=title, clues=(f"商品线索：{clues}\n" if clues else ""),
+            paths=_format_cached_paths(known)),
         what="类目选择（缓存路径）", stage="auto_cat",
     )
     idx = data.get("index")
@@ -545,7 +604,8 @@ async def _click_cat_path(session: BrowserSession, path: list) -> dict:
 
 
 async def _try_cached_category(session: BrowserSession, title: str,
-                               site: str = "") -> Optional[dict]:
+                               site: str = "",
+                               clues: str = "") -> Optional[dict]:
     """缓存快路径：LLM 从已知路径里选一条 → 逐列直点 → 确认 → 回读校验。
 
     返回值与 auto_cat 的成功返回【同构】（status/path/pathList/leaf/levels/trace/
@@ -561,7 +621,7 @@ async def _try_cached_category(session: BrowserSession, title: str,
     if not known:
         return None
     try:
-        path, reason = await _pick_cached_category(title, known)
+        path, reason = await _pick_cached_category(title, known, clues)
     except Exception as e:
         # 缓存是加速手段，它自己的 LLM 调用失败不该拖垮整个阶段：落回慢路径
         logger.warning(f"缓存类目选择失败，落回逐级遍历：{e}")
@@ -599,7 +659,8 @@ async def _try_cached_category(session: BrowserSession, title: str,
 
 async def auto_cat(session: BrowserSession, rowid: str, title: str,
                    max_levels: int = 8, lookahead: bool = True,
-                   use_cache: bool = True, site: str = "") -> dict:
+                   use_cache: bool = True, site: str = "",
+                   info: Optional[dict] = None) -> dict:
     """阶段③：逐级选定产品类目到叶子，确认后留在页面（不刷新，状态交后续阶段）。
 
     走 UI 树而非类目 API（理由见上方注释块）：打开弹窗读第 0 列 → 前瞻各候选的子类目 →
@@ -617,8 +678,16 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
     列 0 重新点选，右侧列随之全部销毁重建，因此不必特意清理——但列索引必须按层级
     算（第 N 级点列 N），不能沿用原脚本「总点最后一列」的写法。
 
+    info 传 product-info.json 的内容时，会从中提取年龄段/尺码线索一并喂给 LLM
+    （见 cat_clues 上方的 2026-08-29 取证：只给标题会把「女…宝宝」并列的童装
+    判成成人女装，一路错到叶子，直到阶段⑧ 尺码对不上才暴露）。不传则退化成
+    原来的只看标题，判断逻辑一行不变。
+
     会真实修改草稿的类目值。类目变更会清空「关联BestSeller款」（页面自带行为）。
     """
+    clues = cat_clues(info)
+    if clues:
+        logger.info(f"类目判断线索：{clues}")
     await open_edit(session, rowid)
     await asyncio.sleep(2)
     await session.kill_stuck_modals()  # 上一轮残留的遮罩会挡住「选择分类」按钮
@@ -634,7 +703,7 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
     # 缓存快路径：命中就 7.6s 走完，未命中/不匹配落回下方原有逐级遍历（不需清场，
     # 理由见 _try_cached_category 的 docstring）
     if use_cache:
-        hit = await _try_cached_category(session, title, site)
+        hit = await _try_cached_category(session, title, site, clues)
         if hit:
             return hit
 
@@ -656,7 +725,7 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
             children = await _lookahead_children(
                 session, level, options,
                 restore=state["cols"][level].get("active"))
-        idx, reason = await _pick_category(title, options, path, children)
+        idx, reason = await _pick_category(title, options, path, children, clues)
         name = options[idx]
         cr = await _click_cat_in_column(session, level, name)
         if not cr.get("clicked"):
@@ -1234,6 +1303,50 @@ async def _readback_attr(session: BrowserSession, label: str, row_no: int = 1) -
     return await session.eval_json(js)
 
 
+async def _trim_comp_rows(session: BrowserSession, label: str, keep: int) -> dict:
+    r"""成分类字段行数多于 keep 时，点末行的 .icon_remove 裁到只剩 keep 行。
+
+    【为什么必须裁】平台按 attrValueId 逐行判重（2026-08-30 从编辑页 bundle
+    Layout-*.js 取证：selectPercent 属性遍历各行，`if (n.includes(p)) return
+    C(\`${t._label}不能重复选择\`)`，且这道闸排在「百分比之和=100」之前）。
+    而认领带来的初始行数由源商品决定：本例「成分」页面初始就是 2 行
+    （聚酯纤维 90% + 氨纶 10%），我们按源含量重建出的却是 2 行
+    （聚酯纤维 60% + 棉 40%）——行数刚好相等时没事，一旦初始行比重建结果多，
+    多出来的旧行就【原样留在表单里】：_ensure_comp_rows 只加不减，写入又只覆盖
+    前 N 行。2026-08-30 实测复现（rowid 173539495458369319）：页面 3 行时按
+    2 行写入，回读得到 ['聚酯纤维(涤纶）', '棉', '棉'] —— 第 3 行的旧「棉」与
+    新写的第 2 行撞同一根纤维，保存即报「成分不能重复选择」，整单卡在阶段⑭。
+
+    只点【末行】的 icon_remove：第 1 行没有这个图标（2026-08-30 实测：行 1 只有
+    icon_add，行 2 起才同时有 icon_add + icon_remove），且实测点末行删的就是末行、
+    不会错删前面已填好的行。keep < 1 一律按 1 处理——首行删不掉，硬要删只会空转。
+    """
+    keep = max(1, int(keep))
+    js = r"""(async () => {
+      const sleep = ms => new Promise(r => setTimeout(r, ms));
+      const it = Array.from(document.querySelectorAll('#productBasicInfo .ant-form-item'))
+        .find(el => {
+          const l = el.querySelector('.ant-form-item-label label');
+          if (!l) return false;
+          const sp = l.querySelector('.attr-label');
+          const name = sp ? (sp.textContent||'').trim()
+                          : (l.getAttribute('title')||l.textContent||'').trim();
+          return name === __LABEL__; });
+      if (!it) return JSON.stringify({err: 'row-not-found'});
+      const rows = () => it.querySelectorAll('.ant-select').length;
+      const before = rows();
+      let guard = 0;
+      while (rows() > __KEEP__ && guard++ < 10) {
+        const rms = Array.from(it.querySelectorAll('.icon_remove'));
+        if (!rms.length) break;              // 只剩首行（无删除图标），到此为止
+        rms[rms.length - 1].click();
+        await sleep(1200);
+      }
+      return JSON.stringify({before: before, after: rows(), trimmed: before - rows()});
+    })()""".replace("__LABEL__", J(label)).replace("__KEEP__", str(keep))
+    return await session.eval_json(js)
+
+
 async def _ensure_comp_rows(session: BrowserSession, label: str, row_no: int) -> dict:
     """成分类字段行数不够时点 .icon_add 加行，直到有 row_no 个下拉。"""
     js = r"""(async () => {
@@ -1739,6 +1852,26 @@ async def generate_titles(info: dict) -> dict:
         )
         return any(re.search(p, text, re.I) for p in pats)
 
+    def _has_subjective_claim(text: str) -> bool:
+        """主观营销用语硬闸——Temu 明确禁止的绝对化/主观化表述。
+
+        平台禁用词类型：最高级（Best/Perfect）、必备类（Must Have）、
+        第一类（#1/Top/Leading）、完美类（Perfect/Flawless）等。
+        中文同样拦截「好物/神器/必备/最好/第一/完美」等。
+        """
+        # 英文主观营销词
+        en_pats = (
+            r"\b(best|perfect|flawless|ultimate|ideal)\b",
+            r"\b(must[\s-]?have|essential|necessary)\b",
+            r"\b(top|leading|premier|superior|unbeatable)\b",
+            r"\b(number[\s-]?one|#\s*1|no\.?\s*1)\b",
+            r"\b(amazing|incredible|unbelievable|revolutionary)\b",
+        )
+        # 中文主观营销词
+        zh_pats = r"(好物|神器|必备|最好|第一|完美|极致|顶级|首选|王牌)"
+        return (any(re.search(p, text, re.I) for p in en_pats)
+                or bool(re.search(zh_pats, text)))
+
     def _en_reject(en: str) -> Optional[str]:
         """英文标题不合格的具体原因；合格返回 None。
 
@@ -1761,6 +1894,8 @@ async def generate_titles(info: dict) -> dict:
             return "含年份或时效词"
         if _has_price_claim(en):
             return "含价格/优惠宣称"
+        if _has_subjective_claim(en):
+            return "含主观营销用语"
         return None
 
     def _zh_reject(zh: str) -> Optional[str]:
@@ -1776,6 +1911,8 @@ async def generate_titles(info: dict) -> dict:
         if _has_price_claim(zh) or re.search(
                 r"包邮|免邮|特价|清仓|折扣|秒杀|亏本|甩卖", zh):
             return "含价格/优惠宣称"
+        if _has_subjective_claim(zh):
+            return "含主观营销用语"
         return None
 
     # 【候选数 3 不是 10】2026-08-24 耗时实测：原先要 10 个候选、每个还带 logic 字段，
@@ -1790,19 +1927,25 @@ async def generate_titles(info: dict) -> dict:
         "核心写作规则（必须严格遵守）：\n"
         "1. 字符限制：每个标题严格控制在 40-70 个字符（含空格），确保手机端完整显示。\n"
         "2. 关键词布局：必须包含 [核心品类词] + [材质/功能属性] + [使用场景] + [人群]。\n"
-        "3. 流量钩子（二选一或组合）：数量策略（Set of 2 / 2 Pcs / Value Pack）、\n"
-        "   解决痛点（Must Have / Upgrade / No More...）。\n"
+        "3. 流量钩子（选用客观事实描述）：数量策略（Set of 2 / 2 Pcs / Value Pack）、\n"
+        "   功能描述（Waterproof / Breathable / Adjustable）、\n"
+        "   场景适用（For Home / Daily Use / Travel）。\n"
+        "   【严禁主观营销用语】不许出现 Best / Perfect / Must Have / Essential /\n"
+        "   Top / Leading / #1 / Amazing / Incredible 等主观化/绝对化表述——\n"
+        "   平台明确禁用此类词汇，会被直接拒审。只描述客观事实（材质、数量、功能、场景）。\n"
         "   【严禁任何价格与优惠表述】不许出现 Under $X / Cheap / Budget / Sale / Off /\n"
         "   Discount / Deal / Free Shipping 等：写标题时真实售价尚未确定（由后续申报价决定），\n"
         "   任何价格数字都是编的，属虚假价格宣称。\n"
         "4. 严禁使用 Emoji 和任何特殊符号，只允许英文字母、数字、空格、连字符。\n"
-        "5. 禁用：严禁最高级（Best/Perfect 等）、严禁长难句、严禁中文字符。\n"
-        "6. 严禁年份（2025/2026/25/26 等）与 New Arrival/Latest/This Year 这类时效表述——\n"
+        "5. 严禁年份（2025/2026/25/26 等）与 New Arrival/Latest/This Year 这类时效表述——\n"
         "   商品生命周期跨年，年份次年即成过期信息。季节词（Winter/Fall）可保留。\n"
-        "标题结构公式：\n"
-        "A 视觉冲击型：[Emoji]+[形容词]+[核心产品]+[关键属性]+[场景]\n"
-        "B 套装型：[数量套装]+[核心产品]+[卖点]+[材质/功能]+[人群]（不带价格）\n"
-        "C 痛点解决型：[问题场景]+[产品方案]+[亮点]+[送礼属性]\n"
+        "标题结构公式（推荐按商品类型选用）：\n"
+        "A 基础型：[核心品类] + [关键属性] + [材质/功能] + [适用场景/人群]\n"
+        "   示例：Adjustable Pet Harness for Small Dogs, Breathable Mesh, Daily Walking\n"
+        "B 套装型：[数量] + [核心品类] + [关键属性] + [材质/功能] + [适用人群]\n"
+        "   示例：2 Pcs Kitchen Storage Containers, Airtight Seal, BPA Free, For Home Use\n"
+        "C 多功能型：[核心品类] + [多个功能点] + [材质] + [场景]\n"
+        "   示例：Waterproof Phone Holder for Car, Adjustable Angle, Dashboard Mount\n"
         "分析时必须结合商品实际信息（从下方商品标题、源商品参数、SKU 价格、图片理解摘要中提炼\n"
         "人群/品类/材质/特点/款式/季节/场景，禁止套用与本商品无关的模板词）。\n"
         f"品牌红线：品牌名严禁出现在任何标题中（本商品品牌为 {brand or '无'}，\n"
@@ -1937,14 +2080,44 @@ def norm_size(s: str) -> str:
     见 _SIZE_ALIASES 上方的实测说明），最后才回落到剥 cm/码 后缀（保留 M/XL）。
     """
     t = str(s).strip()
-    # 描述性尾巴：建议/参考/适合 + 身高/体重…，以及括号补充说明
-    t = re.split(r"[（(]|建议|参考|适合|推荐", t)[0].strip()
-    # 童装数字码主体：110cm → 110、110-120 → 110
+    # 描述性尾巴：建议/参考/适合 + 身高/体重…，以及括号补充说明。
+    # 【方括号与冒号也是引导符】2026-09-01 实测三单（1051830242405 源键 `L【`、
+    # 668802700848 源键 `L:60克`、1065904018146 源键 `M 胸围33背长29Г`）：1688 商家
+    # 把规格/克重/测量值直接拼在尺码键里，引导符不止圆括号。页面选项就是干净的
+    # S/M/L/XL，三单的字母码全在页面上，却因归一没剥掉尾巴而报「源尺码在页面选项里
+    # 全部不存在」——尺码一个都没勾、整单卡在阶段⑧。故把 `【[〔` 与 `:：` 一并纳入。
+    t = re.split(r"[（(【\[〔]|[:：]|建议|参考|适合|推荐", t)[0].strip()
+    # 月龄/岁码必须【连区间带单位】一起保留，不能只取第一段数字。
+    # 2026-08-29 实测（草稿 173539495458370139，女童牛仔两件套）：该类目 54 个
+    # 尺码选项里同时有 6M、6-9M、6-12M、6Y、6-7Y——只取第一段数字时这五个全部
+    # 归一成 "6"，于是源尺码 6-9m 把它们【全都勾上】，13 个框对应 5 个源尺码，
+    # 而 fix_sizes 的收敛判据（每个框的勾选态 == 归一值是否在 wanted 里）恰好
+    # 全部成立，返回 status=ok，SKU 表凭空多出 8 行。
+    # 故月龄（m/月）与岁（y/t/岁）分开、区间两端都留：6-9m / 6m / 6y / 2-3y。
+    # T 码（美式学步童装 3T）按岁归一到 y，那本就是同一档（3T ≈ 3Y）。
+    my = re.match(r"^(\d{1,2})\s*(?:-\s*(\d{1,2}))?\s*(m|月|个月|y|t|岁|yr|years?)$", t, re.I)
+    if my:
+        unit = "m" if my.group(3).lower() in ("m", "月", "个月") else "y"
+        return (my.group(1) + ("-" + my.group(2) if my.group(2) else "")) + unit
+    # 童装身高码主体：110cm → 110、110-120 → 110（2026-08-21 起的既有行为，
+    # 身高码在页面上只有单值 90/100/110/120/130，没有上面那种区间碰撞）
     m = re.match(r"^(\d+)", t)
     if m:
         return m.group(1)
     # 字母码（M/XL/XXL）：只剥 cm 与「码」后缀
     t = re.sub(r"(cm)?码?$", "", t, flags=re.I).strip()
+    # 【空格后跟测量描述时才取首段】2026-09-01 实测（1065904018146 猫咪绝育服，
+    # 源键 `M 胸围33背长29Г`——末尾那个 Г 是商家把「厘米」的 cm 打成了西里尔字母）：
+    # 页面就是干净的 S/M/L，靠上面剥后缀剥不掉空格后的整段测量值。
+    # 但【不能无条件按空格取第一段】：成人女装类目的页面选项有 `Asian One-size`、
+    # `Petite One-size`、`Asian Tall XL` 这类版型变体（见 _SIZE_ALIASES 上方取证），
+    # 无条件取首段会把它们全归一成 Asian/Petite，多个不同选项撞成同一个值，
+    # 复现 6M/6-9M 那类「一个源尺码勾中多个框却仍判收敛」的假 ok。
+    # 故只在【首段本身就是纯字母码】时才丢弃其余段：M/XL 是尺码、Asian 不是。
+    if " " in t or "　" in t:
+        head = re.split(r"[\s　]+", t)[0].strip()
+        if head.lower() in _ADULT_SIZE_TOKENS:
+            t = head
     # 同义别名（均码/one-size 等）：别名表命中就用统一键，否则保留原样。
     # 别名比对忽略大小写与内部空格/连字符（`One Size`、`one-size` 都要能命中），
     # 但返回值保留原大小写形态的字母码（M/XL 走不到这一步的替换）。
@@ -1955,6 +2128,176 @@ def norm_size(s: str) -> str:
     if t in _SIZE_ALIASES:
         return _SIZE_ALIASES[t]
     return t
+
+
+# ---- 尺码档位（婴幼童 / 成人）判定 -------------------------------------------
+# 【为什么要判档位】2026-08-29 真站取证（offer 1055568943470，1688 标题「棕色女亚马逊
+# 牙雅跨境现货坑条短袖上衣夏季宝宝花朵印花牛仔裤棉」）：标题里「女」与「宝宝」并列，
+# 类目遍历第 1 级已判出「女宝宝服装…符合婴儿服饰及鞋靴」，第 2 级却反转成「女士时尚」，
+# 一路走到叶子「女士牛仔两件套」。错类目下阶段④ 属性照样填满 11/11、阶段⑦ SKC 也正常
+# （成人女装与童装属性行大量重合），整条链上第一个对年龄段敏感的环节是阶段⑧ 的尺码
+# 交叉比对——于是错误延后约 5 分钟才以「源尺码在页面选项里全部不存在」暴露，报错文案
+# 还把人往「尺码归一没覆盖某种写法」的方向带。
+#
+# 月龄码/岁码（6-9m、2-3y、90cm）与成人码（S/M/L、Asian One-size）是【互斥】的两套
+# 体系，它们本身就是最硬的年龄段信号，比标题措辞可靠得多。故把它抽成显式判定，
+# 一处喂给类目提示词做事前约束，一处给阶段⑧ 的报错做事后指认。
+_RE_MONTH_SIZE = re.compile(r"^\d{1,2}\s*-?\s*\d{0,2}\s*(m|月|个月)$", re.I)
+_RE_YEAR_SIZE = re.compile(r"^\d{1,2}\s*-?\s*\d{0,2}\s*(y|t|岁|yr|year)s?$", re.I)
+_ADULT_SIZE_TOKENS = {"xs", "s", "m", "l", "xl", "xxl", "xxxl", "2xl", "3xl", "4xl",
+                      "onesize", "one-size", "free"}
+
+
+def size_tier(sizes) -> str:
+    """按尺码写法判商品档位：`baby`（婴幼童）/ `adult`（成人）/ `""`（判不出）。
+
+    判据取【只有一种档位会出现的写法】，不做模糊打分：
+      - 月龄码 `6-9m` / 岁码 `2-3y` / 厘米体高码 `90`、`110cm` → baby
+      - 纯字母码 S/M/L/XL、one-size（含 `Asian L`、`Petite One-size` 这类平台版型
+        变体的尾段）→ adult
+    数字码 80~150 是童装身高码（成人码不用三位数字），>150 不认（可能是腰围/鞋码），
+    判不出就返回 ""——上层一律按「没有这个信号」处理，绝不据此否定 LLM 的判断。
+    """
+    baby = adult = 0
+    for raw in (sizes or []):
+        t = str(raw).strip()
+        if not t:
+            continue
+        # 【借 norm_size 剥掉商家拼进来的规格尾巴】2026-09-01：源键形如 `L:60克`、
+        # `M 胸围33背长29Г` 时，下面的字母码判据取整串比对，一个都命中不了 →
+        # 返回 ""，于是阶段⑧ 报错时那句「真因是类目选错」的指认永远不触发。
+        #
+        # 【但归一命中别名表时必须弃用归一值】norm_size 会把中文「均码」折叠成
+        # `onesize`，而 onesize 在 _ADULT_SIZE_TOKENS 里 —— 直接用归一值会把「均码」
+        # 判成 adult。均码童装成人都在用，是刻意的中立值，本函数对它就该返回 ""
+        # 而不是猜一个档位（否则会据此否定 LLM 的类目判断）。故只在归一【没走进
+        # 别名表】时采纳它：剥尾缀是纯增益，同义折叠会丢掉档位中立这个信息。
+        n = norm_size(t)
+        if n and n not in _SIZE_ALIASES.values():
+            t = n
+        if _RE_MONTH_SIZE.match(t) or _RE_YEAR_SIZE.match(t):
+            baby += 1
+            continue
+        m = re.match(r"^(\d{2,3})", t)
+        if m:
+            if 60 <= int(m.group(1)) <= 150:
+                baby += 1
+            continue
+        # 字母码：取最后一段（`Asian Tall XL` → `XL`），命中成人码表才算
+        tail = re.split(r"[\s_]+", t)[-1].strip().lower()
+        if tail in _ADULT_SIZE_TOKENS or re.sub(r"[\s_-]+", "", t).lower() in _ADULT_SIZE_TOKENS:
+            adult += 1
+    if baby and not adult:
+        return "baby"
+    if adult and not baby:
+        return "adult"
+    return ""
+
+
+# ---- 配件色（变种表里缺源数据的颜色）识别 -----------------------------------
+# 【判据落在变种信息表，不落在源 skus】2026-09-01 真站取证（草稿
+# 184807703138719835，源 offer 890185900190「魔法精灵蓬蓬裙」）：1688 商家把
+# 【主商品 + 配件】放在同一个 offer 的颜色维里卖——主色 5 个码，配件「紫精灵头纱」
+# 只有 M 一个码（那个 M 是凑数占位，头纱本身没尺码）。
+#
+# 源颜色名与页面颜色维【永远对不上】：页面是平台色板（113 项 白色/米白色/…/红色/
+# 桔红色/…），认领时把「魔法精灵蓬蓬裙」映射成「白色」、「紫精灵头纱」映射成
+# 「红色」。故一切按源颜色名去找复选框的做法都必然找不到目标。
+#
+# 平台按 颜色×尺码 展开【完整笛卡尔积】（2×5=10 行），源只有 6 个真实 SKU，于是配件色
+# 多出来的 4 行没有任何源数据。实测那 10 行的货号/申报价/重量：
+#   白色 XS/S/M/L/XL → 魔法精灵蓬蓬裙-XS…-XL，价 26.03，重 120   （5 行齐全）
+#   红色 M           → 紫精灵头纱-M，价 14.02，重 120            （仅此 1 行）
+#   红色 XS/S/L/XL   → 三列全空，平台报「申报价格不能为空」「请填写重量」
+# 这也是 ⑦b 那 4 行预览图替换失败的真因：它们压根不对应任何源 SKU。
+#
+# 故判据取【页面实况】：某颜色在变种表里只有 1 行有源数据、而别的颜色多行齐全 →
+# 它是配件色，反选掉，不发它的 SKC/SKU。
+_JS_VARIANT_ROW_FILL = r"""(() => {
+  const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+  const sku = document.getElementById('skuDataInfo');
+  if (!sku) return JSON.stringify({err: 'no-skuDataInfo'});
+  const t0 = sku.querySelector('table');
+  if (!t0) return JSON.stringify({err: 'no-table'});
+  const heads = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
+  // 列按表头找，不写死下标（无尺码类目表头整体左移，见 fix_sku_codes 的取证）
+  const iColor = heads.findIndex(h => /^颜色/.test(h));
+  const iSize = heads.findIndex(h => /^尺码/.test(h));
+  const iCode = heads.findIndex(h => h.includes('SKU货号'));
+  const iPrice = heads.findIndex(h => h.includes('申报价格'));
+  const iWeight = heads.findIndex(h => h.includes('重量'));
+  if (iColor < 0) return JSON.stringify({err: 'no-color-column', heads: heads});
+  const val = (tds, k) => {
+    if (k < 0 || !tds[k]) return '';
+    const ins = Array.from(tds[k].querySelectorAll('input, textarea'));
+    for (const x of ins) { const v = (x.value || '').trim(); if (v) return v; }
+    return '';
+  };
+  const rows = Array.from(t0.querySelectorAll('tbody tr')).map((tr, i) => {
+    const tds = Array.from(tr.children);
+    const code = val(tds, iCode), price = val(tds, iPrice), weight = val(tds, iWeight);
+    return {i: i, color: txt(tds[iColor] || null),
+            size: iSize >= 0 ? txt(tds[iSize] || null) : '',
+            code: code, price: price, weight: weight,
+            // 有源数据 = 货号/申报价/重量任一有值；三个都空才是「凭空多出来的行」
+            filled: !!(code || price || weight)};
+  });
+  const byColor = {};
+  rows.forEach(r => {
+    if (!byColor[r.color]) byColor[r.color] = {total: 0, filled: 0, filledSizes: []};
+    const b = byColor[r.color];
+    b.total += 1;
+    if (r.filled) { b.filled += 1; b.filledSizes.push(r.size); }
+  });
+  return JSON.stringify({heads: heads, rows: rows, byColor: byColor});
+})()"""
+
+
+def accessory_colors_from_rows(by_color: dict) -> list:
+    """从变种表的按色统计里挑出配件色：只有 1 行有源数据、而别的颜色多行齐全。
+
+    by_color 形如 {"白色": {"total": 5, "filled": 5}, "红色": {"total": 5, "filled": 1}}。
+
+    【判据刻意收得很窄】只认「别的颜色都是多行齐全、只有它是单行」这一种形态：
+      - 各色 filled 全等 → 正常商品（含各色都只有 1 行的无尺码维商品），一个都不剔
+      - 某色 filled == 0 → 不剔。整列空的成因是上游还没填（价格/重量阶段没跑），
+        不是配件色；据此反选会误伤正常颜色。
+    2026-09-01 核对已落盘 52 个商品（28 个多颜色）：27 个各色齐全，仅本单是 (5, 1)。
+    """
+    if not isinstance(by_color, dict) or len(by_color) < 2:
+        return []
+    filled = {c: (v or {}).get("filled", 0) for c, v in by_color.items()}
+    if len(set(filled.values())) == 1:
+        return []
+    if max(filled.values()) <= 1:
+        return []
+    return [c for c, n in filled.items() if n == 1]
+
+
+# 反选一个颜色复选框（按【页面】颜色文本精确匹配）。返回是否点到、点后的勾选态。
+# 【只反选，绝不勾选】本函数用于剔配件色，任何情况下都不该把没勾的勾上。
+_JS_UNCHECK_COLOR = r"""(() => {
+  const WANT = __WANT__;
+  const items = Array.from(document.querySelectorAll('#skuAttrsInfo .ant-form-item'));
+  for (const it of items) {
+    const labEl = it.querySelector('.ant-form-item-label');
+    const lab = (labEl ? labEl.textContent : '').trim();
+    if (!(lab === '颜色' || (lab.includes('颜色') && !lab.includes('颜色表')))) continue;
+    const cbs = Array.from(it.querySelectorAll('label.d-checkbox'));
+    const hit = cbs.find(l => (l.textContent || '').trim() === WANT);
+    if (!hit) return JSON.stringify({found: false,
+      checkedOptions: cbs.filter(l => {
+        const i = l.querySelector('input'); return i && i.checked;
+      }).map(l => (l.textContent || '').trim())});
+    const input = hit.querySelector('input');
+    if (!input.checked) return JSON.stringify({found: true, wasChecked: false,
+                                               clicked: false, checked: false});
+    input.click();
+    return JSON.stringify({found: true, wasChecked: true, clicked: true,
+                           checked: !!input.checked});
+  }
+  return JSON.stringify({found: false, err: 'no-color-group'});
+})()"""
 
 
 _JS_SIZE_GROUP_STATES = r"""(() => {
@@ -2044,6 +2387,87 @@ def _raw_sku_count(info_path: str) -> int:
         return 0
 
 
+async def drop_accessory_colors(session: BrowserSession,
+                                max_rounds: int = 6) -> dict:
+    """阶段⑦a：把配件色（变种表里只有单行有源数据的颜色）从颜色维里反选掉。
+
+    【为什么排在 ⑦ 之前】反选让平台重建变种表，该色的 SKC 图位与 SKU 行一起消失，
+    于是 ⑦/⑦b 天然不会碰它——不必在那两个阶段各自判「这个颜色跳不跳」。
+
+    【判据读页面，不读源 skus】源颜色名（「紫精灵头纱」）与页面颜色维（平台色板的
+    「红色」）永远对不上，只能按变种表里「哪些行有源数据」来认。取证见
+    _JS_VARIANT_ROW_FILL 上方。故本函数不需要 info_path。
+
+    【只反选，不勾选】职责是剔除，不是对齐颜色维；源里有而页面没勾的颜色一律不管
+    （那是认领阶段的事）。
+    """
+    st = await session.eval_json(_JS_VARIANT_ROW_FILL)
+    if st.get("err"):
+        # 与 ⑧ 同一取向：读不到变种表时不硬判失败，交由后续阶段暴露真问题
+        return {"status": "skipped",
+                "reason": f"读不到变种信息表（{st.get('err')}），本阶段跳过"}
+    by_color = st.get("byColor") or {}
+    targets = accessory_colors_from_rows(by_color)
+    stats = {c: {"total": v.get("total"), "filled": v.get("filled"),
+                 "filledSizes": v.get("filledSizes")} for c, v in by_color.items()}
+    if not targets:
+        return {"status": "skipped", "byColor": stats,
+                "reason": "变种表里各颜色的有效行数一致，没有配件色需要剔除"}
+
+    dropped, missed = [], []
+    for name in targets:
+        r = await session.eval_json(_JS_UNCHECK_COLOR.replace("__WANT__", J(name)))
+        if not r.get("found"):
+            missed.append(name)
+            logger.warning(f"配件色「{name}」在颜色复选框里找不到（已勾选项："
+                           f"{r.get('checkedOptions')}），未反选")
+            continue
+        if not r.get("wasChecked"):
+            logger.info(f"配件色「{name}」本来就没勾选，无需反选")
+            continue
+        if r.get("checked"):
+            missed.append(name)
+            logger.warning(f"配件色「{name}」点了反选但仍是勾选态")
+            continue
+        dropped.append(name)
+        logger.info(
+            f"配件色「{name}」已反选：变种表 {by_color[name].get('total')} 行里只有 "
+            f"{by_color[name].get('filled')} 行有源数据"
+            f"（尺码 {by_color[name].get('filledSizes')}），不发它的 SKC/SKU")
+        await asyncio.sleep(1.2)
+
+    if not dropped:
+        return {"status": "error" if missed else "skipped",
+                "targets": targets, "missed": missed, "byColor": stats,
+                "reason": (f"配件色未能反选：{missed}" if missed
+                           else "配件色本来就未勾选")}
+
+    # 反选会触发变种表重建，等它稳定（行数连续两轮不变），与 ⑧ 同一等待机制
+    last_n, stable = -1, 0
+    for _ in range(20):
+        n = (await session.eval_json(_JS_SKU_ROW_COUNT)).get("n", 0)
+        if n == last_n:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable = 0
+        last_n = n
+        await asyncio.sleep(0.6)
+
+    after = await session.eval_json(_JS_VARIANT_ROW_FILL)
+    left = set((after.get("byColor") or {}).keys())
+    still = [c for c in dropped if c in left]
+    if still:
+        return {"status": "error", "targets": targets, "dropped": dropped,
+                "byColor": stats,
+                "reason": f"反选后变种表里仍有这些颜色的行：{still}"}
+    return {"status": "ok", "targets": targets, "dropped": dropped,
+            "missed": missed, "byColor": stats,
+            "rowCount": len(after.get("rows") or [])}
+
+
+
 async def fix_sizes(session: BrowserSession, info_path: str,
                     max_rounds: int = 25) -> dict:
     """阶段⑧：尺码勾选修正，使勾选状态与源商品 SKU 一致。
@@ -2094,10 +2518,29 @@ async def fix_sizes(session: BrowserSession, info_path: str,
     page_norms = {norm_size(s["t"]) for s in states0}
     hit = [w for w in wanted if w in page_norms]
     if not hit:
+        # 【把「类目选错」与「尺码写法没覆盖」两种成因分开报】2026-08-29 实测
+        # （offer 1055568943470）：源是月龄码 6-9m/2-3y，页面全是 Asian S/M/L
+        # 成人码——两套体系互斥，这不是归一漏了某种写法，而是阶段③ 把童装判进了
+        # 女士牛仔两件套。原文案只列两串尺码，人会去补别名表，而该改的是类目。
+        # 故用 size_tier 对两侧各判一次档位，档位相反时直接指认真因与修法。
+        src_tier = size_tier(list(info.get("skus") or {}))
+        page_tier = size_tier([s["t"] for s in states0])
+        head = "源尺码在页面选项里全部不存在，未改动任何勾选"
+        mismatch = bool(src_tier and page_tier and src_tier != page_tier)
+        if mismatch:
+            # 真因放在最前面：service 层的 note 只留 200 字符，坠在尾巴上的
+            # 结论会被截掉，人看到的仍是两串尺码。
+            names = {"baby": "婴幼童/童装码", "adult": "成人码"}
+            cur_cat = await read_current_category(session)
+            head = ("源尺码在页面选项里全部不存在，未改动任何勾选。【真因是类目选错，不是尺码别名】"
+                    + "源商品是" + names[src_tier] + "、页面类目是" + names[page_tier]
+                    + "，两套尺码体系互斥；应重跑阶段③ 类目并关掉类目缓存。当前类目："
+                    + ((cur_cat or "读不到")[:60]))
         return {"status": "error",
-                "reason": f"源尺码在页面选项里全部不存在，未改动任何勾选："
-                          f"源 {wanted} / 页面 {sorted(page_norms)[:12]}",
+                "reason": f"{head}。源 {wanted} / 页面 {sorted(page_norms)[:12]}",
                 "wantedSizes": wanted,
+                "srcTier": src_tier, "pageTier": page_tier,
+                "catMismatch": mismatch,
                 "pageSizes": [s["t"] for s in states0]}
 
     # 2) 勾选修正
@@ -2139,6 +2582,9 @@ async def fix_sizes(session: BrowserSession, info_path: str,
     result = {"status": "ok", "wantedSizes": wanted, "toggled": toggles,
               "rowCount": final_count}
     if missing:
+        # missing 单出一个键：调用方（service._st_fix_sizes）要据此发 manual_check，
+        # 从 warning 字符串里再解析回来既脆又没必要（2026-08-29 起）。
+        result["missing"] = missing
         result["warning"] = f"源尺码在页面复选框中不存在: {missing}"
     return result
 
@@ -2659,7 +3105,61 @@ async def set_variant(session: BrowserSession, info_path: str,
     if len(d_list) != 3:
         return {"status": "error", "reason": f"尺寸需为 长x宽x高 三个值: {d_list}"}
 
+    # 【平台硬校验：材积重量 <= 实际重量】2026-09-01 真站取证（宠物服装发布失败）：
+    # 接口报错「材积重量大于实际重量，无法录入，请调整体积或者重量」。
+    # 材积重量 = 长×宽×高÷6，单位 g。宠物衣服等体积相对大但实际很轻的商品易触发。
+    # 调整策略：优先上调重量到材积重量（保持尺寸不变，运费按体积重算本就该如此）；
+    # 若上调后超出 30kg 上限才考虑压缩尺寸（罕见，此时已是超大件）。
+    dims_float = [float(d) for d in d_list]
+    volume_weight = (dims_float[0] * dims_float[1] * dims_float[2]) / 6
+    weight_float = float(w_g)
+    if volume_weight > weight_float:
+        # 上调重量到材积重量，向上取整（平台按整数 g 计）
+        adjusted_weight = int(volume_weight) + 1
+        if adjusted_weight <= 30000:
+            logger.info(
+                f"材积重量 {volume_weight:.1f}g > 实际重量 {w_g}g，"
+                f"上调重量到 {adjusted_weight}g（尺寸 {'x'.join(d_list)}cm 不变）"
+            )
+            w_g = str(adjusted_weight)
+        else:
+            # 极端情况：材积重量超 30kg（如 50x50x72cm），此时等比压缩尺寸到材积重 30kg
+            # 保持长宽高比例，体积缩到原来的 (30000*6 / 原体积) 倍，各边乘 该比例的立方根
+            target_vol = 30000 * 6  # 30kg 对应的 cm³
+            current_vol = dims_float[0] * dims_float[1] * dims_float[2]
+            ratio = (target_vol / current_vol) ** (1/3)
+            d_list = [str(int(d * ratio)) for d in dims_float]
+            w_g = "30000"
+            logger.warning(
+                f"材积重量 {volume_weight:.1f}g 超出 30kg 上限，"
+                f"等比压缩尺寸到 {'x'.join(d_list)}cm（材积重 30kg）"
+            )
+
     msrp = str(round(float(price) / 7, 2)).rstrip("0").rstrip(".")
+
+    # 【等变种表自己渲染出来，不能只等容器】2026-09-01 取证（--from-stage variant
+    # 直接进编辑页）：open_edit 的判据是 skuDataInfo 这个容器 div 存在，而容器属于
+    # 页面骨架，它出现时里面先渲染的是【库存表】——此刻 skuDataInfo 下只有一张表，
+    # 表头 ['SKU货号', '包装清单']、0 行，_JS_FILL_VARIANT 取 tbody[0] 拿到的正是它，
+    # 于是报 no-column:申报价/尺寸/重量。约 2s 后变种表才挂上，且挂在库存表【之前】
+    # （DOM 序 tbody[0] 才成立）。全流程跑时前面十几个阶段耗时几分钟，掩盖了这个竞态。
+    # 判据用「申报价 + 尺寸 + 重量三列齐备」而不是表数量：要等的就是这三列可定位。
+    js_wait = r"""(() => {
+      const sku = document.getElementById('skuDataInfo');
+      if (!sku) return JSON.stringify({ready: false, reason: 'no-skuDataInfo'});
+      const txt = e => ((e||{}).textContent||'').replace(/\s+/g, ' ').trim();
+      const heads = Array.from(sku.querySelectorAll('thead th')).map(txt);
+      const has = k => heads.some(h => h.includes(k));
+      return JSON.stringify({
+        ready: has('申报价') && has('尺寸') && has('重量'),
+        heads: heads,
+      });
+    })()"""
+    ready = await session.wait_for(js_wait, lambda d: d.get("ready"), timeout=30)
+    if not ready.get("ready"):
+        return {"status": "error",
+                "reason": f"变种表未渲染出申报价/尺寸/重量列（表头 {ready.get('heads')}）"}
+
     js = (_JS_FILL_VARIANT
           .replace("__PRICE__", J(str(price)))
           .replace("__DIMS__", J(d_list))
@@ -2837,7 +3337,10 @@ _JS_FILL_STOCK_CAT = r"""(async () => {
   if (!sku) return JSON.stringify({err: 'no-skuDataInfo'});
   const tb = sku.querySelectorAll('tbody')[1];
   if (!tb) return JSON.stringify({err: 'no-second-tbody'});
-  const rows = Array.from(tb.querySelectorAll('tr'));
+  // 行区间（左闭右开）由 python 侧分批传入，见 _fill_rows_batched
+  const START = __START__, END = __END__;
+  const all = Array.from(tb.querySelectorAll('tr'));
+  const rows = all.slice(START, END);
   const findCatTd = tds => tds.find(td =>
     Array.from(td.querySelectorAll('select option')).some(o => o.text === '混合套装'));
   let processed = 0;
@@ -2856,17 +3359,22 @@ _JS_FILL_STOCK_CAT = r"""(async () => {
   }
   await sleep(600);
   const bad = [], sample = [];
-  Array.from(tb.querySelectorAll('tr')).forEach(r => {
+  // 回读只校验本批那几行；total 回传整表行数，供 python 侧算下一批
+  let total = 0;
+  Array.from(tb.querySelectorAll('tr')).forEach((r, i) => {
     const tds = Array.from(r.querySelectorAll('td'));
     const catTd = findCatTd(tds);
     if (!catTd) return;
+    total++;
+    if (i < START || i >= END) return;
     const sels = Array.from(catTd.querySelectorAll('select'));
     const qtyInp = catTd.querySelector('input[name=skuCategoryNum]');
     const row = [sels[0]?sels[0].value:'', sels[1]?sels[1].value:'', qtyInp?qtyInp.value:''];
     sample.push(row);
     if (row[0] !== CAT || row[1] !== UNIT || row[2] !== QTY) bad.push(row);
   });
-  return JSON.stringify({processed, bad, sample: sample.slice(0, 4)});
+  return JSON.stringify({processed, bad, sample: sample.slice(0, 4),
+                         total, rowCount: all.length});
 })()"""
 
 # 包装清单：每行一个「配件 ant-select（w120） + 数量 input + 加号」的子行，末行另带
@@ -2959,7 +3467,10 @@ _JS_FILL_PACKING = r"""(async () => {
     return {ok: got === name || got.includes(name), got};
   };
 
-  const rows = Array.from(tb.querySelectorAll('tr'));
+  // 行区间（左闭右开）由 python 侧分批传入，见 _fill_rows_batched
+  const START = __START__, END = __END__;
+  const all = Array.from(tb.querySelectorAll('tr'));
+  const rows = all.slice(START, END);
   let processed = 0;
   const failed = [];
   for (const tr of rows) {
@@ -2989,12 +3500,16 @@ _JS_FILL_PACKING = r"""(async () => {
   }
   await sleep(500);
 
-  // 回读校验：每行都要子行数对上、配件名非占位、数量和等于要求的件数
+  // 回读校验：只看本批那几行，要求子行数对上、配件名非占位、数量和等于要求的件数
+  // total 回传整表包装清单行数，供 python 侧算下一批（末批据此收敛）
   const want = ITEMS.reduce((a, x) => a + Number(x.qty), 0);
   const bad = [], sample = [];
-  Array.from(tb.querySelectorAll('tr')).forEach(tr => {
+  let total = 0;
+  Array.from(tb.querySelectorAll('tr')).forEach((tr, i) => {
     const td = packTdOf(tr);
     if (!td) return;
+    total++;
+    if (i < START || i >= END) return;
     const got = lineOf(td).map(l => {
       const x = l.sel.querySelector('.ant-select-selection-item');
       return {name: x ? (x.title || x.textContent || '').trim() : '',
@@ -3005,8 +3520,65 @@ _JS_FILL_PACKING = r"""(async () => {
     const blank = got.some(x => !x.name || x.name === '请选择配件' || !x.qty);
     if (got.length !== ITEMS.length || blank || sum !== want) bad.push({got, sum, want});
   });
-  return JSON.stringify({processed, failed, bad, sample, want});
+  return JSON.stringify({processed, failed, bad, sample, want,
+                         total, rowCount: all.length});
 })()"""
+
+
+# 一批多少行。30 行来自实测速率：包装清单每行约 1~2s（点加号/删子行各 450ms + 每个
+# 配件下拉展开与搜索），30 行最坏约 60s，离单次 eval 的 180s 上限还有三倍余量；
+# SKU分类那段每行只有两次 setSel + 一次 setInp，30 行更快。再往大取就失去了分批的
+# 意义（88 行整表跑了 190s，133 行直接撞 180s 超时，正是 2026-08-31 商品
+# 1015843615215 的病根）。
+_ROW_BATCH = 30
+
+
+async def _fill_rows_batched(session: BrowserSession, js: str, what: str,
+                             timeout: int = 180) -> dict:
+    """把带 __START__/__END__ 行区间的填写 JS 分批执行，合并成单次调用的返回形状。
+
+    【为什么必须分批而不是把超时调大】2026-08-31 商品 1015843615215（19 色 x 7 码 =
+    133 行 SKU）在阶段⑪ 撞 180s 超时失败。这两段 JS 都是「逐行 DOM 操作 + 每步
+    sleep」的结构，耗时与行数成正比：5 行约 20s、88 行 190s、133 行超过 180s。
+    把 timeout 往上堆只是把红线后移，颜色再多一倍照样炸；且单次 eval 越长，中途
+    遇到 Vue 重渲染/页面导航就整批白跑，没有任何已完成进度。分批后每批 30 行、
+    单批耗时与商品无关，行数上限被彻底解耦。
+
+    【为什么行区间在 JS 侧切、而不是 python 侧传 tr 列表】DOM 节点不能跨 eval 传递，
+    每批必须自己重新 querySelectorAll。切片用【整表下标】而非「第 N 个匹配行」：
+    包装清单列的判定（packTdOf）本身可能漏掉某些行，用匹配序号切片会让批与批之间
+    的边界随判定结果漂移，整表下标是稳定的。
+
+    【末批如何收敛】JS 回传 rowCount（整表 tr 数），据此算出总批数——首批跑完就知道
+    还有几批，不必先单独发一次「读行数」的 eval。
+    """
+    start, merged, batches = 0, None, 0
+    while True:
+        r = await session.eval_json(
+            js.replace("__START__", str(start)).replace("__END__", str(start + _ROW_BATCH)),
+            timeout=timeout)
+        if r.get("err"):
+            return r
+        batches += 1
+        if merged is None:
+            merged = dict(r)
+        else:
+            # processed 累加；bad/failed/sample 合并（sample 只留前几条，同 JS 侧口径）
+            merged["processed"] = (merged.get("processed") or 0) + (r.get("processed") or 0)
+            for k in ("bad", "failed"):
+                if r.get(k):
+                    merged[k] = (merged.get(k) or []) + r[k]
+            if r.get("sample"):
+                merged["sample"] = ((merged.get("sample") or []) + r["sample"])[:4]
+            merged["total"] = r.get("total")
+        row_count = r.get("rowCount") or 0
+        start += _ROW_BATCH
+        if start >= row_count:
+            break
+    if batches > 1:
+        logger.info(f"{what}：{merged.get('rowCount')} 行分 {batches} 批填写"
+                    f"（每批 {_ROW_BATCH} 行），处理 {merged.get('processed')} 行")
+    return merged or {}
 
 
 # 平台配件词表里服装相关的确切名（2026-08-27 逐词搜索实测所得）。
@@ -3118,6 +3690,12 @@ _PACKING_ALIAS = {
     "开衫": "毛衣", "针织衫": "毛衣", "打底衫": "T恤", "打底裤": "紧身裤袜",
     "校服": "工作服", "发带": "头巾", "肚兜": "围兜", "口水巾": "围兜",
     "运动服": "便服上衣", "背带裤": "护胸背带裤", "泳衣": "游泳衣",
+    # 上下连身的婴幼童常见形态：平台词表里【没有】「连体裤/连体衣/爬服」这些词，
+    # 归不动就会一路掉到「长裤」（真站取证 999389808041：源部件是连体裤，包装清单
+    # 判成长裤 → 尺码分类取到「下装」，而源部件名判出的是「连体衣」，两边配不上、
+    # 靠序号兜底才碰巧配对）。护胸背带裤是词表里语义最近的连身项，故统一归到它。
+    "连体裤": "护胸背带裤", "连体衣": "护胸背带裤", "爬服": "护胸背带裤",
+    "哈衣": "护胸背带裤", "连身衣": "护胸背带裤", "背带裙": "护胸背带裤",
     # 源属性「套装类型」给的合成词（见 product-info.json 的 attributes），只是补项
     # 兜底用；单件商品的清单仍由模型按标题逐项列。
     "裙套装": "半身裙", "裤套装": "长裤", "短裤套装": "短裤", "背带裤套装": "护胸背带裤",
@@ -3163,6 +3741,82 @@ def _size_category_for(accessory: str) -> Optional[str]:
     「尺码分类不要写死关键词」那条的取向）。
     """
     return _ACCESSORY_SIZE_CATEGORY.get((accessory or "").strip())
+
+
+# 部件名（源尺码表图里的「部件：上衣/连衣裙」写法）→ 尺码分类关键词。
+#
+# 【为什么另建一张表、不复用 _ACCESSORY_SIZE_CATEGORY】那张表的键是平台包装清单词表里的
+# 确切词（便服上衣/护胸背带裤…），而部件名是【1688 商家在图上随手写的】自由文本
+# （上衣/T恤/短袖/背带裙/裤子/下装…），两套词汇不重合。这里只做「部件名 → 分类关键词」
+# 的粗粒度归类，用于把分件实测表与两张平台尺码表配对，故按包含匹配、词短的在后面。
+_PART_SIZE_CATEGORY_KEYWORDS = [
+    # 连体衣优先：「背带裤」「连体」这类是上下连身，若先匹配到「裤」会归错
+    ("连体衣", ("连体", "背带裤", "背带裙", "吊带裤", "工装裤裙", "爬服", "哈衣")),
+    ("连衣裙", ("连衣裙", "长裙", "公主裙", "礼服")),
+    ("半身裙", ("半身裙", "短裙", "包臀裙", "百褶裙", "裙子")),
+    ("马甲", ("马甲",)),
+    ("下装", ("裤", "下装", "打底裤", "短裤", "长裤")),
+    ("上装", ("上衣", "上装", "t恤", "衬衫", "卫衣", "毛衣", "外套", "夹克",
+              "开衫", "背心", "吊带", "短袖", "长袖", "针织衫", "打底衫")),
+    # 「裙」放最后：前面几条更具体的都没中时才按裙处理（半身裙是童装里更常见的形态）
+    ("半身裙", ("裙",)),
+]
+
+
+def _size_category_for_part(part: str) -> Optional[str]:
+    """源图部件名对应的尺码分类关键词；判不出返回 None。"""
+    t = (part or "").strip().lower()
+    if not t:
+        return None
+    for cat, words in _PART_SIZE_CATEGORY_KEYWORDS:
+        if any(w in t for w in words):
+            return cat
+    return None
+
+
+def _category_keyword_of(selected: str) -> Optional[str]:
+    """从平台实际选中的完整分类名（「女童装-连体衣」）反推分类关键词。
+
+    调用方传 category=None 时走的是「跟随平台预选」，此时手上没有关键词，但配对分件
+    实测表需要它。选中值是页面回读的事实，比重新猜一遍可靠。
+    """
+    t = (selected or "").strip()
+    if not t:
+        return None
+    # 长的在前：候选之间虽不互相包含，但类目前缀（女童装-）也带「装」字，按长度取最稳
+    for cat in sorted({c for c, _ in _PART_SIZE_CATEGORY_KEYWORDS}, key=len, reverse=True):
+        if cat in t:
+            return cat
+    return None
+
+
+def _pick_part_measurements(parts: list, category: Optional[str],
+                            which: int) -> tuple[dict, str]:
+    """从分件实测表里挑出第 which 张平台尺码表该用的那一份，返回（实测表, 部件名）。
+
+    【为什么必须按部件挑、不能两张表都吃同一份】2026-08-29 真站取证（1688 商品
+    1058585588864，T恤+牛仔背带裙两件套）：源详情图上明明分开给了两张表——
+    「部件：上衣」量肩宽/袖长/前衣长/胸围，「部件：连衣裙」量前衣长/腰围——而原实现
+    只读扁平的 sizeMeasurements（看图时两张表被压成一份），于是平台的「尺码表」与
+    「尺码表2」填出【完全相同的数值】：两张都是 前衣长 42/45/48/51/54 + 胸围
+    52/54/56/58/60。尺码分类倒是分对了（上装 / 连体衣），但数值同源，等于给买家一份
+    错尺码表——上衣的衣长被套到了连衣裙上。这与 _ACCESSORY_SIZE_CATEGORY 上方那段
+    「两张一样等于给买家一份错尺码表」是同一个坑的另一半（分类分了、数值没分）。
+
+    配对优先按【尺码分类关键词】：分类是本张表实际强制的测量维度，用它配比用序号配
+    可靠——包装清单的件序（便服上衣 + 半身裙）与源图部件序（连衣裙 在前、上衣 在后）
+    并不保证一致，本商品就正好是反的。分类配不上时才退回按序号取，那至少还能让两张
+    表拿到不同的数据（比同源好），并由调用方把实际用了哪个部件报进结果供人工复核。
+    """
+    if not parts:
+        return {}, ""
+    if category:
+        for e in parts:
+            if _size_category_for_part(e.get("part", "")) == category:
+                return e.get("measurements") or {}, e.get("part", "")
+    idx = which if which < len(parts) else len(parts) - 1
+    e = parts[idx]
+    return e.get("measurements") or {}, e.get("part", "")
 
 
 def _canon_accessory(name: str) -> str:
@@ -3332,10 +3986,11 @@ async def set_stock(session: BrowserSession, info_path: str,
         logger.info("SKU分类沿用提前预热的判断结果，跳过本阶段 LLM 调用")
     cat, qty, unit = str(judge.get("skuCat", "1")), str(judge.get("qty", 1)), str(judge.get("unit", "1"))
 
-    res = await session.eval_json(_JS_FILL_STOCK_CAT
+    res = await _fill_rows_batched(session, _JS_FILL_STOCK_CAT
                                    .replace("__CAT__", J(cat))
                                    .replace("__QTY__", J(qty))
-                                   .replace("__UNIT__", J(unit)))
+                                   .replace("__UNIT__", J(unit)),
+                                   what="SKU分类")
     if res.get("err"):
         return {"status": "error", "stage": "sku-category", **res}
 
@@ -3343,8 +3998,9 @@ async def set_stock(session: BrowserSession, info_path: str,
     # 页面回读若发现和不等（例如某项配件名没匹配上、行数没补齐），报 validation-error
     # 交上层重试——放过去等于让接口再打回一次。
     packing = judge.get("packing") or []
-    pk = await session.eval_json(
-        _JS_FILL_PACKING.replace("__ITEMS__", J(packing)), timeout=180)
+    pk = await _fill_rows_batched(
+        session, _JS_FILL_PACKING.replace("__ITEMS__", J(packing)),
+        what="包装清单", timeout=180)
     if pk.get("err"):
         return {"status": "error", "stage": "packing", **pk}
     if pk.get("failed"):
@@ -3533,8 +4189,24 @@ _JS_SET_SIZECHART_CAT = r"""(async () => {
         await sleep(180);
       }
     }
-    if (!target) return JSON.stringify({ok: false, reason: 'option-not-found',
-                                        keyword, cur, options: opts});
+    // 【关键词落空但下拉只有唯一选项 → 跟随它，不判失败】2026-09-01 取证：
+    // 999389808041 / 1039758347697 / 827598413718 三单的阶段⑨ 全部以
+    // option-not-found（keyword=连体衣，options=['女童装']）告败、整张尺码表没填。
+    // 唯一选项意味着平台已按已选类目把分类定死，此时关键词对不上只说明我们按件别
+    // 猜的那个词与平台措辞不同，而不是选错了档——没有别的可选，跟随它即是唯一正解。
+    // 这与下面 keyword 为空时「只认唯一选项」是同一条取向（多选项才宁可报错交人工）。
+    if (!target) {
+      const all = Array.from(drop.querySelectorAll('.ant-select-item-option'));
+      if (opts.length === 1 && all.length) {
+        all[0].click();
+        await sleep(800);
+        const only = curOf();
+        if (only) return JSON.stringify({ok: true, selected: only,
+                                         source: 'only-option', keyword, options: opts});
+      }
+      return JSON.stringify({ok: false, reason: 'option-not-found',
+                             keyword, cur, options: opts});
+    }
   } else {
     const all = Array.from(drop.querySelectorAll('.ant-select-item-option'));
     if (opts.length !== 1 || !all.length)
@@ -3669,6 +4341,151 @@ _JS_CLICK_SIZECHART_OK = r"""(async () => {
 })()"""
 
 
+# ---- 测量参数名对齐（平台强制参数名 ← 源实测参数名）--------------------------
+#
+# 【为什么要这张表，纯子串包含为什么不够】2026-09-01 真站取证（offer 999389808041，
+# 女童牛仔外套 + 连体裤两件套）：源详情图分件给了「部件：连体裤」的实测表，视觉阶段
+# 把它读得完全正确（总衣长 59/64/69/74/79、腰围 48~56，跳码规则与供应商尺寸列都没混
+# 进来）。但平台「女童装-下装」这一档强制的参数是【测量全围】与【摆长】，而原来的对齐
+# 只做子串包含（`k in p or p in k`）：
+#     测量全围 ←→ 腰围 / 胸围     两向都不含，不成立
+#     摆长     ←→ 总衣长           两向都不含，不成立
+# 于是对齐结果是空字典，整份识准的源数据被判为「一列都没有」全部丢弃，两列改交模型
+# 凭空估算，填出摆长 32~44（源总衣长实际是 59~79，差了近一倍）。
+#
+# 同商品的第一张表（外套/上装）反而正常，纯属运气：「前衣长」含「衣长」、「胸围」被
+# 「胸围全围」包含，子串刚好命中。也就是说这条路一直靠巧合工作，只是此前没撞上
+# 一组两边字面完全不搭的参数名。
+#
+# 表的方向是【平台参数名 → 源参数名候选】，候选按优先级从高到低排：
+# 「测量全围」在下装档量的是腰一圈，故腰围优先于下摆围、胸围只作最后兜底。
+# 键用平台参数名的【裸词】（不含全围/半围后缀，见 _match_param 的归一），一个键覆盖
+# 「腰围」「腰围全围」两种写法，免得同一档参数在表里写两遍。
+_PARAM_SYNONYMS = {
+    # 全围类：平台在下装档统一叫「测量全围」，具体量哪一圈由分类决定（下装量腰、
+    # 上装量胸），故按分类语义排优先级
+    "测量全围": ("腰围", "腰围(橡筋)", "下摆围", "坐围", "臀围", "胸围"),
+    "胸围": ("胸围", "上胸围", "夹圈", "腰围"),
+    "腰围": ("腰围", "腰围(橡筋)", "裤腰围", "坐围"),
+    "臀围": ("臀围", "坐围", "腰围"),
+    "领围": ("领围", "颈围", "领圈"),
+    "大腿围": ("大腿围", "腿围", "髀围"),
+    "脚口": ("脚口", "裤脚口", "脚围", "下摆围"),
+    # 长度类：源侧的「总衣长/前衣长/后衣长」都是同一件的衣长量法，能互相顶
+    "摆长": ("总衣长", "衣长", "前衣长", "上身长", "后衣长"),
+    "衣长": ("衣长", "前衣长", "总衣长", "上身长", "后衣长"),
+    "上衣长": ("上身长", "衣长", "前衣长", "总衣长"),
+    "裙长": ("裙长", "衣长", "前衣长", "总衣长"),
+    "连衣裙长": ("总衣长", "裙长", "衣长", "前衣长"),
+    "裤长": ("裤长", "侧裤长", "长裤裤长", "裤长(不含吊带)", "九分裤长", "外侧长"),
+    # 裤内长是【裆到脚口】，与外侧裤长不是同一段，故只认真正的内长量法，
+    # 不拿侧裤长顶——顶了会让内长比实际长出一个裆深（约 20cm）
+    "裤内长": ("裤内长", "内长", "内缝长", "下裆长"),
+    "裆深": ("裆深", "前裆", "立裆"),
+    "袖长": ("袖长", "袖长(含肩)", "长袖长"),
+    "肩宽": ("肩宽", "总肩宽", "肩点至肩点"),
+}
+
+# 平台参数名里的量法后缀：比对前剥掉，让「腰围全围」与「腰围」归到同一个键。
+# 只剥后缀不动词干（「测量全围」整体就是一个参数名，剥完剩「测量」反而没意义，
+# 故它在 _PARAM_SYNONYMS 里按原样登记，由精确命中先行拦下）。
+_RE_PARAM_SUFFIX = re.compile(r"(全围|半围|周长|围度)$")
+
+# 剥后缀会剩下【非部位词】的整词：整体就是一个参数名，不能拆。
+# 「测量全围」剥完剩「测量」——那不是身体部位，拿它去查同义词表必然落空
+# （虽有 _match_param 里的原词兜底，但归一结果本身失真，跨函数复用时会踩坑）。
+_PARAM_STEM_KEEP = ("测量全围", "测量半围")
+
+
+def _param_stem(name: str) -> str:
+    """平台/源参数名归一：去空格与量法后缀，供同义词表查键。"""
+    t = re.sub(r"\s+", "", str(name or "")).strip()
+    if t in _PARAM_STEM_KEEP:
+        return t
+    return _RE_PARAM_SUFFIX.sub("", t) or t
+
+
+def _match_param(target: str, vals: dict) -> Optional[str]:
+    """在源实测行 vals 里找出平台参数 target 该取哪个键；找不到返回 None。
+
+    三级判据，越靠前越可信：
+      1. 字面相同（含剥掉全围/半围后缀后相同）——最稳，直接用
+      2. 同义词表按登记顺序取第一个命中的源键——顺序即优先级，见 _PARAM_SYNONYMS
+      3. 子串包含——原有行为，留着兜住表里没登记的写法（「胸围」↔「胸围全围」这类
+         本就靠它，撤掉等于回退）
+
+    子串这级刻意放最后：它是最容易误配的一级（「裤长」会命中「裤内长」，而两者
+    差一个裆深），前两级都没结论时才轮到它。
+    """
+    if target in vals:
+        return target
+    stem = _param_stem(target)
+    for k in vals:
+        if _param_stem(k) == stem:
+            return k
+    for cand in _PARAM_SYNONYMS.get(stem, ()) or _PARAM_SYNONYMS.get(target, ()):
+        if cand in vals:
+            return cand
+        for k in vals:
+            if _param_stem(k) == _param_stem(cand):
+                return k
+    cand = [k for k in vals if k and (k in target or target in k)]
+    return cand[0] if cand else None
+
+
+# 交模型做参数名映射时的提示词。词表兜不住的写法才走这里（见 _map_params_by_llm）。
+_PARAM_MAP_PROMPT = """你是服装尺码表数据对齐助手。
+
+平台尺码表要求填这几个测量参数：{targets}
+源商品实测尺寸表里有这些参数：{sources}
+
+请判断平台的每个参数应该取源表里的哪一个参数值（同一个量法的不同叫法，如
+「摆长」与「总衣长」、「测量全围」与「腰围」）。规则：
+1. 只在上面列出的源参数里选，不要编造名字；
+2. 【量的不是同一段就不要映射】宁可留空交后续估算，也不要拿一个量法不同的值顶替——
+   例如「裤内长」是裆到脚口，与「侧裤长」（腰到脚口）差一个裆深，不能互相顶；
+   「胸围」与「腰围」是不同部位，只有源表里确实没有对应部位时才考虑；
+3. 判不准的平台参数直接不要出现在结果里（留空是安全的，错配会给买家一份错尺码表）。
+
+只输出严格JSON，键是平台参数名、值是源参数名，不要其他文字：
+{{"<平台参数>": "<源参数>"}}"""
+
+
+async def _map_params_by_llm(targets: list, sources: list) -> dict:
+    """交模型把词表兜不住的平台参数名映射到源参数名，返回 {平台参数: 源参数}。
+
+    【为什么词表之外还要这一层】源参数名是 1688 商家在详情图上随手写的自由文本
+    （腰围(橡筋)、裤长(不含吊带)、九分裤长…），穷举不完；而对齐失败的代价不是
+    少填一列，是【整列被判缺、改用凭空估算的值】——那正是 999389808041 踩的坑。
+    故词表命中不了时多问一次模型，比直接退到估算划算：映射只是选个名字，
+    输入输出都极短（一次几百 token），而估算是整表重新造数。
+
+    结果只保留「键在 targets 里、值在 sources 里」的项：模型偶尔会顺手编一个源里
+    没有的参数名，放过去会让调用方按不存在的键取值、静默取空。
+
+    best-effort：失败一律吞掉返回空映射（调用方随后照旧走估算），不让一个辅助的
+    名称对齐把整个阶段⑨ 搞挂——这与项目「辅助路径坏了不影响主流程」的取向一致。
+    """
+    from app.publish.llm import ask_json
+
+    try:
+        data = await ask_json(
+            _PARAM_MAP_PROMPT.format(targets="、".join(targets),
+                                     sources="、".join(sources)),
+            what="尺码表参数名映射", stage="sizechart")
+    except Exception as e:
+        logger.warning(f"尺码表参数名映射失败（照旧走估算兜底）：{e}")
+        return {}
+    out = {}
+    for k, v in (data or {}).items():
+        if k in targets and isinstance(v, str) and v in sources:
+            out[k] = v
+    if out:
+        logger.info("尺码表参数名映射（模型）："
+                    + "、".join(f"{k}←{v}" for k, v in out.items()))
+    return out
+
+
 def _guess_size_kind(title: str, sizes: list) -> dict:
     """按尺码字样与标题推断人群档位，供估算提示词用。
 
@@ -3741,7 +4558,9 @@ def _check_measurements(est: dict, sizes: list, need: list) -> list:
 
 
 async def _estimate_measurements(title: str, size_ref: dict, sizes: list,
-                                 need: list, known: dict) -> dict:
+                                 need: list, known: dict,
+                                 part: str = "",
+                                 src_rows: Optional[dict] = None) -> dict:
     """按身高体重参考 + 已有实测列，估算弹窗缺的那几个测量参数。
 
     走 llm.ask_json：它内部用 get_llm()，自动跟随发布页 UI 的模型下拉，顺带白拿
@@ -3751,6 +4570,16 @@ async def _estimate_measurements(title: str, size_ref: dict, sizes: list,
 
     把已有实测列一起塞进提示词（known）是为了让估算与实测同档：源已给衣长 44 时，
     模型报的胸围应当是同一件衣服的胸围，而不是脱开源数据另算一套版型。
+
+    part：套装分件填表时【本张表是哪一件】（上衣/连衣裙…）。不带这个，套装的两张表
+    都要估算时模型看到的输入完全相同（标题是整个套装的），必然给出同一套值——那正是
+    「两张尺码表参数一样」的另一半成因（见 _pick_part_measurements 的真站取证）。
+
+    src_rows：源实测的【对齐前原始行】（键已过 norm_size，参数名是商家原写法）。
+    known 是对齐【之后】的表，未对齐上的列已经被剔掉了——2026-09-01 取证
+    （offer 999389808041 的连体裤）源明明给了总衣长 59~79，因为平台叫「摆长」没对上，
+    模型连这条唯一可靠的档位锚点都看不到，于是把摆长估成 32~44。故把原始行也一并给出：
+    参数名对不上不等于数据没价值，同一件衣服的其它量法就是最好的量级参照。
     """
     from app.publish.llm import ask_json
 
@@ -3760,14 +4589,32 @@ async def _estimate_measurements(title: str, size_ref: dict, sizes: list,
         f"- {s}：" + "、".join(f"{p}{v}" for p, v in (known.get(norm_size(s)) or {}).items())
         for s in sizes if known.get(norm_size(s))
     ) or "（无）"
+    # 源原始行里【已对齐过的参数不再重复列】：known_text 已经写过它们，重复只是
+    # 拉长提示词。剩下的正是「源量了、但平台参数名对不上」的那些列，它们是估算的档位锚点。
+    aligned_names = {p for s in sizes for p in (known.get(norm_size(s)) or {})}
+    raw_lines = []
+    for s in sizes:
+        row = (src_rows or {}).get(norm_size(s)) or {}
+        rest = {p: v for p, v in row.items() if p not in aligned_names}
+        if rest:
+            raw_lines.append(f"- {s}：" + "、".join(f"{p}{v}" for p, v in rest.items()))
+    raw_text = ("\n源商品同一件衣服的其它实测量法（参数名与平台不同，不要照抄名字，"
+                "只作量级与档差参照——估算值必须与它们协调、不能量级失真）：\n"
+                + "\n".join(raw_lines) + "\n") if raw_lines else ""
     # 【别写死童装】档差随人群变：童装按身高 10cm 一档，成人按胸围 4cm 一档，
     # 套错档会让整表系统性失真。本管线确实跑成人女装（见 set_titles 的真站取证
     # offer 846106032776），故按尺码字样与标题推断，拿不准按通用处理。
     kind = _guess_size_kind(title, sizes)
+    # 部件提示放在标题之后、参考数据之前：先让模型知道「只看这一件」再读数据
+    part_text = (f"本次只估算这个套装里的【{part}】这一件，测量值必须是这一件的"
+                 f"（不要按套装里另一件的版型给）。\n"
+                 if part else "")
     prompt = (
         f"你是{kind['expert']}。商品：{title}\n"
+        f"{part_text}"
         f"源商品提供的试穿参考（身高/体重）：\n{ref_text}\n\n"
-        f"源商品已给出的实测尺寸（同一件衣服，估算须与之协调）：\n{known_text}\n\n"
+        f"源商品已给出的实测尺寸（同一件衣服，估算须与之协调）：\n{known_text}\n"
+        f"{raw_text}\n"
         f"请给出尺码 {'/'.join(sizes)} 的实际成衣测量值（单位cm）："
         f"{'、'.join(need)}。\n"
         f"要求：1. 符合{kind['fit']}，数值随尺码单调递增、梯度合理"
@@ -3901,16 +4748,19 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     if not params or not sizes:
         return {"status": "error", "reason": f"弹窗参数/尺码行读取失败: {meta}"}
 
-    # 参数键对齐（弹窗强制参数名可能是「胸围全围」，而源数据返回「胸围」）
-    def _align_params(vals):
+    # 参数键对齐（弹窗强制参数名可能是「摆长」「测量全围」，而源数据写「总衣长」「腰围」）。
+    # 判据走 _match_param 的三级：字面/剥后缀 → 同义词表 → 子串包含，真站取证与
+    # 「为什么纯子串不够」见 _PARAM_SYNONYMS 上方那段。extra 是模型补的映射
+    # （{平台参数: 源参数}），只在词表全都对不上时才有值。
+    def _align_params(vals, extra: Optional[dict] = None):
         out = {}
         for p in params:
-            if p in vals:
-                out[p] = vals[p]
-                continue
-            cand = [k for k in vals if k and (k in p or p in k)]
-            if cand:
-                out[p] = vals[cand[0]]
+            k = _match_param(p, vals)
+            if k is None and extra:
+                mapped = extra.get(p)
+                k = mapped if mapped in vals else None
+            if k is not None:
+                out[p] = vals[k]
         return out
 
     # 测量值来源：源商品实测平铺尺寸（sizeMeasurements）优先，弹窗要而源没有的参数交模型估算。
@@ -3920,12 +4770,53 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # 衣长/裤长两列（店家套了套装模板），弹窗按类目强制的胸围全围/袖长一个都没有。原先
     # 「有源数据就必须全齐，否则报错要人工清空字段走兜底」——源给了一半反倒比完全没有更糟。
     # 改为源给的照用（实测值比估算准），只把缺的那几列问模型，人工不必再介入。
-    src_meas = info.get("sizeMeasurements") or {}
-    norm = {norm_size(k): _align_params(v or {}) for k, v in src_meas.items()}
+    #
+    # 【套装按部件取数】源图分开给了「部件：上衣」「部件：连衣裙」两张表时（见
+    # extract._VISION_PROMPT 的 sizeMeasurementsByPart），两张平台尺码表各取自己那件；
+    # 只有扁平表时照旧共用（那本就是一张合表）。真站取证见 _pick_part_measurements。
+    parts = info.get("sizeMeasurementsByPart") or []
+    part_used = ""
+    if parts:
+        # 配对键取【平台实际选中的分类】：category 可能是 None（跟随预选），
+        # 而 sel 里的选中值是刚回读的事实。
+        # source='only-option' 时 category 非空却【没被采纳】（关键词落空、下拉只有
+        # 唯一选项，见 _JS_SET_SIZECHART_CAT 里那段）——此时拿 category 去配对会用一个
+        # 平台并未选中的词，故一律以回读值为准。
+        key = (None if sel.get("source") == "only-option" else category) \
+            or _category_keyword_of(sel.get("selected") or "")
+        picked, part_used = _pick_part_measurements(parts, key, which)
+        if picked:
+            src_meas = picked
+            logger.info(f"尺码表{which + 1} 取源分件实测表「{part_used}」"
+                        f"（分类 {sel.get('selected')}）")
+        else:
+            src_meas = info.get("sizeMeasurements") or {}
+    else:
+        src_meas = info.get("sizeMeasurements") or {}
+    src_norm = {norm_size(k): (v or {}) for k, v in src_meas.items()}
+    norm = {k: _align_params(v) for k, v in src_norm.items()}
     need = [p for p in params
             if any(p not in (norm.get(norm_size(s)) or {}) for s in sizes)]
+
+    # 【词表兜不住时先问名称映射，再退估算】源参数名是商家在图上随手写的自由文本
+    # （腰围(橡筋)、裤长(不含吊带)…），穷举不完；而对齐失败的代价是【整列改用凭空
+    # 估算】而不是少填一列（真站取证见 _PARAM_SYNONYMS）。故只要源确实给了数据、
+    # 却有参数一列都没对上，就先花一次极短的调用问名字，比整表重新造数划算。
+    if need and src_norm:
+        src_keys = sorted({k for row in src_norm.values() for k in (row or {})})
+        # 只问那些【一行都没对上】的参数：部分尺码缺值是源表本身不全，问名字没用
+        unmapped = [p for p in need
+                    if not any(p in (norm.get(norm_size(s)) or {}) for s in sizes)]
+        if unmapped and src_keys:
+            extra = await _map_params_by_llm(unmapped, src_keys)
+            if extra:
+                norm = {k: _align_params(v, extra) for k, v in src_norm.items()}
+                need = [p for p in params
+                        if any(p not in (norm.get(norm_size(s)) or {}) for s in sizes)]
+
     if need:
-        est = await _estimate_measurements(title, size_ref, sizes, need, norm)
+        est = await _estimate_measurements(title, size_ref, sizes, need, norm,
+                                           part=part_used, src_rows=src_norm)
         for s in sizes:
             key = norm_size(s)
             row = dict(norm.get(key) or {})
@@ -3971,6 +4862,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
             "tplName": tpl_name, "category": sel.get("selected"),
             "categorySource": sel.get("source"),
             "params": params, "measureSource": gen, "estimated": need,
+            "partUsed": part_used,
             "data": norm, "formText": final.get("text")}
 
 
@@ -4601,6 +5493,37 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
         applied.append(rec)
         # 项间留 1s：动态增删行重渲染期间立刻动下一项容易点击落空
         await asyncio.sleep(1.0)
+
+    # ---- 成分类字段收尾：把多余的旧行裁掉 ----------------------------------
+    # 【为什么必须有这一步】写入只覆盖前 N 行，而页面初始行数由认领时搬来的源数据
+    # 决定，可能【多于】本轮要写的行数；_ensure_comp_rows 又只加不减，多出来的旧行
+    # 就带着旧纤维留在表单里。它与新写的某一行撞同一根纤维时，平台按 attrValueId
+    # 判重报「XX成分不能重复选择」，保存整单卡死（2026-08-30 实测复现，取证见
+    # _trim_comp_rows 的 docstring）。
+    #
+    # 目标行数取本轮该字段 change 的最大 row：那就是重建结果的行数
+    # （_rebuild_main_comp / 合计补差都按 row 从 1 连续编号）。
+    # 【只裁本轮真写过的成分字段】没进 changes 的字段保持原样——它的行数是平台或
+    # 人工给的，本函数没有依据去动（「只聚焦当前修改」的一贯取向）。
+    comp_rows: dict = {}
+    for c in changes:
+        if c.get("kind") == "number" or c.get("num") is None:
+            continue
+        label = c["label"]
+        comp_rows[label] = max(comp_rows.get(label, 1), int(c.get("row") or 1))
+    for label, keep in comp_rows.items():
+        # best-effort：裁不动只记日志，绝不影响已写好的值（辅助路径的一贯取向）
+        try:
+            t = await _trim_comp_rows(session, label, keep)
+        except Exception as e:
+            logger.warning(f"{label} 多余成分行裁剪异常（忽略）：{e}")
+            continue
+        if t.get("err"):
+            logger.warning(f"{label} 多余成分行裁剪未执行：{t['err']}")
+        elif t.get("trimmed"):
+            logger.info(f"{label} 裁掉 {t['trimmed']} 个多余成分行"
+                        f"（{t['before']} → {t['after']} 行，避免平台判「重复选择」）")
+
     return applied, cache_refreshed, comp_failed
 
 
@@ -5113,7 +6036,13 @@ _JS_RED_ANCHORS = r"""(() => {
     const hit = ids.find(x => href.includes(x.id) || txt === x.name);
     if (hit && !out.some(o => o.id === hit.id)) out.push({id: hit.id, name: hit.name});
   }
-  return JSON.stringify({redSections: out});
+  // 读取具体的错误提示（ant-form-item-explain-error 类）
+  const errors = [];
+  for (const err of Array.from(document.querySelectorAll('.ant-form-item-explain-error'))) {
+    const txt = (err.textContent || '').trim();
+    if (txt && txt.length <= 100) errors.push(txt);
+  }
+  return JSON.stringify({redSections: out, fieldErrors: errors});
 })()"""
 
 # 保存成功后弹「继续编辑 / 返回列表」确认框。【必须关掉】：它是 .ant-modal 级弹窗，
@@ -5254,6 +6183,9 @@ async def save(session: BrowserSession, rowid: str = "") -> dict:
                        f"{pre['acted']}；剩余 {pre.get('remaining')}")
         await asyncio.sleep(1.0)
 
+    # toast 时间窗起点：只回捞【本次点击之后】弹出的提示，免得把上游阶段的旧提示
+    # 当成本次保存的结论（见 browser.recent_toasts 上方的取证记录）。
+    t_click = time.time()
     clicked = await session.eval_json(_JS_CLICK_SAVE)
     if not clicked.get("clicked"):
         return {"status": "error", "stage": "click", **clicked}
@@ -5286,12 +6218,14 @@ async def save(session: BrowserSession, rowid: str = "") -> dict:
         ids = [{"id": k, "name": v} for k, v in SECTION_IDS.items()]
         red = await session.eval_json(_JS_RED_ANCHORS.replace("__IDS__", J(ids)))
         sections = red.get("redSections") or []
-        logger.error(
-            "保存校验失败（页面无 toast，靠红锚点定位）："
-            + ("、".join(s["name"] for s in sections) or "未识别出红色区块")
-        )
+        field_errors = red.get("fieldErrors") or []
+        detail = "、".join(s["name"] for s in sections) or "未识别出红色区块"
+        if field_errors:
+            detail += f"；具体错误：{' | '.join(field_errors[:5])}"
+        logger.error(f"保存校验失败（页面无 toast，靠红锚点定位）：{detail}")
         return {"status": "validation-error", "errors": errors,
-                "redSections": sections, "messages": feedback.get("messages"),
+                "redSections": sections, "fieldErrors": field_errors,
+                "messages": feedback.get("messages"),
                 "confirmDialog": confirm}
 
     after = await _draft_update_time(session, rowid) if rowid else None
@@ -5309,7 +6243,16 @@ async def save(session: BrowserSession, rowid: str = "") -> dict:
         blockers = [m for m in (confirm.get("visibleModals") or [])
                     if "继续编辑" not in "".join(m.get("buttons") or [])]
         msgs = [m for m in (feedback.get("messages") or []) if m]
-        reason = "无校验错误但草稿更新时间未变，保存可能未生效"
+        # 【平台 toast 才是真因所在，优先于「更新时间未变」这个症状】2026-09-01 两单
+        # （1067271196776、1051827161006）：页面弹的是「错误：请上传预览图」，而
+        # _JS_SAVE_FEEDBACK 读不到店小秘自有的 d-message 浮层，只好报「保存可能未生效」，
+        # 把人往「点击没生效」的方向带。toast 哨兵当时已经抓到了这条，接过来放在最前面。
+        toasts = browser.recent_toasts(since=t_click, bad_only=True)
+        if toasts:
+            reason = "保存被平台拒绝：" + "；".join(toasts[:3])
+            logger.error(f"保存失败，平台提示：{toasts[:3]}")
+        else:
+            reason = "无校验错误但草稿更新时间未变，保存可能未生效"
         if blockers:
             reason += (f"；页面上还有 {len(blockers)} 个弹窗挡着（很可能是上一阶段没关掉的"
                        f"编辑器，遮罩会吃掉保存点击）：{blockers[:2]}")
@@ -5318,6 +6261,7 @@ async def save(session: BrowserSession, rowid: str = "") -> dict:
             reason += f"；页面提示：{msgs[:3]}"
         return {"status": "validation-error",
                 "reason": reason[:400],
+                "platformToasts": toasts,
                 "blockingModals": blockers,
                 "updateTime": {"before": before, "after": after},
                 "messages": feedback.get("messages"), "confirmDialog": confirm}
@@ -5574,19 +6518,35 @@ async def _publish_landed(session: BrowserSession, rowid: str) -> dict:
     js = _JS_LIST_HAS_ROW.replace("__RID__", rowid)
     out: dict = {}
     try:
-        for name, url in (("draft", DRAFT_LIST_URL), ("online", ONLINE_LIST_URL)):
+        for name, url in (("fail", PUBLISH_FAIL_LIST_URL),
+                          ("draft", DRAFT_LIST_URL),
+                          ("online", ONLINE_LIST_URL)):
             try:
-                await session.navigate(url, new_tab=(name == "draft"))
+                await session.navigate(url, new_tab=(name == "fail"))
                 out[name] = await session.eval_json(js)
             except Exception as e:
                 logger.warning(f"读{name}列表失败（忽略）：{e}")
                 out[name] = {"err": str(e)}
-        # 在线有它即成功；草稿箱没它是辅证（平台可能延迟几秒才刷进在线列表）
+        # 【失败列表优先，且它有一票否决权】2026-09-01 实测：材积重量这类校验是平台
+        # 后端异步做的，点完「立即发布」草稿行确实离开了草稿箱，几秒后才带着失败原因
+        # 落到发布失败列表。原判据 `online_found or draft_gone` 在这种情况下命中
+        # draft_gone、判成 ok，于是「发了但被拒」被报成成功——本轮宠物衣服 11 个商品
+        # 状态文件全记着 publish: ok，实际全在失败列表里，就是这么来的。
+        fail_found = bool((out.get("fail") or {}).get("found"))
         online_found = bool((out.get("online") or {}).get("found"))
         draft_gone = (out.get("draft") or {}).get("found") is False
+        if fail_found:
+            out["published"] = False
+            out["reason"] = "在发布失败列表里（平台后端校验拒绝）"
+            out["failText"] = (out.get("fail") or {}).get("text")
+            return out
+        # 【draft_gone 单独不足以判成功】草稿列表分页，_JS_LIST_HAS_ROW 只看当前页
+        # （rowsOnPage 恒 50）；商品在第 2 页也会读成 found: False。故要么在线列表
+        # 确认有它，要么至少排除了「还在失败列表」这一种——后者已在上面 return。
         out["published"] = online_found or draft_gone
         out["reason"] = ("在线产品列表已有该行" if online_found
-                         else "草稿箱已无该行" if draft_gone else "两个列表都未确认")
+                         else "草稿箱当前页已无该行（注意草稿列表分页，非强证据）"
+                         if draft_gone else "三个列表都未确认")
         return out
     finally:
         try:
@@ -5653,10 +6613,14 @@ async def publish_now(session: BrowserSession, rowid: str = "",
         ids = [{"id": k, "name": v} for k, v in SECTION_IDS.items()]
         red = await session.eval_json(_JS_RED_ANCHORS.replace("__IDS__", J(ids)))
         sections = red.get("redSections") or []
-        logger.error("发布校验失败（页面无 toast，靠红锚点定位）："
-                     + ("、".join(s["name"] for s in sections) or "未识别出红色区块"))
+        field_errors = red.get("fieldErrors") or []
+        error_detail = ("、".join(s["name"] for s in sections) or "未识别出红色区块")
+        if field_errors:
+            error_detail += f"；具体错误：{' | '.join(field_errors[:5])}"
+        logger.error(f"发布校验失败（页面无 toast，靠红锚点定位）：{error_detail}")
         return {"status": "validation-error", "errors": errors,
-                "redSections": sections, "messages": feedback.get("messages"),
+                "redSections": sections, "fieldErrors": field_errors,
+                "messages": feedback.get("messages"),
                 "publishModal": modal}
 
     msgs = feedback.get("messages") or []
@@ -5785,10 +6749,64 @@ _JS_LIVE_STATE = r"""(async () => {
       const lab = (l ? l.textContent : '').trim();
       return lab === '尺码' || (lab.includes('尺码') && !lab.includes('尺码表'));
     });
+  // ⑦a 剔配件色：变种信息表按颜色统计「有源数据的行数」。续跑判定据此认配件色
+  // （反选只改未保存表单，save 没成功过就会回到认领时的全勾状态）。
+  // 判据与列定位同 _JS_VARIANT_ROW_FILL，见那里的真站取证。
+  const variantByColor = (() => {
+    const t0 = (sku || document).querySelector('table');
+    if (!t0) return null;
+    const hs = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
+    const iC = hs.findIndex(h => /^颜色/.test(h));
+    const iCode = hs.findIndex(h => h.includes('SKU货号'));
+    const iPrice = hs.findIndex(h => h.includes('申报价格'));
+    const iW = hs.findIndex(h => h.includes('重量'));
+    if (iC < 0) return null;
+    const v = (tds, k) => {
+      if (k < 0 || !tds[k]) return '';
+      const ins = Array.from(tds[k].querySelectorAll('input, textarea'));
+      for (const x of ins) { const q = (x.value || '').trim(); if (q) return q; }
+      return '';
+    };
+    const acc = {};
+    Array.from(t0.querySelectorAll('tbody tr')).forEach(tr => {
+      const tds = Array.from(tr.children);
+      const c = txt(tds[iC] || null);
+      if (!acc[c]) acc[c] = {total: 0, filled: 0};
+      acc[c].total += 1;
+      if (v(tds, iCode) || v(tds, iPrice) || v(tds, iW)) acc[c].filled += 1;
+    });
+    return Object.keys(acc).length ? acc : null;
+  })();
   const attrImgBad = attrImgs.filter(i => {
     const w = i.naturalWidth || 0, h = i.naturalHeight || 0;
     return w && h && (w < __MINW__ || h < __MINH__);
   }).length;
+
+  // ⑦b SKU 预览图：变种【信息】表第一列，与上面 attrImg* 那组（变种【属性】区）
+  // 是两处不同的图，续跑必须分开判——2026-08-30 玩具类那单正是 ⑦ 合理跳过、
+  // ⑦b 从未跑过而被平台拒（见「阶段⑦b SKU 预览图」段落的取证）。
+  // 判据与 sku_preview_state 一致：非 1:1 或短边 < __PREVMIN__ 即 bad；
+  // 尺寸未知（naturalWidth=0，图没加载完）不计入 bad——未知不等于不合格。
+  const prevTable = (document.getElementById('skuDataInfo') || document)
+    .querySelector('table');
+  const prevHeads = prevTable
+    ? Array.from(prevTable.querySelectorAll('thead th')).map(th => txt(th)) : [];
+  const iPrevCol = prevHeads.findIndex(h => h.includes('预览图'));
+  let previewCount = 0, previewBad = 0;
+  if (prevTable && iPrevCol >= 0) {
+    Array.from(prevTable.querySelectorAll('tbody tr')).forEach(tr => {
+      const cell = Array.from(tr.children)[iPrevCol];
+      if (!cell) return;
+      const im = Array.from(cell.querySelectorAll('img'))
+        .find(x => /^https?:/.test(x.currentSrc || x.src || ''));
+      if (!im) return;
+      previewCount++;
+      const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
+      if (w && h && (Math.abs(w / h - 1) >= 0.01 || w < __PREVMIN__ || h < __PREVMIN__)) {
+        previewBad++;
+      }
+    });
+  }
 
   // ③ 类目：三个信号一起读，任一命中即判「类目丢了/失效」，须从 ③ 重跑。
   // catText 取分类下拉的当前值（回落到认领旧值时这里是「其他（...）」这类占位类目）；
@@ -5827,6 +6845,7 @@ _JS_LIVE_STATE = r"""(async () => {
     attrCbCount: attrCbCount,
     // 本类目有没有尺码维：⑧⑨ 的 skipped 是否合理要靠它复核（无尺码表栏 + 无尺码组）
     hasSizeGroup: hasSizeGroup,
+    variantByColor: variantByColor,
     catText: catText,
     catListText: catListText,
     catUnset: catListText.includes('未选择分类'),
@@ -5843,6 +6862,9 @@ _JS_LIVE_STATE = r"""(async () => {
     sizechartCount: scCount,
     attrImgCount: attrImgs.length,
     attrImgBad: attrImgBad,
+    // ⑦b：预览图总数与其中不合规的张数（0 张说明该类目没有这一列，交阶段自己判）
+    previewCount: previewCount,
+    previewBad: previewBad,
     shippingSet: !!(shipSel && txt(shipSel)) && !!shipRadio,
     descImgCount: descImgs.length,
     descForeignCount: foreign.length,
@@ -5857,7 +6879,8 @@ async def live_state(session: BrowserSession) -> dict:
     """
     st = await session.eval_json(
         _JS_LIVE_STATE.replace("__MINW__", str(images.CLOTH_MIN_W))
-                      .replace("__MINH__", str(images.CLOTH_MIN_H)))
+                      .replace("__MINH__", str(images.CLOTH_MIN_H))
+                      .replace("__PREVMIN__", str(PREVIEW_MIN_SIDE)))
     if not st.get("rendered"):
         logger.warning("编辑页 SKU 区未渲染完，实况判定按「全部需重跑」处理")
     # 类目异常单独打一行：这是整单卡死的上游根因，而页面那条 d-message 几秒就自己消失，
@@ -5914,8 +6937,21 @@ _JS_PICK_FROM_SPACE = r"""(async () => {
   const hit = items.find(it => Array.from(it.querySelectorAll('img'))
     .some(i => (i.src || '').includes(__FID__)));
   if (!hit) {
+    // 【报清弹窗现状，别只说「找不到」】2026-09-01 排查 890185900190（4 行同一张
+    // 200x200 源图、逐行各传一次）时，本分支只回 3 个 src 尾段，判断不了到底是
+    // 「图床按内容去重导致新 fileId 根本不存在」还是「翻页了没找到」。
+    // 故把当前页全部文件名与已选中项一并回报：前者能直接看出目标名在不在，
+    // 后者能看出是不是上一行选中的那张还留着选中态（累积多选语义下会）。
+    const names = items.map(it => {
+      const i = it.querySelector('img');
+      return i ? ((i.src || '').split('?')[0].split('/').pop() || '') : '';});
+    const chosen = items.map((it, k) => {
+      const c = it.querySelector('.img-check');
+      return (c && /取消选[择中]/.test(c.textContent || '')) ? k : -1;})
+      .filter(k => k >= 0);
     return JSON.stringify({stage: 'pick', err: '弹窗里找不到刚上传的图',
-      itemCount: items.length,
+      wantName: __FID__, itemCount: items.length,
+      pageNames: names.slice(0, 24), alreadySelected: chosen,
       firstSrcs: items.slice(0, 3).map(it => {
         const i = it.querySelector('img'); return i ? (i.src || '').slice(-40) : null;})});
   }
@@ -7064,6 +8100,324 @@ async def skc_replace_row(session: BrowserSession, row_keyword: str, img_dir: st
             "finalCount": final.get("count"), "finalSrcs": final.get("srcs")}
 
 
+# ==================== 阶段⑦b SKU 预览图 ====================
+# 【预览图是第三处图片位，与 ⑥ 素材图、⑦ SKC 颜色图都不是同一个地方】
+# 2026-08-30 取证（rowid 173539495459009087，玩具类 8 颜色无尺码）：发布被平台拒
+# 「错误：预览图尺寸不能小于800*800」，而管线此前【没有任何代码碰过这一列】。
+# 三处的容器各不相同：
+#   ⑥ 素材图      .material-img-module                  整个商品一张
+#   ⑦ SKC 颜色图  #skuAttrsInfo（变种【属性】区）        每颜色 3~10 张
+#   ⑦b SKU 预览图 #skuDataInfo（变种【信息】表）第一列   每 SKU 行一张
+#
+# 【为什么阶段⑦ 跳过了却仍被拒】skc_image_support 探的是 #skuAttrsInfo，玩具类那个
+# 区块确实没有图位（8 个复选框全是颜色），判 supported=False → ⑦ 正确地 skipped。
+# 但预览图在 #skuDataInfo，两者正交：⑦ 该跳过，⑦b 仍然必须跑。服装类此前没暴露是
+# 因为 1688 服装主图普遍 >=800x800 恰好蒙过，玩具类源图小才撞线（实测那 8 行：
+# 720x606 / 749x627 / 717x610 三张破线，另有 3 张恰好 800x800、1 张 1920x1920）。
+#
+# 【不重判颜色归属，只补几何——与 _skc_size_fallback 同一取向】认领时店小秘已按
+# SKU 把每行的图带过来了，归属本来就对（实测 8 行 6 个不同 src）。这里下载现有图、
+# 做 1:1 合规化后原位换回：画面一张不换、行序一动不动，只补像素与比例。故本阶段
+# 【零 LLM 调用】，也不需要 vision.plan_skc 那套按颜色分图。
+#
+# 【规格取素材图那条页面原文】页面在素材图区写着「素材图尺寸要求比例为1：1，
+# 不小于800*800」，预览图列自己没写提示，但拒绝文案与之逐字一致。故走
+# images.square_image（中心裁 1:1 + 放大到 1785 方图）：一次同时满足 1:1 与
+# >=800x800，且与阶段⑥ 同规格。
+#
+# 【为什么连恰好 800x800 的也一起重做】拒绝文案说的是「不能小于 800*800」，字面上
+# 800 应当通过；但同一批里 720x606 那几张连【1:1 比例】都不满足，而比例是平台明写的
+# 另一条要求。逐行分别判「差比例还是差像素」会让这里长出两条分支，而两条分支的产物
+# 都是同一个 square_image 调用。故统一重做，代价只是多传几张图（纯本地变换 + 直传，
+# 无 LLM），换来的是边界情况一次性消除。
+#
+# 【交互形态 2026-08-30 三轮真站探查确认，勿照搬 ⑥⑦ 的做法】
+#   - 触发器：td > div.sku-image-box.ant-dropdown-trigger
+#   - 【合成 hover 即可展开菜单】不必像 ⑦ SKC 行那样走 CDP 真实点击。⑦ 那条约束的
+#     成因是「JS click 会命中素材图残留的菜单实例」，这里的菜单是行内 trigger 自己
+#     的实例，hover 展开后菜单项集合就能唯一认出（见下方 SKU_PREVIEW_MENU_ITEMS）。
+#   - 菜单 8 项，含「空间图片」（与素材图同名；注意描述图那处叫「空间【上传】」，
+#     三处文案不统一，每处都必须实测，别互相照抄）。
+#   - 弹窗与 ⑥⑦ 是【同一个组件实例】：标题「从图片空间选择」、20 个 .img-item、
+#     .img-check 文本「点击选择」、计数器「已选择N张图片」全部一致，故 _pick_from_space
+#     可以直接复用，不必另写选图逻辑。
+#   - 菜单里有「应用到全部」，能一次给所有行赋同一张图。【刻意不用】：那会让 8 个
+#     颜色共用一张预览图，等于把每个 SKU 的辨识度抹掉，人工发布也不会这么做。
+
+# 预览图行内菜单的特征菜单项（2026-08-30 实测该菜单共 8 项）。
+# 用于在页面众多 .ant-dropdown 实例里认出它——「应用到全部」是它独有的特征项，
+# 素材图菜单只有 4 项且没有这一项，故两者可明确区分（同 ⑦ 靠「应用到所有颜色」区分）。
+SKU_PREVIEW_MENU_ITEMS = ("空间图片", "应用到全部")
+
+# 预览图要求：1:1 且不小于 800x800（页面素材图区原文，拒绝文案与之一致）
+PREVIEW_MIN_SIDE = 800
+
+
+# 读变种信息表每行的预览图状态：颜色名 + 图 URL + 尺寸，并标出不合规的行。
+#
+# 【表格与列都按结构定位，不写死下标】#skuDataInfo 里有两张 table（第一张是价格/
+# 尺寸/重量，第二张是库存/SKU分类），预览图在【第一张】的第一列。颜色列同样按表头
+# 找，与 _JS_READ_SKU_CODES 一套判据——无尺码类目下表头是
+# ['预览图( 批量)', '颜色', ...]，写死下标会整体错位（那次的病根，见 fix_sku_codes）。
+#
+# bad 的判据是「非 1:1 或短边 < 800」，与 PREVIEW_MIN_SIDE 一致。naturalWidth 为 0
+# 表示图还没加载完，按【读不到】处理而不是判不合格：未知不等于不合格（同
+# upload_image 尺寸闸的取向）。
+#
+# 【「空图位」必须与「尺寸未知」分开，empty 单独一个字段】2026-09-01 取证（两单
+# 1067271196776、1051827161006）：save 被平台拒「错误：请上传预览图」，而 ⑦b 之前
+# 判的是 skipped、note 还写「6 行预览图均已满足 1:1 且不小于 800x800」——因为原判据
+# 只看得见 <img>，格子里压根没有 img 的行既进不了 bad、也进不了 unknown（unknown 要
+# 求有 img 但 naturalWidth=0），于是被当成合规行放过，错误一路延后到 ⑭ 才以「保存
+# 可能未生效」这种含糊结论暴露。
+# 「没有图」是确定性的不合格，与「图在加载」相反：前者要去上传，后者要等或跳过。
+# 判据取【格子里有没有 trigger 却没有任何 http 图源】——trigger 在说明这一列可换图。
+_JS_SKU_PREVIEW_STATE = r"""(() => {
+  const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+  const sku = document.getElementById('skuDataInfo');
+  if (!sku) return JSON.stringify({err: 'no-skuDataInfo'});
+  const t0 = sku.querySelector('table');
+  if (!t0) return JSON.stringify({err: 'no-table'});
+  const heads = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
+  const iPrev = heads.findIndex(h => h.includes('预览图'));
+  const iColor = heads.findIndex(h => /^颜色/.test(h));
+  if (iPrev < 0) return JSON.stringify({err: 'no-preview-column', heads: heads});
+  const MIN = __MIN__;
+  const rows = [];
+  Array.from(t0.querySelectorAll('tbody tr')).forEach((tr, i) => {
+    const tds = Array.from(tr.children);
+    const cell = tds[iPrev];
+    if (!cell) return;
+    const im = Array.from(cell.querySelectorAll('img'))
+      .find(x => (x.currentSrc || x.src || '').startsWith('http'));
+    const w = im ? (im.naturalWidth || 0) : 0;
+    const h = im ? (im.naturalHeight || 0) : 0;
+    // 未知尺寸(w/h=0)不判 bad：图没加载完不等于不合格
+    const known = w > 0 && h > 0;
+    const square = known && Math.abs(w / h - 1) < 0.01;
+    // 空图位：本行有换图入口(trigger)却没有任何 http 图源 —— 平台会拒「请上传预览图」。
+    // 与 known=false 的「图在加载」区分开（后者 im 存在、只是 naturalWidth 还是 0）。
+    const empty = !im && !!cell.querySelector('.sku-image-box.ant-dropdown-trigger');
+    rows.push({i: i, color: iColor >= 0 ? txt(tds[iColor]) : '',
+               url: im ? (im.currentSrc || im.src || '') : '',
+               w: w, h: h, empty: empty,
+               bad: known && (!square || w < MIN || h < MIN)});
+  });
+  return JSON.stringify({rows: rows, heads: heads,
+                         previewIdx: iPrev, colorIdx: iColor,
+                         hasTrigger: !!t0.querySelector(
+                           'tbody tr .sku-image-box.ant-dropdown-trigger')});
+})()"""
+
+
+async def sku_preview_state(session: BrowserSession) -> dict:
+    """读变种信息表每行预览图的现状。返回 {"rows": [...], "supported": bool|None, ...}。
+
+    supported=False：表里有行但一个 trigger 都没有，即本类目这一列不可换图，调用方
+    应当 skipped（与 skc_image_support 同一取向）。
+    supported=None：表没渲染完（零行）时证据不足，别当「不支持」，让真失败暴露。
+    """
+    st = await session.eval_json(
+        _JS_SKU_PREVIEW_STATE.replace("__MIN__", J(PREVIEW_MIN_SIDE)))
+    if st.get("err"):
+        return {"supported": None, **st}
+    rows = st.get("rows") or []
+    if not rows:
+        return {"supported": None, **st}
+    return {"supported": bool(st.get("hasTrigger")), **st}
+
+
+# 悬停某行预览图展开菜单并点「空间图片」，打开空间弹窗。
+#
+# 【整段放在一个 evaluate 里】与 ⑥ 素材图同一个理由：hover 菜单会因失焦自动收起，
+# 拆成多次往返时中间那步可能落在已消失的 DOM 上。
+#
+# 【按行下标定位而不按颜色名匹配】读与写之间本阶段不点任何东西、行序不会变；
+# 但仍回传该行【当前】颜色名，由调用方核对与读到时是否一致——Vue 若在两次 eval
+# 之间重排过，宁可跳过那行报出来，也不能把图挂到别的 SKU 上（同 _JS_FILL_SKU_CODES
+# 的取向：填错比不填更难查）。
+_JS_OPEN_SKU_PREVIEW_SPACE = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+  const IDX = __IDX__, PREV = __PREV__, ICOLOR = __ICOLOR__;
+  const sku = document.getElementById('skuDataInfo');
+  if (!sku) return JSON.stringify({stage: 'locate', err: 'no-skuDataInfo'});
+  const t0 = sku.querySelector('table');
+  if (!t0) return JSON.stringify({stage: 'locate', err: 'no-table'});
+  const trs = Array.from(t0.querySelectorAll('tbody tr'));
+  const tr = trs[IDX];
+  if (!tr) return JSON.stringify({stage: 'locate', err: '行不存在: ' + IDX,
+                                  rowCount: trs.length});
+  const tds = Array.from(tr.children);
+  const cell = tds[PREV];
+  if (!cell) return JSON.stringify({stage: 'locate', err: '该行没有预览图单元格'});
+  const nowColor = ICOLOR >= 0 ? txt(tds[ICOLOR]) : '';
+  const trig = cell.querySelector('.sku-image-box.ant-dropdown-trigger');
+  if (!trig) return JSON.stringify({stage: 'locate', err: '该行没有预览图 trigger',
+                                    nowColor: nowColor});
+  const before = (() => {
+    const im = Array.from(cell.querySelectorAll('img'))
+      .find(x => (x.currentSrc || x.src || '').startsWith('http'));
+    return im ? (im.currentSrc || im.src || '') : '';
+  })();
+  trig.scrollIntoView({block: 'center'});
+  await sleep(700);
+  // 【合成 hover 即可展开——2026-08-30 实测】trigger 与它内层的 .single-image
+  // 都派发：实测 trigger 那层就绑了事件，但两个都发更稳（多余那次无副作用，
+  // 同 _JS_OPEN_MATERIAL_SPACE 的做法）
+  const inner = trig.querySelector('.single-image') || trig;
+  [trig, inner].forEach(el => {
+    if (!el) return;
+    ['mouseenter', 'mouseover', 'mousemove'].forEach(t =>
+      el.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+  });
+  // 【轮询等菜单，不硬等】菜单是同步渲染（实测 hover 后 1.2s 内必现），轮询命中即走；
+  // 判「展开」只认 display:none 之外的实例——菜单 off-screen 停靠时 offsetHeight
+  // 不可靠（见本模块阶段⑥⑦ 公共机制段落的第 3 条实测结论）
+  const WANT = __ITEMS__;
+  let menu = null;
+  for (let k = 0; k < 30; k++) {
+    menu = Array.from(document.querySelectorAll('.ant-dropdown')).find(d => {
+      if (/display:\s*none/.test(d.getAttribute('style') || '')) return false;
+      const its = Array.from(d.querySelectorAll('.ant-dropdown-menu-item')).map(i => txt(i));
+      return WANT.every(w => its.includes(w));
+    });
+    if (menu) break;
+    await sleep(100);
+  }
+  if (!menu) return JSON.stringify({stage: 'menu', err: '悬停后预览图菜单未展开',
+                                    nowColor: nowColor});
+  const item = Array.from(menu.querySelectorAll('.ant-dropdown-menu-item'))
+    .find(i => txt(i) === '空间图片');
+  if (!item) return JSON.stringify({stage: 'menu', err: '菜单里没有「空间图片」项',
+                                    items: Array.from(
+                                      menu.querySelectorAll('.ant-dropdown-menu-item'))
+                                      .map(i => txt(i))});
+  item.click();
+  // 轮询等弹窗（实测点后约 100ms 列表就绪，上限 6s 兜住慢的情况）
+  let opened = false;
+  for (let k = 0; k < 60; k++) {
+    await sleep(100);
+    opened = Array.from(document.querySelectorAll('.ant-modal'))
+      .some(m => m.offsetHeight > 0 &&
+        ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+    if (opened) break;
+  }
+  return JSON.stringify({stage: 'ok', opened: opened, nowColor: nowColor,
+                         srcBefore: before});
+})()"""
+
+
+# 回读某行预览图的 src 与尺寸（替换后的成功判据）
+_JS_SKU_PREVIEW_ROW_SRC = r"""(() => {
+  const sku = document.getElementById('skuDataInfo');
+  if (!sku) return JSON.stringify({err: 'no-skuDataInfo'});
+  const t0 = sku.querySelector('table');
+  if (!t0) return JSON.stringify({err: 'no-table'});
+  const tr = Array.from(t0.querySelectorAll('tbody tr'))[__IDX__];
+  if (!tr) return JSON.stringify({err: 'no-row'});
+  const cell = Array.from(tr.children)[__PREV__];
+  if (!cell) return JSON.stringify({err: 'no-cell'});
+  const im = Array.from(cell.querySelectorAll('img'))
+    .find(x => (x.currentSrc || x.src || '').startsWith('http'));
+  return JSON.stringify({src: im ? (im.currentSrc || im.src || '') : null,
+                         w: im ? (im.naturalWidth || 0) : 0,
+                         h: im ? (im.naturalHeight || 0) : 0});
+})()"""
+
+
+async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
+                                  image_path: str, preview_idx: int,
+                                  color_idx: int = -1, expect_color: str = "",
+                                  full_cid: Optional[str] = None) -> dict:
+    """阶段⑦b 替换【一行】的 SKU 预览图：直传图床、悬停菜单选「空间图片」、弹窗选图。
+
+    image_path 必须是【已做过合规化】的图（1:1 且 >=800x800，走 images.square_image）：
+    与 ⑥⑦ 一致，本函数不代做合规化——那是纯本地的确定性变换，由调用方先做好，
+    免得这里既管页面交互又管图片处理、失败时分不清是哪一层的问题。
+
+    preview_idx / color_idx 由 sku_preview_state 读出来传进来，不在这里重复解析表头：
+    一批行共用一次表头解析，与「批次开始解析一次 SheetSchema 全批复用」同一取向。
+
+    expect_color 非空时核对该行【当前】颜色名是否与读到时一致，不一致就拒绝替换——
+    Vue 重排过的话，挂上去就是挂到别的 SKU 上了。
+    """
+    up = await upload_image(session, image_path, full_cid=full_cid)
+    if up.get("status") != "ok":
+        return {"status": "error", "stage": "upload", "row": row_idx, "upload": up}
+
+    opened = await session.eval_json(
+        _JS_OPEN_SKU_PREVIEW_SPACE
+        .replace("__IDX__", J(row_idx))
+        .replace("__PREV__", J(preview_idx))
+        .replace("__ICOLOR__", J(color_idx))
+        .replace("__ITEMS__", J(list(SKU_PREVIEW_MENU_ITEMS)))
+        .replace("__TITLE__", J(SPACE_MODAL_TITLE))
+    )
+    # 行序核对放在开弹窗【之后】：菜单已经绑定到这一行了，此时若发现颜色对不上，
+    # 关掉弹窗即可，什么都没改动。放在之前则要多一次 eval 往返。
+    now_color = opened.get("nowColor") or ""
+    if expect_color and now_color and now_color != expect_color:
+        # 多颜色商品（尤其各颜色尺码数不等）最容易撞这条：读状态与逐行替换之间
+        # Vue 若重排过，按下标定位就会落到别的 SKU 上。拒绝替换是对的，但必须留证，
+        # 否则事后只看到「N 行替换失败」，看不出是行序问题（2026-09-01 的盲区）。
+        logger.warning(
+            f"预览图第 {row_idx + 1} 行行序变了，拒绝替换："
+            f"期望「{expect_color}」，现在是「{now_color}」")
+        await _close_space_modal(session)
+        return {"status": "error", "stage": "row-moved", "row": row_idx,
+                "err": f"行序变了：期望「{expect_color}」，现在是「{now_color}」",
+                "upload": up}
+    if opened.get("err") or not opened.get("opened"):
+        # 与 pick/readback 一样落日志：本阶段失败会让整单发布被平台拦，
+        # 而 service 那边只发 manual_check（不写日志文件），事后无从定位（2026-09-01
+        # 排查 890185900190 时就卡在这个盲区）。
+        logger.warning(
+            f"预览图第 {row_idx + 1} 行打不开空间弹窗[{opened.get('stage') or '?'}]："
+            f"{opened.get('err') or ''}"
+            + (f"（页面共 {opened['rowCount']} 行）" if opened.get("rowCount") else "")
+            + f" 当前颜色「{now_color}」")
+        return {"status": "error", "stage": "open-space", "row": row_idx,
+                "detail": opened, "upload": up}
+
+    picked = await _pick_from_space(session, up["fileId"])
+    if picked.get("err"):
+        # 【选图失败要把弹窗现状说全】同图逐行各传一次时，图床可能按内容去重、
+        # 让本次的新 fileId 在弹窗里根本不存在（2026-09-01 890185900190 的疑点）。
+        # 判断这一点只需要「想要的文件名 + 当前页有哪些名字 + 谁已被选中」，
+        # 故这三样直接进日志，别只留一句「找不到刚上传的图」。
+        logger.warning(
+            f"预览图第 {row_idx + 1} 行选图失败[{picked.get('stage') or '?'}]："
+            f"{picked.get('err') or ''}"
+            + (f" | 想要 {picked['wantName']}" if picked.get("wantName") else "")
+            + (f" | 弹窗 {picked['itemCount']} 项" if picked.get("itemCount") is not None else "")
+            + (f" | 已选中项序 {picked['alreadySelected']}"
+               if picked.get("alreadySelected") else "")
+            + (f" | 当前页文件名 {picked['pageNames']}" if picked.get("pageNames") else ""))
+        # 弹窗可能还开着挡住后续操作，尽力关掉（best-effort，失败不影响错误返回）
+        await _close_space_modal(session)
+        return {"status": "error", "stage": "pick", "row": row_idx,
+                "detail": picked, "upload": up}
+
+    after = await session.eval_json(
+        _JS_SKU_PREVIEW_ROW_SRC.replace("__IDX__", J(row_idx))
+        .replace("__PREV__", J(preview_idx)))
+    fid = up["fileId"].rsplit("/", 1)[-1]
+    # 【成功判据是回读到的 src 含新 fileId】只看「src 变了」不够：挂错行时本行 src
+    # 同样可能变（原脚本的素材图误替换事故正是这么发生的，见 set_material 的注释）
+    ok = fid in (after.get("src") or "")
+    if not ok:
+        logger.error(f"预览图第 {row_idx + 1} 行替换后回读不含新 fileId："
+                     f"before={(opened.get('srcBefore') or '')[-50:]} "
+                     f"after={(after.get('src') or '')[-50:]}")
+    return {"status": "ok" if ok else "error",
+            "stage": "" if ok else "readback",
+            "row": row_idx, "color": now_color, "upload": up,
+            "fileId": up["fileId"],
+            "srcBefore": opened.get("srcBefore"), "srcAfter": after.get("src"),
+            "sizeAfter": {"w": after.get("w"), "h": after.get("h")}}
+
+
 # ==================== 阶段⑪ 产品描述长图 ====================
 # 业务规则（SKILL.md 阶段⑪）：Temu 只关心商品图。工厂/公司介绍图、促销海报、
 # 中文尺码表、与商品无关的图一律删；重复图删；含中文的商品图英化后替换。
@@ -7261,7 +8615,8 @@ async def desc_map(session: BrowserSession, info_path: str = "") -> dict:
 #
 # 2026-08-24 真站探查（rowid 173539495454339053，19 个模块）：data-idx=0 是文字模块，
 # 内容是 1688 的关联商品 JSON 残留 `{"styleType":"offer-type-1","items":"8886...}`，
-# 纯垃圾；另有商品确实用文字模块放尺码对照（`80【身高65-75cm】`），那种要英化保留。
+# 纯垃圾；另有商品用文字模块放尺码对照（`80【身高65-75cm】`）。2026-09-01 起两类
+# 一律删除（见 desc_text_delete_all），本函数只负责枚举、不做内容判断。
 _JS_DESC_TEXT_MAP = r"""(() => {
   const m = __MODAL__;
   if (!m) return JSON.stringify({err: '编辑器不在'});
@@ -7299,58 +8654,6 @@ _JS_DESC_IDX_MAP = r"""(() => {
     if (c.querySelector('.desc-img-box img')) map.push(c.getAttribute('data-idx'));
   });
   return JSON.stringify({map, modCount: mods.length});
-})()"""
-
-
-# 改写 data-idx 为 __IDX__ 的文字模块内容。
-#
-# 【必须走右侧面板的 textarea】模块自身的 div.desc-content 不是 contenteditable、
-# 也不是 input，直接改 innerText 保存时不生效（组件状态没变）。流程是：
-# 点左侧 .using-item → 右侧 .smt-content-right 渲染「文字模块」面板 → 写它的
-# textarea.ant-input。写完必须派发 input 事件，否则 Vue 不同步、保存后回到原文
-# （本项目其它表单字段同样的坑，见 _js_fill_by_label）。
-#
-# 500 字符是面板自己标的上限（「总字符数:160 / 500」），超了平台会截断，
-# 故调用方传进来前就该截好；这里再兜一刀，避免静默截断。
-_JS_DESC_TEXT_SET = r"""(async () => {
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  const m = __MODAL__;
-  if (!m) return JSON.stringify({status: 'error', reason: '编辑器不在'});
-  const item = m.querySelector('.using-item[data-idx="__IDX__"]');
-  if (!item) return JSON.stringify({status: 'error', reason: 'using-item-not-found'});
-  item.scrollIntoView({block: 'center'});
-  await sleep(300);
-  item.click();
-  await sleep(1200);            // 面板渲染有入场过程，读太早拿不到 textarea
-
-  const panel = m.querySelector('.smt-content-right');
-  if (!panel) return JSON.stringify({status: 'error', reason: 'panel-not-found'});
-  const ta = panel.querySelector('textarea.ant-input, textarea');
-  if (!ta) return JSON.stringify({status: 'error', reason: 'textarea-not-found'});
-
-  const before = ta.value;
-  const text = __TEXT__;
-  if (text.length > 500) {
-    return JSON.stringify({status: 'error', reason: 'text-too-long',
-                           len: text.length});
-  }
-  // 原生 setter + input 事件：Vue 只认事件，直接赋 value 不同步
-  const desc = Object.getOwnPropertyDescriptor(
-    window.HTMLTextAreaElement.prototype, 'value');
-  desc.set.call(ta, text);
-  ta.dispatchEvent(new Event('input', {bubbles: true}));
-  ta.dispatchEvent(new Event('change', {bubbles: true}));
-  await sleep(600);
-
-  // 回读：面板 textarea 与模块本体都要变（后者证明组件真的同步了）
-  const mod = m.querySelector(
-    '.smt-content-center .smt-desc-content[data-idx="__IDX__"] .desc-content');
-  return JSON.stringify({
-    status: 'ok', before: before.slice(0, 80),
-    readback: ta.value.slice(0, 80),
-    modText: mod ? (mod.innerText || '').trim().slice(0, 80) : null,
-    filled: ta.value.trim() === text.trim(),
-  });
 })()"""
 
 
@@ -7506,66 +8809,46 @@ async def desc_text_map(session: BrowserSession) -> dict:
             "modCount": r.get("modCount")}
 
 
-async def desc_text_apply(session: BrowserSession, plan: list) -> dict:
-    """阶段⑬ 按计划处理文字模块：英化改写 或 删除。
+async def desc_text_delete_all(session: BrowserSession) -> dict:
+    """阶段⑬ 删掉描述区【全部文字模块】。
 
-    plan: [{"idx": "0", "action": "translate"|"delete"|"keep",
-            "text": "<translate 时的英文正文>", "reason": "..."}]
-    idx 用 desc_text_map 返回的 data-idx 原值。
+    【为什么不再按内容分类】2026-09-01 用户要求描述区所有文字板块一律移除。此前是
+    交 LLM 判「采集残留 JSON 删 / 尺码对照表英化保留」，现在不留保留分支：尺码信息
+    已由阶段⑧ 的平台尺码表承载，描述区那份纯文本只是重复与中文残留来源。
 
-    【顺序：先全部 translate，再倒序 delete】两个动作都按 data-idx 寻址，而删除
-    会让后续 data-idx 重排。先删就会把待翻译项的 idx 改掉，写到别的模块上去。
-    删除本身倒序（大→小），理由同 desc_delete。
+    【倒序删除】data-idx 在删除后会重排，从大到小删则每次只影响比它更大的下标，
+    已处理过的不受影响（正序删会错位，同 desc_delete）。
 
     单项失败不拖垮整体（best-effort）：记进 failed 继续，交调用方决定是否告警。
-    描述文字不是必填项，改不动就保留原文，比中断整个商品划算。
+    描述文字不是必填项，删不掉就保留原文，比中断整个商品划算。
+
+    返回里带上枚举到的 texts 原文：调用方要拿它做尺码取证（见 service._st_desc 的
+    _size_evidence）。放在这里返回而不是让调用方自己再 desc_text_map 一次，是为了
+    省掉一次页面 eval——删除后模块就没了，事后补读不到。
     """
-    st = await _desc_ensure_open(session)
-    if st.get("err"):
-        return {"status": "error", **st}
+    tm = await desc_text_map(session)
+    if tm.get("status") != "ok":
+        return {"status": "error", **tm}
+    texts = [t for t in (tm.get("texts") or []) if str(t.get("idx") or "").strip()]
+    idxs = sorted({str(t.get("idx")) for t in texts},
+                  key=lambda x: int(x) if x.isdigit() else 0, reverse=True)
+    if not idxs:
+        return {"status": "ok", "deleted": [], "failed": [], "found": 0,
+                "texts": []}
 
-    translated, deleted, failed, kept = [], [], [], []
-
-    # 1) 先改写（此时 data-idx 还没被删除动作扰动）
-    for p in plan:
-        if (p.get("action") or "") != "translate":
-            continue
-        idx, text = str(p.get("idx")), (p.get("text") or "").strip()
-        if not text:
-            failed.append({"idx": idx, "err": "translate 但没给 text"})
-            continue
-        if len(text) > 500:
-            text = text[:500]          # 面板上限，超了平台会静默截断
-            logger.warning(f"文字模块 idx={idx} 译文超 500 字符，已截断")
-        r = await session.eval_json(
-            _JS_DESC_TEXT_SET.replace("__MODAL__", _JS_DESC_MODAL)
-                             .replace("__IDX__", idx)
-                             .replace("__TEXT__", J(text)))
-        if r.get("status") == "ok" and r.get("filled"):
-            translated.append({"idx": idx, "text": text[:60],
-                               "reason": p.get("reason", "")})
-        else:
-            failed.append({"idx": idx, "action": "translate", **r})
-            logger.warning(f"文字模块 idx={idx} 改写失败：{r.get('reason') or r}")
-
-    # 2) 再倒序删除
-    dels = sorted({str(p.get("idx")) for p in plan
-                   if (p.get("action") or "") == "delete"},
-                  key=lambda x: int(x) if str(x).isdigit() else 0, reverse=True)
-    for idx in dels:
+    deleted, failed = [], []
+    for idx in idxs:
         r = await session.eval_json(
             _JS_DESC_DELETE.replace("__MODAL__", _JS_DESC_MODAL)
                            .replace("__IDX__", idx))
         if r.get("err") or not r.get("deleted"):
-            failed.append({"idx": idx, "action": "delete", **r})
+            failed.append({"idx": idx, **r})
             logger.warning(f"文字模块 idx={idx} 删除失败：{r.get('err') or r}")
         else:
             deleted.append(idx)
-
-    kept = [str(p.get("idx")) for p in plan if (p.get("action") or "") == "keep"]
     return {"status": "ok" if not failed else "partial",
-            "translated": translated, "deleted": deleted,
-            "kept": kept, "failed": failed}
+            "deleted": deleted, "failed": failed, "found": len(idxs),
+            "texts": texts}
 
 
 async def desc_save(session: BrowserSession) -> dict:
@@ -8133,7 +9416,12 @@ async def desc_replace(session: BrowserSession, pos: int, image_path: str,
                     "err": f"第 {pos} 个模块当前不是期望的源图，拒绝替换以免错位",
                     "expect": expect_url, "actual": cur}
 
-    up = await upload_image(session, image_path, full_cid=full_cid)
+    # 描述图按【描述图】的下限过闸，不套服装的 1340×1785：平台对描述图只要求
+    # 两边 >= 480、比例 0.5~2（见 images.check_desc_size 与 upload_image 的
+    # min_w/min_h 说明）。2026-08-29 实测一张达标的 480×480 被服装闸门拒掉，
+    # 页面留着 1688 原始外链，⑬ 整单失败。
+    up = await upload_image(session, image_path, full_cid=full_cid,
+                            min_w=images.DESC_MIN_W, min_h=images.DESC_MIN_H)
     if up.get("status") != "ok":
         return {"status": "error", "stage": "upload", "upload": up}
     fid = up["fileId"].rsplit("/", 1)[-1]
@@ -8611,6 +9899,81 @@ async def _close_video_modal(session: BrowserSession) -> dict:
     except Exception as e:
         logger.warning(f"关视频地址弹窗失败（不影响主流程判定）：{e}")
         return {"err": str(e)}
+
+
+# 视频区「删除」链接：把整块封面 + 播放/删除入口置空（详见 delete_video 的说明）。
+#
+# 【为什么按 .video-operate-box 里的 a 文本认，而不用 nth-child】2026-08-29 探查
+# （workspace/_probe_video_delete.py）确认这一块的真实结构是：
+#     .video-operate-img > .video-operate-img-box
+#         ├─ .img-out > img.img-css        封面（没视频时是内嵌 base64 占位图）
+#         └─ .video-operate-box
+#               ├─ <div><a class="link"> 播放 </a></div>   ← 播放多套了一层 div
+#               └─ <a class="link"> 删除 </a>              ← 删除是直接子节点
+# 两个 a 的 class 都只是 link、层级还不对称，故只有文本可靠；且文本两侧带空格，
+# 必须 trim 后严格等值比（用 includes 会把别处的「删除」按钮也认进来）。
+_JS_DELETE_VIDEO = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const op = document.querySelector('.video-operate');
+  if (!op) return JSON.stringify({stage: 'locate', err: '找不到视频区块 .video-operate'});
+  const box = op.querySelector('.video-operate-box');
+  if (!box) return JSON.stringify({stage: 'locate', err: '找不到 .video-operate-box'});
+  const a = Array.from(box.querySelectorAll('a'))
+    .find(x => (x.textContent || '').trim() === '删除');
+  if (!a) return JSON.stringify({stage: 'locate', err: '视频区里找不到「删除」链接',
+    links: Array.from(box.querySelectorAll('a')).map(x => (x.textContent || '').trim())});
+
+  const imgBox = op.querySelector('.video-operate-img');
+  const gone = () => !imgBox || getComputedStyle(imgBox).display === 'none';
+  if (gone()) return JSON.stringify({stage: 'done', already: true});
+
+  a.scrollIntoView({block: 'center'});
+  await sleep(200);
+  a.click();
+
+  // 轮询等置空生效。实测是同步的（0.4s 采样第一帧就已 display:none），但组件
+  // 若哪天改成异步置空，固定 sleep 会误判成失败，故仍轮询。
+  let ok = false;
+  for (let i = 0; i < 20; i++) {
+    ok = gone();
+    if (ok) break;
+    await sleep(150);
+  }
+  return JSON.stringify({stage: 'done', already: false, cleared: ok,
+    imgBoxStyle: imgBox ? (imgBox.getAttribute('style') || '') : ''});
+})()"""
+
+
+async def delete_video(session: BrowserSession) -> dict:
+    """把编辑页产品视频【删掉】（丢弃视频路线，与 set_video 二选一）。
+
+    【为什么要这条路线】set_video 是把 1688 搬来的竖屏视频裁成 Temu 允许的比例再回填，
+    但下载 + ffmpeg 转码 + 直传三步每个商品要花几十秒到几分钟，而视频本身只是加分项。
+    批量发布时用户往往宁可整批不要视频、换取速度与确定性（不合规视频会在阶段⑮ 发布
+    之后才被平台打回，见 set_video 上方的说明）。故给批次一个开关：开则走原来的比例
+    审核，关就在这里直接点「删除」。
+
+    【纯前端置空，不打接口，不弹二次确认——2026-08-29 逐帧探查取证】
+    （workspace/_probe_video_delete_click.py，10 帧 × 0.4s 采样）：
+      - 点击后第一帧 .video-operate-img 就已 display:none，播放/删除两个 a 高度归 0；
+      - 全程 .ant-modal-wrap / .ant-popconfirm 一个都没出现，也没有任何 toast；
+      - 不 save 直接重载编辑页，封面块回到 display:flex——说明改动只在未保存的表单里。
+    最后一点意味着这个操作的安全阀与 desc-delete 相同：真正生效要靠后续阶段⑭ save。
+
+    返回 {"status": "ok"/"error", "already": 本来就没视频, "stage": 失败环节}。
+    """
+    r = await session.eval_json(_JS_DELETE_VIDEO)
+    if r.get("err"):
+        return {"status": "error", "stage": r.get("stage") or "", **r}
+    if r.get("already"):
+        logger.info("视频区本来就是空的，无需删除")
+        return {"status": "ok", "already": True}
+    if not r.get("cleared"):
+        # 点了但封面块还在：组件没吃这一下，页面上视频还挂着
+        return {"status": "error", "stage": "verify",
+                "err": "已点「删除」但视频封面块 3s 内仍未消失", **r}
+    logger.info("产品视频已删除（未保存，落库靠后续 save）")
+    return {"status": "ok", "already": False}
 
 
 async def read_video_url(session: BrowserSession, rowid: str) -> dict:

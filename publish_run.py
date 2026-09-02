@@ -24,6 +24,7 @@ import json
 import sys
 
 from app.logger import logger
+from app.publish import alert
 from app.publish.service import STAGES, run_batch, set_image_concurrency
 
 
@@ -90,9 +91,16 @@ async def main() -> int:
     ap.add_argument("--from-stage", default="",
                     help="从指定阶段起重跑（阶段 id，见 --list-stages）")
     ap.add_argument("--list-stages", action="store_true", help="列出阶段 id 后退出")
+    ap.add_argument("--test-alert", action="store_true",
+                    help="只发一条飞书测试告警后退出（验证 [publish.alert] 配好没有）")
     ap.add_argument("--publish", action="store_true",
                     help="⑭ 保存成功后继续点「发布」→「立即发布」真正上架"
                          "（不可逆，不给这个开关时 ⑮ 阶段跳过）")
+    # 视频取向做成「关掉才丢弃」而不是「开了才保留」：默认行为与加这个开关之前一致，
+    # 老命令行照抄不变（同 --publish 的取向——改变默认行为的那一侧才需要显式加参数）
+    ap.add_argument("--no-video", action="store_true",
+                    help="⑬b 丢弃产品视频：编辑页直接点「删除」，不做比例合规化"
+                         "（不给则保留视频、裁到 1:1/3:4/16:9 后回填）")
     ap.add_argument("--image-concurrency", type=int, default=0,
                     help="生图并发数（⑤b 图片清理与 ⑬ 描述图英化共用）。"
                          "不给则用发布页配置的值（默认 30）；给了会写进配置、长期生效")
@@ -102,6 +110,16 @@ async def main() -> int:
         for sid, name in STAGES:
             _p(f"  {sid:<10} {_gbk(name)}")
         return 0
+
+    if args.test_alert:
+        cfg = alert.load_alert_config()
+        if not cfg["enabled"]:
+            _p("飞书告警未启用：在 config/config.toml 的 [publish.alert] 段配 "
+               "webhook（或设环境变量 PUBLISH_ALERT_WEBHOOK）")
+            return 1
+        ok = await alert.send_text("[自检] manus-gui 发布告警通道正常")
+        _p("已发送，去群里确认" if ok else "发送失败，详见日志")
+        return 0 if ok else 1
 
     if args.tasks:
         with open(args.tasks, encoding="utf-8") as f:
@@ -125,9 +143,16 @@ async def main() -> int:
         except ValueError as e:
             ap.error(str(e))
 
-    r = await run_batch(tasks, store=args.store, site=args.site,
-                        on_progress=_print_progress, from_stage=args.from_stage,
-                        do_publish=args.publish, price=args.price)
+    # run_batch 内部的中断（aborted / 单商品 fail / 收尾有失败）由 service 的告警钩子
+    # 统一报；这里兜的是 run_batch 本身抛出来的异常——钩子在它里面，抛出来就报不了了。
+    try:
+        r = await run_batch(tasks, store=args.store, site=args.site,
+                            on_progress=_print_progress, from_stage=args.from_stage,
+                            do_publish=args.publish, price=args.price,
+                            keep_video=not args.no_video)
+    except Exception as e:
+        await alert.alert_batch_crash(str(e), store=args.store, site=args.site)
+        raise
     logger.info(f"批次结束：{r}")
     return 0 if r.get("fail") == 0 else 1
 

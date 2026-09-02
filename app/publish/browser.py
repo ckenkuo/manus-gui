@@ -26,6 +26,7 @@ IIFE 包裹，改成传参要逐处改写 JS 本身，收益不抵风险。故�
 import asyncio
 import json
 import re
+import time
 from typing import Any, Callable, Optional
 
 from playwright.async_api import Page, async_playwright
@@ -54,6 +55,11 @@ DRAFT_LIST_URL = DIANXIAOMI_HOST + "/web/popTemu/pageList/draft"
 # 阶段⑮ 发布成功的取证列表：发布后该行从草稿箱消失、出现在在线产品
 # （2026-08-24 实测，见 pipeline._publish_landed）
 ONLINE_LIST_URL = DIANXIAOMI_HOST + "/web/popTemu/pageList/online"
+# 发布失败列表：平台的材积重量等校验是【后端异步】做的，点完「立即发布」草稿行会先
+# 离开草稿箱，几秒后带着失败原因落到这里。只看在线/草稿两个列表会把这种情况判成成功
+# （2026-09-01 实测，见 pipeline._publish_landed）。
+PUBLISH_FAIL_LIST_URL = (DIANXIAOMI_HOST
+                         + "/web/popTemu/pageList/offline?dxmOfflineState=publishFail")
 CRAWL_URL = DIANXIAOMI_HOST + "/web/productCrawl/dataAcquisition"
 
 # WebBridge 时代的瞬时错误特征（"Promise was collected" / -32000），Playwright 下换成
@@ -83,6 +89,20 @@ class TargetClosedError(RuntimeError):
     """页面/浏览器已关闭（页签被关、Chrome 退出或页面崩溃）——不可重试，须重建会话。"""
 
 
+# ---- 共享页面锁 -------------------------------------------------------------
+# 【为什么锁在这一层，而不在各自的扫描模块里】本模块的会话模型是「挑一个店小秘页签复用」
+# （见 BrowserSession.open），于是任何两个各自 new BrowserSession() 的只读扫描，
+# 拿到的其实是【同一个页签】——各自在自己模块里加锁毫无用处，A 正在读列表 DOM 时
+# B 一个 navigate 就把页面换走了（表现为 A 读到另一个列表的行，还完全静默）。
+# 2026-08-30 新增未认领清单扫描（app/publish/crawlbox.py）后这条路径才真实存在：
+# 在那之前只有采集箱一个扫描者，它自己的模块级锁够用。
+#
+# 与发布作业的互斥不走这把锁：发布是 15 阶段跨多次调用共用一个页面的长流程，
+# 拿锁拿几十分钟不现实。那边的取向是「有作业在跑就跳过这一轮扫描」（见
+# collectbox._tick 与 app.py 的 _publish_job_busy），扫描迟一轮毫无损失。
+PAGE_LOCK = asyncio.Lock()
+
+
 # evaluate/eval_json 的「没传参」哨兵：None 是合法的 JS 参数（null），不能拿它判断
 _NO_ARG = object()
 
@@ -102,6 +122,37 @@ _TOAST_BINDING = "__dxmToast"
 # 判级用的关键词：命中即 warning（用户需要知道），其余按 info 记流水。
 _TOAST_BAD_WORDS = ("错误", "失败", "异常", "不能", "不可", "无权", "删除",
                     "超时", "请先", "必填", "无效", "已存在")
+
+# 最近的 toast 环形缓冲（(时间戳, 文案)），供调用方回看「刚才那次点击弹了什么」。
+#
+# 【为什么 toast 必须留缓冲，不能只打日志】2026-09-01 取证（两单 1067271196776、
+# 1051827161006）：save 后平台弹「错误：请上传预览图」，这条被本模块的 toast 哨兵
+# 抓到并记了 warning，但阶段⑭ 的 _JS_SAVE_FEEDBACK 只读 .ant-message /
+# .ant-notification —— 店小秘的 d-message 是自有浮层，两个选择器都抓不到，于是
+# save 判据两边都空，只能报「无校验错误但草稿更新时间未变，保存可能未生效」这种
+# 查不下去的结论，把排查方向从「预览图没上传」带偏到「保存点击没生效」。
+# 真因当时就明明白白弹在页面上，只是没人把它接住。
+# 故在打日志的同一处留一份带时间戳的缓冲，让 save 能按时间窗回捞。
+_TOAST_LOG: list = []
+_TOAST_LOG_MAX = 60
+
+
+def recent_toasts(since: float = 0.0, bad_only: bool = False) -> list:
+    """回看 since（time.time() 时间戳）之后出现的 toast 文案，最新在后。
+
+    save 这类「点一下然后看页面怎么回应」的场景用它取证：按时间窗过滤，避免把
+    上一个阶段的旧提示算进本次结论。bad_only=True 时只留命中 _TOAST_BAD_WORDS 的。
+    """
+    out = [t for ts, t in _TOAST_LOG if ts >= since]
+    if bad_only:
+        out = [t for t in out if any(w in t for w in _TOAST_BAD_WORDS)]
+    # 同一条文案在一个窗口里可能重复出现（浮层动画），按首次出现去重保序
+    seen, uniq = set(), []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
 
 _JS_TOAST_WATCH = r"""(() => {
   if (window.__dxmToastInstalled) return JSON.stringify({installed: false, reason: 'already'});
@@ -440,6 +491,10 @@ class BrowserSession:
             msg = (text or "").strip()
             if not msg:
                 return
+            # 先入缓冲再打印：调用方（如阶段⑭ save）要能回捞本次点击后的提示
+            _TOAST_LOG.append((time.time(), msg))
+            if len(_TOAST_LOG) > _TOAST_LOG_MAX:
+                del _TOAST_LOG[:-_TOAST_LOG_MAX]
             if any(w in msg for w in _TOAST_BAD_WORDS):
                 logger.warning(f"页面提示：{msg}")
             else:

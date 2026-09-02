@@ -93,12 +93,16 @@ async def fetch(session: BrowserSession, url: str,
     # Python 直连——老形态 detailUrl 没有 CORS 头，页面内 fetch 必抛 Failed to fetch
     # （见 extract._fetch_desc_imgs_direct 的注释）。best-effort：拿不到就没有描述图。
     desc_imgs: list = []
+    desc_text = ""
     detail_url = data.get("detailUrl")
     if detail_url:
         from app.publish.browser import J
         try:
             d = await session.eval_json(E._JS_DETAIL.replace("__URL__", J(detail_url)))
             desc_imgs = d.get("imgs") or []
+            # 文字与图从【同一个响应体】剥出，故这里连着取：有些商家把整张尺码表打成
+            # 明文而不是做成图（见 E.desc_text_of 的取证），只抠图会把它整段丢掉。
+            desc_text = E.desc_text_of(d.get("html") or "")
             if not desc_imgs:
                 logger.warning(f"详情接口页面内 fetch 未抠到图（status={d.get('status')} "
                                f"len={d.get('len')}），改直连重试")
@@ -106,10 +110,15 @@ async def fetch(session: BrowserSession, url: str,
             logger.warning(f"详情接口页面内 fetch 失败：{e}；改直连重试")
         if not desc_imgs:
             try:
-                desc_imgs = E._fetch_desc_imgs_direct(detail_url)
+                desc_imgs, direct_text = E._fetch_desc_direct(detail_url)
+                # 页面内那条已拿到文字时不覆盖：两条路径抠的是同一份内容，而先到的那份
+                # 已经确认可读（直连走的是另一套编码判定，没必要再挑一次）
+                desc_text = desc_text or direct_text
                 logger.info(f"详情接口直连成功：描述图 {len(desc_imgs)} 张")
             except Exception as e:
                 logger.warning(f"详情接口直连也失败（描述图为空）：{e}")
+        if desc_text:
+            logger.info(f"详情描述含文字内容 {len(desc_text)} 字（可能含明文尺码表）")
 
     main_imgs = [u for u in (data.get("images") or []) if isinstance(u, str)]
     # 属性走 extract.parse_attrs 的键名表切分（1688 独有：属性容器取 textContent
@@ -128,6 +137,7 @@ async def fetch(session: BrowserSession, url: str,
                 for s in (data.get("skuMap") or []) if isinstance(s, dict)],
         mainImages=main_imgs,
         descImages=list(desc_imgs),
+        descText=desc_text,
         unitWeightKg=data.get("unitWeight"),
         videoUrl="",
         extra={

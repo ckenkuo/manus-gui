@@ -6,8 +6,10 @@
   python publish_inspect.py images <rowid> [--out 目录]      列出/下载三组图片
   python publish_inspect.py dump-attrs <rowid>             属性当前值+下拉选项
   python publish_inspect.py check-attrs <rowid> <info.json> 属性审核清单（dry-run）
-  python publish_inspect.py enrich-vision <info.json>      视觉回填阶段①四个看图字段
+  python publish_inspect.py enrich-vision <info.json>      视觉回填阶段①的看图字段
                                                            （不连浏览器，只读本地图）
+  python publish_inspect.py enrich-desc-text <info.json>   从详情纯文字抽尺码表
+                                                           （不连浏览器、不看图）
   python publish_inspect.py pick-rowid "标题" "店铺" [--site 站点]  认领后按站点筛 rowid
   python publish_inspect.py cache-list                      类目/属性缓存现状（不连浏览器）
   python publish_inspect.py cache-clear [--slug <slug>]     清缓存（不给 slug 则全清）
@@ -16,7 +18,7 @@
   python publish_inspect.py crawl "<1688链接>"                        链接采集（建采集记录）
   python publish_inspect.py claim "标题" "店铺" [--site 站点]           认领到店铺站点（建草稿）
   python publish_inspect.py collect-claim "<链接>" "标题" "店铺"        阶段②全流程→rowid
-  python publish_inspect.py auto-cat <rowid> "商品标题"      逐级选定产品类目
+  python publish_inspect.py auto-cat <rowid> "商品标题" [--info-json info.json]  逐级选定产品类目
   python publish_inspect.py check-attrs <rowid> <info.json> --apply   应用属性修改
   python publish_inspect.py set-titles <rowid> <info.json>            中英文标题+产地
   python publish_inspect.py fix-sizes <rowid> <info.json>             尺码勾选修正
@@ -27,6 +29,8 @@
   python publish_inspect.py set-shipping <rowid> [--deadline 文本]      发货时效+运费模板
   python publish_inspect.py set-material <rowid> <方图.jpg>             阶段⑥ 素材图替换
   python publish_inspect.py skc-row <rowid> "灰色" <图目录>              阶段⑦ 整行换 SKC 图
+  python publish_inspect.py sku-preview <rowid>                        阶段⑦b 变种表预览图现状（只读）
+  python publish_inspect.py sku-preview-fix <rowid> <行号> <方图.jpg>     阶段⑦b 换某行预览图
   python publish_inspect.py desc-delete <rowid> 1,3,5                  阶段⑪ 删描述模块
   python publish_inspect.py desc-save <rowid>                          阶段⑪ 保存描述编辑器
   python publish_inspect.py save <rowid>                              保存落库（不发布）
@@ -35,6 +39,9 @@
   - set-material / skc-row 传进来的图必须【已做过合规化】（素材图 1785² 方图走
     images.square_image；SKC 图 3:4 且 ≥1340×1785 走 images.fit_34）。这两个命令
     不代做合规化，尺寸不对会被发布校验静默拦下。
+  - sku-preview-fix 的图同样要先合规化：预览图要求 1:1 且不小于 800×800，
+    走 images.square_image 即可（与素材图同一个函数）。先跑 sku-preview 看哪几行
+    不合规、行号是多少，再逐行 fix。
   - skc-row 按【文件名排序】挂图，故颜色专属图命名 01.jpg 就落在首位、免拖拽。
   - desc-delete 删完【必须再跑 desc-save】才生效：描述编辑器点「关闭」即丢弃改动
     （2026-08-20 实测）。这一点反过来也是安全阀——验证时不保存就不会动到真实草稿。
@@ -91,6 +98,8 @@ async def main() -> int:
     p.add_argument("--no-cache", action="store_true",
                    help="不用已知类目路径缓存，强制走完整遍历")
     p.add_argument("--site", default="", help="经营站点（缓存键的一部分）")
+    p.add_argument("--info-json", default="",
+                   help="product-info.json 路径，给类目判断补年龄段/尺码线索")
     p = sub.add_parser("dump-attrs", help="导出产品属性当前值+下拉选项（只读）")
     p.add_argument("rowid")
     p.add_argument("--skip-options", action="store_true",
@@ -159,6 +168,12 @@ async def main() -> int:
     p.add_argument("rowid")
     p.add_argument("row_keyword", help="颜色行关键词，如「灰色」")
     p.add_argument("img_dir", help="图片目录，按文件名排序挂载（01.jpg 落首位）")
+    p = sub.add_parser("sku-preview", help="阶段7b 变种表预览图现状（只读）")
+    p.add_argument("rowid")
+    p = sub.add_parser("sku-preview-fix", help="阶段7b 某行预览图换图（写入）")
+    p.add_argument("rowid")
+    p.add_argument("row", type=int, help="行号（从 1 起，见 sku-preview）")
+    p.add_argument("image", help="已合规化的方图路径（1:1 且不小于 800x800）")
     p = sub.add_parser("desc-map", help="阶段11 列出描述模块（只读）")
     p.add_argument("rowid")
     p.add_argument("--info-json", default="", help="附带 complianceNotes 供对照")
@@ -171,12 +186,17 @@ async def main() -> int:
     p.add_argument("image", help="替换用的本地图（中文图英化产物，见 images.edit_image）")
     p = sub.add_parser("desc-save", help="阶段11 保存描述编辑器（写入）")
     p.add_argument("rowid")
-    p = sub.add_parser("enrich-vision", help="视觉回填阶段1四字段（只读）")
+    p = sub.add_parser("enrich-vision", help="视觉回填阶段1看图字段（只读）")
     p.add_argument("info_json", help="product-info.json 路径")
     p.add_argument("--overwrite", action="store_true",
                    help="重填已有值（默认只填空字段）")
-    p.add_argument("--max-images", type=int, default=12,
-                   help="一次请求最多传几张唯一图（默认12）")
+    p.add_argument("--max-images", type=int, default=20,
+                   help="一次请求最多传几张唯一图（默认20）")
+    p = sub.add_parser("enrich-desc-text",
+                       help="从详情纯文字抽尺码表（只读，不看图）")
+    p.add_argument("info_json", help="product-info.json 路径")
+    p.add_argument("--keep-vision", action="store_true",
+                   help="不覆盖已有值（默认文字优先覆盖视觉结果）")
     # 阶段②（app/publish/claim.py）：会真实建采集记录/草稿，副作用不可逆
     p = sub.add_parser("crawl", help="链接采集单个 1688 链接（写入，建采集记录）")
     p.add_argument("url", help="1688 商品链接")
@@ -214,6 +234,18 @@ async def main() -> int:
         print(json.dumps(r, ensure_ascii=False, indent=2))
         return 0
 
+    # 详情文字抽尺码表：比视觉回填还轻（不看图、只读一个 JSON 字段），同样不碰浏览器
+    if args.cmd == "enrich-desc-text":
+        from app.publish.extract import enrich_desc_text
+        try:
+            r = await enrich_desc_text(args.info_json,
+                                       overwrite=not args.keep_vision)
+        except Exception as e:
+            logger.error(f"详情文字尺码回填失败：{e}")
+            return 1
+        print(json.dumps(r, ensure_ascii=False, indent=2))
+        return 0
+
     # 缓存管理同理只碰本地 JSON：放在 CDP 检查之前，没开调试 Chrome 也能看/能清。
     if args.cmd in ("cache-list", "cache-clear"):
         from app.publish.cache import cache_stats, clear
@@ -246,9 +278,16 @@ async def main() -> int:
                 f"变种行 {len(r.get('skus') or [])} | 区块 {sum(1 for v in (r.get('sections') or {}).values() if v)}/7"
             )
         elif args.cmd == "auto-cat":
+            # 不给 --info-json 就只用标题判类目（判断逻辑不变，只是少了年龄段
+            # 线索）；给了则连尺码档位一起喂给 LLM，见 pipeline.cat_clues。
+            cat_info = None
+            if args.info_json:
+                with open(args.info_json, encoding="utf-8") as f:
+                    cat_info = json.load(f)
             r = await auto_cat(session, args.rowid, args.title,
                                lookahead=not args.no_lookahead,
-                               use_cache=not args.no_cache, site=args.site)
+                               use_cache=not args.no_cache, site=args.site,
+                               info=cat_info)
             print(json.dumps(r, ensure_ascii=False, indent=2))
             logger.info(f"类目已选定（{r['levels']} 级，走{'缓存' if r.get('source') == 'cache' else '遍历'}）"
                         f"：{r['path']}")
@@ -413,9 +452,10 @@ async def main() -> int:
                     + (f" | 红色区块={red}" if red else "")
                     + (f" | 错误={r.get('errors')}" if r.get("errors") else "")
                 )
-        elif args.cmd in ("set-material", "skc-row", "desc-map", "desc-delete",
+        elif args.cmd in ("set-material", "skc-row", "sku-preview",
+                          "sku-preview-fix", "desc-map", "desc-delete",
                           "desc-replace", "desc-save"):
-            # 阶段⑥⑦⑪ 共用一个分支：都要先进编辑页，再按子命令分流。
+            # 阶段⑥⑦⑦b⑪ 共用一个分支：都要先进编辑页，再按子命令分流。
             # 就地 import 同 enrich-vision 的取向，不动顶部的 import 块。
             from app.publish.pipeline import (
                 desc_delete,
@@ -424,6 +464,8 @@ async def main() -> int:
                 desc_save,
                 set_material,
                 skc_replace_row,
+                sku_preview_replace_row,
+                sku_preview_state,
             )
             await open_edit(session, args.rowid)
             await asyncio.sleep(2)
@@ -433,6 +475,25 @@ async def main() -> int:
                 r = await set_material(session, args.image)
             elif args.cmd == "skc-row":
                 r = await skc_replace_row(session, args.row_keyword, args.img_dir)
+            elif args.cmd == "sku-preview":
+                r = await sku_preview_state(session)
+            elif args.cmd == "sku-preview-fix":
+                # 先读一次表头拿列下标与该行颜色（同 service 的做法：列位置不写死）
+                st = await sku_preview_state(session)
+                if st.get("supported") is not True:
+                    r = {"status": "error", "stage": "state",
+                         "err": f"变种表预览图列不可用：{st.get('err') or st.get('supported')}"}
+                else:
+                    rows = st.get("rows") or []
+                    i = args.row - 1
+                    if not 0 <= i < len(rows):
+                        r = {"status": "error", "stage": "state",
+                             "err": f"行号 {args.row} 超出范围（共 {len(rows)} 行）"}
+                    else:
+                        r = await sku_preview_replace_row(
+                            session, i, args.image, st["previewIdx"],
+                            color_idx=st.get("colorIdx", -1),
+                            expect_color=rows[i].get("color") or "")
             elif args.cmd == "desc-map":
                 r = await desc_map(session, args.info_json)
             elif args.cmd == "desc-delete":
@@ -450,6 +511,12 @@ async def main() -> int:
                 logger.info("改动已应用，但【尚未生效】——需再跑 desc-save 保存描述编辑器")
             elif r.get("status") == "validation-error":
                 logger.warning(f"{r.get('note') or '校验未通过'}｜{r.get('foreignHosts')}")
+            elif args.cmd == "sku-preview":
+                # 只读命令，返回里没有 status 字段，不该落进下面那条失败判定
+                bad = [x for x in (r.get("rows") or []) if x.get("bad")]
+                logger.info(f"预览图 {len(r.get('rows') or [])} 行，"
+                            f"其中 {len(bad)} 行不合规"
+                            f"（要求 1:1 且不小于 800x800）")
             elif r.get("status") != "ok":
                 logger.error(f"{args.cmd} 失败：stage={r.get('stage')} {r.get('err') or ''}")
         elif args.cmd in ("crawl", "claim", "pick-rowid", "collect-claim"):

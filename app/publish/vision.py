@@ -11,12 +11,13 @@ mock 掉 ask_json_with_images 就能离线跑（见 tests/test_publish_service.p
 拿不准一律 uncertain=True 交 service 层发 manual_check 事件，不硬猜——选错图会上真店。
 LLM 调用失败按主流程语义抛异常（同 app/publish/llm.py 开头说明），由 service 记 fail。
 """
+import asyncio
 import os
 import re
 from typing import Optional
 
 from app.logger import logger
-from app.publish.llm import ask_json, ask_json_with_images
+from app.publish.llm import ask_json, ask_json_with_images, image_ref
 
 _IMG_RE = re.compile(r"^main-\d+\.(jpg|jpeg|png|webp)$", re.I)
 
@@ -273,91 +274,6 @@ rows 必须覆盖上面每一个颜色（没图的给 "images": []），uncertai
     return {"status": "ok", "rows": rows, "uncertain_rows": uncertain_rows}
 
 
-async def plan_desc_text(texts: list, info: Optional[dict] = None) -> dict:
-    """阶段⑬：判断描述区每个【文字模块】该英化保留还是删除。
-
-    texts: [{"idx": "0", "text": "...", "len": int}]（pipeline.desc_text_map 的产物）
-    返回 {"status": "ok", "plan": [{"idx", "action", "text", "reason"}]}，
-    action ∈ translate / delete / keep；translate 时 text 是英文正文。
-
-    两类真实样本（2026-08-24）：
-    - 该删：1688 关联商品 JSON 残留
-      `{"styleType":"offer-type-1","items":"888688384773,…","usemap":"_sdmap_0"}`
-      ——这是采集时带过来的结构化垃圾，买家看到就是一串乱码
-    - 该译：尺码对照 `80【身高65-75cm】…`——对买家有实际价值，英化保留
-
-    纯文本判断不需要视觉，走 ask_json（比传图便宜且快）。
-    LLM 漏判或异常时该模块按 keep 处理——保守方向，不删不该删的
-    （与 plan_desc 对漏判的处理一致）。
-    """
-    items = [t for t in (texts or []) if (t.get("text") or "").strip()]
-    if not items:
-        return {"status": "ok", "plan": [], "reason": "描述区无文字模块"}
-
-    listing = "\n\n".join(
-        f"[模块 idx={t['idx']}]\n{(t.get('text') or '')[:600]}" for t in items)
-    prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
-
-下面是该商品 Temu 描述区的 {len(items)} 个「文字模块」原文（从 1688 采集带过来的）：
-
-{listing}
-
-逐个决定怎么处理：
-
-- "delete"：无意义内容——采集残留的 JSON/代码片段（如
-  {{"styleType":"offer-type-1","items":"8886...","usemap":"_sdmap_0"}}）、
-  采集失败留下的占位符（整段只有 null / undefined / NaN / 空白反复出现）、
-  乱码、店铺广告/关注引导、工厂或公司介绍、与商品无关的说明、纯符号。
-- "translate"：对海外买家有价值的信息——尺码/身高对照、洗涤保养说明、
-  材质说明、搭配建议等。把它翻译成**自然的英文**，保留原有分行与数字，
-  单位保持 cm。译文不得超过 500 字符（平台上限），超了就精简掉次要信息。
-- "keep"：原文已经是纯英文且无需改动。
-
-翻译要求：不要逐字硬译，用海外买家习惯的表达；不要加价格、折扣、
-运费承诺等原文没有的内容；不要出现年份。
-
-只输出 JSON：{{"plan": [{{"idx": "<原样照抄模块 idx>",
-"action": "translate|delete|keep", "text": "<translate 时填英文正文，其余留空>",
-"reason": "<10字内理由>"}}]}}
-plan 必须覆盖上面每一个模块。"""
-
-    data = await ask_json(prompt, what="阶段⑬文字模块规划", stage="desc")
-
-    valid = {str(t["idx"]): t for t in items}
-    plan, seen = [], set()
-    for p in data.get("plan") or []:
-        if not isinstance(p, dict):
-            continue
-        idx = str(p.get("idx"))
-        if idx not in valid or idx in seen:
-            continue
-        act = p.get("action")
-        if act not in ("translate", "delete", "keep"):
-            continue
-        text = (p.get("text") or "").strip()
-        if act == "translate" and not text:
-            # 说要译却没给正文，按 keep 处理而不是留个空模块
-            act, text = "keep", ""
-        seen.add(idx)
-        plan.append({"idx": idx, "action": act, "text": text,
-                     "reason": (p.get("reason") or "")[:40]})
-
-    for idx in valid:                       # LLM 漏判的一律保留（保守）
-        if idx not in seen:
-            plan.append({"idx": idx, "action": "keep", "text": "",
-                         "reason": "LLM 未判，保守保留"})
-    # 【一个都没判中必须告警】保守保留本身没错，但「全员 keep」与「模型认为都该留」
-    # 长得一模一样，静默下去就查不出提示词/解析出了问题——2026-08-25 实测：本函数
-    # 拼好的 listing 忘了拼进 prompt，模型收到「下面是 1 个模块」却看不到原文，回了
-    # {"plan": [], "error": "未收到需要处理的模块原文"}，于是描述区的 `null null null`
-    # 一路被判 keep 发到页面上，日志里一行异常都没有。
-    if not seen:
-        logger.warning(
-            f"阶段⑬ 文字模块规划一项都没判中（{len(valid)} 个模块全按 keep 保留），"
-            f"模型原始返回：{str(data)[:200]}")
-    return {"status": "ok", "plan": plan}
-
-
 async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
     """阶段⑬：对 desc_map 列出的描述模块逐个判「删/留/英化替换」。
 
@@ -375,13 +291,37 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
     与 900×1200，save 被静默弹回）。故凡 desc_map 标了 tooSmall 的，判 keep 后一律
     改判 replace 并带 needsUpscale 标记——这类图只缺像素、内容是干净的，交给
     service 走纯几何放大即可，不必烧一次生图。已判 delete 的不动（要删的不必管尺寸）。
+
+    【取不到的图必须在问模型之前剔掉，且不能靠"少传一张"】提示词按 pos 标识每张图，
+    少传一张会让其后每张的位次整体前移、模型判断落到错误的图上（2026-09-02 实测
+    offer 654598552346：28 张少传 1 张，pos 16/19 拿到邻图的结论，两张超比例长图
+    被漏判）。故这里先逐张解析 data URL、把解析不出的连同它的 pos 一起摘掉，
+    listing 与传图列表始终一一对应，pos 仍是页面真实序号。
+    摘掉的图按 keep 处理并在 unreachable 里报出来：源图已从源站消失，英化/放大都
+    无从下手（下载不到原图），只能留着原图交人工——⑬ 的 desc_save 会把它报成
+    「仍有外链图未转存」，那条告警此时是准确的。
     """
     mods = [m for m in (modules or []) if m.get("url")]
     if not mods:
         return {"status": "ok", "delete": [], "replace": [], "keep": [],
                 "reason": "描述区无模块"}
 
+    # 先解析成 data URL：空串表示源站取不到（见 llm.image_ref）。解析结果直接传给
+    # ask_json_with_images（它对已是 data URL 的字符串原样透传），不会重复下载。
+    refs = await asyncio.to_thread(lambda: [image_ref(m["url"]) for m in mods])
+    unreachable = [m["pos"] for m, r in zip(mods, refs) if not r]
+    pairs = [(m, r) for m, r in zip(mods, refs) if r]
+    if not pairs:
+        return {"status": "error", "reason": "描述区所有图都取不到（源站图已失效）",
+                "delete": [], "replace": [], "keep": [m["pos"] for m in mods],
+                "unreachable": unreachable}
+    if unreachable:
+        logger.warning(f"阶段⑬描述图规划：pos {unreachable} 源站取不到，"
+                       f"不交模型判断、按保留处理（页面留原图，需人工换图）")
+    mods = [m for m, _ in pairs]
+
     listing = "\n".join(f"第{m['pos']} 张（pos={m['pos']}）" for m in mods)
+    all_pos = [m["pos"] for m in mods]
     prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
 
 下面是该商品详情描述区的 {len(mods)} 张图，按页面展示顺序，序号就是 pos：
@@ -395,9 +335,9 @@ Temu 半托管发布只关心商品图，请逐张决定动作：
 
 只输出 JSON：{{"actions": [{{"pos": 1, "action": "keep|delete|replace",
 "reason": "<10字内>"}}]}}
-actions 必须覆盖每一张（pos 从 1 到 {len(mods)}）。"""
+actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     data = await ask_json_with_images(
-        prompt, [m["url"] for m in mods], what="阶段⑬描述图规划", system=_SYS,
+        prompt, [r for _, r in pairs], what="阶段⑬描述图规划", system=_SYS,
         stage="desc")
 
     valid_pos = {m["pos"]: m for m in mods}
@@ -421,16 +361,26 @@ actions 必须覆盖每一张（pos 从 1 到 {len(mods)}）。"""
 
     # 尺寸兜底：keep 里但尺寸不达标的，改判 replace + needsUpscale（理由见 docstring）。
     # 已在 replace 里的不用管：它本来就要重新出图，出图收尾的 compress 会把尺寸拉够。
-    kept_small = [p for p in keep if valid_pos[p].get("tooSmall")]
+    # 【取不到的图不进兜底】它下载不到原图，放大与英化都无从下手，只能留原图交人工。
+    unreach = set(unreachable)
+    kept_small = [p for p in keep
+                  if valid_pos[p].get("tooSmall") and p not in unreach]
     if kept_small:
         keep = [p for p in keep if p not in set(kept_small)]
         for p in kept_small:
+            # 理由取 desc_map 算好的 sizeReasons（可能是「小于 480x480」也可能是
+            # 「宽高比超出 0.5~2.0」两类，见 images.check_desc_size）；写死尺寸
+            # 文案会把超比例的长条图说成「像素不够」，人工复核时看不出真因。
+            why = "、".join(valid_pos[p].get("sizeReasons") or []) \
+                or f"尺寸 {valid_pos[p].get('size')} 不符合描述图要求"
             replace.append({"pos": p, "url": valid_pos[p]["url"],
-                            "needsUpscale": True,
-                            "reason": f"尺寸 {valid_pos[p].get('size')} 低于 1340x1785"})
+                            "needsUpscale": True, "reason": why[:60]})
         replace.sort(key=lambda r: r["pos"])
-    return {"status": "ok", "delete": sorted(set(delete)),
-            "replace": replace, "keep": sorted(set(keep))}
+    out = {"status": "ok", "delete": sorted(set(delete)),
+           "replace": replace, "keep": sorted(set(keep) | unreach)}
+    if unreachable:
+        out["unreachable"] = sorted(unreach)
+    return out
 
 
 async def check_cleaned(image_path: str) -> dict:

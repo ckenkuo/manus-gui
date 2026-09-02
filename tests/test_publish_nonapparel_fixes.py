@@ -154,10 +154,14 @@ def test_一张都没换成时也要关编辑器(monkeypatch):
     """`not deleted and not replaced` 那条早退原先直接 return，把全屏 modal 留在页面上。
 
     一张都没换成时恰恰最需要关——此时编辑器一定是开着的。
+
+    2026-08-30 起该条件多了 `and not rehosted`（keep 图转存也算干了活，见
+    _rehost_desc_keeps），故按前缀定位而不是整句字面量——判的是「早退路径关不关
+    编辑器」，不该被条件表达式的增补写死。
     """
     import inspect
     src = inspect.getsource(S._st_desc)
-    i = src.index("if not deleted and not replaced:")
+    i = src.index("if not deleted and not replaced")
     j = src.index("张全部保留", i)
     # 早退分支内、return 之前必须有关闭动作
     assert "ensure_desc_closed" in src[i:j], "早退路径没有关闭描述编辑器"

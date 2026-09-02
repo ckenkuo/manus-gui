@@ -241,7 +241,7 @@ def _patched(monkeypatch):
         return None
     monkeypatch.setattr(pipeline.asyncio, "sleep", _no_sleep)
 
-    async def _upload(session, path, full_cid=None):
+    async def _upload(session, path, full_cid=None, **kw):
         return {"status": "ok", "fileId": "abc/deadbeef"}
     monkeypatch.setattr(pipeline, "upload_image", _upload)
 

@@ -150,7 +150,9 @@ def _content_type(fname: str) -> str:
 
 async def upload_image(session: BrowserSession, file_path: str,
                        full_cid: Optional[str] = None,
-                       skip_size_check: bool = False) -> dict:
+                       skip_size_check: bool = False,
+                       min_w: Optional[int] = None,
+                       min_h: Optional[int] = None) -> dict:
     """把本地图片直传店小秘图床，返回可直接填进表单的图片 URL。
 
     调用前提：session 已停在店小秘任意已登录页面（第 1、3 步要靠页面 cookie）。
@@ -165,11 +167,24 @@ async def upload_image(session: BrowserSession, file_path: str,
     图床再被弹回，排查成本远高于在这里直接拒掉。skip_size_check=True 可跳过
     （非服装类素材、或调用方已自行校验时用），但默认必查：上传是所有图片进平台的
     唯一入口，把关放这里才不会被某条新增调用路径绕过。
+
+    min_w/min_h 按用途覆盖那道闸的下限（不传＝服装的 1340×1785）：描述图的平台
+    要求只有「两边 >= 480、比例 0.5~2」，套服装下限会把达标的图拒掉。
     """
     if not os.path.exists(file_path):
         return {"status": "error", "stage": "precheck", "err": f"文件不存在: {file_path}"}
     if not skip_size_check:
-        chk = check_cloth_size(file_path)
+        # 【下限按用途传，不能一律套服装的 1340×1785】2026-08-29 实测
+        # （草稿 173539495458370139 第 10 张描述图）：描述图的平台要求只是
+        # 「两边 >= 480、比例 0.5~2」（images.check_desc_size），而这里默认
+        # 套服装闸门，于是一张合规的 480×480 描述图被拒两轮、页面上留着 1688
+        # 原始外链，⑬ 最终以「1 张不符合要求」整单失败——被拒的图其实是达标的。
+        # 闸门本身要留（它挡住了小图静默弹回，见下方 docstring），只是下限要
+        # 跟着用途走：素材/SKC 图不传参照旧默认，描述图传 DESC_MIN_W/H。
+        chk = check_cloth_size(
+            file_path,
+            **{k: v for k, v in (("min_w", min_w), ("min_h", min_h))
+               if v is not None})
         if not chk["ok"]:
             logger.error(f"图片尺寸不达标，拒绝上传：{os.path.basename(file_path)} {chk['reason']}")
             return {"status": "error", "stage": "size-check",

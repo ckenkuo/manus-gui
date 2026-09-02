@@ -70,3 +70,48 @@ def test_字母码不被别名表误伤():
     # 别名表只收确定同义的写法，S/M/L 这类不能被牵连
     for v in ("S", "M", "L", "XL", "XXL", "XXS"):
         assert norm_size(v) == v
+
+# 2026-08-29 真站踩坑（草稿 173539495458370139，类目「女童牛仔两件套」，54 个尺码
+# 选项）：月龄/岁码只取第一段数字时，6M / 6-9M / 6-12M / 6Y / 6-7Y 全归一成 "6"，
+# 源尺码 6-9m 于是把这 5 个框全勾上（5 个源尺码勾出 13 个框、SKU 表多 8 行），而
+# fix_sizes 的收敛判据恰好全部成立，返回 status=ok——错误一路带到人工核对。
+# 故月龄与岁分开、区间两端都保留。
+def test_月龄区间码不与单值码碰撞():
+    keys = [norm_size(x) for x in ("6M", "6-9M", "6-12M", "9M", "9-12M", "12M")]
+    assert len(set(keys)) == 6, keys
+
+
+def test_月龄与岁码不互相碰撞():
+    assert norm_size("6-9M") != norm_size("6-9Y")
+    assert norm_size("2Y") != norm_size("2M")
+    assert norm_size("18-24M") != norm_size("18-24Y")
+
+
+def test_月龄岁码大小写与中文单位同归一():
+    assert norm_size("6-9m") == norm_size("6-9M")
+    assert norm_size("2-3y") == norm_size("2-3Y")
+    assert norm_size("6个月") == norm_size("6M")
+    assert norm_size("3岁") == norm_size("3Y")
+
+
+def test_T码按岁归一():
+    # 美式学步童装 3T 与 3Y 是同一档
+    assert norm_size("3T") == norm_size("3Y")
+
+
+def test_真实商品源尺码只勾中五个框():
+    """1055568943470 的源尺码 × 该类目 54 个选项：必须精确命中 5 个。"""
+    src = ["18-24m", "12-18m", "6-9m", "9-12m", "2-3y"]
+    page = ["56", "80", "Newborn", "0-1M", "0-3M", "1-3M", "3M", "3-6M", "6M",
+            "6-9M", "9M", "9-12M", "6-12M", "12M", "12-18M", "18M", "24M", "1Y",
+            "1-2Y", "18-24M", "2Y", "2-3Y", "3Y", "3-4Y", "6Y", "6-7Y", "8Y",
+            "1M", "90", "110", "130"]
+    wanted = {norm_size(k) for k in src}
+    hit = [p for p in page if norm_size(p) in wanted]
+    assert hit == ["6-9M", "9-12M", "12-18M", "18-24M", "2-3Y"], hit
+
+
+def test_身高码行为不回退():
+    """月龄码分支不能吃掉身高码：页面身高码只有单值 90/100/110/120/130。"""
+    assert norm_size("110cm建议身高100-110cm") == norm_size("110")
+    assert norm_size("90cm码") == "90"

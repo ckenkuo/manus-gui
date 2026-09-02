@@ -62,6 +62,39 @@ def test_控件行栅格不超过12列(client):
     assert sum(widths) == 12, f"控件行合计 {sum(widths)} 列（应为 12）：{widths}"
 
 
+def test_保留视频开关在页面上(client):
+    """开关 + 记忆键 + 提交三处都要在：少一处就是「关了照旧处理视频」。"""
+    t = client.get("/publish").text
+    assert 'id="chkKeepVideo"' in t
+    assert "LS_KEEPVIDEO" in t, "开关要记住上次选择"
+    assert 'keep_video: $("chkKeepVideo").checked' in t, "提交时必须带上 keep_video"
+
+
+def test_batch_把keep_video透传给service(client, webapp, monkeypatch):
+    """关掉开关必须一路传到 run_batch；不给时默认 True（保留视频，与老行为一致）。"""
+    seen = {}
+
+    async def _fake_run_batch(tasks, **kw):
+        seen.update(kw)
+        return {"ok": 1, "fail": 0, "batch": 1}
+
+    monkeypatch.setattr(webapp.publish_service, "run_batch", _fake_run_batch)
+
+    def _post(body):
+        seen.clear()
+        r = client.post("/publish/batch", json={
+            "tasks": [{"url": "https://detail.1688.com/offer/1.html"}],
+            "store": "StoreA", "site": "美国", **body})
+        assert r.status_code == 200
+        with client.stream("GET", f"/publish/batch/{r.json()['job_id']}/events") as s:
+            for _ in s.iter_lines():
+                break
+        return seen.get("keep_video")
+
+    assert _post({"keep_video": False}) is False
+    assert _post({}) is True, "不给时默认保留视频"
+
+
 def test_batch_把price透传给service(client, webapp, monkeypatch):
     """路由必须把 price 原样交给 run_batch；不传时是空串（默认值由管线决定）。"""
     seen = {}

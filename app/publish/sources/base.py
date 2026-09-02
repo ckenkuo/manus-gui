@@ -211,6 +211,12 @@ class SourceProduct:
       mainImages    轮播主图 URL 列表，顺序即页面顺序（首图会成为 main-01.jpg，
                     而店小秘素材图取的就是 main-01）
       descImages    详情长图 URL 列表
+      descText      详情描述里的【纯文字】（剥掉标签后的可读文本），拿不到给空串。
+                    2026-09-01 取证（offer 971999094281 韩系牛仔外套）：有些商家把
+                    整张尺码表直接打在详情文字里而不是做成图（「S 衣长59 胸围118
+                    袖长57 肩宽52」三行），而原先详情接口的 HTML 只被正则抠了 <img>、
+                    文字整段丢弃，于是 sizeMeasurements 落成空、阶段⑨ 两列全靠估算。
+                    只做「把文字留下来」，怎么解析是 extract 侧的事（见 enrich_desc_text）
       unitWeightKg  单件重量（千克）。拿不到给 None——阶段⑩ 会转 LLM 预估
       videoUrl      主视频 URL，没有给空串
       extra         平台专属的附加信息，原样进 raw.json 留档便于排查（如亚马逊的
@@ -224,6 +230,7 @@ class SourceProduct:
     skuMap: list = field(default_factory=list)
     mainImages: list = field(default_factory=list)
     descImages: list = field(default_factory=list)
+    descText: str = ""
     unitWeightKg: float = None
     videoUrl: str = ""
     extra: dict = field(default_factory=dict)
@@ -242,6 +249,7 @@ class SourceProduct:
             "subject": self.title,
             "images": list(self.mainImages),
             "descImages": list(self.descImages),
+            "descText": self.descText,
             "unitWeight": self.unitWeightKg,
             "skuMap": list(self.skuMap),
             "attrs": dict(self.attributes),

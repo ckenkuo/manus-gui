@@ -73,7 +73,8 @@ import time
 
 from app.config import config
 from app.logger import logger
-from app.publish.browser import DIANXIAOMI_HOST, BrowserSession, ensure_cdp_alive
+from app.publish.browser import (DIANXIAOMI_HOST, PAGE_LOCK, BrowserSession,
+                                  ensure_cdp_alive)
 # 只 import base（纯字符串判断），不 import sources 包本身——那会经 get_adapter 的
 # 延迟导入链拉起 Playwright，而本模块判平台只是个正则
 from app.publish.sources.base import platform_name, platform_of, source_id
@@ -122,10 +123,14 @@ CACHE_DIR = str(config.workspace_root / "publish-cache")
 _SCAN_NAME = "collectbox-scan.json"
 
 # 扫描与发布作业抢同一个 CDP 页面（发布是 15 阶段共用一个 page，见 browser.py 的会话
-# 模型）。这把锁只保证【本模块内部】不并发扫描；与发布作业的互斥由 service 侧的
-# 「作业跑着就跳过这一轮」实现（见 _tick 里的 busy 判断），因为让扫描去抢正在填表单的
-# 页面会把用户的表单导航掉。
-_scan_lock = asyncio.Lock()
+# 模型）。与发布作业的互斥由 service 侧的「作业跑着就跳过这一轮」实现（见 _tick 里的
+# busy 判断），因为让扫描去抢正在填表单的页面会把用户的表单导航掉。
+#
+# 【2026-08-30 从模块私有锁改成 browser.PAGE_LOCK】新增了未认领清单扫描
+# （app/publish/crawlbox.py），它也 new BrowserSession() 而 open() 是「挑同一个店小秘
+# 页签复用」——两个扫描器各锁自己模块等于没锁，对方一个 navigate 就把页面换走，
+# 本模块会静默读到另一个列表的 DOM。锁必须与「被争用的资源」同层，故提到 browser.py。
+_scan_lock = PAGE_LOCK
 
 # siteValue → 站点名。运行时按 DOM 对齐求解后填进来（见 _solve_site_names），
 # 只增不减：某一轮 DOM 没渲染出来时保留上一次求到的名字。

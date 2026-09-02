@@ -14,6 +14,8 @@ screenshots/
 # 本机一次性调试/修复产物（含硬编码本地路径，只在本机跑，不入库）
 probe_upload.json
 repair_pawly.py
+# 跑测试时重定向的临时输出（含本机绝对路径，误提交过一次）
+.tmp_*.txt
 
 # 经验库运行时数据（jsonl 含 embedding，运行时生成）。
 # 仅匹配项目根的 experience/，不波及源码模块 app/experience/。

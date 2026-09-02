@@ -103,6 +103,10 @@ class _FakeSession:
         self.js = js
         return {"count": 3, "bad": [], "sample": []}
 
+    async def wait_for(self, code, predicate, timeout=30, interval=1.5):
+        """变种表渲染等待：假会话里表头视为已齐备（真站竞态见 set_variant 的说明）。"""
+        return {"ready": True, "heads": ["申报价格 (CNY)", "尺寸(cm)", "重量(g)"]}
+
 
 def _info(tmp_path, **over):
     info = {"title": "儿童加厚卫衣两件套", "packInfo": {}, **over}
@@ -181,9 +185,49 @@ async def test_non_apparel_asks_llm(tmp_path, monkeypatch):
     r = await pipeline.set_variant(
         sess, _info(tmp_path, title="儿童益智积木套装 200 颗"),
         cat_path=["玩具", "积木"])
-    assert r["dims"] == ["22", "18", "12"] and r["weight"] == "650"
+    # 尺寸原样采用模型给的值；重量被材积重量闸上调（22x18x12÷6 = 792g > 650g），
+    # 见 set_variant 里那段平台硬校验的说明——这里断言的是「模型的尺寸没被改动」。
+    assert r["dims"] == ["22", "18", "12"] and r["weight"] == "793"
     # 提示词必须让模型自己判包装形式：写死「快递袋」会把彩盒类的高估成 3~5cm
     assert "包装形式" in seen["prompt"] and "刚性包装" in seen["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_volume_weight_gate_adjusts_weight(tmp_path, monkeypatch):
+    """材积重量 > 实际重量时上调重量、尺寸不动（平台硬校验，2026-09-01 真站取证）。
+
+    服装类固定 30x25x3cm 材积重恒为 375g，而宠物衣服源 packInfo 只有 50g，
+    必然触发接口报错「材积重量大于实际重量，无法录入」。
+    """
+    import app.publish.llm as pub_llm
+
+    async def _boom(*a, **kw):
+        raise AssertionError("不该调用 LLM")
+
+    monkeypatch.setattr(pub_llm, "ask_json", _boom)
+    sess = _FakeSession()
+    r = await pipeline.set_variant(
+        sess, _info(tmp_path, title="宠物衣服狗狗纱裙", packInfo={"unitWeightKg": 0.05}),
+        cat_path=["宠物用品", "狗服饰及配件"])
+    assert r["dims"] == ["30", "25", "3"]      # 尺寸不动
+    assert r["weight"] == "376"                # 375g 材积重向上取整 +1
+
+
+@pytest.mark.asyncio
+async def test_volume_weight_gate_keeps_compliant_weight(tmp_path, monkeypatch):
+    """材积重量已 <= 实际重量时，重量原样不动（闸门不该无条件改值）。"""
+    import app.publish.llm as pub_llm
+
+    async def _boom(*a, **kw):
+        raise AssertionError("不该调用 LLM")
+
+    monkeypatch.setattr(pub_llm, "ask_json", _boom)
+    sess = _FakeSession()
+    # 30x25x3 材积重 375g，源重量 800g 已达标
+    r = await pipeline.set_variant(
+        sess, _info(tmp_path, title="儿童加厚卫衣", packInfo={"unitWeightKg": 0.8}),
+        cat_path=["童装"])
+    assert r["dims"] == ["30", "25", "3"] and r["weight"] == "800"
 
 
 @pytest.mark.asyncio

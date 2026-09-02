@@ -85,6 +85,9 @@ _CONFIG_TOML_PATH = os.path.join("config", "config.toml")
 # MULTIMODAL_MODELS 白名单里，否则 ask_with_images 直接抛 ValueError（不是静默丢图）。
 LLM_STAGES = [
     {"id": "extract", "label": "① 采集提炼（视觉回填）", "vision": True},
+    # ①b 是【纯文本】判断点：从详情描述的明文里抽尺码表（见 extract.enrich_desc_text）。
+    # 与 ① 分开登记而不是共用，正因为它不看图——能走快档模型，没必要跟着视觉档一起慢。
+    {"id": "extract_text", "label": "①b 详情文字尺码表", "vision": False},
     {"id": "auto_cat", "label": "③ 产品类目", "vision": False},
     {"id": "attrs", "label": "④ 属性审核", "vision": False},
     {"id": "titles", "label": "⑤ 标题生成", "vision": False},
@@ -366,6 +369,12 @@ def image_ref(img: str) -> str:
 
     下载走 extract._download_image（浏览器头 + 指数退避重试）：图片 CDN 对无
     UA/Referer 的裸请求做 bot 拦截，表现为连接重置或 403。
+
+    【取不到图返回空串，由调用方滤掉】源站图被商家删掉时是 404，_download_image
+    按「跳过」处理（返回 0 字节、不落盘）。此时这里不能继续读那个从没写成的临时
+    文件——2026-09-02 实测（offer 654598552346 的 desc-01）：404 改成不抛之后，
+    异常只是从 RuntimeError 变成 FileNotFoundError，⑬ 照样整品失败。一张图取不到
+    不该让整个看图阶段挂掉，故返回空串。
     """
     if not img or img.startswith("data:"):
         return img
@@ -375,7 +384,9 @@ def image_ref(img: str) -> str:
 
         with tempfile.TemporaryDirectory() as td:
             tmp = os.path.join(td, "remote.img")
-            _download_image(img, tmp)
+            if not _download_image(img, tmp) or not os.path.exists(tmp):
+                logger.warning(f"图片取不到，本次看图跳过该张：{img}")
+                return ""
             with open(tmp, "rb") as f:
                 raw = f.read()
         return f"data:{_mime_of(raw[:12])};base64," + base64.b64encode(raw).decode()
@@ -403,7 +414,19 @@ async def ask_json_with_images(
     已挡住给视觉阶段配非多模态模型，故这里拿到的必是能看图的那些。
     """
     llm = get_llm(stage)
+    # 【空引用一律抛，不在这里静默丢】空串 = 那张图取不到（源站 404 等，见 image_ref）。
+    # 这里不能替调用方"跳过该张"：多数看图提示词把图的【位次】当标识（阶段⑬ 按 pos
+    # 逐张判动作、⑥⑦ 按序号归属颜色），少传一张会让其后每张的位次整体前移一位，
+    # 模型的判断于是落到错误的图上——2026-09-02 实测（offer 654598552346）：28 张
+    # 少传 1 张，⑬ 的 pos 16/19 拿到的是邻图的结论，两张超比例长图被判 keep 漏掉。
+    # 静默错位比直接失败糟得多（前者把错数据发上真店），故交由调用方按自己的
+    # 位次语义决定怎么剔除，见 vision.plan_desc。
     refs = [image_ref(i) if isinstance(i, str) else i for i in images]
+    n_bad = sum(1 for r in refs if not r)
+    if n_bad:
+        raise RuntimeError(
+            f"{what}：{n_bad}/{len(refs)} 张图取不到（源站图可能已失效）。"
+            "调用方须先剔除取不到的图再重排位次，不能直接少传")
     logger.info(f"{what}：视觉判断，传图 {len(refs)} 张")
     raw = await llm.ask_with_images(
         messages=[Message.user_message(prompt)],

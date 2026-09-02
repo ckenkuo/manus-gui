@@ -41,6 +41,10 @@ pytest tests/test_experience_*.py -v             # 经验库单测（离线，�
 - **全程中文**：思考过程和最终结论都用中文输出。
 - **不用 emoji**：生成的代码、注释、文档和提交内容中一律不用 emoji。
 - **善用 subagent 控制上下文**：任务面板拆出多个子任务时，主 agent 应判断哪些可交给 subagent 完成（如广搜代码、批量读文件、独立子任务），避免主 agent 上下文过长。
+- **不重复造轮子**：改或扩展现有功能时，先理解之前的实现逻辑（设计意图、已考虑的边界情况）；项目已有记忆库（memory/*.md），可结合项目搜索工具发现已解决过的问题和踩过的坑，避免重复发明轮子。
+- **代码迁移用 copy 再改**：迁移或复制代码时，先 copy 完整逻辑到新位置，再在新位置上改写；不要边读边从头手写一遍（容易遗漏分支或引入新错误）。
+- **默认不写测试与项目说明文档**：用户未明确要求时，不生成测试脚本，不写专门的项目说明 Markdown；只在用户明确要求时提供测试或文档。
+- **不盲目折中方案**：折中方案往往意味着方案尚未理清；首选思路清晰、合理的单一方案，不过度优化、不预留不必要的可扩展点。
 
 ## 代码约定
 
@@ -71,6 +75,8 @@ pytest tests/test_experience_*.py -v             # 经验库单测（离线，�
 - **主图下载必须带浏览器头 + 重试**：裸 `requests` 会被 CDN 拦（连接重置/403）。
 - **按 Sheet 真实表头写入/判重**：各 Sheet 列序不同，批次开始解析一次 `SheetSchema` 全批复用，**绝不硬编码列号**。
 - **1688 选择器已实测**：结果卡片 `.search-offer-wrapper`（连字符）、详情价 `.module-od-main-price`、运费 `.module-od-shipping-services`、重量 `.module-od-product-pack-info`；改前先确认页面结构没变。
+- **材积重量硬校验**：平台要求 长×宽×高÷6 <= 实际重量(g)，宠物服装等轻薄品类易触发。阶段⑩已自动上调重量到材积重（超30kg才压缩尺寸）。
+- **标题生成禁主观营销词**：Temu 明确禁用 Best/Perfect/Must Have/Essential/Top/#1/Amazing 等主观化/绝对化表述，中文禁「好物/神器/必备/最好/第一/完美/极致/顶级」。提示词只建议客观描述（材质/数量/功能/场景），`_has_subjective_claim` 闸门拦截两次生成都违规的直接报错。严禁价格/优惠（Under $X/Cheap/Sale/Discount/Free Shipping）、年份时效词（2025/New Arrival/Latest）。
 - **Temu「区域」≠ 店铺，区域就是域名**：顶栏「全球/美国/欧区」切换换的是**域名**（全球 `agentseller.temu.com`、美国 `agentseller-us.temu.com`），`mallid` 与 `region` cookie 跨区域**完全不变**（`region=211` 只是碰巧与美国站订单前缀同码）。故店铺键必须带区域（`mallid@host`），页面 URL 一律运行时拼域名、**不留写死全球域的 URL 常量**。切区域**不能点顶栏标签**（业务页上非当前区域全带 `disabled` 类，合成与真实点击都不跳），只能换域名导航 + 等顶栏渲染后复核。只有全球/美国域名经实测，其它区域不许臆造。详见 [app/temu_region.py](app/temu_region.py)。
 - **店名读 `window.__USER_INFO__`，不是 `rawData`**：本版后台**没有** `window.rawData`（原先「rawData 优先」形同虚设，一路掉到顶栏启发式，靠排除词表挡「查看使用教程」这类按钮，文案一改就误命中）。可靠挂载点是 `window.__USER_INFO__.shopList[].malInfoList[]`（`{mallId: 数字, mallName}`）——注意平台把 mall 拼成 **`mal`**，且 `mallId` 是**数字**，与 mallid 字符串比对前必须 `String()` 归一。
 - **视觉模型 `qwen3.7-plus` 是多模态**（能看图），坐标按 `css = px / dpr` 换算，截图前先 `remove_highlights()`。

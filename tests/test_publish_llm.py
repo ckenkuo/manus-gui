@@ -245,17 +245,37 @@ def test_list_stages_给UI的形状(_isolate_llm_prefs):
     assert rows["desc"]["vision"] is True and rows["attrs"]["vision"] is False
 
 
+# 【可配模型但不是可续跑阶段】的判断点：它们在某个管线阶段【内部】跑，故不进
+# service.STAGES（那张表驱动续跑下拉与 _STAGE_FUNCS，塞进去会多出一个没有实现函数的
+# 假阶段），但仍要能单独配模型。
+#   extract_text：阶段①b 从详情文字抽尺码表，在 extract 内部跑（2026-09-01 新增）。
+#     与 ① 分开登记正因为它【不看图】——纯文本判断点能走快档模型，没必要跟视觉档一起慢。
+_NON_PIPELINE_STAGES = {"extract_text"}
+
+
 def test_每个LLM阶段id都在service的STAGES里():
     """阶段 id 必须与 service.STAGES 对齐：UI 阶段名、续跑下拉、模型覆盖共用一套命名。
 
     对不上的表现是「设了覆盖但不生效」——UI 上看着配好了，实际调用点传的 stage
     与登记表里的 key 不是一个字符串，静默回落默认。
+
+    例外见 _NON_PIPELINE_STAGES：那些是阶段内部的判断点，白名单显式列出而不是放宽
+    判据——否则下次真写错一个阶段 id 时这条测试就拦不住了。
     """
     from app.publish.service import STAGES
 
     ids = {s for s, _ in STAGES}
     for s in llm.LLM_STAGES:
+        if s["id"] in _NON_PIPELINE_STAGES:
+            continue
         assert s["id"] in ids, f"{s['id']} 不在 service.STAGES 里"
+
+
+def test_阶段内部判断点仍可配模型():
+    """_NON_PIPELINE_STAGES 里的 id 要真的能设覆盖：白名单不能变成「免检」。"""
+    for sid in _NON_PIPELINE_STAGES:
+        assert sid in {s["id"] for s in llm.LLM_STAGES}, f"{sid} 没登记进 LLM_STAGES"
+        assert sid in llm._LLM_STAGE_IDS, f"{sid} 不被 set_stage_choice 接受"
 
 
 def test_active_label_带出阶段覆盖(_isolate_llm_prefs):

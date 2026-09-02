@@ -109,6 +109,38 @@
           </div>
           <span id="scanTimerHint" class="text-muted small"></span>
         </div>
+        <!-- 未认领清单定时扫描开关：与左边那个是【两个不同的列表】，故是两个独立总闸。
+             采集箱＝已认领的草稿（带店铺/站点/rowid，只差编辑）；
+             未认领＝数据采集页里还没认领的采集记录（没有店铺站点，要走完整认领→发布）。
+             用户可能只想开其中一个，共用一个开关会让「开一个就开两个」。 -->
+        <div class="ms-3 d-flex align-items-center gap-2">
+          <div class="form-check form-check-inline form-switch small mb-0 me-0">
+            <input class="form-check-input" type="checkbox" id="chkCrawlTimer" />
+            <label
+              class="form-check-label"
+              for="chkCrawlTimer"
+              title="开启后按下方间隔定时扫描店小秘数据采集页的「未认领」标签，列出还没认领的采集记录供勾选，走「认领 → 编辑 → 发布」完整流程。扫描只读（不点任何按钮、不会自动认领也不会自动发布），发布作业跑着时这一轮会自动跳过"
+              >定时扫描未认领</label
+            >
+          </div>
+          <span id="crawlTimerHint" class="text-muted small"></span>
+        </div>
+        <!-- 数据搬家清单定时扫描开关：第三张来源清单，与左边两个又是不同的列表。
+             采集箱＝已认领的草稿；未认领＝自己采集但没认领的记录；
+             数据搬家＝**别人已在 Temu 上架过的成品**（自带平台 SPU ID），可整条搬过来。
+             三个总闸各自独立，理由同上：用户可能只想开其中一个。 -->
+        <div class="ms-3 d-flex align-items-center gap-2">
+          <div class="form-check form-check-inline form-switch small mb-0 me-0">
+            <input class="form-check-input" type="checkbox" id="chkBanjiaTimer" />
+            <label
+              class="form-check-label"
+              for="chkBanjiaTimer"
+              title="开启后按下方间隔定时扫描店小秘「数据搬家」池的「未认领」标签，列出可搬到自己店铺的成品供勾选批量认领。扫描只读（不点任何按钮、不会自动认领），发布作业跑着时这一轮会自动跳过"
+              >定时扫描数据搬家</label
+            >
+          </div>
+          <span id="banjiaTimerHint" class="text-muted small"></span>
+        </div>
         <div class="ms-auto">
           <a href="/collect" class="btn btn-sm btn-outline-secondary me-1">
             <i class="bi bi-box-seam"></i> 批量采集
@@ -223,10 +255,32 @@
                 </button>
                 <span id="scanSelCount" class="text-muted small"></span>
                 <span class="flex-grow-1"></span>
+                <!-- 填属性并发布：走列表页「批量操作 → 全属性修改」，一次弹窗给整批草稿填
+                     仓库/发货时效/运费模板，然后接着走「批量操作 → 批量发布」上架。
+                     这三项是发布前的硬性必填，而数据搬家认领过来的草稿它们全是空的
+                     （实测不填就发布，「发布检测」判 0 条通过、原因「半托管仓库不能为空」）；
+                     逐条进编辑页填要十几秒一条，几十条就是十几分钟。
+                     【填属性两步走：先预览再执行】第一次点是 dry-run（只探测该填什么，不提交），
+                     确认无误后按钮变成「确认提交」再点一次才真改。理由是它会覆盖这三项的
+                     已有值且不可逆，而「该填什么」是运行时从下拉里读出来的、事先看不到。
+                     【发布另外单独确认一次】上架比改草稿更不可逆，故填完属性再问一次。
+                     数据搬家那条链不同：它在认领前已经把三步统一 confirm 过，中途不再问。 -->
+                <button
+                  id="btnBulkAttr"
+                  class="btn btn-outline-warning btn-sm"
+                  title="给勾选的草稿批量填仓库/发货时效/运费模板，然后批量发布上架。取值固定：仓库与运费模板取下拉第一项、发货时效取工作日数最大的那项。填属性先预览再提交，发布前再确认一次"
+                >
+                  <span
+                    id="bulkAttrSpinner"
+                    class="spinner-border spinner-border-sm d-none"
+                    role="status"
+                  ></span>
+                  <i class="bi bi-sliders"></i> 填属性并发布
+                </button>
                 <button
                   id="btnScanToTasks"
                   class="btn btn-primary btn-sm"
-                  title="把勾选的行填进下方任务框，并把店铺/站点带过去，复核后点「开始发布」"
+                  title="把勾选的行填进下方任务框（覆盖原有内容，不追加），并把店铺/站点带过去，复核后点「开始发布」"
                 >
                   <i class="bi bi-arrow-down"></i> 填入任务框
                 </button>
@@ -246,6 +300,242 @@
                     </tr>
                   </thead>
                   <tbody id="scanBodyRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 未认领清单：数据采集页「未认领」标签下的采集记录，勾选后走完整「认领→发布」流程。
+           【与上面那张表是两个不同的列表，别混】
+             上：采集箱 = 已认领的草稿，带店铺/站点/rowid，只差编辑 → 填「源链接|rowid」跳过认领
+             本：未认领 = 还没认领的采集记录，没有店铺/站点/rowid → 填【纯源链接】，
+                 由阶段② 真实执行「采集 → 认领到下方选定的店铺站点 → 取 rowid」
+           故本表没有「编辑状态」「店铺」「站点」三列——认领都还没发生，那三样是认领的产物。
+           取而代之的是「可否认领」与源价：这批要先决定认领到哪个店哪个站点，源价是选品时看的。
+           【店铺/站点必须在下方表单里选】本表给不出这两个值，勾选后不会自动带（上面那张会带，
+           因为那些行已经认领到某个店了）。填入时会提示一句「记得选店铺站点」。 -->
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center py-2">
+          <span
+            class="small cache-toggle"
+            role="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#crawlCollapse"
+            aria-expanded="true"
+            aria-controls="crawlCollapse"
+          >
+            <i class="bi bi-chevron-down"></i>
+            <i class="bi bi-inbox"></i> 未认领待认领清单
+            <span id="crawlSummary" class="text-muted ms-2"></span>
+          </span>
+          <span class="d-flex align-items-center gap-2">
+            <!-- 只列可认领：默认开。canClaim=false 的行点了也认领不了（店小秘侧的限制），
+                 但不藏掉——关掉开关能一起列出来对照，藏掉会让人以为它们不存在。 -->
+            <div class="form-check form-check-inline form-switch small mb-0 me-0">
+              <input class="form-check-input" type="checkbox" id="chkOnlyClaimable" />
+              <label
+                class="form-check-label text-muted"
+                for="chkOnlyClaimable"
+                title="只列可认领的行（本功能的目标）。关掉会把店小秘标为不可认领的行也列出来对照——那类行认领会失败"
+                >只看可认领</label
+              >
+            </div>
+            <!-- 扫哪个标签：默认 no（未认领）。已认领/全部只为对照——已认领的那批
+                 该走上面那张采集箱表（它们已经有店铺站点和 rowid 了）。 -->
+            <select
+              id="selCrawlState"
+              class="form-select form-select-sm"
+              style="width: auto"
+              title="扫数据采集页的哪个标签。「未认领」= state=no（本功能的目标，要走完整认领流程）；「已认领」/「全部」仅供对照——已认领的行请走上面的采集箱清单"
+            ></select>
+            <div class="input-group input-group-sm" style="width: 140px">
+              <input
+                id="inputCrawlInterval"
+                type="number"
+                min="5"
+                max="1440"
+                class="form-control form-control-sm"
+                title="扫描间隔（分钟），默认 30。采集记录是人工采集攒出来的，攒够一批是小时级节奏"
+              />
+              <span class="input-group-text">分钟</span>
+            </div>
+            <button
+              id="btnCrawlScanNow"
+              class="btn btn-outline-secondary btn-sm text-nowrap"
+              title="立刻扫一次（不必等定时器）。只读：不点任何按钮、不会认领。有发布作业在跑时会拒绝——扫描要导航那个页面，会毁掉正在填的表单"
+            >
+              <span
+                id="crawlSpinner"
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+              ></span>
+              <i class="bi bi-arrow-clockwise"></i> 立即扫描
+            </button>
+          </span>
+        </div>
+        <div id="crawlCollapse" class="collapse show">
+          <div class="card-body py-2">
+            <div id="crawlEmpty" class="text-muted small">
+              尚未扫描。打开顶部「定时扫描未认领」开关，或点右上角「立即扫描」。
+            </div>
+            <div id="crawlBody" class="d-none">
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <div class="form-check form-check-inline small mb-0">
+                  <input class="form-check-input" type="checkbox" id="chkCrawlAll" />
+                  <label class="form-check-label text-muted" for="chkCrawlAll"
+                    >全选本页</label
+                  >
+                </div>
+                <button id="btnCrawlInvert" class="btn btn-outline-secondary btn-sm">
+                  反选
+                </button>
+                <span id="crawlSelCount" class="text-muted small"></span>
+                <span class="flex-grow-1"></span>
+                <button
+                  id="btnCrawlToTasks"
+                  class="btn btn-primary btn-sm"
+                  title="把勾选的行按【纯源链接】填进下方任务框（覆盖原有内容，不追加），走完整 ①→⑮（含②认领）。店铺/站点请在下方表单里选定——这批还没认领，本表给不出那两个值"
+                >
+                  <i class="bi bi-arrow-down"></i> 填入任务框
+                </button>
+              </div>
+              <div class="table-responsive" style="max-height: 420px; overflow-y: auto">
+                <table class="table table-sm table-hover align-middle mb-0">
+                  <thead class="sticky-top bg-body">
+                    <tr class="text-muted small">
+                      <th style="width: 34px"></th>
+                      <th style="width: 54px">图</th>
+                      <th>产品标题</th>
+                      <th style="width: 90px">可否认领</th>
+                      <th style="width: 110px">源价</th>
+                      <th style="width: 130px">来源</th>
+                      <th style="width: 120px">采集时间</th>
+                    </tr>
+                  </thead>
+                  <tbody id="crawlBodyRows"></tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 数据搬家清单：店小秘「数据搬家」池里【别人已在 Temu 上架过的成品】，
+           勾选后【批量认领】到指定店铺站点（一次弹窗认领 N 条）。
+           【与上面两张表的区别】
+             采集箱 = 已认领的草稿，带 rowid/店铺/站点  → 填「源链接|rowid」跳过认领
+             未认领 = 自己采集的记录，逐行点「认领」    → 填纯源链接，由阶段②认领
+             本表   = 平台公共池的成品，自带 SPU ID     → **本表自己就能批量认领**
+           故本表的主按钮不是「填入任务框」而是「批量认领」：它直接在数据搬家页上勾行、
+           开弹窗、勾店铺站点、点确定，一次搞定整批（池子实测 1796 条，逐条走不通）。
+           认领完自动接着填属性并发布（整条管线一次点到底）。
+           【认领不可逆】会在目标店铺真实创建草稿（只能到采集箱手动删），故按钮带二次确认。 -->
+      <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center py-2">
+          <span
+            class="small cache-toggle"
+            role="button"
+            data-bs-toggle="collapse"
+            data-bs-target="#banjiaCollapse"
+            aria-expanded="true"
+            aria-controls="banjiaCollapse"
+          >
+            <i class="bi bi-chevron-down"></i>
+            <i class="bi bi-truck"></i> 数据搬家清单
+            <span id="banjiaSummary" class="text-muted ms-2"></span>
+          </span>
+          <span class="d-flex align-items-center gap-2">
+            <!-- 隐藏已搬到目标店的行：默认开。判据是行的 claimedShops（已搬到哪些店铺 id），
+                 按下方选定的店铺比对——同一条商品可以搬到多个店铺，已搬到 A 店的行
+                 对 B 店来说仍是可搬的，故不能只看「未认领」标签。 -->
+            <div class="form-check form-check-inline form-switch small mb-0 me-0">
+              <input class="form-check-input" type="checkbox" id="chkHideClaimed" />
+              <label
+                class="form-check-label text-muted"
+                for="chkHideClaimed"
+                title="隐藏已经搬到【下方选定店铺】的行（判据是该行的已搬店铺列表）。同一条商品可搬到多个店铺，故这个过滤跟着店铺选择变"
+                >隐藏已搬本店</label
+              >
+            </div>
+            <select
+              id="selBanjiaState"
+              class="form-select form-select-sm"
+              style="width: auto"
+              title="扫数据搬家池的哪个标签。「未认领」= 一个店都还没搬过（本功能的主目标）；「已认领」/「全部」供对照——已搬过的行仍可搬到别的店铺"
+            ></select>
+            <div class="input-group input-group-sm" style="width: 140px">
+              <input
+                id="inputBanjiaInterval"
+                type="number"
+                min="5"
+                max="1440"
+                class="form-control form-control-sm"
+                title="扫描间隔（分钟），默认 30。数据搬家池是平台给的公共池，变化是小时级节奏"
+              />
+              <span class="input-group-text">分钟</span>
+            </div>
+            <button
+              id="btnBanjiaScanNow"
+              class="btn btn-outline-secondary btn-sm text-nowrap"
+              title="立刻扫一次（不必等定时器）。只读：不点任何按钮、不会认领。有发布作业在跑时会拒绝——扫描要导航那个页面，会毁掉正在填的表单"
+            >
+              <span
+                id="banjiaSpinner"
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+              ></span>
+              <i class="bi bi-arrow-clockwise"></i> 立即扫描
+            </button>
+          </span>
+        </div>
+        <div id="banjiaCollapse" class="collapse show">
+          <div class="card-body py-2">
+            <div id="banjiaEmpty" class="text-muted small">
+              尚未扫描。打开顶部「定时扫描数据搬家」开关，或点右上角「立即扫描」。
+            </div>
+            <div id="banjiaBody" class="d-none">
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <div class="form-check form-check-inline small mb-0">
+                  <input class="form-check-input" type="checkbox" id="chkBanjiaAll" />
+                  <label class="form-check-label text-muted" for="chkBanjiaAll"
+                    >全选本页</label
+                  >
+                </div>
+                <button id="btnBanjiaInvert" class="btn btn-outline-secondary btn-sm">
+                  反选
+                </button>
+                <span id="banjiaSelCount" class="text-muted small"></span>
+                <span class="flex-grow-1"></span>
+                <button
+                  id="btnBanjiaClaim"
+                  class="btn btn-warning btn-sm"
+                  title="把勾选的行批量认领到【下方选定的店铺与站点】。会在店小秘真实创建草稿（不可逆，只能到采集箱手动删），故点了会先要求确认"
+                >
+                  <span
+                    id="banjiaClaimSpinner"
+                    class="spinner-border spinner-border-sm d-none"
+                    role="status"
+                  ></span>
+                  <i class="bi bi-box-arrow-in-down"></i> 批量认领到本店
+                </button>
+              </div>
+              <div class="table-responsive" style="max-height: 420px; overflow-y: auto">
+                <table class="table table-sm table-hover align-middle mb-0">
+                  <thead class="sticky-top bg-body">
+                    <tr class="text-muted small">
+                      <th style="width: 34px"></th>
+                      <th style="width: 54px">图</th>
+                      <th>产品标题 / SPU</th>
+                      <th style="width: 90px">源站点</th>
+                      <th style="width: 110px">源价</th>
+                      <th style="width: 92px">已搬店铺</th>
+                      <th style="width: 130px">来源</th>
+                      <th style="width: 120px">创建时间</th>
+                    </tr>
+                  </thead>
+                  <tbody id="banjiaBodyRows"></tbody>
                 </table>
               </div>
             </div>
@@ -278,7 +568,9 @@
                 <option value="">（读取中…）</option>
               </select>
             </div>
-            <div class="col-6 col-md-3">
+            <!-- 站点列收到 2 列给「保留视频」开关腾位：站点名都很短（美国/日本），
+                 收窄不伤可读性；下拉展开时选项仍按内容宽度渲染。 -->
+            <div class="col-6 col-md-2">
               <label class="form-label small text-muted mb-1">
                 站点
                 <a
@@ -336,10 +628,11 @@
                 title="⑩ 变种表申报价（人民币），想按实际卖价申报就填在这里；留空按默认 188.88。建议售价自动按 ÷7 折算成美元"
               />
             </div>
-            <!-- 自动发布开关：默认开（用户 2026-08-25 要求）。放在「开始发布」左边
-                 而不是折叠区里——它决定流程是否走到不可逆的 ⑮，必须一眼看得见。
-                 只占 1 列：标签短、开关窄，栅格合计仍须 = 12（见 test_控件行栅格不超过12列）。 -->
-            <div class="col-6 col-md-1">
+            <!-- 两个批次级开关：都放在「开始发布」左边而不是折叠区里——一个决定流程是否
+                 走到不可逆的 ⑮，一个决定 ⑬b 花不花几十秒到几分钟处理视频，都得一眼看得见。
+                 合占 2 列（标签短、开关窄，两行叠放），栅格合计仍须 = 12
+                 （见 test_控件行栅格不超过12列）。 -->
+            <div class="col-6 col-md-2">
               <div class="form-check form-check-inline form-switch small mb-1">
                 <input
                   class="form-check-input"
@@ -352,6 +645,20 @@
                   for="chkDoPublish"
                   title="开：⑭ 保存落库成功后继续点「发布」→「立即发布」，商品直接上架（不可逆，上架后要下架才能改）。关：流程收尾在保存落库，草稿留在店小秘等人工核对"
                   >自动发布</label
+                >
+              </div>
+              <div class="form-check form-check-inline form-switch small mb-1">
+                <input
+                  class="form-check-input"
+                  type="checkbox"
+                  id="chkKeepVideo"
+                  checked
+                />
+                <label
+                  class="form-check-label"
+                  for="chkKeepVideo"
+                  title="开：⑬b 把认领时从 1688 搬来的视频裁成 Temu 允许的比例（1:1/3:4/16:9）后回填，每个商品要下载+转码+上传，多花几十秒到几分钟。关：直接点视频区的「删除」丢弃视频，整批换速度与确定性"
+                  >保留视频</label
                 >
               </div>
             </div>
@@ -846,6 +1153,9 @@
       // 不能因为 localStorage 读不到（首次访问/隐私模式）就退成关，那等于默认值随
       // 浏览器状态漂移。
       const LS_PUBLISH = "publish.doPublish";
+      // 「保留视频」开关同理：默认开（与加开关之前的行为一致），只有显式存过 "0"
+      // 才算关，读不到不退成关。
+      const LS_KEEPVIDEO = "publish.keepVideo";
 
       async function loadStores() {
         const sel = $("selStore");
@@ -860,14 +1170,19 @@
             return;
           }
           const want = localStorage.getItem(LS_STORE) || "";
+          // 【option 上带 data-shop-id】数据搬家清单要判「这行已经搬到本店了吗」，
+          // 判据是行的 claimedShops（一串 shopId）对比当前选定店铺的 id。
+          // value 仍是店铺名（发布接口按名字认店铺，别改），故 id 挂 data 属性。
           sel.innerHTML =
             '<option value="">（请选择店铺）</option>' +
             stores
               .map(
                 (s) =>
-                  `<option value="${esc(s.name)}" ${
-                    s.name === want ? "selected" : ""
-                  }>${esc(s.name)}${s.expired ? "（授权已过期）" : ""}</option>`
+                  `<option value="${esc(s.name)}" data-shop-id="${esc(
+                    s.id || ""
+                  )}" ${s.name === want ? "selected" : ""}>${esc(s.name)}${
+                    s.expired ? "（授权已过期）" : ""
+                  }</option>`
               )
               .join("");
           // 回填成功才联动加载站点：没选中店铺时站点下拉没有意义，也不该白探一次。
@@ -938,6 +1253,24 @@
       });
       $("selSite").addEventListener("change", () => {
         localStorage.setItem(LS_SITE, $("selSite").value);
+        // 【换站点要重渲染数据搬家表】站点不影响「能不能勾」（跨站搬是常规用途），
+        // 但影响站点列上那个「源站 → 目标站」的标注，故要重画。
+        // 已勾的行只在「已搬到本店」这一种情形下失效（换店铺才会触发），这里一并复查。
+        if (typeof banjiaItems !== "undefined" && banjiaChecked.size) {
+          const dropped = [...banjiaChecked].filter((r) => {
+            const it = banjiaItems.find((x) => x.rowid === r);
+            return !it || claimedToCurrentShop(it);
+          });
+          dropped.forEach((r) => banjiaChecked.delete(r));
+          if (dropped.length)
+            showToast(
+              "勾选已调整",
+              `有 ${dropped.length} 条勾选不再适用（已搬到当前店铺），已取消勾选` +
+                (banjiaChecked.size ? `；仍有 ${banjiaChecked.size} 条待认领` : ""),
+              "warning"
+            );
+        }
+        if (typeof renderBanjiaRows === "function") renderBanjiaRows();
       });
       $("lnkReloadStores").addEventListener("click", (e) => {
         e.preventDefault();
@@ -1083,7 +1416,14 @@
               }></td>
               <td>${
                 it.img
-                  ? `<img src="${esc(it.img)}" alt="" style="width:40px;height:40px;object-fit:cover;border-radius:.25rem">`
+                  ? // 【referrerpolicy="no-referrer" 别删】1688 图床 cbu01.alicdn.com 有
+                    // 防盗链：带非阿里域的 Referer 一律拒（2026-09-01 实测采集箱 90/105、
+                    // 未认领 82/200 张图因此全破，控制台不报错、只是显示不出来）。
+                    // 不发 Referer 就放行。对另三个域名（img.cdnfe.com / img.pddpic.com /
+                    // m.media-amazon.com）实测无害，故统一加、不按域名分支。
+                    // 与记忆 temu-cdn-image-download 是同一类问题的两端：那条讲的是
+                    // Python 侧下载要带浏览器 UA，这里是浏览器侧 <img> 不能带 Referer。
+                    `<img src="${esc(it.img)}" alt="" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:cover;border-radius:.25rem">`
                   : ""
               }</td>
               <td class="small cell-ellipsis" title="${esc(it.title)}&#10;${esc(it.cat)}">${esc(
@@ -1261,9 +1601,12 @@
         const lines = picked.map((i) =>
           i.offerId ? `${i.sourceUrl}|${i.rowid}` : i.rowid
         );
+        // 【为什么先清空再填而不是追加】原先是追加，同一批商品勾错重勾、或扫描后
+        // 再点一次，任务框里就会堆出重复行，跑批时同一个 rowid 被走两遍（②认领有
+        // rowid 挡着不会多草稿，但后面阶段全是白跑，还可能互相覆盖已填内容）。
+        // 清单勾选本身就是「这一批要发什么」的完整表达，故以勾选结果为准整体覆盖。
         const ta = $("inputTasks");
-        const prev = ta.value.trim();
-        ta.value = (prev ? prev + "\n" : "") + lines.join("\n");
+        ta.value = lines.join("\n");
 
         // 店铺/站点：勾中的行都属于同一店铺站点时自动带过去（这些行已认领到那里，
         // 换成别的店会在 ② 认领阶段又建一条草稿）。混选多个店铺时不猜，提示用户自己选。
@@ -1309,7 +1652,1030 @@
         );
       });
 
+
+      // ---- 未认领清单：数据采集页「未认领」标签，走完整「认领 → 发布」流程 ----
+      // 【与上面采集箱那段是两套独立状态，别复用变量】两张表的行结构不同（那边主键
+      // rowid、有店铺站点与编辑进度；这里主键 cid、没有店铺站点、有可否认领），
+      // 勾选集合也必须分开——否则在一张表里勾的行会算进另一张表的「已选 N 条」。
+      let crawlItems = [];
+      const crawlChecked = new Set();
+
+      // 当前显示的行（受「只看可认领」过滤）。全选/反选/填入都只作用于这批。
+      function visibleCrawlItems() {
+        if (!$("chkOnlyClaimable").checked) return crawlItems;
+        return crawlItems.filter((i) => i.canClaim);
+      }
+
+      function renderCrawlStatus(d) {
+        $("chkCrawlTimer").checked = !!d.enabled;
+        if (d.onlyClaimable != null) $("chkOnlyClaimable").checked = !!d.onlyClaimable;
+        if (d.states && !$("selCrawlState").options.length) {
+          $("selCrawlState").innerHTML = d.states
+            .map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`)
+            .join("");
+        }
+        if (d.state) $("selCrawlState").value = d.state;
+        if (d.intervalMinutes) $("inputCrawlInterval").value = d.intervalMinutes;
+
+        const bits = [];
+        if (d.enabled) bits.push(d.nextAt ? `下次 ${d.nextAt.slice(11, 16)}` : "已开启");
+        const cl = d.claimable || {};
+        if (d.scannedAt)
+          bits.push(`上次 ${d.scannedAt.slice(5, 16)} 扫到可认领 ${cl.yes || 0} 条`);
+        if (d.skipped) bits.push(`跳过 ${d.skipped} 轮`);
+        if (d.lastError) bits.push(`⚠ ${d.lastError.slice(0, 40)}`);
+        $("crawlTimerHint").textContent = bits.join(" · ");
+
+        // 卡片头摘要：本次取了多少 + 三个标签的总数（未认领/已认领/全部）。
+        // 三个都标出来是为了让「未认领 395 / 已认领 1353」的对比一眼可见——
+        // 已认领那批该走上面的采集箱清单，标出来才不会有人在这张表里找它们。
+        const c = d.counts || {};
+        const parts = [];
+        if (d.scannedAt) {
+          parts.push(`${esc(d.scannedLabel || d.stateLabel || "")} 取 ${d.count} 条`);
+          if (d.total > d.count) parts.push(`共 ${d.total}`);
+          parts.push(
+            `可认领 ${cl.yes || 0}` + (cl.no ? ` · 不可认领 ${cl.no}` : "")
+          );
+        }
+        if (c.no != null) parts.push(`未认领共 ${c.no}`);
+        if (c.claimed != null) parts.push(`已认领 ${c.claimed}`);
+        $("crawlSummary").textContent = parts.length ? "（" + parts.join(" · ") + "）" : "";
+      }
+
+      function renderCrawlRows() {
+        const shown = visibleCrawlItems();
+        const has = shown.length > 0;
+        $("crawlEmpty").classList.toggle("d-none", has);
+        $("crawlBody").classList.toggle("d-none", !has);
+        if (!has) {
+          // 扫过但过滤后为空 ≠ 没扫过，文案必须分开（同采集箱那段的理由）
+          $("crawlEmpty").textContent = crawlItems.length
+            ? `本次扫到 ${crawlItems.length} 条，但没有可认领的。关掉「只看可认领」可以看全部。`
+            : "尚未扫描。打开顶部「定时扫描未认领」开关，或点右上角「立即扫描」。";
+          return;
+        }
+        $("crawlBodyRows").innerHTML = shown
+          .map((it) => {
+            // 来源列：与采集箱那张表共用 PLATFORM_BADGE 配色。
+            // 【认不出平台在这里更严重】采集箱的行认不出还能按 rowid 从某阶段续跑，
+            // 这里的行连 rowid 都没有——没有适配器就跑不通阶段①，故标「不支持」而非「未知源」。
+            const src = it.offerId
+              ? `<a href="${esc(it.sourceUrl)}" target="_blank" class="text-decoration-none" title="${esc(it.sourceUrl)}"><span class="badge ${
+                  PLATFORM_BADGE[it.platform] || "text-bg-secondary"
+                } me-1">${esc(it.platformName || it.platform)}</span>${esc(it.offerId)}</a>`
+              : it.sourceUrl
+              ? `<span class="text-danger" title="${esc(it.sourceUrl)}&#10;该域名没有对应的提炼适配器，这行走不通阶段①（认领了也没法自动编辑）">不支持</span>`
+              : '<span class="text-muted">—</span>';
+            // 可否认领：来自 operate.canClaim。不可认领的行连勾选框都禁掉——
+            // 勾了也只会在阶段② 失败，让它可勾等于给用户留个必然踩空的坑。
+            const claim = it.canClaim
+              ? '<span class="badge text-bg-success" title="店小秘标记该行可认领：勾选后由阶段②「采集→认领到下方选定的店铺站点→取 rowid」真实执行">待认领</span>'
+              : `<span class="badge text-bg-light text-muted" title="${esc(
+                  it.operateHint || "店小秘标记该行不可认领，勾选也会在阶段②失败"
+                )}">不可认领</span>`;
+            // 源价：原币种价 + 美元价都显示。1688 是人民币、Temu 源本身是美元，
+            // 只显示一个会让人误读一位数量级（0.59 元 vs 0.09 美元）。
+            const price = it.price
+              ? `${esc(it.price)}${esc(it.currency || "")}` +
+                (it.priceUsd && it.currency !== "USD"
+                  ? `<br /><span class="text-muted">$${esc(it.priceUsd)}</span>`
+                  : "")
+              : '<span class="text-muted">—</span>';
+            return `<tr>
+              <td><input class="form-check-input crawl-pick" type="checkbox" value="${esc(
+                it.cid
+              )}" ${crawlChecked.has(it.cid) ? "checked" : ""} ${
+              it.canClaim ? "" : "disabled"
+            } /></td>
+              <td>${
+                it.img
+                  ? // referrerpolicy 别删：1688 图床防盗链，理由见采集箱那张表的同一处注释
+                    `<img src="${esc(
+                      it.img
+                    )}" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:cover;border-radius:4px" />`
+                  : ""
+              }</td>
+              <td class="small cell-ellipsis" title="${esc(it.title)}">${esc(
+              it.title
+            )}</td>
+              <td>${claim}</td>
+              <td class="small">${price}</td>
+              <td class="small">${src}</td>
+              <td class="small text-muted">${esc(it.createdAt)}</td>
+            </tr>`;
+          })
+          .join("");
+        syncCrawlSelCount();
+      }
+
+      function syncCrawlSelCount() {
+        const n = crawlChecked.size;
+        $("crawlSelCount").textContent = n ? `已选 ${n} 条` : "";
+      }
+
+      function applyCrawlState(d) {
+        if (d.items) {
+          crawlItems = d.items;
+          // 清掉已经不在清单里的勾选（重扫后有些行已被认领走了）
+          [...crawlChecked].forEach((k) => {
+            if (!crawlItems.some((i) => i.cid === k)) crawlChecked.delete(k);
+          });
+        }
+        renderCrawlStatus(d);
+        renderCrawlRows();
+      }
+
+      async function loadCrawlState() {
+        try {
+          const r = await fetch("/publish/crawlbox");
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyCrawlState(d);
+        } catch (e) {
+          $("crawlTimerHint").textContent = "（状态读取失败）";
+        }
+      }
+
+      async function postCrawlSettings(payload) {
+        try {
+          const r = await fetch("/publish/crawlbox/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyCrawlState(d);
+          return d;
+        } catch (e) {
+          showToast("设置失败", String(e).replace(/^Error:\s*/, ""), "danger");
+          loadCrawlState(); // 回填后端真实状态，别让控件停在用户以为生效的位置
+        }
+      }
+
+      $("chkCrawlTimer").addEventListener("change", async () => {
+        const on = $("chkCrawlTimer").checked;
+        const d = await postCrawlSettings({ enabled: on });
+        if (d)
+          showToast(
+            "定时扫描未认领",
+            on
+              ? `已开启：每 ${d.intervalMinutes} 分钟扫一次${d.stateLabel}列表`
+              : "已关闭",
+            on ? "success" : "secondary"
+          );
+      });
+      $("chkOnlyClaimable").addEventListener("change", () => {
+        // 只影响呈现，不用重扫（扫描本来就把整页取回来了），故先本地重渲染再落盘设置
+        renderCrawlRows();
+        postCrawlSettings({ onlyClaimable: $("chkOnlyClaimable").checked });
+      });
+      $("selCrawlState").addEventListener("change", () => {
+        postCrawlSettings({ state: $("selCrawlState").value });
+      });
+      $("inputCrawlInterval").addEventListener("change", () => {
+        const n = parseInt($("inputCrawlInterval").value, 10);
+        if (!n) return;
+        postCrawlSettings({ intervalMinutes: n });
+      });
+
+      $("btnCrawlScanNow").addEventListener("click", async () => {
+        $("btnCrawlScanNow").disabled = true;
+        $("crawlSpinner").classList.remove("d-none");
+        try {
+          const r = await fetch("/publish/crawlbox/scan", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ state: $("selCrawlState").value }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyCrawlState(d);
+          showToast(
+            "扫描完成",
+            `${d.scannedLabel || d.stateLabel} 扫到 ${d.count} 条` +
+              (d.total > d.count ? `（共 ${d.total} 条，只取前 ${d.count} 条）` : ""),
+            d.count ? "success" : "secondary"
+          );
+        } catch (e) {
+          showToast("扫描失败", String(e).replace(/^Error:\s*/, ""), "danger");
+        } finally {
+          $("btnCrawlScanNow").disabled = false;
+          $("crawlSpinner").classList.add("d-none");
+        }
+      });
+
+      // 勾选：事件委托挂在 tbody 上（行是重渲染出来的，逐个绑会在每次渲染后丢）
+      $("crawlBodyRows").addEventListener("change", (e) => {
+        const box = e.target.closest(".crawl-pick");
+        if (!box) return;
+        if (box.checked) crawlChecked.add(box.value);
+        else crawlChecked.delete(box.value);
+        syncCrawlSelCount();
+      });
+      $("chkCrawlAll").addEventListener("change", () => {
+        const on = $("chkCrawlAll").checked;
+        // :not(:disabled) 是必须的：不可认领的行勾了也只会在阶段②失败
+        document.querySelectorAll(".crawl-pick:not(:disabled)").forEach((b) => {
+          b.checked = on;
+          if (on) crawlChecked.add(b.value);
+          else crawlChecked.delete(b.value);
+        });
+        syncCrawlSelCount();
+      });
+      $("btnCrawlInvert").addEventListener("click", () => {
+        document.querySelectorAll(".crawl-pick:not(:disabled)").forEach((b) => {
+          b.checked = !b.checked;
+          if (b.checked) crawlChecked.add(b.value);
+          else crawlChecked.delete(b.value);
+        });
+        syncCrawlSelCount();
+      });
+
+      // 「填入任务框」：把勾选行按【纯源链接】写进任务框，走完整 ①→⑮（含②认领）。
+      // 【为什么这里填纯源链接，而采集箱那边填「源链接|rowid」】两张表的行处于流程的
+      // 不同位置：采集箱的行已经是认领好的草稿，带 rowid 就是告诉阶段② 「别再认领了」
+      // （再认领会凭空多一条草稿，认领不可逆）；本表的行还没认领，rowid 压根不存在，
+      // 必须让阶段② 真实跑「采集 → 认领到店铺站点 → 取 rowid」。
+      // 【店铺/站点不自动带】本表没有这两个值（它们是认领的产物），故只能提醒用户去下方
+      // 表单选定——采集箱那边能自动带是因为那些行已经认领到某个店了。
+      $("btnCrawlToTasks").addEventListener("click", () => {
+        const shown = visibleCrawlItems();
+        const picked = shown.filter((i) => crawlChecked.has(i.cid));
+        if (!picked.length) {
+          showToast("无法填入", "请先勾选要认领发布的商品", "warning");
+          return;
+        }
+        // 认不出平台的行跑不通阶段①（没有提炼适配器），且这里连 rowid 都没有、
+        // 没有任何续跑路径可退，故直接剔掉而不是填进去让它在①炸掉。
+        // 采集箱那边的处置不同（填 rowid 让人补 info_path），因为那些行已有草稿。
+        const bad = picked.filter((i) => !i.offerId);
+        const good = picked.filter((i) => i.offerId);
+        if (!good.length) {
+          showToast(
+            "无法填入",
+            `勾中的 ${bad.length} 行来源域名都没有提炼适配器（阶段①跑不通），已全部跳过`,
+            "danger"
+          );
+          return;
+        }
+        // 先清空再填，理由同采集箱那边：勾选结果就是这批要发的全部内容，追加会在
+        // 重复勾选或重扫后堆出重复行。本表更要覆盖——这些行还没认领，重复行会让
+        // 阶段② 对同一个源链接认领两次，凭空多出一条草稿（认领不可逆）。
+        const ta = $("inputTasks");
+        ta.value = good.map((it) => it.sourceUrl).join("\n");
+
+        const msgs = [`已填入 ${good.length} 行（纯源链接，将走②认领）`];
+        if (bad.length)
+          msgs.push(`跳过 ${bad.length} 行：来源域名无提炼适配器`);
+        const srcNames = [...new Set(good.map((i) => i.platformName).filter(Boolean))];
+        if (srcNames.length > 1) msgs.push(`来源：${srcNames.join("、")}`);
+        // 店铺/站点必须提醒：这批还没认领，选错店就会认领到错的店铺（不可逆，
+        // 草稿只能到列表里手动删）。故不管当前下拉选了什么都提示一句。
+        const store = $("selStore").value;
+        const site = $("selSite").value;
+        msgs.push(
+          store && site
+            ? `将认领到 ${store} / ${site}——请确认这是目标店铺站点（认领不可逆）`
+            : "请先在下方选定店铺与站点：这批还没认领，阶段②会真实认领到所选店铺站点"
+        );
+        showToast(
+          "已填入任务框",
+          msgs.join("；"),
+          bad.length || !(store && site) ? "warning" : "success"
+        );
+      });
+
+
+      // ---- 数据搬家清单：平台公共池的成品，勾选后【批量认领】到本店 ----
+      // 【与上面两张表是第三套独立状态，别复用变量】三张表的行结构各不相同
+      // （采集箱主键 rowid + 编辑进度；未认领主键 cid + 可否认领；本表主键 rowid +
+      // SPU + 已搬店铺），勾选集合也必须各自独立，否则一张表里勾的行会算进另一张。
+      let banjiaItems = [];
+      const banjiaChecked = new Set();
+
+      // 当前选定店铺的 shopId（判「已搬到本店」用）。取不到就返回空串——
+      // 那时「隐藏已搬本店」这个过滤没有判据可用，一律不隐藏（见 visibleBanjiaItems）。
+      function currentShopId() {
+        const opt = $("selStore").selectedOptions[0];
+        return (opt && opt.dataset.shopId) || "";
+      }
+
+      // 这一行是否已经搬到【当前选定店铺】。
+      // 【为什么不能只看「未认领」标签】同一条商品可以搬到多个店铺：已搬到 A 店的行
+      // 在平台的「已认领」标签里，但对 B 店来说它仍是可搬的。故判据是行自己的
+      // claimedShops（一串 shopId）里有没有当前店铺。
+      function claimedToCurrentShop(it) {
+        const sid = currentShopId();
+        if (!sid) return false;
+        return (it.claimedShops || []).some((x) => String(x) === String(sid));
+      }
+
+      // 站点名归一：清单里的站点列有「秘鲁站」「哥伦比亚」两种写法（带不带「站」不统一），
+      // 而站点下拉给的是另一种。比对前统一去掉尾部的「站」（与后端 _norm_site 同口径）。
+      function normSite(s) {
+        return String(s || "").trim().replace(/站$/, "");
+      }
+
+      // 这一行的源站点与当前选定站点是否为【跨站】。
+      // 【只用于提示，绝不用于拦截】2026-09-01 我一度把「源站点必须等于目标站点」做成
+      // 硬限制，那是**把功能的核心用途给禁掉了**：数据搬家的目的本来就是「看到别人在
+      // A 站卖得好的品，搬到我的 B 站去卖」，同站搬反而是少数情形。用户当场指出规则反了。
+      // 故这里只回答「是不是跨站」这个事实，由调用方决定要不要提示；可勾与否不看它。
+      //
+      // 【那么「半托管仓库不能为空」的真因是什么】那次失败我归因成「跨站导致仓库填不对」，
+      // 但真正的原因另有其人（见 bulkattr 的浮层遮挡与虚拟列表截断两条）：
+      // 运费模板当时被浮层挡住没填上，而发货时效读的是被截断的清单。跨站本身不是错。
+      function isCrossSite(it) {
+        const want = normSite($("selSite").value);
+        if (!want) return false;
+        const got = normSite(it.site);
+        if (!got || /^\d+$/.test(got)) return false; // 站点名没解析出来，无从判断
+        return got !== want;
+      }
+
+      function visibleBanjiaItems() {
+        if (!$("chkHideClaimed").checked) return banjiaItems;
+        // 没选店铺时不过滤：没有判据却把行藏掉，会让人以为池子是空的
+        if (!currentShopId()) return banjiaItems;
+        return banjiaItems.filter((i) => !claimedToCurrentShop(i));
+      }
+
+      function renderBanjiaStatus(d) {
+        $("chkBanjiaTimer").checked = !!d.enabled;
+        if (d.hideClaimed != null) $("chkHideClaimed").checked = !!d.hideClaimed;
+        if (d.states && !$("selBanjiaState").options.length) {
+          $("selBanjiaState").innerHTML = d.states
+            .map((s) => `<option value="${esc(s.id)}">${esc(s.label)}</option>`)
+            .join("");
+        }
+        if (d.state) $("selBanjiaState").value = d.state;
+        if (d.intervalMinutes) $("inputBanjiaInterval").value = d.intervalMinutes;
+
+        const bits = [];
+        if (d.enabled) bits.push(d.nextAt ? `下次 ${d.nextAt.slice(11, 16)}` : "已开启");
+        if (d.scannedAt) bits.push(`上次 ${d.scannedAt.slice(5, 16)} 扫到 ${d.count} 条`);
+        if (d.skipped) bits.push(`跳过 ${d.skipped} 轮`);
+        if (d.lastError) bits.push(`⚠ ${d.lastError.slice(0, 40)}`);
+        $("banjiaTimerHint").textContent = bits.join(" · ");
+
+        // 卡片头摘要：本次取了多少 + 三个标签的总数。
+        // 三个都标出来的理由同未认领那张表：让「未认领 1067 / 已认领 729」的对比一眼可见。
+        const c = d.counts || {};
+        const parts = [];
+        if (d.scannedAt) {
+          parts.push(`${esc(d.scannedLabel || d.stateLabel || "")} 取 ${d.count} 条`);
+          if (d.total > d.count) parts.push(`共 ${d.total}`);
+        }
+        if (c.no != null) parts.push(`未认领共 ${c.no}`);
+        if (c.yes != null) parts.push(`已认领 ${c.yes}`);
+        $("banjiaSummary").textContent = parts.length ? "（" + parts.join(" · ") + "）" : "";
+      }
+
+      function renderBanjiaRows() {
+        const shown = visibleBanjiaItems();
+        const has = shown.length > 0;
+        $("banjiaEmpty").classList.toggle("d-none", has);
+        $("banjiaBody").classList.toggle("d-none", !has);
+        if (!has) {
+          // 扫过但过滤后为空 ≠ 没扫过，文案必须分开（同另两张表的理由）
+          $("banjiaEmpty").textContent = banjiaItems.length
+            ? `本次扫到 ${banjiaItems.length} 条，但都已经搬到当前店铺了。关掉「隐藏已搬本店」可以看全部。`
+            : "尚未扫描。打开顶部「定时扫描数据搬家」开关，或点右上角「立即扫描」。";
+          return;
+        }
+        $("banjiaBodyRows").innerHTML = shown
+          .map((it) => {
+            // 来源列：与另两张表共用 PLATFORM_BADGE 配色。
+            // 【认不出平台在本表不算问题】数据搬家的行自带平台 SPU、认领后直接就是可编辑的
+            // 草稿，源链接只是取证信息；故这里不像未认领那张表标「不支持」。
+            const src = it.offerId
+              ? `<a href="${esc(it.sourceUrl)}" target="_blank" class="text-decoration-none" title="${esc(
+                  it.sourceUrl
+                )}"><span class="badge ${
+                  PLATFORM_BADGE[it.platform] || "text-bg-secondary"
+                } me-1">${esc(it.platformName || it.platform)}</span>${esc(
+                  it.offerId
+                )}</a>`
+              : it.sourceUrl
+              ? `<a href="${esc(it.sourceUrl)}" target="_blank" class="text-muted text-decoration-none" title="${esc(
+                  it.sourceUrl
+                )}">未知源</a>`
+              : '<span class="text-muted">—</span>';
+            // 源价：原币种价（SKU 级取来的）+ 美元区间。
+            // 【美元显示成区间而不是取一头】SPU 级只有 min/max，同款时两者相等；
+            // 取下限当单价会写错价（记忆 collect-sku-level-rows 记过这个坑）。
+            const usd =
+              it.priceUsdMin && it.priceUsdMax
+                ? it.priceUsdMin === it.priceUsdMax
+                  ? `$${esc(it.priceUsdMin)}`
+                  : `$${esc(it.priceUsdMin)}~${esc(it.priceUsdMax)}`
+                : "";
+            const price = it.price
+              ? `${esc(it.price)}${esc(it.currency || "")}` +
+                (usd ? `<br /><span class="text-muted">${usd}</span>` : "")
+              : usd
+              ? `<span class="text-muted">${usd}</span>`
+              : '<span class="text-muted">—</span>';
+            // 已搬店铺：只显示个数 + 是否含当前店。
+            // 【可勾与否只看一个判据：有没有搬到本店】再认领只会凭空多一条草稿（不可逆）。
+            // 跨站点**不禁**——那正是数据搬家的核心用途（把别人在 A 站的品搬到我的 B 站）。
+            const mine = claimedToCurrentShop(it);
+            const cross = isCrossSite(it);
+            const nShops = (it.claimedShops || []).length;
+            const shopCell = mine
+              ? '<span class="badge text-bg-secondary" title="该行已经搬到当前选定的店铺，再认领会凭空多一条草稿，故不可勾选">已搬本店</span>'
+              : nShops
+              ? `<span class="badge text-bg-light text-muted" title="已搬到 ${nShops} 个其它店铺（店铺 id：${esc(
+                  (it.claimedShops || []).join("、")
+                )}）。同一条商品可搬到多个店铺，故对当前店铺仍可搬">其它 ${nShops} 店</span>`
+              : '<span class="text-muted">—</span>';
+            // 跨站的行标一个中性徽章：告诉用户「这是从 A 站搬到 B 站」，不是警告。
+            // 认领后草稿归属的是**选定站点**，仓库/运费模板按那个站点填，与源站点无关。
+            const siteCell = !cross
+              ? esc(it.site || "—")
+              : `<span class="badge text-bg-info-subtle text-info-emphasis" title="源站点「${esc(
+                  it.site || "未解析"
+                )}」→ 将搬到「${esc(
+                  $("selSite").value
+                )}」。跨站点搬是本功能的常规用途，认领后草稿归属选定站点">${esc(
+                  it.site || "站点未知"
+                )} → ${esc($("selSite").value)}</span>`;
+            return `<tr>
+              <td><input class="form-check-input banjia-pick" type="checkbox" value="${esc(
+                it.rowid
+              )}" ${banjiaChecked.has(it.rowid) ? "checked" : ""} ${
+              mine ? "disabled" : ""
+            } /></td>
+              <td>${
+                it.img
+                  ? // referrerpolicy 别删：1688 图床防盗链，理由见采集箱那张表的同一处注释
+                    `<img src="${esc(
+                      it.img
+                    )}" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:cover;border-radius:4px" />`
+                  : ""
+              }</td>
+              <td class="small cell-ellipsis" title="${esc(it.title)}&#10;SPU ${esc(
+              it.spuId
+            )}&#10;${esc(it.categoryPath || "")}">${esc(it.title)}${
+              it.spuId ? ` <span class="text-muted">${esc(it.spuId)}</span>` : ""
+            }</td>
+              <td class="small">${siteCell}</td>
+              <td class="small">${price}</td>
+              <td class="small">${shopCell}</td>
+              <td class="small">${src}</td>
+              <td class="small text-muted">${esc(it.createdAt)}</td>
+            </tr>`;
+          })
+          .join("");
+        syncBanjiaSelCount();
+      }
+
+      // 【计数只数「当前可见且已勾」的行】不能直接用 banjiaChecked.size：
+      // 换店铺会让「隐藏已搬本店」过滤掉一批行，而 banjiaChecked 里仍留着它们的 rowid，
+      // 于是计数显示「已选 2 条」但表里那两行已经不见了，点认领又报「请先勾选」——
+      // 2026-09-01 实测到的 bug，用户看到的是自相矛盾的两句话。
+      // 现在计数与「认领按钮实际会提交的那批」用同一个判据（visibleBanjiaItems ∩ 勾选），
+      // 数字对不上时用户当场就能看出来，而不是等到点按钮才被拒。
+      function syncBanjiaSelCount() {
+        const shown = visibleBanjiaItems();
+        const n = shown.filter((i) => banjiaChecked.has(i.rowid)).length;
+        const hidden = banjiaChecked.size - n;
+        $("banjiaSelCount").textContent = n
+          ? `已选 ${n} 条` + (hidden > 0 ? `（另有 ${hidden} 条因过滤已隐藏，不会认领）` : "")
+          : hidden > 0
+          ? `勾选的 ${hidden} 条都已被过滤隐藏（不会认领）`
+          : "";
+      }
+
+      function applyBanjiaState(d) {
+        if (d.items) {
+          banjiaItems = d.items;
+          // 清掉已经不在清单里的勾选（重扫后有些行已被搬走了）
+          [...banjiaChecked].forEach((k) => {
+            if (!banjiaItems.some((i) => i.rowid === k)) banjiaChecked.delete(k);
+          });
+        }
+        renderBanjiaStatus(d);
+        renderBanjiaRows();
+      }
+
+      async function loadBanjiaState() {
+        try {
+          const r = await fetch("/publish/banjia");
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyBanjiaState(d);
+        } catch (e) {
+          $("banjiaTimerHint").textContent = "（状态读取失败）";
+        }
+      }
+
+      async function postBanjiaSettings(payload) {
+        try {
+          const r = await fetch("/publish/banjia/settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyBanjiaState(d);
+          return d;
+        } catch (e) {
+          showToast("设置失败", String(e).replace(/^Error:\s*/, ""), "danger");
+          loadBanjiaState(); // 回填后端真实状态，别让控件停在用户以为生效的位置
+        }
+      }
+
+      $("chkBanjiaTimer").addEventListener("change", async () => {
+        const on = $("chkBanjiaTimer").checked;
+        const d = await postBanjiaSettings({ enabled: on });
+        if (d)
+          showToast(
+            "定时扫描数据搬家",
+            on
+              ? `已开启：每 ${d.intervalMinutes} 分钟扫一次${d.stateLabel}列表`
+              : "已关闭",
+            on ? "success" : "secondary"
+          );
+      });
+      $("chkHideClaimed").addEventListener("change", () => {
+        // 只影响呈现，不用重扫（claimedShops 扫描时已经带回来了）。
+        // 【打开过滤会让已勾的行落到过滤外】与换店铺同一个坑，同样要当场说清楚，
+        // 否则计数与「实际会认领的那批」又会不一致（见 syncBanjiaSelCount 的注释）。
+        if ($("chkHideClaimed").checked && banjiaChecked.size) {
+          const visible = new Set(visibleBanjiaItems().map((i) => i.rowid));
+          const dropped = [...banjiaChecked].filter((r) => !visible.has(r));
+          dropped.forEach((r) => banjiaChecked.delete(r));
+          if (dropped.length)
+            showToast(
+              "勾选已调整",
+              `有 ${dropped.length} 条勾选的商品已经搬到本店，被过滤隐藏，已取消勾选` +
+                (banjiaChecked.size ? `；仍有 ${banjiaChecked.size} 条待认领` : ""),
+              "warning"
+            );
+        }
+        renderBanjiaRows();
+        postBanjiaSettings({ hideClaimed: $("chkHideClaimed").checked });
+      });
+      $("selBanjiaState").addEventListener("change", () => {
+        postBanjiaSettings({ state: $("selBanjiaState").value });
+      });
+      $("inputBanjiaInterval").addEventListener("change", () => {
+        const n = parseInt($("inputBanjiaInterval").value, 10);
+        if (!n) return;
+        postBanjiaSettings({ intervalMinutes: n });
+      });
+
+      $("btnBanjiaScanNow").addEventListener("click", async () => {
+        $("btnBanjiaScanNow").disabled = true;
+        $("banjiaSpinner").classList.remove("d-none");
+        try {
+          const r = await fetch("/publish/banjia/scan", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ state: $("selBanjiaState").value }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          applyBanjiaState(d);
+          showToast(
+            "扫描完成",
+            `${d.scannedLabel || d.stateLabel} 扫到 ${d.count} 条` +
+              (d.total > d.count ? `（共 ${d.total} 条，只取前 ${d.count} 条）` : ""),
+            d.count ? "success" : "secondary"
+          );
+        } catch (e) {
+          showToast("扫描失败", String(e).replace(/^Error:\s*/, ""), "danger");
+        } finally {
+          $("btnBanjiaScanNow").disabled = false;
+          $("banjiaSpinner").classList.add("d-none");
+        }
+      });
+
+      // 勾选：事件委托挂 tbody（行是重渲染出来的，逐个绑会在每次渲染后丢）
+      $("banjiaBodyRows").addEventListener("change", (e) => {
+        const box = e.target.closest(".banjia-pick");
+        if (!box) return;
+        if (box.checked) banjiaChecked.add(box.value);
+        else banjiaChecked.delete(box.value);
+        syncBanjiaSelCount();
+      });
+      $("chkBanjiaAll").addEventListener("change", () => {
+        const on = $("chkBanjiaAll").checked;
+        // :not(:disabled) 是必须的：已搬到本店的行再认领只会多一条草稿
+        document.querySelectorAll(".banjia-pick:not(:disabled)").forEach((b) => {
+          b.checked = on;
+          if (on) banjiaChecked.add(b.value);
+          else banjiaChecked.delete(b.value);
+        });
+        syncBanjiaSelCount();
+      });
+      $("btnBanjiaInvert").addEventListener("click", () => {
+        document.querySelectorAll(".banjia-pick:not(:disabled)").forEach((b) => {
+          b.checked = !b.checked;
+          if (b.checked) banjiaChecked.add(b.value);
+          else banjiaChecked.delete(b.value);
+        });
+        syncBanjiaSelCount();
+      });
+
+      // 「批量认领到本店」：在数据搬家页上勾行 → 开弹窗 → 勾店铺站点 → 确定。
+      // 【会真实创建草稿，不可逆】故必须二次确认，且确认框里把「几条 / 到哪个店 / 哪个站点」
+      // 三件事都写清楚——选错店铺的后果是一批草稿只能到采集箱里手动删。
+      $("btnBanjiaClaim").addEventListener("click", async () => {
+        const shown = visibleBanjiaItems();
+        // 【跨站点不拦】数据搬家的用途本来就是「把别人在 A 站的品搬到我的 B 站」，
+        // 拦掉等于禁掉核心功能（2026-09-01 我一度做成硬限制，被用户当场指出规则反了）。
+        // 认领后草稿归属**选定站点**，三项属性按那个站点填，与源站点无关。
+        const picked = shown.filter((i) => banjiaChecked.has(i.rowid));
+        const cross = picked.filter((i) => isCrossSite(i));
+        if (!picked.length) {
+          // 【区分两种「没得认领」】上面两个监听器已经在换店铺/开过滤时清过勾选，
+          // 故走到这里通常真的是没勾。但 banjiaChecked 非空却筛不出可见行仍有可能
+          // （比如重扫后清单变了），那时说「请先勾选」会让人以为自己没点——
+          // 把真实原因说出来，别让用户对着「已选 N 条」和这句话干瞪眼。
+          showToast(
+            "无法认领",
+            banjiaChecked.size
+              ? `勾选的 ${banjiaChecked.size} 条都不在当前显示的清单里（可能已搬到本店被过滤，` +
+                `或重扫后已离开列表）。请重新勾选要搬的商品`
+              : "请先勾选要搬到本店的商品",
+            "warning"
+          );
+          return;
+        }
+        const store = $("selStore").value;
+        const site = $("selSite").value;
+        if (!store || !site) {
+          showToast(
+            "无法认领",
+            "请先在下方选定店铺与站点：认领会真实创建草稿到所选店铺站点",
+            "warning"
+          );
+          return;
+        }
+        // 【一次 confirm 说清整条管线】用户 2026-09-01 明确要求勾选后一次点到底，
+        // 故这里必须把三步都写出来——尤其最后一步是**真实上架**，不可逆程度远超建草稿。
+        // 后面两步不再各弹确认，那个「确认」的分量全压在这一次上，措辞不能含糊。
+        if (
+          !confirm(
+            `将对 ${picked.length} 条商品执行完整管线：\n\n` +
+              `  1. 认领到店铺「${store}」站点「${site}」（创建 ${picked.length} 条草稿）\n` +
+              (cross.length
+                ? `     其中 ${cross.length} 条是跨站点搬（源站点不是${site}，这是常规用途）\n`
+                : "") +
+              `  2. 批量填仓库 / 发货时效 / 运费模板（覆盖已有值）\n` +
+              `  3. 批量发布 —— 商品在 Temu【真实上架】\n\n` +
+              `全程【不可撤销】：草稿只能手动删，上架只能手动下架。\n` +
+              `发布检测未通过的会留在采集箱、不发布。\n\n确认执行？`
+          )
+        )
+          return;
+
+        logLine(
+          `=== 数据搬家管线开始：${picked.length} 条 → ${store} / ${site} ===`,
+          "text-info"
+        );
+        $("btnBanjiaClaim").disabled = true;
+        $("banjiaClaimSpinner").classList.remove("d-none");
+        try {
+          const r = await fetch("/publish/banjia/claim", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              rowids: picked.map((i) => i.rowid),
+              store: store,
+              site: site,
+              state: $("selBanjiaState").value,
+            }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          const res = d.result || {};
+          const msgs = [`勾中 ${d.checked}/${d.requested} 条`];
+          if (res.success != null) msgs.push(`认领成功 ${res.success}`);
+          if (res.failed) msgs.push(`失败 ${res.failed}`);
+          if (res.skipped) msgs.push(`跳过 ${res.skipped}`);
+          if (!res.finished)
+            // 结果弹窗读不到时不能说成功——最终事实要看重扫后的「已搬店铺」列
+            msgs.push("未读到结果弹窗，请重扫清单核对「已搬店铺」列");
+          if ((d.missing || []).length)
+            msgs.push(`${d.missing.length} 条在列表里没找到（可能已被搬走）`);
+          if ((d.unchecked || []).length)
+            msgs.push(`已取消平台默认勾上的站点：${d.unchecked.join("、")}`);
+          logPipeline("认领", d.logs);
+          showToast("批量认领完成", msgs.join("；"), "success");
+          banjiaChecked.clear();
+          $("btnBanjiaScanNow").click();
+
+          // 【认领完直接跑完整条管线：填三项 → 发布】这三项（仓库/发货时效/运费模板）
+          // 是平台发布前的硬性必填——实测属性没填就点批量发布，「发布检测」判 0 条通过、
+          // 原因写着「半托管仓库不能为空」。本清单存在的意义就是这条完整管线，
+          // 让用户中途再去另一张表手工点一遍等于把管线断在中间。
+          // 后端在认领时已按源链接回查出新草稿的 rowid（draftRowids），故这里直接接上。
+          // 【一次 confirm 到底】上面那个 confirm 已经把「认领 N 条 → 填属性 → 发布上架」
+          // 整条说清楚了（含不可逆警告），故后续两步不再各弹一次确认
+          // （2026-09-01 用户明确要求：勾选后一次点到底）。
+          const drafts = d.draftRowids || [];
+          if (drafts.length) {
+            if (d.draftError)
+              showToast("部分草稿未回查到", d.draftError, "warning");
+            // 第 2 步：填三项（直接提交，不再 dry-run 预览）
+            const attrOk = await runBulkAttr(drafts, true, {
+              note: `刚认领的 ${drafts.length} 条草稿`,
+              chained: true, // 别在填完属性后重扫列表页：紧接着的发布还要用这个页面找行
+            });
+            // 填属性失败就不往下发布：属性没填全，发布检测必然把它们全判未通过，
+            // 白跑一趟还多一个「为什么 0 条通过」的困惑
+            if (attrOk) await runPublish(drafts);
+          } else {
+            showToast(
+              "下一步",
+              (d.draftError ? d.draftError + "。" : "") +
+                "认领的草稿会落到上面的「采集箱待编辑清单」；点那张表的「立即扫描」把它们列出来，" +
+                "再用「填属性并发布」补上仓库/发货时效/运费模板并发布",
+              "warning"
+            );
+          }
+        } catch (e) {
+          logLine(`[认领] 失败：${String(e).replace(/^Error:\s*/, "")}`, "text-danger");
+          showToast("批量认领失败", String(e).replace(/^Error:\s*/, ""), "danger");
+        } finally {
+          $("btnBanjiaClaim").disabled = false;
+          $("banjiaClaimSpinner").classList.add("d-none");
+        }
+      });
+
+      // 店铺换了要重渲染数据搬家表：「已搬本店」这一列与「隐藏已搬本店」过滤都按
+      // 当前店铺算（同一条商品可搬到多个店铺，判据是行的 claimedShops 对比店铺 id）。
+      // 【换店铺可能让已勾的行落到过滤外】那些行对新店铺来说是「已搬本店」，会被隐藏，
+      // 于是它们不再参与认领。这件事必须当场说出来：2026-09-01 实测的 bug 正是它
+      // 悄悄发生——计数还写着「已选 2 条」，点认领却报「请先勾选」，两句话自相矛盾。
+      // 现在换店铺时就把「有几条因此不算了」讲清楚，并把它们从勾选集合里剔掉，
+      // 让「勾选集合」与「会被认领的那批」始终一致。
+      $("selStore").addEventListener("change", () => {
+        const before = banjiaChecked.size;
+        if (before) {
+          const visible = new Set(visibleBanjiaItems().map((i) => i.rowid));
+          // 失效判据要与「可勾选」完全一致：可见之外还要站点相符、且没搬过本店
+          const dropped = [...banjiaChecked].filter((r) => {
+            if (!visible.has(r)) return true;
+            const it = banjiaItems.find((x) => x.rowid === r);
+            return !it || claimedToCurrentShop(it);
+          });
+          dropped.forEach((r) => banjiaChecked.delete(r));
+          if (dropped.length)
+            showToast(
+              "勾选已调整",
+              `换店铺后有 ${dropped.length} 条勾选不再适用（对「${
+                $("selStore").value || "新店铺"
+              }」来说它们已经搬过了、或源站点不符），已取消勾选` +
+                (banjiaChecked.size ? `；仍有 ${banjiaChecked.size} 条待认领` : ""),
+              "warning"
+            );
+        }
+        renderBanjiaRows();
+      });
+
+      // ---- 采集箱「填属性并发布」：填仓库/发货时效/运费模板，再批量发布 ----
+      // 【两步走：先 dry-run 预览，再确认提交】它会覆盖这三项的已有值且不可逆，而
+      // 「该填什么」是运行时从下拉里读出来的（选项因店铺+站点而异），事先看不到。
+      // 故第一次点只探测并把结果列出来，第二次点才真提交。
+      // pending 存着上一次 dry-run 的 rowids：确认提交时必须提交同一批，
+      // 不能重新取当前勾选——用户可能在预览后又改了勾选，那预览就对不上了。
+      let bulkAttrPending = null;
+
+      function resetBulkAttrBtn() {
+        bulkAttrPending = null;
+        $("btnBulkAttr").className = "btn btn-outline-warning btn-sm";
+        $("btnBulkAttr").innerHTML =
+          '<span id="bulkAttrSpinner" class="spinner-border spinner-border-sm d-none" role="status"></span>' +
+          '<i class="bi bi-sliders"></i> 填属性并发布';
+      }
+
+      // 【抽成函数供两个入口共用】一个入口是采集箱表上的「填属性并发布」按钮（用户手工
+      // 勾选那批），另一个是数据搬家「批量认领」成功后自动接上（用刚认领出的新草稿
+      // rowid）。两条路的后续完全一样（预览 → 确认提交），故共用这一份而不是各写一遍。
+      // ctx.from 只用于文案，让用户看得出这次预览是「手工勾的」还是「刚认领的」。
+      async function runBulkAttr(rowids, isConfirm, ctx) {
+        ctx = ctx || {};
+        $("btnBulkAttr").disabled = true;
+        const sp = $("bulkAttrSpinner");
+        if (sp) sp.classList.remove("d-none");
+        try {
+          const r = await fetch("/publish/bulkattr", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rowids: rowids, dryRun: !isConfirm }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+
+          logPipeline("填属性", d.logs);
+          const filled = d.filled || [];
+          const skipped = d.skipped || [];
+          // 把「哪一项 / 哪个站点或店铺 / 填什么」逐条列出来：这是用户唯一能核对的地方，
+          // 只报个数（「将填 5 个下拉」）等于让人闭着眼确认不可逆操作。
+          const lines = filled.map(
+            (f) => `${f.kind}（${f.rowName || "—"}）→ ${f.picked}`
+          );
+          if (skipped.length)
+            lines.push(
+              ...skipped.map(
+                (s) => `跳过 ${s.kind || "?"}（${s.rowName || "—"}）：${s.reason}`
+              )
+            );
+          if (isConfirm) {
+            const okN = filled.filter((f) => f.applied).length;
+            showToast(
+              "属性已填",
+              `${d.checked} 条草稿，成功填了 ${okN} 个下拉` +
+                (skipped.length ? `，跳过 ${skipped.length} 个` : ""),
+              okN ? "success" : "warning"
+            );
+            resetBulkAttrBtn();
+            // 提交后重扫采集箱：这三项属于编辑产物，填完编辑进度会变。
+            // 【串联时不在这里重扫】重扫会 navigate 走列表页，而紧接着的发布还要用
+            // 同一个页面找行；让发布跑完再扫（见 runPublish 末尾）。
+            if (!ctx.chained) $("btnScanNow").click();
+            // 一个下拉都没填成时告诉调用方别往下发布：属性没填全，
+            // 发布检测必然全判未通过
+            return okN > 0;
+          } else {
+            if (!filled.length) {
+              showToast(
+                "无可填项",
+                "探测完成但一个下拉都填不了：" +
+                  (skipped.map((s) => s.reason).join("；") ||
+                    "弹窗里没有可填的下拉"),
+                "danger"
+              );
+              resetBulkAttrBtn();
+              return false;
+            }
+            bulkAttrPending = { rowids: rowids };
+            $("btnBulkAttr").className = "btn btn-danger btn-sm";
+            $("btnBulkAttr").innerHTML =
+              '<span id="bulkAttrSpinner" class="spinner-border spinner-border-sm d-none" role="status"></span>' +
+              `<i class="bi bi-check2"></i> 确认提交（${filled.length} 项）`;
+            // 从「认领」自动接上来时把按钮滚进视野：用户的注意力在下面那张表上，
+            // 不滚过去会以为流程断了（其实预览已经出来、只等确认）。
+            try {
+              $("btnBulkAttr").scrollIntoView({ block: "center", behavior: "smooth" });
+            } catch (e) {}
+            showToast(
+              `预览：${ctx.note || d.checked + " 条草稿"}将这样填`,
+              lines.join("；") +
+                "。核对无误后点采集箱那张表上的红色「确认提交」按钮（会覆盖已有值，不可撤销）",
+              "warning"
+            );
+            return false; // 预览态：调用方不应继续往下发布
+          }
+        } catch (e) {
+          logLine(
+            `[填属性] ${isConfirm ? "提交" : "探测"}失败：` +
+              String(e).replace(/^Error:\s*/, ""),
+            "text-danger"
+          );
+          showToast(
+            isConfirm ? "提交失败" : "探测失败",
+            String(e).replace(/^Error:\s*/, ""),
+            "danger"
+          );
+          resetBulkAttrBtn();
+          return false;
+        } finally {
+          $("btnBulkAttr").disabled = false;
+          const sp2 = $("bulkAttrSpinner");
+          if (sp2) sp2.classList.add("d-none");
+        }
+      }
+
+      // 【管线最后一棒：批量发布】走列表页「批量操作 → 批量发布」，平台先跑「发布检测」，
+      // 后端按用户选定的策略点「跳过，发布检测通过的产品」——能发的先发走，
+      // 未通过的留在采集箱并把原因带回来（多是「半托管仓库不能为空」，即属性没填全）。
+      // confirm=true 由调用方传：整条管线的确认已经在认领前那一次 confirm 里做过了。
+      async function runPublish(rowids) {
+        logLine(`[发布] 开始：${rowids.length} 条草稿，先跑平台的发布检测`);
+        showToast(
+          "正在发布",
+          `${rowids.length} 条草稿正在跑发布检测并上架，检测较慢请稍候`,
+          "secondary"
+        );
+        try {
+          const r = await fetch("/publish/publish", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ rowids: rowids, confirm: true }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+
+          logPipeline("发布", d.logs);
+          const passed = d.passed == null ? "?" : d.passed;
+          const failed = d.failed || 0;
+          // 未通过的逐条列出原因：这是用户唯一能据以补救的信息，
+          // 只报个数（「3 条未通过」）等于让人自己去店小秘一条条翻
+          const lines = (d.issues || []).slice(0, 8).map((cells) => {
+            const arr = Array.isArray(cells) ? cells : [String(cells)];
+            // 行形如 [序号, 产品问题, 产品标题, 店铺, 时间]
+            const why = arr[1] || "?";
+            const title = (arr[2] || "").slice(0, 22);
+            return `${why}${title ? "（" + title + "…）" : ""}`;
+          });
+          if (d.published) {
+            showToast(
+              "已发布",
+              `${passed} 条已提交上架` +
+                (failed
+                  ? `；${failed} 条未通过检测、留在采集箱：${lines.join("；")}`
+                  : "") +
+                "。发布是异步任务，到店小秘「在线产品」列表可看最终结果",
+              failed ? "warning" : "success"
+            );
+          } else {
+            // passed===0 或读不出计数：后端不会发布，把原因如实转达
+            showToast(
+              "未发布",
+              (d.note || "发布检测未通过") +
+                (lines.length ? `：${lines.join("；")}` : ""),
+              "danger"
+            );
+          }
+          logLine(
+            d.published
+              ? `[发布] 完成：${d.note || passed + " 条已上架"}`
+              : `[发布] 未发布：${d.note || "检测未通过"}`,
+            d.published ? "text-success" : "text-danger"
+          );
+          // 发布后重扫采集箱：发出去的行会离开草稿列表，留下的就是要补救的
+          $("btnScanNow").click();
+          return !!d.published;
+        } catch (e) {
+          logLine(`[发布] 失败：${String(e).replace(/^Error:\s*/, "")}`, "text-danger");
+          showToast(
+            "发布失败",
+            String(e).replace(/^Error:\s*/, "") +
+              "。草稿仍在采集箱，属性已填好，可稍后在采集箱清单里重试发布",
+            "danger"
+          );
+          return false;
+        }
+      }
+
+      $("btnBulkAttr").addEventListener("click", async () => {
+        // 第二次点（按钮已是「确认提交」态）：提交上次预览的那一批。
+        // 【必须提交同一批 rowids，不能重取当前勾选】用户可能在预览后又改了勾选，
+        // 那预览内容就与将要提交的对不上了（不可逆动作，不容许这种偏差）。
+        const isConfirm = !!bulkAttrPending;
+        let rowids;
+        if (isConfirm) {
+          rowids = bulkAttrPending.rowids;
+        } else {
+          const shown = visibleScanItems();
+          const picked = shown.filter((i) => scanChecked.has(i.rowid));
+          if (!picked.length) {
+            showToast("无法执行", "请先在采集箱清单里勾选要填的草稿", "warning");
+            return;
+          }
+          rowids = picked.map((i) => i.rowid);
+        }
+        // 【这个入口保留「先预览再确认」两段式】它与数据搬家那条链不同：那边整条管线
+        // 在认领前已经统一 confirm 过一次，这边是独立入口、没有上游确认，
+        // 故仍先出预览让用户核对「哪一项→填什么」，第二次点才提交。
+        const ok = await runBulkAttr(rowids, isConfirm, {});
+        // 属性填成功后接着发布：这个入口同样服务于「填属性 → 发布」这条链
+        // （草稿填完属性的唯一去向就是发布）。发布不可逆，故单独确认一次。
+        if (isConfirm && ok) {
+          if (
+            confirm(
+              `属性已填好。是否立即发布这 ${rowids.length} 条？\n\n` +
+                `商品将在 Temu【真实上架】，只能手动下架。\n` +
+                `发布检测未通过的会留在采集箱、不发布。\n\n确认发布？`
+            )
+          )
+            await runPublish(rowids);
+          else
+            showToast(
+              "未发布",
+              "属性已填好，草稿留在采集箱；随时可以再勾选发布",
+              "secondary"
+            );
+        }
+      });
+
+      // 改了采集箱的勾选就把「确认提交」态退回去：预览针对的是当时那一批 rowids，
+      // 勾选变了还留着确认态会让人以为提交的是新勾的那批。
+      $("scanBodyRows").addEventListener("change", () => {
+        if (bulkAttrPending) resetBulkAttrBtn();
+      });
+
       loadScanState();
+      loadCrawlState();
+      loadBanjiaState();
 
       // 自动发布开关：状态回填 + 顶部提示条随开关切换文案。
       // 提示条两种措辞刻意分色：开＝danger（这一趟会真上架，不可逆），
@@ -1332,6 +2698,14 @@
       });
       syncPublishHint();
 
+      // 保留视频开关：只记状态，不配提示条。与自动发布不同——它既不改变可逆性
+      // （视频删除只落在未保存的表单里，靠 ⑭ save 才生效），也不影响成败判定
+      // （⑬b 从不 fail），故一条 hover 说明足够，多一条顶部横幅反而挤掉发布警示。
+      $("chkKeepVideo").checked = localStorage.getItem(LS_KEEPVIDEO) !== "0";
+      $("chkKeepVideo").addEventListener("change", () => {
+        localStorage.setItem(LS_KEEPVIDEO, $("chkKeepVideo").checked ? "1" : "0");
+      });
+
       function esc(s) {
         return String(s == null ? "" : s).replace(
           /[&<>"']/g,
@@ -1352,6 +2726,15 @@
         const el = $("toast");
         el.className = `toast text-bg-${kind}`;
         new bootstrap.Toast(el, { delay: 4000 }).show();
+      }
+
+      // 【把三个管线接口的过程日志写进「本批进度」】这三个动作（认领/填属性/发布）
+      // 一次调用要跑几十秒到几分钟，期间用户只看到一个转圈的按钮。后端把每一步收集在
+      // 响应的 logs 数组里带回来，这里逐行写进上面那个日志框——与 /publish/batch 的
+      // SSE 不同：那是长驻作业、值得开一条流；这三个是一次性调用，随响应带回最省事。
+      // tag 用来标出是哪一步，日志混在一起时能看出边界。
+      function logPipeline(tag, logs) {
+        (logs || []).forEach((line) => logLine(`[${tag}] ${line}`));
       }
 
       function logLine(text, cls = "") {
@@ -1620,6 +3003,8 @@
               // ⑮ 发布闸门。默认开（勾选状态即真相，不在这里另设默认值——
               // 两处各写一份默认会漂移）
               do_publish: $("chkDoPublish").checked,
+              // ⑬b 视频去留。关掉＝编辑页直接点「删除」，省掉下载+转码+直传
+              keep_video: $("chkKeepVideo").checked,
             }),
           });
           const { job_id } = await r.json();

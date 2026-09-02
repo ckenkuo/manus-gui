@@ -875,6 +875,7 @@ from app.publish import service as publish_service
 from app.publish import llm as publish_llm
 from app.publish import cache as publish_cache
 from app.publish import shops as publish_shops
+from app.publish import alert as publish_alert
 
 
 @app.get("/publish/stores")
@@ -1032,6 +1033,7 @@ async def publish_batch(
     use_cache: bool = Body(True, embed=True),
     price: str = Body("", embed=True),
     do_publish: bool = Body(True, embed=True),
+    keep_video: bool = Body(True, embed=True),
 ):
     """启动一批发布作业，返回 job_id；进度经 /publish/batch/{job_id}/events (SSE) 消费。
 
@@ -1046,6 +1048,10 @@ async def publish_batch(
     --publish），实际使用中每次都要人再去命令行跑一遍，反而把「全自动优先」的取向
     抵消掉了。开关在前端（chkDoPublish），默认勾选；不勾则流程仍收尾在 ⑭ 保存落库。
     注意发布不可逆：上架后要下架才能改。
+
+    keep_video 是 ⑬b 产品视频的去留开关（默认 True＝保留）。True 走原来的比例合规化
+    （下载→ffmpeg 裁比例→直传→回填，每个商品几十秒到几分钟）；False 就在编辑页直接
+    点视频区的「删除」丢弃，整批换速度与确定性。开关在前端 chkKeepVideo。
     """
     job_id = str(uuid.uuid4())
     job = PublishJob(job_id, store, site)
@@ -1060,8 +1066,14 @@ async def publish_batch(
                 tasks, store=store, site=site,
                 on_progress=_on_progress, from_stage=from_stage,
                 use_cache=use_cache, price=price, do_publish=do_publish,
+                keep_video=keep_video,
             )
         except Exception as e:
+            # run_batch 内部的中断已由 service 的告警钩子报过（aborted / product_done /
+            # batch_done）；能落到这里的是 run_batch 本身抛出的未捕获异常——钩子在
+            # run_batch 里，此时已经出不来了，故这一处要自己发一发，否则 Web 端跑批
+            # 崩了群里一点动静都没有。
+            await publish_alert.alert_batch_crash(str(e), store=store, site=site)
             await job.push({"type": "aborted", "reason": f"发布异常：{e}"})
         finally:
             job.done = True
@@ -1119,6 +1131,24 @@ async def publish_batch_events(job_id: str):
 
 from app.publish import collectbox as publish_collectbox
 
+# ---- 数据采集页「未认领」清单定时扫描 ----------------------------------------
+# 【与上面的采集箱扫描是两个不同的列表，别混】采集箱（collectbox）里是**已认领**的草稿，
+# 带店铺/站点/rowid；这里（crawlbox）扫的是数据采集页「未认领」标签下的采集记录，
+# 还没有店铺、没有站点、没有 rowid——正因如此它才要走「认领 → 编辑 → 发布」的完整流程。
+# 两者的接口、主键、以及「填进任务框该填什么」全不同，详见 app/publish/crawlbox.py 头部。
+#
+# 故这里是**另一套**接口与另一个定时器，而不是给 /publish/collectbox 加个参数：
+# 用户可能只想扫其中一个，共用一个开关会让「开一个就开两个」。
+from app.publish import crawlbox as publish_crawlbox
+
+# ---- 数据搬家清单定时扫描 ----------------------------------------------------
+# 【第三张来源清单】数据搬家池里是**别人已在 Temu 上架过的成品**（自带平台 SPU ID），
+# 可整条搬到自己店铺；上面两张一个是自采记录（crawlbox）、一个是已认领草稿（collectbox）。
+# 三者的列表接口、主键、可用字段全不同，对照表见 app/publish/banjia.py 头部。
+# 它的接口在本文件下方（含唯一的写接口 /publish/banjia/claim），这里先导入是为了
+# 与另两个模块一起注入 busy 判据、一起在 startup 里起定时器。
+from app.publish import banjia as publish_banjia
+
 
 def _publish_job_busy() -> bool:
     """当前是否有发布作业在跑（定时器据此跳过这一轮扫描）。
@@ -1130,6 +1160,8 @@ def _publish_job_busy() -> bool:
 
 
 publish_collectbox.set_busy_checker(_publish_job_busy)
+publish_crawlbox.set_busy_checker(_publish_job_busy)
+publish_banjia.set_busy_checker(_publish_job_busy)
 
 
 @app.on_event("startup")
@@ -1146,6 +1178,17 @@ async def _start_collectbox_timer():
     except Exception as e:
         # best-effort：定时器起不来不该让整个 Web 服务起不来
         logger.warning(f"采集箱定时扫描启动失败（忽略）：{e}")
+    # 【三个定时器各自单独 try】它们互不依赖，一个起不来不该连带另外两个也起不来。
+    try:
+        if publish_crawlbox.start_if_enabled():
+            logger.info("未认领清单定时扫描按上次设置自动启动")
+    except Exception as e:
+        logger.warning(f"未认领清单定时扫描启动失败（忽略）：{e}")
+    try:
+        if publish_banjia.start_if_enabled():
+            logger.info("数据搬家清单定时扫描按上次设置自动启动")
+    except Exception as e:
+        logger.warning(f"数据搬家清单定时扫描启动失败（忽略）：{e}")
 
 
 @app.get("/publish/collectbox")
@@ -1201,6 +1244,209 @@ async def collectbox_scan_now(state: str = Body("", embed=True)):
     publish_collectbox.save_scan(r)
     st = publish_collectbox.status()
     return {**st, "items": r.get("items") or []}
+
+
+# ---- 未认领清单接口（数据采集页「未认领」标签）--------------------------------
+# 路由前缀刻意用 /publish/crawlbox 而不是给 collectbox 加参数：两个清单的行结构不同
+# （那边有 rowid + 店铺 + 站点 + 编辑进度，这里有 cid + 可否认领、没有店铺站点），
+# 前端也是两张各自渲染的表。合成一个接口只会让返回体变成「看 state 才知道有哪些字段」。
+
+@app.get("/publish/crawlbox")
+async def crawlbox_state():
+    """未认领清单定时器现状 + 上次扫到的清单。读磁盘缓存，不触发扫描。"""
+    st = publish_crawlbox.status()
+    scan = publish_crawlbox.load_scan()
+    return {**st, "items": scan.get("items") or [],
+            "states": [{"id": k, "label": v["label"]}
+                       for k, v in publish_crawlbox.CRAWL_STATES.items()],
+            "intervalMin": publish_crawlbox.INTERVAL_MIN,
+            "intervalMax": publish_crawlbox.INTERVAL_MAX,
+            "intervalDefault": publish_crawlbox.INTERVAL_DEFAULT}
+
+
+@app.post("/publish/crawlbox/settings")
+async def crawlbox_settings(enabled: Optional[bool] = Body(None, embed=True),
+                            intervalMinutes: Optional[int] = Body(None, embed=True),
+                            state: Optional[str] = Body(None, embed=True),
+                            onlyClaimable: Optional[bool] = Body(None, embed=True)):
+    """改未认领清单定时器设置（开关/间隔/扫哪个标签/是否只列可认领）。只改传了的项。"""
+    try:
+        return await publish_crawlbox.apply_settings(
+            enabled=enabled, interval_minutes=intervalMinutes, state=state,
+            only_claimable=onlyClaimable)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/publish/crawlbox/scan")
+async def crawlbox_scan_now(state: str = Body("", embed=True)):
+    """立刻扫一次未认领清单。返回现状 + 新清单。
+
+    与采集箱扫描共用 browser.PAGE_LOCK（都要导航同一个店小秘页签），故两个「立即扫描」
+    同时点也不会互相把页面导航走——后点的那个在锁上等着。
+    有发布作业在跑时拒掉：扫描会把那个 CDP 页面导航走，等于毁掉正在填的表单。
+    """
+    if _publish_job_busy():
+        raise HTTPException(409, "有发布作业正在跑，扫描会抢占编辑页；请等作业结束后再扫")
+    cfg = publish_crawlbox.get_settings()
+    r = await publish_crawlbox.scan_once(state or cfg["state"])
+    if r.get("error") and not r.get("items"):
+        raise HTTPException(503, f"扫描失败：{r['error']}")
+    publish_crawlbox.save_scan(r)
+    st = publish_crawlbox.status()
+    return {**st, "items": r.get("items") or []}
+
+
+# ---- 数据搬家清单接口（模块导入与 busy 注入在上面的定时器段落）----------------
+# 【本清单比另两张多一个写接口】/publish/banjia/claim 会真实创建草稿（不可逆）。
+# 刻意不做成「扫到就自动认领」：定时器只扫清单，认领必须由用户勾选后显式发起。
+
+
+@app.get("/publish/banjia")
+async def banjia_state():
+    """数据搬家清单定时器现状 + 上次扫到的清单。读磁盘缓存，不触发扫描。"""
+    st = publish_banjia.status()
+    scan = publish_banjia.load_scan()
+    return {**st, "items": scan.get("items") or [],
+            "states": [{"id": k, "label": v["label"]}
+                       for k, v in publish_banjia.BANJIA_STATES.items()],
+            "intervalMin": publish_banjia.INTERVAL_MIN,
+            "intervalMax": publish_banjia.INTERVAL_MAX,
+            "intervalDefault": publish_banjia.INTERVAL_DEFAULT}
+
+
+@app.post("/publish/banjia/settings")
+async def banjia_settings(enabled: Optional[bool] = Body(None, embed=True),
+                          intervalMinutes: Optional[int] = Body(None, embed=True),
+                          state: Optional[str] = Body(None, embed=True),
+                          hideClaimed: Optional[bool] = Body(None, embed=True)):
+    """改数据搬家定时器设置（开关/间隔/扫哪个标签/是否隐藏已搬到目标店的行）。"""
+    try:
+        return await publish_banjia.apply_settings(
+            enabled=enabled, interval_minutes=intervalMinutes, state=state,
+            hide_claimed=hideClaimed)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.post("/publish/banjia/scan")
+async def banjia_scan_now(state: str = Body("", embed=True)):
+    """立刻扫一次数据搬家清单。返回现状 + 新清单。
+
+    与另两个扫描共用 browser.PAGE_LOCK，故三个「立即扫描」同时点也不会互相把页面
+    导航走。有发布作业在跑时拒掉（扫描会抢占那个 CDP 页面，毁掉正在填的表单）。
+    """
+    if _publish_job_busy():
+        raise HTTPException(409, "有发布作业正在跑，扫描会抢占编辑页；请等作业结束后再扫")
+    cfg = publish_banjia.get_settings()
+    r = await publish_banjia.scan_once(state or cfg["state"])
+    if r.get("error") and not r.get("items"):
+        raise HTTPException(503, f"扫描失败：{r['error']}")
+    publish_banjia.save_scan(r)
+    st = publish_banjia.status()
+    return {**st, "items": r.get("items") or []}
+
+
+@app.post("/publish/banjia/claim")
+async def banjia_claim(rowids: list = Body(..., embed=True),
+                       store: str = Body(..., embed=True),
+                       site: str = Body(..., embed=True),
+                       state: str = Body("", embed=True)):
+    """把勾中的数据搬家行批量认领到指定店铺站点。
+
+    【会真实创建草稿，不可逆】故必须由用户在清单里勾选并选好店铺站点才能调到这里；
+    后端不做「全选当页」这类便捷操作（rowids 为空直接 400）。
+
+    与扫描互斥走同一把页面锁（认领全程要在页面上勾行、开弹窗）；有发布作业在跑时拒掉
+    ——认领会把那个 CDP 页面导航走，等于毁掉正在填的表单。
+    """
+    if _publish_job_busy():
+        raise HTTPException(409, "有发布作业正在跑，认领会抢占编辑页；请等作业结束后再认领")
+    logs: list = []
+    try:
+        cfg = publish_banjia.get_settings()
+        r = await publish_banjia.claim_batch(
+            rowids, store, site, state=state or cfg["state"], on_log=logs.append)
+        return {**r, "logs": logs}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # 认领这一路的失败几乎都是「页面状态不对/店小秘接口异常」这类可重试的情况，
+        # 报 503 让前端提示「稍后重试」，而不是 500（那会被当成本服务的 bug）
+        raise HTTPException(503, str(e))
+
+
+# ---- 采集箱「全属性修改」批量填仓库/发货时效/运费模板 -------------------------
+# 【它补的是数据搬家认领后的空档】认领过来的草稿这三项是空的，而它们是发布前的硬性必填。
+# 逐条进编辑页填（pipeline.set_stock / set_shipping）在批量场景下要十几分钟，
+# 走列表页的「批量操作 → 全属性修改」一次弹窗改完整批。详见 app/publish/bulkattr.py。
+#
+# 【默认 dry-run】点「确定」会真实覆盖整批草稿的这三项，故接口的 dryRun 默认 True：
+# 先返回「打算填什么」让用户核对，确认后再带 dryRun=false 提交。
+from app.publish import bulkattr as publish_bulkattr
+
+
+@app.post("/publish/bulkattr")
+async def bulkattr_apply(rowids: list = Body(..., embed=True),
+                         dryRun: bool = Body(True, embed=True)):
+    """给采集箱里勾中的草稿批量填仓库/发货时效/运费模板。
+
+    取值规则固定（2026-09-01 用户确认）：仓库与运费模板取下拉第一项，
+    发货时效取工作日数最大的那项。规则不做成参数——批量入口的下拉是按店铺+站点分别
+    渲染的，支持任意值就要让前端给出「店铺×站点 → 值」的完整矩阵，那已经不叫批量了。
+
+    dryRun=True（默认）只探测并返回打算填什么，不提交；false 才真实修改（不可逆）。
+    """
+    if _publish_job_busy():
+        raise HTTPException(409, "有发布作业正在跑，本操作会抢占编辑页；请等作业结束后再试")
+    # 【过程日志随响应带回】这三个接口都是「一次调用跑几十秒」的长动作，期间用户只能
+    # 干等。把每一步收集起来随响应返回，前端写进「本批进度」——与 /publish/batch 的
+    # SSE 不同，这些动作不是长驻作业，为它们各开一条 SSE 不划算；而它们的日志量很小
+    # （每条草稿几行），随响应带回最省事。
+    logs: list = []
+    try:
+        r = await publish_bulkattr.apply_bulk_attrs(
+            rowids, dry_run=dryRun, on_log=logs.append)
+        return {**r, "logs": logs}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+
+
+# ---- 批量发布（数据搬家管线的最后一棒）----------------------------------------
+# 走列表页的「批量操作 → 批量发布」。平台会先弹「发布检测」，检测未过的原因多是
+# 「半托管仓库不能为空」——正是上一步 bulkattr 要填的三项，故这三个接口是一条链：
+#     /publish/banjia/claim → /publish/bulkattr → /publish/publish  ← 这里
+#
+# 【confirm 是不可逆闸门】发布让商品在 Temu 真实上架、只能手动下架，故默认 False：
+# 不显式传 True 就只跑到发布检测看「几条能发、几条不能发及原因」。
+# 【检测未通过的处置：跳过】用户 2026-09-01 明确选定「跳过，发布检测通过的产品」，
+# 能发的先发走、不因个别失败拖住整批；未通过的留在采集箱并把原因报回前端。
+from app.publish import publish_batch as publish_publisher
+
+
+@app.post("/publish/publish")
+async def publish_drafts(rowids: list = Body(..., embed=True),
+                         confirm: bool = Body(False, embed=True)):
+    """批量发布采集箱里的草稿（管线最后一棒）。
+
+    confirm=False（默认）只跑发布检测并返回 {passed, failed, issues}，不发布；
+    true 才点「跳过，发布检测通过的产品」真实上架（不可逆）。
+    """
+    if _publish_job_busy():
+        raise HTTPException(409, "有发布作业正在跑，本操作会抢占编辑页；请等作业结束后再试")
+    logs: list = []
+    try:
+        r = await publish_publisher.publish_batch(
+            rowids, confirm=confirm, on_log=logs.append)
+        return {**r, "logs": logs}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        # 失败也要把已收集的日志给出去：它正是「跑到哪一步炸的」的唯一线索
+        raise HTTPException(503, str(e) + (
+            "｜过程：" + " / ".join(logs[-4:]) if logs else ""))
 
 
 @app.exception_handler(Exception)

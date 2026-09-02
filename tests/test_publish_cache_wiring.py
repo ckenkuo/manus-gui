@@ -310,7 +310,7 @@ async def test_清单为空时不调LLM(_no_sleep, monkeypatch):
 async def test_答不匹配则落回遍历(_no_sleep, monkeypatch):
     cache.remember_category(PATH, "旧标题")
 
-    async def _pick(title, known):
+    async def _pick(title, known, clues=""):
         return None, "都不匹配"
     monkeypatch.setattr(pipeline, "_pick_cached_category", _pick)
     assert await pipeline._try_cached_category(_FakeSession(), "标题") is None
@@ -332,7 +332,7 @@ async def test_中途点不中则落回且不再点后续级(_no_sleep, monkeypa
     """类目树变了，继续点只会在错位的列里乱点，把弹窗状态搅得更脏。"""
     cache.remember_category(PATH, "旧标题")
 
-    async def _pick(title, known):
+    async def _pick(title, known, clues=""):
         return PATH, "命中"
     monkeypatch.setattr(pipeline, "_pick_cached_category", _pick)
     s = _FakeSession(click_results=[
@@ -348,7 +348,7 @@ async def test_中途点不中则落回且不再点后续级(_no_sleep, monkeypa
 async def test_回读见不到叶子则落回(_no_sleep, monkeypatch):
     cache.remember_category(PATH, "旧标题")
 
-    async def _pick(title, known):
+    async def _pick(title, known, clues=""):
         return PATH, "命中"
     monkeypatch.setattr(pipeline, "_pick_cached_category", _pick)
     monkeypatch.setattr(pipeline, "read_current_category",
@@ -361,7 +361,7 @@ async def test_命中返回与遍历同构(_no_sleep, monkeypatch):
     """_st_auto_cat 与 publish_inspect 都消费这个返回，形状必须一致。"""
     cache.remember_category(PATH, "旧标题")
 
-    async def _pick(title, known):
+    async def _pick(title, known, clues=""):
         return PATH, "标题里有针织套头"
     monkeypatch.setattr(pipeline, "_pick_cached_category", _pick)
     monkeypatch.setattr(

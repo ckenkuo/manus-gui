@@ -50,6 +50,8 @@ def _fake_stages(monkeypatch, calls: list, fail_at: str = "", raise_at: str = ""
                 "skuFilledRows": 8, "sizechartAdded": True, "attrImgCount": 6,
                 "shippingSet": True, "descImgCount": 10, "descForeignCount": 0,
                 "skuCodeCount": 8, "skuCodeBad": 0,
+                # ⑦b 预览图达标（这份桩的语义是「成果都还在」）
+                "previewCount": 8, "previewBad": 0,
                 "catText": "女士运动卫裤", "catUnset": False, "catDeleted": False}
     monkeypatch.setattr(service, "live_state", fake_live)
 
@@ -60,6 +62,14 @@ def _fake_live(monkeypatch, **over):
             "skuFilledRows": 0, "sizechartAdded": False, "attrImgCount": 0,
             "shippingSet": False, "descImgCount": 12, "descForeignCount": 12,
             "skuCodeCount": 0, "skuCodeBad": 0,
+            # ⑦b 预览图：「全丢」语义下这一列也是认领带来的 1688 原始破线图
+            # （2026-08-30 玩具类那单实测 8 行里 3 行非 1:1 且短边不足 800）
+            "previewCount": 8, "previewBad": 8,
+            # ⑦a 剔配件色：默认按【没有配件色】的普通商品给（各色有效行数齐平），
+            # 于是 drop_acc 默认不进重跑集——它只在真有配件色时才有事做，不像
+            # ⑤~⑬ 那样「表单丢了就一定要重跑」。要测它的用例自己覆盖本字段。
+            "variantByColor": {"白色": {"total": 5, "filled": 5},
+                               "黑色": {"total": 5, "filled": 5}},
             # 类目默认有效：⑤ 起的表单丢了是常态，类目失效是另一类故障，
             # 由 test_类目失效时连带重跑类目与属性 单独覆盖
             "catText": "女士运动卫裤", "catUnset": False, "catDeleted": False}
@@ -333,6 +343,9 @@ async def test_plan_desc_动作分桶且漏判保留(monkeypatch):
             {"pos": 99, "action": "delete", "reason": "越界pos"},
         ]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
+    # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
+    # test_publish_desc_unreachable_pos.py），测试里桩掉避免真去下载
+    monkeypatch.setattr(vision, "image_ref", lambda u: "data:image/jpeg;base64,AAAA")
 
     mods = [{"pos": i, "url": f"https://x/{i}.jpg", "onDxmHost": True} for i in (1, 2, 3)]
     r = await vision.plan_desc(mods, {"title": "t"})
@@ -613,7 +626,11 @@ async def test_run_batch_单商品失败不拖垮批次(tmp_path, monkeypatch):
 async def test_save未成功时按实况重跑表单阶段(tmp_path, monkeypatch):
     calls, events = [], []
     _fake_stages(monkeypatch, calls)
-    _fake_live(monkeypatch)                     # 实况：表单成果全丢
+    # 实况：表单成果全丢；变种表按有配件色给（⑦a 只在真有配件色时才有事做，
+    # 见 _fake_live 里 variantByColor 的说明）
+    _fake_live(monkeypatch,
+               variantByColor={"白色": {"total": 5, "filled": 5},
+                               "红色": {"total": 5, "filled": 1}})
     state = service.load_state("rowid-100")
     for sid, _ in service.STAGES:               # 除 save 外全记 ok
         if sid != "save":
@@ -642,7 +659,7 @@ async def test_实况显示表单还在时不重复重跑(tmp_path, monkeypatch)
     _fake_stages(monkeypatch, calls)
     _fake_live(monkeypatch, titleFilled=True, skuRowCount=8, skuFilledRows=8,
                sizechartAdded=True, attrImgCount=6, shippingSet=True,
-               descForeignCount=0, skuCodeCount=8, skuCodeBad=0)
+               descForeignCount=0, skuCodeCount=8, skuCodeBad=0, previewBad=0)
     state = service.load_state("rowid-101")
     for sid, _ in service.STAGES:
         if sid != "save":
@@ -666,7 +683,7 @@ async def test_尺码勾选丢了连带重跑尺码表变种库存(tmp_path, mon
     _fake_stages(monkeypatch, calls)
     # 标题/图片/运输都在，只有变种表空了
     _fake_live(monkeypatch, titleFilled=True, attrImgCount=6, shippingSet=True,
-               descForeignCount=0, skuRowCount=0)
+               descForeignCount=0, skuRowCount=0, previewBad=0)
     state = service.load_state("rowid-102")
     for sid, _ in service.STAGES:
         if sid != "save":
@@ -918,7 +935,7 @@ async def test_货号是中文时单独重跑货号阶段(tmp_path, monkeypatch)
     _fake_stages(monkeypatch, calls)
     _fake_live(monkeypatch, titleFilled=True, skuRowCount=8, skuFilledRows=8,
                sizechartAdded=True, attrImgCount=6, shippingSet=True,
-               descForeignCount=0, skuCodeCount=8, skuCodeBad=2)
+               descForeignCount=0, skuCodeCount=8, skuCodeBad=2, previewBad=0)
     state = service.load_state("rowid-103")
     for sid, _ in service.STAGES:
         if sid != "save":
@@ -945,16 +962,23 @@ async def test_plan_desc_干净小图改判放大(monkeypatch):
         return {"actions": [{"pos": 1, "action": "keep", "reason": "干净"},
                             {"pos": 2, "action": "keep", "reason": "干净"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
+    # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
+    # test_publish_desc_unreachable_pos.py），测试里桩掉避免真去下载
+    monkeypatch.setattr(vision, "image_ref", lambda u: "data:image/jpeg;base64,AAAA")
 
     mods = [
-        {"pos": 1, "url": "https://x/1.jpg", "size": "900x1200", "tooSmall": True},
+        {"pos": 1, "url": "https://x/1.jpg", "size": "900x1200", "tooSmall": True,
+         "sizeReasons": ["900x1200 小于 480x480"]},
         {"pos": 2, "url": "https://x/2.jpg", "size": "1340x2010", "tooSmall": False},
     ]
     r = await vision.plan_desc(mods, {"title": "t"})
     # 小图改判 replace 并带放大标记；达标的仍然 keep
     assert [x["pos"] for x in r["replace"]] == [1]
     assert r["replace"][0]["needsUpscale"] is True
-    assert "1340x1785" in r["replace"][0]["reason"]
+    # 理由取 desc_map 算好的 sizeReasons，不写死服装的 1340x1785——描述图的口径是
+    # 两边 >= 480 且比例 0.5~2.0，写死尺寸会把超比例的长条图说成「像素不够」
+    # （2026-09-02 实测 790x1847 那两张就是这么被说错的）
+    assert "480" in r["replace"][0]["reason"]
     assert r["keep"] == [2]
 
 
@@ -964,6 +988,9 @@ async def test_plan_desc_已判删的小图不改判(monkeypatch):
     async def _fake(prompt, images, what="", system=None, stage=None):
         return {"actions": [{"pos": 1, "action": "delete", "reason": "工厂图"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
+    # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
+    # test_publish_desc_unreachable_pos.py），测试里桩掉避免真去下载
+    monkeypatch.setattr(vision, "image_ref", lambda u: "data:image/jpeg;base64,AAAA")
 
     mods = [{"pos": 1, "url": "https://x/1.jpg", "size": "800x800", "tooSmall": True}]
     r = await vision.plan_desc(mods, {"title": "t"})
@@ -977,6 +1004,9 @@ async def test_plan_desc_脏图不叠加放大标记(monkeypatch):
     async def _fake(prompt, images, what="", system=None, stage=None):
         return {"actions": [{"pos": 1, "action": "replace", "reason": "中文"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
+    # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
+    # test_publish_desc_unreachable_pos.py），测试里桩掉避免真去下载
+    monkeypatch.setattr(vision, "image_ref", lambda u: "data:image/jpeg;base64,AAAA")
 
     mods = [{"pos": 1, "url": "https://x/1.jpg", "size": "900x1200", "tooSmall": True}]
     r = await vision.plan_desc(mods, {"title": "t"})
@@ -990,6 +1020,9 @@ async def test_plan_desc_读不到尺寸时不误判(monkeypatch):
     async def _fake(prompt, images, what="", system=None, stage=None):
         return {"actions": [{"pos": 1, "action": "keep", "reason": "干净"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
+    # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
+    # test_publish_desc_unreachable_pos.py），测试里桩掉避免真去下载
+    monkeypatch.setattr(vision, "image_ref", lambda u: "data:image/jpeg;base64,AAAA")
 
     mods = [{"pos": 1, "url": "https://x/1.jpg"}]      # 无 size / tooSmall 字段
     r = await vision.plan_desc(mods, {"title": "t"})
