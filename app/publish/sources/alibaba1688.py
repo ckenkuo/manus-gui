@@ -11,6 +11,7 @@ wait_human_verify，全是对真站逐个试出来的，且已有单测覆盖
 反过来说：1688 之所以没有独立的取数实现，正是因为 extract.py 本身就是它的实现。
 新平台（拼多多/Temu/亚马逊）才需要各自写取数 JS。
 """
+import asyncio
 from app.logger import logger
 from app.publish.browser import BrowserSession
 from app.publish.sources.base import SourceProduct, source_id
@@ -75,6 +76,11 @@ async def fetch(session: BrowserSession, url: str,
     if not r.get("ok"):
         raise RuntimeError(f"导航失败: {r}")
 
+    # 【2026-09-03 额外等待数据注入】navigate() 已改用 "load" 事件，但 1688 的
+    # window.context 数据可能在 load 之后才异步注入。这里额外等待 2 秒，给数据注入
+    # 脚本足够的执行时间。best-effort：如果 2 秒还不够，wait_for 会继续轮询 40 秒。
+    await asyncio.sleep(2.0)
+
     # 反爬闸门放在等数据【之前】：被拦时 window.context 压根不存在，先干等 40s 再
     # 报「数据未就绪」纯属浪费——那 40s 里人本来就能把滑块拖完
     await E.wait_human_verify(session, url, on_manual=on_manual)
@@ -86,7 +92,46 @@ async def fetch(session: BrowserSession, url: str,
             data = await session.wait_for(
                 E._JS_EXTRACT, lambda d: d.get("found"), timeout=timeout)
         if not data.get("found"):
-            raise RuntimeError("页面数据未就绪（未登录或被拦截？）")
+            # 【2026-09-03 增强错误诊断】如果 _JS_EXTRACT 返回了诊断信息，先打印出来
+            if "diagnostic" in data:
+                logger.error(f"页面数据结构诊断：{data['diagnostic']}")
+                raise RuntimeError(
+                    f"页面数据结构异常：window.context.result 存在但 data 字段不存在。\n"
+                    f"诊断信息：{data['diagnostic']}\n"
+                    f"这可能是 1688 改版或反爬机制导致的数据结构变化。"
+                )
+
+            # 旧版诊断（兼容没有 diagnostic 字段的情况）
+            try:
+                diag = await session.eval_json("""
+                (() => {
+                    const hasContext = typeof window.context !== 'undefined';
+                    const hasResult = hasContext && typeof window.context.result !== 'undefined';
+                    const loginBtn = document.querySelector('[class*="login"]') ||
+                                     document.querySelector('a[href*="login"]');
+                    const hasSlider = !!document.querySelector('[class*="slider"]') ||
+                                     !!document.querySelector('[class*="verify"]') ||
+                                     !!document.querySelector('#nc_1_wrapper');
+                    return {
+                        hasContext,
+                        hasResult,
+                        hasLoginBtn: !!loginBtn,
+                        loginBtnText: loginBtn ? loginBtn.textContent.trim() : '',
+                        hasSlider,
+                        title: document.title,
+                        url: location.href
+                    };
+                })()
+                """)
+                logger.error(f"页面诊断：{diag}")
+            except Exception as e:
+                logger.warning(f"诊断失败：{e}")
+
+            raise RuntimeError(
+                f"页面数据未就绪（未登录或被拦截？）\n"
+                f"已等待 {timeout}s，window.context.result.data 仍不存在。\n"
+                f"请检查：1) 是否已登录 1688  2) 是否有滑块验证  3) 页面是否正常加载"
+            )
     logger.info(f"页面数据就绪：{data.get('subject')}")
 
     # 描述长图：先页面内 fetch（新形态 detailUrl 走这条即可），失败或抠不到图再
@@ -125,6 +170,23 @@ async def fetch(session: BrowserSession, url: str,
     # 后键值完全粘连，没有分隔符；另三家平台都给结构化键值对，不需要这步）
     attrs = E.parse_attrs(data.get("attrText"))
 
+    # 【颜色缩略图】2026-09-03 新增：从页面颜色选择器提取每个颜色的缩略图 URL，
+    # 供阶段⑦按源商品顺序对应、不再用 LLM 猜颜色归属（MJ20/MJ21 这类编码命名时
+    # LLM 判断不准）。提取逻辑在 extract._JS_EXTRACT 里，这里只做【去重 + 验证】：
+    #   - 同一个颜色名可能对应多个按钮（hover 状态/不同尺码共用颜色图），取第一个
+    #   - 图 URL 必须是完整 http(s) 链接，data: 开头的 base64 占位图不要
+    color_images_raw = data.get("colorImages") or []
+    color_images = {}
+    for item in color_images_raw:
+        if not isinstance(item, dict):
+            continue
+        c = (item.get("color") or "").strip()
+        img = (item.get("image") or "").strip()
+        if c and img and img.startswith("http") and c not in color_images:
+            color_images[c] = img
+    if color_images:
+        logger.info(f"提取到 {len(color_images)} 个颜色的缩略图：{list(color_images.keys())}")
+
     return SourceProduct(
         platform="1688",
         url=url,
@@ -142,6 +204,8 @@ async def fetch(session: BrowserSession, url: str,
         videoUrl="",
         extra={
             "detailUrl": detail_url or "",
+            # 颜色缩略图：{颜色名: 图URL}，阶段⑦优先用它对应、LLM 判断降级备选
+            "colorImages": color_images,
             # 原始抽取结果留档：raw.json 落的就是它，排查页面改版时要看
             "raw": data,
         },

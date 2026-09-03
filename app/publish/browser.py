@@ -357,6 +357,12 @@ class BrowserSession:
         导航后必须重发 fix_hidden_tab：那两个 CDP 开关每次导航/刷新即失效
         （2026-08-19 实测，见 fix_hidden_tab）。原 pipeline 是在各阶段手动重发，
         这里收进 navigate，少一个漏发的机会。
+
+        【2026-09-03 1688 数据注入时机问题】1688 详情页的 window.context 数据是通过
+        服务端注入的 <script> 标签加载的，但该脚本可能在 domcontentloaded 之后才执行。
+        手动登录后仍报「页面数据未就绪」，排查发现 domcontentloaded 时机太早，数据还没
+        注入完成。故对 1688 域名改用 "load" 事件（等所有资源加载完），给数据注入脚本
+        足够的执行时间。其它域名保持 domcontentloaded（更快）。
         """
         if new_tab:
             ctx = self._browser.contexts[0]
@@ -364,8 +370,11 @@ class BrowserSession:
             self._watch_page(self._page)
             self._cdp = await ctx.new_cdp_session(self._page)
             # 新页签是新的 Page 对象，binding 要重新注册（下面 goto 后统一装）
+
+        # 1688 域名用 load，其它用 domcontentloaded（见上面注释）
+        wait_event = "load" if "1688.com" in url else "domcontentloaded"
         try:
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+            await self.page.goto(url, wait_until=wait_event, timeout=timeout * 1000)
         except Exception as e:
             return {"ok": False, "err": str(e)}
         await self.fix_hidden_tab()

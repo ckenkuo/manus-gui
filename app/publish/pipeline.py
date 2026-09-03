@@ -158,7 +158,15 @@ async def inspect(session: BrowserSession, rowid: str) -> dict:
     用途：搬运写入类子命令前先看清页面此刻长什么样；出问题时对比预期与实际。
     """
     info = await open_edit(session, rowid)
-    await asyncio.sleep(2)  # 等 Vue 把各区块渲染完，否则 form 项读不全
+    # 等 Vue 把表单项渲染出来（原固定 sleep(2)）。
+    # 【判据是表单项数量，不是区块存在】区块 div 几乎立刻挂上，而 _JS_INSPECT 读的是
+    # .ant-form-item —— 只判容器会 0ms 返回、读到半张表（form 项残缺，且完全静默）。
+    await _poll_until(
+        lambda: session.eval_json(
+            "(() => JSON.stringify({n: "
+            "document.querySelectorAll('.ant-form-item').length}))()"),
+        lambda d: d.get("n", 0) >= 10,   # 编辑页表单项远多于 10，够用来判「渲染开始」
+        timeout=2.0)
     data = await session.eval_json(_JS_INSPECT)
     return {"status": "ok", **info, **data}
 
@@ -201,7 +209,18 @@ async def list_images(session: BrowserSession, rowid: str,
     这是服装类发布最常被弹回的一环（见 SKILL.md 的图片硬校验）。
     """
     await open_edit(session, rowid)
-    await asyncio.sleep(2)
+    # 等图片真渲染出来（原固定 sleep(2)）。
+    # 【判据是图片数量，不是区块存在】只判容器会 0ms 返回、读到空图单（静默漏图，
+    # 而本函数的产物直接决定后续合规检查查什么）。判「有 http 图」与 _JS_ALL_IMAGES
+    # 的取图口径一致。
+    await _poll_until(
+        lambda: session.eval_json(r"""(() => {
+            const n = Array.from(document.querySelectorAll('img'))
+              .filter(i => (i.currentSrc || i.src || '').startsWith('http')).length;
+            return JSON.stringify({n});
+        })()"""),
+        lambda d: d.get("n", 0) > 0,
+        timeout=2.0)
     data = await session.eval_json(_JS_ALL_IMAGES)
     groups = {
         "material": len(data.get("material", [])),
@@ -598,7 +617,14 @@ async def _click_cat_path(session: BrowserSession, path: list) -> dict:
         if not cr.get("clicked"):
             return {"ok": False, "clickedLevels": level, "failedLevel": level,
                     "reason": cr.get("reason") or "", "options": cr.get("options") or []}
-        await asyncio.sleep(1.5)   # 等右侧列重建（与慢路径同一实测值）
+        # 等右侧列重建（原固定 sleep(1.5)，上限不变）。判据同慢路径：点第 N 级会
+        # 销毁右侧所有列、只新建下一级，故 n > level+1 即新列已挂上。
+        # 【最后一级不等】它是叶子，本就不会有新列，等满 1.5s 纯属白等——
+        # 这一条让 5 级路径省掉最后那 1.5s。
+        if level < len(path) - 1:
+            await _poll_until(
+                lambda: _cat_columns(session),
+                lambda d, lv=level: (d or {}).get("n", 0) > lv + 1, timeout=1.5)
     return {"ok": True, "clickedLevels": len(path), "failedLevel": None,
             "reason": "", "options": []}
 
@@ -642,9 +668,14 @@ async def _try_cached_category(session: BrowserSession, title: str,
     if not cr.get("confirmed"):
         logger.warning(f"缓存路径确认类目失败（{cr}），落回逐级遍历")
         return None
-    await asyncio.sleep(2)
-    snippet = await read_current_category(session)
+    # 等回显更新（原固定 sleep(2)，上限不变）：确认后 Vue 更新 productBasicInfo 区
+    # 的类目显示，判据就是叶子名出现在回显里
     leaf = path[-1]
+    await _poll_until(
+        lambda: read_current_category(session),
+        lambda snippet: snippet and leaf in snippet,
+        timeout=2.0)
+    snippet = await read_current_category(session)
     if not (snippet and leaf in snippet):
         logger.warning(f"缓存路径回读未见「{leaf}」，落回逐级遍历。实际：{(snippet or '')[:120]}")
         return None
@@ -689,7 +720,40 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
     if clues:
         logger.info(f"类目判断线索：{clues}")
     await open_edit(session, rowid)
-    await asyncio.sleep(2)
+    # 等页面自己的数据加载完（原固定 sleep(2)）。
+    #
+    # 【判据必须是「商家账号已回填」，不是按钮渲染出来】2026-09-03 踩坑取证：
+    # open_edit 只等到 skuDataInfo 出现就返回，而页面随后还在异步回填自身数据
+    # （店铺/站点/类目等）。我先试过两个更弱的判据，都会 0~几十 ms 就返回：
+    #   - 只判 productBasicInfo 存在  → 点击落空，报「选择类目弹窗未就绪」
+    #   - 判「选择分类」按钮可见      → 按钮早就在了，点开弹窗时平台弹
+    #                                  「错误：请选择店铺!」并拒开弹窗
+    # 原 sleep(2) 真正兜住的是这段【数据回填】，不是 DOM 挂载。故判据取商家账号
+    # 那一行有值——它正是平台校验的前置项，有值即说明页面数据到位。
+    # 上限 8s：数据回填比 DOM 慢，2s 只是经验值而非上界；提前满足就立刻返回，
+    # 故放宽上限不会让正常情况变慢。
+    filled = await _poll_until(
+        lambda: session.eval_json(r"""(() => {
+            const sec = document.getElementById('productBasicInfo');
+            if (!sec) return JSON.stringify({ready: false, why: 'no-section'});
+            const row = Array.from(sec.querySelectorAll('.ant-form-item'))
+              .find(el => {
+                const l = el.querySelector('.ant-form-item-label label');
+                const t = l ? (l.getAttribute('title') || l.textContent || '') : '';
+                return t.replace(/[*\s]/g, '').includes('商家账号');
+              });
+            if (!row) return JSON.stringify({ready: false, why: 'no-shop-row'});
+            const sel = row.querySelector('.ant-select-selection-item');
+            const v = sel ? (sel.textContent || '').trim() : '';
+            return JSON.stringify({ready: !!v, value: v.slice(0, 40)});
+        })()"""),
+        lambda d: d.get("ready"),
+        timeout=8.0)
+    if not filled.get("ready"):
+        # 【不抛】这一步只是等待，判不出来就按原样继续——下方打开弹窗本身会报错，
+        # 那条路径的诊断信息（含平台 toast）比在这里抛更有用。
+        logger.warning(f"等商家账号回填超时（{filled.get('why') or filled}），"
+                       "仍继续尝试打开类目弹窗")
     await session.kill_stuck_modals()  # 上一轮残留的遮罩会挡住「选择分类」按钮
 
     r = await session.eval_json(_JS_OPEN_CAT_MODAL)
@@ -742,8 +806,13 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
             step["lookaheadChildren"] = {k: len(v) for k, v in children.items()}
         trace.append(step)
         logger.info(f"类目第{level + 1}级：{name}（{reason}）")
-        await asyncio.sleep(1.5)  # 等右侧列重建
-        after = await _cat_columns(session)
+        # 等右侧列重建：原先固定 sleep(1.5) 再读一次列。收敛信号就是下一次要读的
+        # 那个 n——点第 N 级会销毁右侧所有列、只新建下一级（见本文件类目区块开头的
+        # 联动实测），故「n > level + 1」即新列已挂上。到叶子时不会有新列，
+        # 那种情况等满 1.5s 后 n <= level+1，与改前完全一致（break 到叶子）。
+        after = await _poll_until(
+            lambda: _cat_columns(session),
+            lambda d, lv=level: (d or {}).get("n", 0) > lv + 1, timeout=1.5)
         if after.get("n", 0) <= level + 1:
             break  # 点完没有新列出现 = 到叶子
     else:
@@ -752,10 +821,16 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
     cr = await _confirm_cat(session)
     if not cr.get("confirmed"):
         raise RuntimeError(f"确认类目失败: {cr}")
-    await asyncio.sleep(2)
+    # 等回显更新（原固定 sleep(2)，上限不变）：确认后 Vue 更新 productBasicInfo 区
+    # 的类目显示，判据就是叶子名出现在回显里
+    leaf = path[-1] if path else ""
+    if leaf:
+        await _poll_until(
+            lambda: read_current_category(session),
+            lambda snippet: snippet and leaf in snippet,
+            timeout=2.0)
     snippet = await read_current_category(session)
     # 回读校验：叶子类目名必须出现在基本信息区，否则确认没生效
-    leaf = path[-1] if path else ""
     if leaf and snippet and leaf not in snippet:
         logger.warning(f"类目回读未见「{leaf}」，实际显示：{snippet[:120]}")
     # 走通的路径记进缓存，下一个同类商品就能走快路径。
@@ -936,6 +1011,58 @@ async def _press_escape(session: BrowserSession) -> None:
     )
 
 
+def _js_dropdown_options_rendered(label: str) -> str:
+    """探「该行最近的可见浮层里已渲染出几个选项」。
+
+    给「开下拉之后等什么」用：_open_attr_dropdown 的收敛条件是浮层可见，而浮层可见
+    ≠ 里面的 rc-virtual-list 已挂上 .ant-select-item-option（虚拟列表要一帧才渲染）。
+    原先靠固定 sleep(0.6) 兜这段，现在等这个真实信号（上限仍 0.6s）。
+    「取距本行最近的可见浮层」与坑1/坑2 那套幽灵浮层过滤同一判据
+    （top > -1000 && width > 50），不另立标准。
+    """
+    return r"""(() => {
+      const row = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
+          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
+        || Array.from(document.querySelectorAll('.ant-form-item'))
+          .find(el => { const l = el.querySelector('.ant-form-item-label label');
+            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
+      const rowY = row ? row.getBoundingClientRect().top : 0;
+      const drops = Array.from(document.querySelectorAll('.ant-select-dropdown'))
+        .map(d => ({d, r: d.getBoundingClientRect()}))
+        .filter(x => x.r.top > -1000 && x.r.width > 50);
+      if (!drops.length) return JSON.stringify({n: 0});
+      drops.sort((a, b) => Math.abs(a.r.top - rowY) - Math.abs(b.r.top - rowY));
+      return JSON.stringify({
+        n: drops[0].d.querySelectorAll('.ant-select-item-option').length});
+    })()""".replace("__LABEL__", J(label))
+
+
+async def _poll_until(probe, ok, timeout: float, interval: float = 0.12):
+    """先立即探一次，未成立再按 interval 轮询到 timeout。返回最后一次结果。
+
+    【为什么加这层：把「固定 sleep」换成「条件等待」】属性写入的每一项原先是
+    sleep(0.6) 开下拉 + sleep(0.8) 点选项 + 回读轮询首次也先 sleep(0.5)，
+    合计 1.9s 是【无条件付出】的——而这些值是按最坏情况定的保守量，绝大多数
+    情况下页面早就到位了。2026-09-03 按断点状态统计：命中选项缓存的样本里
+    写 0-4 项中位 48.5s、写 5-9 项中位 179.0s，即每项约 25-30s，固定等待占了
+    可观一块（attrs 阶段本身占全流程 22.5%，是最大头）。
+
+    改成条件等待【不放宽任何判据】：原来的 sleep 时长成为这里的 timeout 上限，
+    最坏情况与改前等价；页面提前就绪时才提前返回。收敛条件由调用方给，
+    与原先 sleep 之后那次检查读的是同一个信号。
+    """
+    data = await probe()
+    if ok(data):
+        return data
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(interval)
+        data = await probe()
+        if ok(data):
+            return data
+    return data
+
+
 async def _visible_dropdown_near(session: BrowserSession, label: str,
                                  max_dist: int = 600) -> dict:
     """检测指定属性行附近是否有可见（未停靠）的下拉浮层。见坑1、坑2。"""
@@ -990,8 +1117,12 @@ async def _open_attr_dropdown(session: BrowserSession, label: str,
         r = await session.eval_json(js_click)
         if not r.get("dispatched"):
             return {"opened": False, **r}
-        await asyncio.sleep(0.5)
-        if (await _visible_dropdown_near(session, label)).get("found"):
+        # 等浮层真出现，而不是固定 sleep(0.5)：收敛信号与原先 sleep 之后那次检查
+        # 完全相同（_visible_dropdown_near），0.5s 成为超时上限（见 _poll_until）
+        seen = await _poll_until(
+            lambda: _visible_dropdown_near(session, label),
+            lambda d: d.get("found"), timeout=0.5)
+        if seen.get("found"):
             return {"opened": True, "attempts": attempt}
     return {"opened": False, "reason": "open-verify-failed"}
 
@@ -1117,7 +1248,20 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
     """
     exp = await _expand_attr_section(session)
     if exp.get("expanded"):
-        await asyncio.sleep(1.2)  # 等折叠区展开动画结束，否则新出现的行还量不到高度
+        # 等折叠区展开动画结束（原固定 sleep(1.2)，上限不变）：判据是属性行数稳定
+        # （展开过程中 Vue 逐步渲染，行数从 0 增长到最终值）。
+        # 选择器用 '#productBasicInfo .ant-form-item' —— 与本文件其它处读属性行的
+        # 口径完全一致，别另造类名。
+        prev_n = -1
+        for _ in range(12):  # 1.2s / 0.1s
+            await asyncio.sleep(0.1)
+            r = await session.eval_json(
+                "(() => JSON.stringify({n: document.querySelectorAll("
+                "'#productBasicInfo .ant-form-item').length}))()")
+            n = r.get("n", 0)
+            if n > 0 and n == prev_n:
+                break  # 连续两次读到相同非零行数 = 渲染完成
+            prev_n = n
     # 属性行是懒渲染：open_edit 只等到 skuDataInfo 出现，跟在后面立刻读经常
     # 读到 0 行（2026-08-21 实测：续跑补开编辑页后 2.5s 就判空失败）。
     # 故这里轮询等到行出来再判，超时返回的最后一次结果交给下方空行分支。
@@ -1182,7 +1326,11 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
             active_read += 1
         else:
             a["optionsEmptyReason"] = "open-failed"
-        await asyncio.sleep(0.3)
+        # 行间隔：0.3s → 0.12s。这里等的是「上一行的下拉收起、不干扰下一行定位」，
+        # 而 _read_active_options 收尾已经关下拉 + 清幽灵；真没清干净时下一行的
+        # _open_attr_dropdown 本就有幂等打开与二次重试兜着。逐行读只在缓存未命中时
+        # 发生（实测每类目 16-18 必填行），这一项省约 3s。
+        await asyncio.sleep(0.12)
     parked = await _park_ghost_dropdowns(session)
     # 现场读到的行写回缓存（按 label 并集合并，见 cache.save_attr_options）
     if use_cache and cat_path and active_read:
@@ -1508,20 +1656,27 @@ async def set_attr(session: BrowserSession, label: str, value: str,
     cur: Optional[dict] = None
     for attempt in (1, 2):
         await _open_attr_dropdown(session, label, sel_idx=row_no - 1)
-        await asyncio.sleep(0.6)
+        # 等浮层里的选项真渲染出来（替代固定 sleep(0.6)，上限同为 0.6s）：
+        # _open_attr_dropdown 的收敛条件只是「浮层可见」，而浮层可见 ≠ 里面的
+        # rc-virtual-list 已挂上 item。见 _poll_until 的说明。
+        await _poll_until(
+            lambda: session.eval_json(_js_dropdown_options_rendered(label)),
+            lambda d: (d or {}).get("n", 0) > 0, timeout=0.6)
         clicked = await _click_dropdown_option(session, label, value)
         if not clicked.get("clicked"):
             # 目标选项可能在虚拟列表可视窗口之外，滚动去找
             clicked = await _scroll_click_option(session, label, value)
-        await asyncio.sleep(0.8)
         if not clicked.get("clicked"):
             await _park_ghost_dropdowns(session)  # 点开未点中也要清，别留浮层
             continue
-        for _ in range(8):  # 回读轮询，等重渲染稳定到目标值
-            cur = await _readback_attr(session, label, row_no)
-            if cur and cur.get("current") == value:
-                break
-            await asyncio.sleep(0.5)
+        # 回读轮询，等重渲染稳定到目标值。
+        # 【先读一次再等】原先点中后先无条件 sleep(0.8)、且每轮都先 sleep(0.5) 再读，
+        # 等于每项白付 0.8s+；点击到 Vue 重渲染往往已完成。总上限不变（约 4s），
+        # 判据（current == value）一字不改。
+        cur = await _poll_until(
+            lambda: _readback_attr(session, label, row_no),
+            lambda d: bool(d) and d.get("current") == value,
+            timeout=4.0, interval=0.5)
         if cur and cur.get("current") == value:
             break
         logger.warning(f"{label} 第{attempt}次设为「{value}」后回读不符，重试")
@@ -1531,7 +1686,9 @@ async def set_attr(session: BrowserSession, label: str, value: str,
 
     result: dict = {"status": "ok", "label": label, "value": value}
     if num is not None:
-        await asyncio.sleep(0.5)
+        # 【不再 sleep(0.5)】上面 select 分支的回读轮询已确认该行稳定到目标值，
+        # 而填数值本身是同步的 setter + dispatchEvent，不需要预热等待；
+        # 填完之后的重渲染由下方最终回读轮询兜住。
         js = r"""(() => {
           const it = Array.from(document.querySelectorAll('#productBasicInfo .ant-form-item'))
             .find(el => {
@@ -1556,16 +1713,23 @@ async def set_attr(session: BrowserSession, label: str, value: str,
             .replace("__IDX__", str(row_no - 1))
         result["num"] = await session.eval_json(js)
 
-    # 最终回读（填数值也可能触发重渲染，再轮询一次）
-    for _ in range(6):
-        cur = await _readback_attr(session, label, row_no)
-        if cur and cur.get("current") == value:
-            break
-        await asyncio.sleep(0.5)
+    # 最终回读（填数值也可能触发重渲染，再轮询一次）。
+    # 【先读一次再等】上面 select 分支的轮询刚确认过 current == value，绝大多数情况
+    # 这里第一次读就命中；原先每轮先读后 sleep 也要在未命中时才付出等待，但 num 分支
+    # 前面那个无条件 sleep(0.5) 是白付的（填数值是同步 dispatchEvent）。
+    # 上限不变（约 3s），判据不改。
+    cur = await _poll_until(
+        lambda: _readback_attr(session, label, row_no),
+        lambda d: bool(d) and d.get("current") == value,
+        timeout=3.0, interval=0.5)
     result["readback"] = cur
     result["status"] = "ok" if cur and cur.get("current") == value else "error"
-    parked = await _park_ghost_dropdowns(session)
-    result["parkedGhosts"] = parked.get("parked", 0)
+    # 幽灵浮层只在真有残留时才清（全文档扫 + 逐个量 rect，不必每项无条件跑）
+    if (await _visible_dropdown_near(session, label)).get("found"):
+        parked = await _park_ghost_dropdowns(session)
+        result["parkedGhosts"] = parked.get("parked", 0)
+    else:
+        result["parkedGhosts"] = 0
     return result
 
 
@@ -1624,27 +1788,35 @@ async def _set_select_by_label(session: BrowserSession, label: str, value: str,
 
     cur = None
     for attempt in (1, 2):
-        # 打开下拉
+        # 打开下拉（内部已条件等待到浮层可见）
         await _open_attr_dropdown(session, label, sel_idx=row_no - 1)
-        await asyncio.sleep(0.6)
+        # 再等浮层里的选项真渲染出来（替代原 sleep(0.6)，上限同为 0.6s）
+        await _poll_until(
+            lambda: session.eval_json(_js_dropdown_options_rendered(label)),
+            lambda d: (d or {}).get("n", 0) > 0, timeout=0.6)
         # 点选项
         c = await _click_dropdown_option(session, label, value)
         if not c.get("clicked"):
             # 目标选项可能在虚拟列表可视窗口之外：滚动该行的下拉找到后再点
             c = await _scroll_click_option(session, label, value)
-        await asyncio.sleep(0.8)
         if not c.get("clicked"):
             await _park_ghost_dropdowns(session)  # 点开未点中也清一次，避免残留浮层
             continue
-        # 回读轮询，等重渲染稳定到目标值
-        for _ in range(8):
-            cur = await session.eval_json(_js_readback())
-            if cur and cur.get("current") == value:
-                break
-            await asyncio.sleep(0.5)
+        # 回读轮询，等重渲染稳定到目标值。
+        # 【先读一次再等】原先每轮都先读后 sleep，但首轮之前还有个 sleep(0.8)，
+        # 等于每项无条件多花 0.8s；点击到 Vue 重渲染常常已完成。
+        # 总时长上限不变（8 × 0.5 = 4s），判据（current == value）一字不改。
+        cur = await _poll_until(
+            lambda: session.eval_json(_js_readback()),
+            lambda d: bool(d) and d.get("current") == value,
+            timeout=4.0, interval=0.5)
         if cur and cur.get("current") == value:
             break  # 成功，退出重试循环
-    await _park_ghost_dropdowns(session)
+    # 【幽灵浮层只在真有残留时才清】_park_ghost_dropdowns 要全文档扫
+    # .ant-select-dropdown 并逐个量 rect，每项都无条件跑一次纯属浪费；
+    # 先探一次「这行附近还有没有可见浮层」，有才清。判据与坑1 那套一致。
+    if (await _visible_dropdown_near(session, label)).get("found"):
+        await _park_ghost_dropdowns(session)
     return {"status": "ok" if (cur and cur.get("current") == value) else "error",
             "label": label, "value": value, "rowNo": row_no, "readback": cur}
 
@@ -2434,7 +2606,7 @@ async def drop_accessory_colors(session: BrowserSession,
             f"配件色「{name}」已反选：变种表 {by_color[name].get('total')} 行里只有 "
             f"{by_color[name].get('filled')} 行有源数据"
             f"（尺码 {by_color[name].get('filledSizes')}），不发它的 SKC/SKU")
-        await asyncio.sleep(1.2)
+        # 原固定 sleep(1.2) 已去掉：下方 2589-2600 行已有变种表稳定等待（行数连续两轮不变）
 
     if not dropped:
         return {"status": "error" if missed else "skipped",
@@ -2556,7 +2728,13 @@ async def fix_sizes(session: BrowserSession, info_path: str,
         # 点击按页面【原始文本】定位（_JS_CLICK_SIZE_CB 是文本匹配，不能传归一值）
         await session.eval_json(_JS_CLICK_SIZE_CB.replace("__T__", J(bad["t"])))
         toggles.append(bad["t"])
-        await asyncio.sleep(1.2)
+        # 等变种表重建（原固定 sleep(1.2)）：轮询等行数变化，上限 1.2s
+        n_before = (await session.eval_json(_JS_SKU_ROW_COUNT)).get("n", 0)
+        for _ in range(12):  # 1.2s / 0.1s
+            await asyncio.sleep(0.1)
+            n_now = (await session.eval_json(_JS_SKU_ROW_COUNT)).get("n", 0)
+            if n_now != n_before:
+                break  # 行数变了 = 重建开始了
 
     # 验证：再读一次，确认全部正确
     states = await session.eval_json(_JS_SIZE_GROUP_STATES)
@@ -4879,7 +5057,11 @@ _ATTR_PROMPT = """你是跨境电商商品属性审核助手。下面是 1688 �
    例如圆领套头毛衣的"细节"却是"露肩"、一体绒商品的"里料纹理"却是"无里料"——
    这类要直接从 options 中选语义最接近的一项改掉。装饰/图案/细节类以图片理解摘要为准，
    在 options 里找包含关键特征的精确选项（如图示蝴蝶结在胸前→"前蝴蝶结"而非"后蝴蝶结"）。
-3. current 已正确或确实拿不准（源信息和图片都无法判断）的才不动，放 notes。
+3. 【保持原值策略】current 已正确或确实拿不准（源信息和图片都无法判断）时：
+   - 如果 current 不是 "(请选择)" 等占位符（即页面已有预填值），输出一条 change，
+     value 设为 current 的值，reason 注明"保持原值"——这样即使后续写入失败重试，
+     也能明确知道要保持这个值，而不是留空。
+   - 如果 current 是 "(请选择)" 且确实拿不准，放 notes 说明情况，不输出 change。
 4. 填写范围：只填【必填项】（required=true），且**必填项必须填全**——
    平台对必填项是硬校验，留空会直接卡在保存、整个商品发不出去。
    current 为 "(请选择)" 的必填项一律要给值；options 里实在没有对应项时，
@@ -4904,6 +5086,12 @@ _ATTR_PROMPT = """你是跨境电商商品属性审核助手。下面是 1688 �
    你给的数值不作准；里衬/里料/辅料/填充类字段不受源主面料含量约束。
    【源没给含量时】不要自己拆成两行去编比例：程序会按「该纤维 100%」单行写入
    （源连主面料成分都没写时按聚酯纤维 100%）。此时主面料字段只需给第 1 行。
+   【按款式区分的成分】若「源主面料成分」给出了 byVariant（不同颜色/款式成分不同），
+   根据表单中已填的颜色/款式，从 byVariant 里匹配对应的成分组。匹配规则：
+   - 先看表单「颜色」字段 current 值是否与 byVariant 某个键部分匹配（如表单填「卡通工装衣」，
+     byVariant 有「卡通卫衣」，两者都含「卡通」就算匹配）；
+   - 匹配不到时用 byVariant 第一组（商家第一个写的往往是主款）；
+   - byVariant 为空或整个字段缺失时按 main_composition 的 fiber/percent 处理。
 6. 里料纹理/里衬类字段有联动必填：选「光面」「绒面/PU」等会动态新增必填行
    （里衬成分、里料克重），填错风险大。源商品没有明确单独里衬时一律选「无里料/无内衬」。
    特别注意：「一体绒」是绒与面料一体成型，不算单独里衬，必须选「无里料/无内衬」。
@@ -4916,7 +5104,7 @@ _ATTR_PROMPT = """你是跨境电商商品属性审核助手。下面是 1688 �
 
 商品标题：{title}
 源商品参数（1688）：{src_attrs}
-源主面料成分（已从源参数解析，百分比以此为准）：{main_composition}
+源主面料成分（已从源参数/详情文字/详情图解析，百分比以此为准）：{main_composition}
 图片理解摘要：{image_understanding}
 表单属性现状：{rows}
 
@@ -5157,6 +5345,7 @@ def _validate_attr_changes(changes: list, attrs: list,
 
     valid: list = []
     rejected: list = []
+    keep_current: list = []  # 明确标记"保持原值"的项
     row_map = {a["label"]: a for a in attrs}
     opt_map = {a["label"]: a.get("options", []) for a in attrs}
     for c in changes:
@@ -5171,6 +5360,12 @@ def _validate_attr_changes(changes: list, attrs: list,
             # dump_attrs 按源键匹配特意读出来的），随那个例外一起撤掉；required_only=
             # False 的探查场景会给所有行都读上 options，用旧写法等于把闸门整个打开。
             rejected.append({**c, "rejectReason": "非必填且当前未填，按策略留空"})
+        # 【保持原值识别】value == current 且 reason 包含"保持"关键词 → 标记为 keep_current
+        # 这类 change 不需要实际写入（页面已经是这个值），但要记录下来，避免被误判为"该改没改"
+        elif (c.get("value") == cur and cur and not cur.startswith("(")
+              and any(kw in str(c.get("reason", "")).lower()
+                     for kw in ["保持", "keep", "不动", "不改", "原值"])):
+            keep_current.append({**c, "reason": c.get("reason", "") + "（已验证匹配）"})
         elif row.get("kind") == "number":
             # 【数值行不查 options】里料克重这类纯输入行 options 恒为空，走 options 闸
             # 会把每个值都拒掉，该行永远填不上、保存卡在「请输入产品属性」
@@ -5275,7 +5470,7 @@ def _validate_attr_changes(changes: list, attrs: list,
 
     # 同字段多行按 row 升序：先覆盖第 1 行再加新行，否则加行时行号对不上
     valid.sort(key=lambda c: (c["label"], c.get("row") or 1))
-    return valid, rejected
+    return valid, rejected, keep_current
 
 
 # 单行重选的窄提示词：只给一行的信息，用重读到的真实 options 重新选一个值。
@@ -5476,8 +5671,10 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
         if (r.get("status") == "error"
                 and row_map.get(c["label"], {}).get("optionsFrom") == "cache"):
             if c.get("num") is not None:
-                # 成分组不做单行重试（理由见 _refresh_row_and_retry 的 docstring）
-                comp_failed.append(c["label"])
+                # 成分字段写入失败：记录到待重试列表，在本轮所有项写完后整组重试
+                # （不能立即重试，因为同一成分字段的其他行可能还没写，整组状态不完整）
+                if c["label"] not in comp_failed:
+                    comp_failed.append(c["label"])
             else:
                 fix = await _refresh_row_and_retry(
                     session, c, row_map[c["label"]], cat_path,
@@ -5491,8 +5688,12 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
                     rec["value"] = fix.get("value")
                     rec["readback"] = fix.get("readback")
         applied.append(rec)
-        # 项间留 1s：动态增删行重渲染期间立刻动下一项容易点击落空
-        await asyncio.sleep(1.0)
+        # 项间等待：原先无条件 1s。它防的是「动态增删行重渲染期间立刻动下一项会点击
+        # 落空」——而增删行只发生在成分类字段（走 _ensure_comp_rows 加行，即带 num 的
+        # 那些项）。普通下拉行不改变行集，不需要这段等待，且下一项的
+        # _open_attr_dropdown 本身就是幂等打开 + 二次重试。故按项分流：
+        # 成分项保留 1s，普通项 0.15s。实测每单写 6-13 项，多数是普通项。
+        await asyncio.sleep(1.0 if c.get("num") is not None else 0.15)
 
     # ---- 成分类字段收尾：把多余的旧行裁掉 ----------------------------------
     # 【为什么必须有这一步】写入只覆盖前 N 行，而页面初始行数由认领时搬来的源数据
@@ -5501,16 +5702,19 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
     # 判重报「XX成分不能重复选择」，保存整单卡死（2026-08-30 实测复现，取证见
     # _trim_comp_rows 的 docstring）。
     #
-    # 目标行数取本轮该字段 change 的最大 row：那就是重建结果的行数
-    # （_rebuild_main_comp / 合计补差都按 row 从 1 连续编号）。
-    # 【只裁本轮真写过的成分字段】没进 changes 的字段保持原样——它的行数是平台或
-    # 人工给的，本函数没有依据去动（「只聚焦当前修改」的一贯取向）。
+    # 【2026-09-03 修正】目标行数必须只计算写入成功（result == "ok"）的成分行，而不是
+    # changes 里的所有成分行：如果某个成分字段的所有行都写失败（options 过期等原因），
+    # 页面实际还是旧值（比如 3 行），但按失败的 change 算出 keep=2 去裁，会错误裁掉
+    # 实际有效的旧行，反而可能制造重复（旧行部分残留 + 下次续跑写入新值 = 新旧混杂）。
+    # 只有写入成功的字段才能确定「页面现在就是我们要的 N 行」，才能安全裁到 N 行。
+    # 写入失败的字段保持原样不裁，交 comp_failed 报人工——这才是真正的 best-effort。
     comp_rows: dict = {}
-    for c in changes:
-        if c.get("kind") == "number" or c.get("num") is None:
-            continue
-        label = c["label"]
-        comp_rows[label] = max(comp_rows.get(label, 1), int(c.get("row") or 1))
+    for a in applied:
+        # 只统计写入成功的成分行
+        if (a.get("result") == "ok" and a.get("num") is not None
+                and a.get("kind") != "number"):
+            label = a["label"]
+            comp_rows[label] = max(comp_rows.get(label, 1), int(a.get("row") or 1))
     for label, keep in comp_rows.items():
         # best-effort：裁不动只记日志，绝不影响已写好的值（辅助路径的一贯取向）
         try:
@@ -5523,6 +5727,74 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
         elif t.get("trimmed"):
             logger.info(f"{label} 裁掉 {t['trimmed']} 个多余成分行"
                         f"（{t['before']} → {t['after']} 行，避免平台判「重复选择」）")
+
+    # ---- 成分字段整组重试：options 过期导致写入失败的成分字段 ---------------
+    # 【为什么要整组重试】成分是一组（合计必须100%），单行重试会破坏总和；且第2、3行
+    # 的下拉选项技术上读不到（_read_active_options 不传 sel_idx 默认读第1行）。
+    # 正解是重读第1行选项（所有成分行共用同一份纤维列表）→ 用新选项重新校验整组 →
+    # 整组重写。只有缓存过期才值得重试（现场刚读的立刻失败，重读也是同一份）。
+    if comp_failed and use_cache and cat_path:
+        comp_retry_ok = []
+        for label in list(set(comp_failed)):  # 去重：同一字段多行都失败时只记录一次
+            try:
+                # 重读第1行的选项（成分字段所有行共用同一份纤维列表）
+                opts, meta = await _read_active_options(session, label, with_meta=True)
+                if not opts:
+                    logger.warning(f"{label} 整组重试：重读选项为空，跳过")
+                    continue
+                # 回灌缓存（与 _refresh_row_and_retry 同理，不管能否救回都要换掉过期数据）
+                if meta["complete"]:
+                    cache.update_attr_row(cat_path[-1], cat_path, label, opts, site)
+                # 从 changes 里提取该字段的所有行，用新选项重新校验
+                comp_changes = [c for c in changes if c["label"] == label]
+                if not comp_changes:
+                    continue
+                # 重新校验：只校验这一组，复用 _validate_attr_changes 的成分校验逻辑
+                # 构造最小 attrs 和 opt_map 给校验函数
+                mini_attrs = [{"label": label, "options": opts,
+                              "hasPercent": row_map.get(label, {}).get("hasPercent")}]
+                mini_opt_map = {label: opts}
+                validated, rejected_retry = [], []
+                for c in comp_changes:
+                    if c.get("value") in opts:
+                        validated.append(c)
+                    else:
+                        rejected_retry.append(c)
+                # 如果有行的值不在新选项里，整组放弃（需要重新问 LLM，不在本函数范围）
+                if rejected_retry:
+                    logger.warning(f"{label} 整组重试：{len(rejected_retry)} 行值不在新选项内，放弃")
+                    continue
+                # 重新校验合计100%（复用核心逻辑）
+                total = sum(c.get("num") or 0 for c in validated)
+                if total != 100:
+                    logger.warning(f"{label} 整组重试：合计 {total}% ≠ 100%，放弃")
+                    continue
+                # 整组重写
+                logger.info(f"{label} 整组重试：选项已更新（{len(opts)} 项），重写 {len(validated)} 行")
+                retry_ok = True
+                for c in validated:
+                    kind = c.get("kind") or "select"
+                    r = await set_attr(session, label, c["value"],
+                                      c.get("num"), c.get("row") or 1, kind=kind)
+                    if r.get("status") != "ok":
+                        retry_ok = False
+                        logger.warning(f"{label} 行{c.get('row')} 重写仍失败：{r.get('reason')}")
+                        break
+                    await asyncio.sleep(1.0)  # 成分行间等待
+                if retry_ok:
+                    comp_retry_ok.append(label)
+                    logger.info(f"{label} 整组重试成功，从 comp_failed 移除")
+                    # 更新 applied 里的记录为成功
+                    for a in applied:
+                        if a["label"] == label:
+                            a["result"] = "ok"
+                            a["retried"] = True
+            except Exception as e:
+                logger.warning(f"{label} 整组重试异常（忽略）：{e}")
+        # 从 comp_failed 移除重试成功的
+        comp_failed = [lbl for lbl in comp_failed if lbl not in comp_retry_ok]
+        if comp_retry_ok:
+            cache_refreshed.extend(comp_retry_ok)
 
     return applied, cache_refreshed, comp_failed
 
@@ -5541,19 +5813,25 @@ _LINKAGE_MAX_ROUNDS = 3
 
 
 async def _scan_linkage_rows(session: BrowserSession, seen: set) -> list:
-    """重扫表单，挑出 seen 之外的必填空行（即刚联动出来的那些）。
+    """重扫表单，挑出 seen 之外的必填行（即刚联动出来的那些）。
 
     【差集要对累积的 seen 取而不是只对上一轮】第二层联动行是第 N 轮写入才冒出来的，
     只跟上一轮比会把早先见过的行反复挑出来重填（写失败的行更是每轮都中），既浪费
     LLM 调用又可能把已填对的值改掉。
+
+    【2026-09-03 改动】原逻辑只扫 current 以"("开头的空行，忽略了有预填值的联动行。
+    但联动行可能有平台默认值（如"里衬成分"默认某个常见纤维），如果这个默认值不合适，
+    就会一直错下去。新逻辑扫【所有】新出现的必填行（无论有无预填值），交给 LLM 审核：
+    - 预填值合适 → LLM 输出"保持原值"（走 keep_current 路径，不实际写入）
+    - 预填值不合适 → LLM 给出正确值并写入
+    - LLM 拿不准且无预填值（"(请选择)"）→ 放 notes，到末尾复扫报人工
     """
     # 联动行在写入后才渲染出来，且重渲染要时间，故等一下再读
     await asyncio.sleep(1.5)
     rows = await session.eval_json(_JS_LIST_ATTR_ROWS)
     return [a for a in rows.get("attrs", [])
             if a["label"] not in seen and a["label"] != "产品属性"
-            and a.get("required") and a.get("visible") is not False
-            and str(a.get("current") or "").startswith("(")]
+            and a.get("required") and a.get("visible") is not False]
 
 
 async def _read_linkage_options(session: BrowserSession, new_rows: list, cat_path,
@@ -5615,12 +5893,15 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
     except Exception as e:
         logger.warning(f"联动行补填问 LLM 失败（忽略，交末尾复扫报人工）：{e}")
         return [], []
-    valid, rejected = _validate_attr_changes(
+    valid, rejected, keep_current = _validate_attr_changes(
         decision.get("changes", []), new_rows, main_comp)
     if rejected:
         logger.warning(f"联动行补填驳回 {len(rejected)} 项："
                        + "、".join(f"{r.get('label')}({r.get('rejectReason')})"
                                    for r in rejected))
+    if keep_current:
+        logger.info(f"联动行补填保持原值 {len(keep_current)} 项："
+                    + "、".join(k.get("label") for k in keep_current))
     if not valid:
         return [], []
     applied, _refreshed, comp_failed = await _apply_attr_changes(
@@ -5681,6 +5962,95 @@ async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dic
             "compFailed": all_comp_failed}
 
 
+def _merge_composition_sources(info: dict) -> dict:
+    """整合所有来源的成分信息，按优先级返回最佳数据源。
+
+    【2026-09-02 新增】成分信息现在有四个可能来源，优先级从高到低：
+      1. compositionFromText（详情文字，商家白纸黑字写的，最可靠）
+      2. compositionFromVision（详情图 OCR，有一定误差但比源属性完整）
+      3. mainComposition（源属性「主面料成分含量」，单一值，可能不完整）
+      4. 默认值（聚酯纤维 100%，兜底）
+
+    返回结构与 mainComposition 一致（供 _ask_attr_review 使用）：
+      {"fiber": 纤维名, "percent": 百分比, "raw": 原文,
+       "byVariant": {款式名: {纤维: 百分比}},  // 可选，按款式区分时才有
+       "source": 数据来源标记,
+       "srcAttrs": 源属性字典}
+
+    【按款式区分的成分】只有 compositionFromText / compositionFromVision 可能给出
+    byVariant（详情里商家写了「卡通款 35棉65涤 / 花边款 82棉18涤」这种），
+    mainComposition 永远是单一值。阶段④写成分时，LLM 会根据表单已填的颜色/款式
+    从 byVariant 里匹配对应的成分组。
+    """
+    # 优先级1：详情文字
+    text_comp = info.get("compositionFromText")
+    if isinstance(text_comp, dict):
+        main = text_comp.get("main") or {}
+        # 转成 mainComposition 的结构（fiber/percent），取 main 里的首个纤维
+        fibers = list(main.items())
+        if fibers:
+            fiber, pct = fibers[0]
+            result = {"fiber": fiber, "percent": pct,
+                      "raw": f"详情文字：{fiber} {pct}%",
+                      "source": "descText",
+                      "srcAttrs": info.get("attributes") or {}}
+            # byVariant 原样透传（阶段④ LLM 会用）
+            if text_comp.get("byVariant"):
+                result["byVariant"] = text_comp["byVariant"]
+            return result
+        # main 为空但有 byVariant 时，仍需返回（让 LLM 从 byVariant 里匹配）
+        if text_comp.get("byVariant"):
+            # 取 byVariant 第一个款式的首个纤维作为默认值
+            first_variant = next(iter(text_comp["byVariant"].values()), {})
+            fibers_var = list(first_variant.items())
+            if fibers_var:
+                fiber, pct = fibers_var[0]
+                result = {"fiber": fiber, "percent": pct,
+                          "raw": f"详情文字（按款式）：{fiber} {pct}%",
+                          "source": "descText",
+                          "srcAttrs": info.get("attributes") or {},
+                          "byVariant": text_comp["byVariant"]}
+                return result
+
+    # 优先级2：详情图识别
+    vision_comp = info.get("compositionFromVision")
+    if isinstance(vision_comp, dict):
+        main = vision_comp.get("main") or {}
+        fibers = list(main.items())
+        if fibers:
+            fiber, pct = fibers[0]
+            result = {"fiber": fiber, "percent": pct,
+                      "raw": f"详情图识别：{fiber} {pct}%",
+                      "source": "vision",
+                      "srcAttrs": info.get("attributes") or {}}
+            if vision_comp.get("byVariant"):
+                result["byVariant"] = vision_comp["byVariant"]
+            return result
+        # main 为空但有 byVariant 时，仍需返回（让 LLM 从 byVariant 里匹配）
+        if vision_comp.get("byVariant"):
+            # 取 byVariant 第一个款式的首个纤维作为默认值
+            first_variant = next(iter(vision_comp["byVariant"].values()), {})
+            fibers_var = list(first_variant.items())
+            if fibers_var:
+                fiber, pct = fibers_var[0]
+                result = {"fiber": fiber, "percent": pct,
+                          "raw": f"详情图识别（按款式）：{fiber} {pct}%",
+                          "source": "vision",
+                          "srcAttrs": info.get("attributes") or {},
+                          "byVariant": vision_comp["byVariant"]}
+                return result
+
+    # 优先级3：源属性（原有逻辑）
+    main_comp = info.get("mainComposition")
+    if main_comp and main_comp.get("fiber"):
+        return {**main_comp, "srcAttrs": info.get("attributes") or {}}
+
+    # 优先级4：兜底（原有逻辑，按默认纤维处理）
+    from app.publish.extract import parse_main_composition
+    main_comp = parse_main_composition(info.get("attributes") or {})
+    return {**main_comp, "srcAttrs": info.get("attributes") or {}}
+
+
 async def check_attrs(session: BrowserSession, info_path: str,
                       apply: bool = False, required_only: bool = True,
                       cat_path=None, use_cache: bool = True,
@@ -5724,29 +6094,29 @@ async def check_attrs(session: BrowserSession, info_path: str,
              "numValues": a.get("numValues"), "options": a.get("options", [])}
             for a in attrs]
 
-    # 旧的 product-info.json 没有 mainComposition 字段，这里就地补算一次：
-    # 阶段①与阶段④可能隔着几天跑，不该因为文件是旧版就丢掉源含量这个确定事实。
-    # 【必须用 falsy 判断而不是 is None】2026-08-25 前解析不出含量时落盘的是 {}，
-    # 只判 None 会让这批旧文件带着空字典走下去，新的「没写就按纤维 100%」默认规则
-    # 对它们完全不生效——又是一次「接线没接上」的静默失效。
-    main_comp = info.get("mainComposition")
-    if not main_comp:
-        from app.publish.extract import parse_main_composition
-        main_comp = parse_main_composition(info.get("attributes") or {})
-    # 把源属性挂进去供 _infer_filler 推断配料纤维：它读 main_comp["srcAttrs"]，
-    # 而 parse_main_composition 只产出 fiber/percent/raw。不挂上去推断恒拿到 {}、
-    # 静默退回写死候选表（等于没接），与 dimsCm 那个死键是同一类失效。
-    main_comp = {**main_comp, "srcAttrs": info.get("attributes") or {}}
+    # 【2026-09-02 改】整合所有来源的成分信息（详情文字 > 详情图 > 源属性 > 默认值）
+    main_comp = _merge_composition_sources(info)
+    comp_src = main_comp.get("source", "attributes")
+    if comp_src == "descText":
+        logger.info(f"成分取自详情文字：{main_comp.get('fiber')} {main_comp.get('percent')}%"
+                    + (f"，另有 {len(main_comp.get('byVariant', {}))} 款式分组"
+                       if main_comp.get('byVariant') else ""))
+    elif comp_src == "vision":
+        logger.info(f"成分取自详情图识别：{main_comp.get('fiber')} {main_comp.get('percent')}%"
+                    + (f"，另有 {len(main_comp.get('byVariant', {}))} 款式分组"
+                       if main_comp.get('byVariant') else ""))
 
     decision = await _ask_attr_review(rows, info, main_comp)
-    valid, rejected = _validate_attr_changes(
+    valid, rejected, keep_current = _validate_attr_changes(
         decision.get("changes", []), attrs, main_comp)
     logger.info(
         f"LLM 审核完成：建议改 {len(valid)} 项"
+        + (f"，保持原值 {len(keep_current)} 项" if keep_current else "")
         + (f"，驳回 {len(rejected)} 项" if rejected else "")
         + ("，开始逐项写入…" if apply and valid else ""))
     result = {"status": "ok", "attrCount": len(rows), "proposed": valid,
-              "rejected": rejected, "notes": decision.get("notes", []),
+              "rejected": rejected, "keepCurrent": keep_current,
+              "notes": decision.get("notes", []),
               "cacheRead": dump.get("cacheRead") or 0,
               "activeRead": dump.get("activeRead") or 0,
               "mainComposition": main_comp or None}
@@ -7979,7 +8349,7 @@ async def skc_replace_row(session: BrowserSession, row_keyword: str, img_dir: st
         d = await session.eval_json(_JS_SKC_DEL_FIRST.replace("__KEY__", J(row_keyword)))
         if not d.get("deleted"):
             return {"status": "error", "stage": stage, "detail": d, **ctx}
-        await asyncio.sleep(0.4)
+        # 原固定 sleep(0.4) 已去掉：_JS_SKC_DEL_FIRST 内部已轮询等待删除完成（上限 6s）
         return None
 
     attached: list = []

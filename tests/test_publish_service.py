@@ -291,7 +291,7 @@ async def test_pick_material_无标注走视觉且坏文件名兜底(tmp_path, m
     _write_main(tmp_path, "main-01.jpg")
     _write_main(tmp_path, "main-02.jpg")
 
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"image": "main-99.jpg", "reason": "不存在的文件", "uncertain": False}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
 
@@ -311,7 +311,7 @@ async def test_plan_skc_分色与漏色进uncertain(tmp_path, monkeypatch):
     for n in ("main-01.jpg", "main-02.jpg", "main-03.jpg"):
         _write_main(tmp_path, n)
 
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"rows": [
             {"color": "灰色", "images": ["main-02.jpg", "main-01.jpg", "ghost.jpg"],
              "uncertain": False},
@@ -336,7 +336,7 @@ async def test_plan_skc_无颜色直接空计划(tmp_path):
 
 @pytest.mark.asyncio
 async def test_plan_desc_动作分桶且漏判保留(monkeypatch):
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"actions": [
             {"pos": 1, "action": "delete", "reason": "工厂图"},
             {"pos": 2, "action": "replace", "reason": "中文"},
@@ -363,7 +363,7 @@ async def test_plan_desc_空模块直接空计划():
 
 @pytest.mark.asyncio
 async def test_check_cleaned_透传质检结论(monkeypatch):
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"clean": False, "issues": "残留拼音"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
@@ -376,13 +376,36 @@ def _notes(*entries) -> dict:
     return {"complianceNotes": {"files": list(entries)}}
 
 
-def test_plan_clean_有干净图就一次调用都不发(tmp_path):
-    for n in ("main-01.jpg", "main-02.jpg"):
+def test_plan_clean_干净图够下限就一次调用都不发(tmp_path):
+    """省钱口径不变，只是「够」的判据从 1 张改成 ⑦ 的行下限（见 plan_clean 说明）。"""
+    for n in ("main-01.jpg", "main-02.jpg", "main-03.jpg", "main-04.jpg"):
         _write_main(tmp_path, n)
     info = _notes({"file": "main-01.jpg", "clean": False, "watermark": True},
-                  {"file": "main-02.jpg", "clean": True})
-    r = vision.plan_clean(info, str(tmp_path))
-    assert r["items"] == [] and "已有干净图" in r["reason"]
+                  {"file": "main-02.jpg", "clean": True},
+                  {"file": "main-03.jpg", "clean": True},
+                  {"file": "main-04.jpg", "clean": True})
+    r = vision.plan_clean(info, str(tmp_path), min_clean=3)
+    assert r["items"] == [] and "无需清理" in r["reason"]
+
+
+def test_plan_clean_干净图不足下限时只清缺口(tmp_path):
+    """1 张干净 + 4 张脏、下限 3 → 只清 2 张（缺口），剩下两张脏图留着不清。
+
+    原口径是「有任意一张干净图就整段跳过」，那是照阶段⑥「素材图只取一张」写的；
+    ⑦ SKC 每个颜色行要 3 张，于是剩下的脏图被原样挂到颜色行上发出去。
+    """
+    for i in range(1, 6):
+        _write_main(tmp_path, f"main-{i:02d}.jpg")
+    info = _notes({"file": "main-01.jpg", "clean": True},
+                  {"file": "main-02.jpg", "clean": False, "chinese": True},
+                  {"file": "main-03.jpg", "clean": False, "watermark": True},
+                  {"file": "main-04.jpg", "clean": False, "logo": True},
+                  {"file": "main-05.jpg", "clean": False, "chinese": True})
+    r = vision.plan_clean(info, str(tmp_path), min_clean=3)
+    # 只清 2 张，且按 _dirty_score 从轻到重取（logo < 水印 < 中文）：
+    # 带中文的最难修成功（要英化重排版、还会因残留拼音过不了质检），排最后
+    assert [i["file"] for i in r["items"]] == ["main-04.jpg", "main-03.jpg"]
+    assert "只清缺口 2 张" in r["reason"]
 
 
 def test_plan_clean_跳过重复图与尺码表(tmp_path):
@@ -958,7 +981,7 @@ async def test_货号是中文时单独重跑货号阶段(tmp_path, monkeypatch)
 @pytest.mark.asyncio
 async def test_plan_desc_干净小图改判放大(monkeypatch):
     """模型判 keep 的干净图，尺寸不达标也必须换掉——内容与尺寸是两条正交判据。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"actions": [{"pos": 1, "action": "keep", "reason": "干净"},
                             {"pos": 2, "action": "keep", "reason": "干净"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
@@ -985,7 +1008,7 @@ async def test_plan_desc_干净小图改判放大(monkeypatch):
 @pytest.mark.asyncio
 async def test_plan_desc_已判删的小图不改判(monkeypatch):
     """要删的图不必管尺寸，改判成替换等于把该删的图留下来了。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"actions": [{"pos": 1, "action": "delete", "reason": "工厂图"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
@@ -1001,7 +1024,7 @@ async def test_plan_desc_已判删的小图不改判(monkeypatch):
 @pytest.mark.asyncio
 async def test_plan_desc_脏图不叠加放大标记(monkeypatch):
     """已判 replace 的图本来就要重新出图，出图收尾的 compress 会把尺寸拉够。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"actions": [{"pos": 1, "action": "replace", "reason": "中文"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见
@@ -1017,7 +1040,7 @@ async def test_plan_desc_脏图不叠加放大标记(monkeypatch):
 @pytest.mark.asyncio
 async def test_plan_desc_读不到尺寸时不误判(monkeypatch):
     """naturalWidth 为 0（图还没加载完）时 desc_map 不给 tooSmall，这里不能瞎猜。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"actions": [{"pos": 1, "action": "keep", "reason": "干净"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     # plan_desc 自己会把 URL 解析成 data URL（位次要与传图一一对应，见

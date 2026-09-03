@@ -360,7 +360,7 @@ async def test_包装估算预热不满足所需字段时重算(tmp_path, monkey
 
     asked = []
 
-    async def fake_ask(prompt, what="判断", retries=3, stage=None):
+    async def fake_ask(prompt, what="判断", retries=3, stage=None, **kw):
         asked.append(what)
         return {"长": 30, "宽": 25, "高": 3, "重量": 420}
 

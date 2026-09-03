@@ -302,6 +302,12 @@ def test_1688空维段不产出空颜色或空尺码():
     assert alibaba1688.norm_spec(">M") == "M>均码"
 
 
+def test_1688抽取脚本使用有效的context回退表达式():
+    """window.context 缺失时也要返回 found=false，而不是脚本语法错误。"""
+    assert "window.context||{})" in E._JS_EXTRACT
+    assert "window.context||)" not in E._JS_EXTRACT
+
+
 # ---- 价格取向 ---------------------------------------------------------------
 
 def test_拼多多取拼团价而非划线价():

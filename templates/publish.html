@@ -234,12 +234,28 @@
             </button>
           </span>
         </div>
-        <div id="scanCollapse" class="collapse show">
+        <div id="scanCollapse" class="collapse">
           <div class="card-body py-2">
             <div id="scanEmpty" class="text-muted small">
               尚未扫描。打开顶部「定时扫描采集箱」开关，或点右上角「立即扫描」。
             </div>
             <div id="scanBody" class="d-none">
+              <!-- 筛选条：店铺/站点/来源平台 -->
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <span class="text-muted small">筛选：</span>
+                <select id="selScanFilterStore" class="form-select form-select-sm" style="width: auto">
+                  <option value="">全部店铺</option>
+                </select>
+                <select id="selScanFilterSite" class="form-select form-select-sm" style="width: auto">
+                  <option value="">全部站点</option>
+                </select>
+                <select id="selScanFilterPlatform" class="form-select form-select-sm" style="width: auto">
+                  <option value="">全部来源</option>
+                </select>
+                <button id="btnScanClearFilter" class="btn btn-outline-secondary btn-sm">
+                  <i class="bi bi-x-circle"></i> 清除筛选
+                </button>
+              </div>
               <!-- 批量操作条：全选/反选 + 已选计数 + 填入任务框。
                    全选只勾【当前显示的行】（受「只看未编辑」过滤），不会把隐藏的已编辑行
                    一起勾上——那正是这个筛选存在的意义。 -->
@@ -375,12 +391,26 @@
             </button>
           </span>
         </div>
-        <div id="crawlCollapse" class="collapse show">
+        <div id="crawlCollapse" class="collapse">
           <div class="card-body py-2">
             <div id="crawlEmpty" class="text-muted small">
               尚未扫描。打开顶部「定时扫描未认领」开关，或点右上角「立即扫描」。
             </div>
             <div id="crawlBody" class="d-none">
+              <!-- 筛选条：来源平台/价格区间 -->
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <span class="text-muted small">筛选：</span>
+                <select id="selCrawlFilterPlatform" class="form-select form-select-sm" style="width: auto">
+                  <option value="">全部来源</option>
+                </select>
+                <input id="inputCrawlMinPrice" type="number" step="0.01" class="form-control form-control-sm"
+                  style="width: 90px" placeholder="最低价$" title="最低价（美元）">
+                <input id="inputCrawlMaxPrice" type="number" step="0.01" class="form-control form-control-sm"
+                  style="width: 90px" placeholder="最高价$" title="最高价（美元）">
+                <button id="btnCrawlClearFilter" class="btn btn-outline-secondary btn-sm">
+                  <i class="bi bi-x-circle"></i> 清除筛选
+                </button>
+              </div>
               <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
                 <div class="form-check form-check-inline small mb-0">
                   <input class="form-check-input" type="checkbox" id="chkCrawlAll" />
@@ -447,15 +477,18 @@
             <span id="banjiaSummary" class="text-muted ms-2"></span>
           </span>
           <span class="d-flex align-items-center gap-2">
-            <!-- 隐藏已搬到目标店的行：默认开。判据是行的 claimedShops（已搬到哪些店铺 id），
-                 按下方选定的店铺比对——同一条商品可以搬到多个店铺，已搬到 A 店的行
-                 对 B 店来说仍是可搬的，故不能只看「未认领」标签。 -->
+            <!-- 隐藏已搬到目标店的行：**默认关**（2026-09-03 从默认开改过来）。
+                 判据是行的 claimedShops（已搬到哪些店铺 id），按下方选定的店铺比对。
+                 【为什么默认关】claimedShops 只到店铺粒度，接口不给站点，而「同一个店铺、
+                 搬到不同站点」是常规操作。默认开会把「已搬本店美国站、现在要搬哥伦比亚站」
+                 的行静默藏掉——用户发布完商品后在清单里找不到它们就是这么来的。
+                 想过滤同店同站的重复行时再手动打开。 -->
             <div class="form-check form-check-inline form-switch small mb-0 me-0">
               <input class="form-check-input" type="checkbox" id="chkHideClaimed" />
               <label
                 class="form-check-label text-muted"
                 for="chkHideClaimed"
-                title="隐藏已经搬到【下方选定店铺】的行（判据是该行的已搬店铺列表）。同一条商品可搬到多个店铺，故这个过滤跟着店铺选择变"
+                title="隐藏已经搬到【下方选定店铺】的行（判据是该行的已搬店铺列表，跟着店铺选择变）。默认关：平台只给到店铺粒度、不给站点，而同店换站点是合法的再搬，开着会把这类行一并藏掉"
                 >隐藏已搬本店</label
               >
             </div>
@@ -490,12 +523,29 @@
             </button>
           </span>
         </div>
-        <div id="banjiaCollapse" class="collapse show">
+        <div id="banjiaCollapse" class="collapse">
           <div class="card-body py-2">
             <div id="banjiaEmpty" class="text-muted small">
               尚未扫描。打开顶部「定时扫描数据搬家」开关，或点右上角「立即扫描」。
             </div>
             <div id="banjiaBody" class="d-none">
+              <!-- 筛选条：来源平台/源站点/价格区间 -->
+              <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
+                <span class="text-muted small">筛选：</span>
+                <select id="selBanjiaFilterPlatform" class="form-select form-select-sm" style="width: auto">
+                  <option value="">全部来源</option>
+                </select>
+                <select id="selBanjiaFilterSite" class="form-select form-select-sm" style="width: auto">
+                  <option value="">全部源站点</option>
+                </select>
+                <input id="inputBanjiaMinPrice" type="number" step="0.01" class="form-control form-control-sm"
+                  style="width: 90px" placeholder="最低价$" title="最低价（美元）">
+                <input id="inputBanjiaMaxPrice" type="number" step="0.01" class="form-control form-control-sm"
+                  style="width: 90px" placeholder="最高价$" title="最高价（美元）">
+                <button id="btnBanjiaClearFilter" class="btn btn-outline-secondary btn-sm">
+                  <i class="bi bi-x-circle"></i> 清除筛选
+                </button>
+              </div>
               <div class="d-flex flex-wrap align-items-center gap-2 mb-2">
                 <div class="form-check form-check-inline small mb-0">
                   <input class="form-check-input" type="checkbox" id="chkBanjiaAll" />
@@ -763,7 +813,7 @@
             </button>
           </span>
         </div>
-        <div id="cacheCollapse" class="collapse show">
+        <div id="cacheCollapse" class="collapse">
           <div class="card-body py-2">
             <div id="cacheEmpty" class="text-muted small">缓存为空，首次跑会边跑边攒。</div>
             <div id="cacheBody" class="small d-none">
@@ -1255,21 +1305,11 @@
         localStorage.setItem(LS_SITE, $("selSite").value);
         // 【换站点要重渲染数据搬家表】站点不影响「能不能勾」（跨站搬是常规用途），
         // 但影响站点列上那个「源站 → 目标站」的标注，故要重画。
-        // 已勾的行只在「已搬到本店」这一种情形下失效（换店铺才会触发），这里一并复查。
-        if (typeof banjiaItems !== "undefined" && banjiaChecked.size) {
-          const dropped = [...banjiaChecked].filter((r) => {
-            const it = banjiaItems.find((x) => x.rowid === r);
-            return !it || claimedToCurrentShop(it);
-          });
-          dropped.forEach((r) => banjiaChecked.delete(r));
-          if (dropped.length)
-            showToast(
-              "勾选已调整",
-              `有 ${dropped.length} 条勾选不再适用（已搬到当前店铺），已取消勾选` +
-                (banjiaChecked.size ? `；仍有 ${banjiaChecked.size} 条待认领` : ""),
-              "warning"
-            );
-        }
+        // 【换站点不再复查「已搬本店」】2026-09-03 去掉：原先这里会把已搬到本店的行
+        // 从勾选里剔掉，可换站点恰恰是那批行**最该被勾**的时候——同店换站点是合法的
+        // 再认领，claimedShops 分不到站点粒度（见 claimedToCurrentShop）。
+        // 留着它等于「一换站点就把刚勾的行全清掉并弹个说不通的提示」。
+        // 剔除失效勾选只在换店铺时做（那时清单会重画），不在换站点时做。
         if (typeof renderBanjiaRows === "function") renderBanjiaRows();
       });
       $("lnkReloadStores").addEventListener("click", (e) => {
@@ -1295,6 +1335,8 @@
       // 参数」，属于前端选择）。
       let scanItems = [];
       const scanChecked = new Set(); // 勾选的 rowid：重渲染后要保住勾选
+      // 筛选条件
+      const scanFilters = { store: "", site: "", platform: "" };
 
       // 编辑进度四档的呈现。stage 由后端按 edit.json 的 6 个标记算出，
       // 语义与依据见 app/publish/collectbox.py 的 _edit_progress。
@@ -1331,9 +1373,23 @@
       // 当前显示的行（受「只看未编辑」过滤）。全选/反选/填入都只作用于这批，
       // 否则「只看未编辑」这个筛选就形同虚设。
       function visibleScanItems() {
-        if (!$("chkOnlyUnedited").checked) return scanItems;
-        // 未知也留着：它可能是没编辑的，藏掉等于让用户永远看不到（后端刻意不猜，理由同上）
-        return scanItems.filter((i) => i.stage === "none" || i.stage === "unknown");
+        let items = scanItems;
+        // 先按编辑进度过滤
+        if ($("chkOnlyUnedited").checked) {
+          // 未知也留着：它可能是没编辑的，藏掉等于让用户永远看不到（后端刻意不猜，理由同上）
+          items = items.filter((i) => i.stage === "none" || i.stage === "unknown");
+        }
+        // 再按筛选条件过滤
+        if (scanFilters.store) {
+          items = items.filter((i) => i.shop === scanFilters.store || i.shopId === scanFilters.store);
+        }
+        if (scanFilters.site) {
+          items = items.filter((i) => i.site === scanFilters.site || i.siteValue === scanFilters.site);
+        }
+        if (scanFilters.platform) {
+          items = items.filter((i) => i.platform === scanFilters.platform);
+        }
+        return items;
       }
 
       function renderScanStatus(d) {
@@ -1461,9 +1517,54 @@
           [...scanChecked].forEach((r) => {
             if (!alive.has(r)) scanChecked.delete(r);
           });
+          // 更新筛选下拉选项
+          updateScanFilterOptions();
         }
         renderScanRows();
       }
+
+      // 更新采集箱筛选下拉选项：从当前数据中提取唯一值
+      function updateScanFilterOptions() {
+        const stores = [...new Set(scanItems.map(i => i.shop || i.shopId).filter(Boolean))].sort();
+        const sites = [...new Set(scanItems.map(i => i.site || i.siteValue).filter(Boolean))].sort();
+        const platforms = [...new Set(scanItems.map(i => i.platform).filter(Boolean))].sort();
+
+        $("selScanFilterStore").innerHTML =
+          '<option value="">全部店铺</option>' +
+          stores.map(s => `<option value="${esc(s)}" ${scanFilters.store === s ? "selected" : ""}>${esc(s)}</option>`).join("");
+
+        $("selScanFilterSite").innerHTML =
+          '<option value="">全部站点</option>' +
+          sites.map(s => `<option value="${esc(s)}" ${scanFilters.site === s ? "selected" : ""}>${esc(s)}</option>`).join("");
+
+        $("selScanFilterPlatform").innerHTML =
+          '<option value="">全部来源</option>' +
+          platforms.map(p => {
+            const label = scanItems.find(i => i.platform === p)?.platformName || p;
+            return `<option value="${esc(p)}" ${scanFilters.platform === p ? "selected" : ""}>${esc(label)}</option>`;
+          }).join("");
+      }
+
+      // 采集箱筛选事件
+      $("selScanFilterStore").addEventListener("change", () => {
+        scanFilters.store = $("selScanFilterStore").value;
+        renderScanRows();
+      });
+      $("selScanFilterSite").addEventListener("change", () => {
+        scanFilters.site = $("selScanFilterSite").value;
+        renderScanRows();
+      });
+      $("selScanFilterPlatform").addEventListener("change", () => {
+        scanFilters.platform = $("selScanFilterPlatform").value;
+        renderScanRows();
+      });
+      $("btnScanClearFilter").addEventListener("click", () => {
+        scanFilters.store = "";
+        scanFilters.site = "";
+        scanFilters.platform = "";
+        updateScanFilterOptions();
+        renderScanRows();
+      });
 
       // 「只看未编辑」：纯前端过滤（扫描时整页都探过了，切开关不必重扫），
       // 但状态要存后端——它属于「定时器的呈现配置」，换标签页应看到同一份。
@@ -1659,11 +1760,27 @@
       // 勾选集合也必须分开——否则在一张表里勾的行会算进另一张表的「已选 N 条」。
       let crawlItems = [];
       const crawlChecked = new Set();
+      // 筛选条件
+      const crawlFilters = { platform: "", minPrice: null, maxPrice: null };
 
       // 当前显示的行（受「只看可认领」过滤）。全选/反选/填入都只作用于这批。
       function visibleCrawlItems() {
-        if (!$("chkOnlyClaimable").checked) return crawlItems;
-        return crawlItems.filter((i) => i.canClaim);
+        let items = crawlItems;
+        // 先按可否认领过滤
+        if ($("chkOnlyClaimable").checked) {
+          items = items.filter((i) => i.canClaim);
+        }
+        // 再按筛选条件过滤
+        if (crawlFilters.platform) {
+          items = items.filter((i) => i.platform === crawlFilters.platform);
+        }
+        if (crawlFilters.minPrice != null) {
+          items = items.filter((i) => i.priceUsd && parseFloat(i.priceUsd) >= crawlFilters.minPrice);
+        }
+        if (crawlFilters.maxPrice != null) {
+          items = items.filter((i) => i.priceUsd && parseFloat(i.priceUsd) <= crawlFilters.maxPrice);
+        }
+        return items;
       }
 
       function renderCrawlStatus(d) {
@@ -1781,10 +1898,49 @@
           [...crawlChecked].forEach((k) => {
             if (!crawlItems.some((i) => i.cid === k)) crawlChecked.delete(k);
           });
+          // 更新筛选下拉选项
+          updateCrawlFilterOptions();
         }
         renderCrawlStatus(d);
         renderCrawlRows();
       }
+
+      // 更新未认领筛选下拉选项
+      function updateCrawlFilterOptions() {
+        const platforms = [...new Set(crawlItems.map(i => i.platform).filter(Boolean))].sort();
+
+        $("selCrawlFilterPlatform").innerHTML =
+          '<option value="">全部来源</option>' +
+          platforms.map(p => {
+            const label = crawlItems.find(i => i.platform === p)?.platformName || p;
+            return `<option value="${esc(p)}" ${crawlFilters.platform === p ? "selected" : ""}>${esc(label)}</option>`;
+          }).join("");
+      }
+
+      // 未认领筛选事件
+      $("selCrawlFilterPlatform").addEventListener("change", () => {
+        crawlFilters.platform = $("selCrawlFilterPlatform").value;
+        renderCrawlRows();
+      });
+      $("inputCrawlMinPrice").addEventListener("input", () => {
+        const val = parseFloat($("inputCrawlMinPrice").value);
+        crawlFilters.minPrice = isNaN(val) ? null : val;
+        renderCrawlRows();
+      });
+      $("inputCrawlMaxPrice").addEventListener("input", () => {
+        const val = parseFloat($("inputCrawlMaxPrice").value);
+        crawlFilters.maxPrice = isNaN(val) ? null : val;
+        renderCrawlRows();
+      });
+      $("btnCrawlClearFilter").addEventListener("click", () => {
+        crawlFilters.platform = "";
+        crawlFilters.minPrice = null;
+        crawlFilters.maxPrice = null;
+        $("inputCrawlMinPrice").value = "";
+        $("inputCrawlMaxPrice").value = "";
+        updateCrawlFilterOptions();
+        renderCrawlRows();
+      });
 
       async function loadCrawlState() {
         try {
@@ -1954,6 +2110,8 @@
       // SPU + 已搬店铺），勾选集合也必须各自独立，否则一张表里勾的行会算进另一张。
       let banjiaItems = [];
       const banjiaChecked = new Set();
+      // 筛选条件
+      const banjiaFilters = { platform: "", site: "", minPrice: null, maxPrice: null };
 
       // 当前选定店铺的 shopId（判「已搬到本店」用）。取不到就返回空串——
       // 那时「隐藏已搬本店」这个过滤没有判据可用，一律不隐藏（见 visibleBanjiaItems）。
@@ -1962,10 +2120,15 @@
         return (opt && opt.dataset.shopId) || "";
       }
 
-      // 这一行是否已经搬到【当前选定店铺】。
+      // 这一行是否已经搬到【当前选定店铺】——注意这个判据【不分站点】。
       // 【为什么不能只看「未认领」标签】同一条商品可以搬到多个店铺：已搬到 A 店的行
       // 在平台的「已认领」标签里，但对 B 店来说它仍是可搬的。故判据是行自己的
       // claimedShops（一串 shopId）里有没有当前店铺。
+      // 【但它只到店铺粒度，不能用来拦】2026-09-03：claimedShops 里只有 shopId，
+      // 接口压根不给「搬到了该店的哪个站点」。而「同一个店铺、搬到不同站点」是常规
+      // 操作（跨站正是本功能的核心用途），所以「已搬本店」并不等于「这次是重复认领」。
+      // 故它现在只用于一个中性徽章 + 一个默认关闭的过滤开关，**不禁用勾选、不自动
+      // 取消勾选**（那会把合法的换站点搬家给拦掉，且用户看不出被拦的原因）。
       function claimedToCurrentShop(it) {
         const sid = currentShopId();
         if (!sid) return false;
@@ -1996,10 +2159,28 @@
       }
 
       function visibleBanjiaItems() {
-        if (!$("chkHideClaimed").checked) return banjiaItems;
-        // 没选店铺时不过滤：没有判据却把行藏掉，会让人以为池子是空的
-        if (!currentShopId()) return banjiaItems;
-        return banjiaItems.filter((i) => !claimedToCurrentShop(i));
+        let items = banjiaItems;
+        // 先按「隐藏已搬本店」过滤
+        if ($("chkHideClaimed").checked) {
+          // 没选店铺时不过滤：没有判据却把行藏掉，会让人以为池子是空的
+          if (currentShopId()) {
+            items = items.filter((i) => !claimedToCurrentShop(i));
+          }
+        }
+        // 再按筛选条件过滤
+        if (banjiaFilters.platform) {
+          items = items.filter((i) => i.platform === banjiaFilters.platform);
+        }
+        if (banjiaFilters.site) {
+          items = items.filter((i) => normSite(i.site) === normSite(banjiaFilters.site));
+        }
+        if (banjiaFilters.minPrice != null) {
+          items = items.filter((i) => i.priceUsdMin && parseFloat(i.priceUsdMin) >= banjiaFilters.minPrice);
+        }
+        if (banjiaFilters.maxPrice != null) {
+          items = items.filter((i) => i.priceUsdMax && parseFloat(i.priceUsdMax) <= banjiaFilters.maxPrice);
+        }
+        return items;
       }
 
       function renderBanjiaStatus(d) {
@@ -2041,7 +2222,7 @@
         if (!has) {
           // 扫过但过滤后为空 ≠ 没扫过，文案必须分开（同另两张表的理由）
           $("banjiaEmpty").textContent = banjiaItems.length
-            ? `本次扫到 ${banjiaItems.length} 条，但都已经搬到当前店铺了。关掉「隐藏已搬本店」可以看全部。`
+            ? `本次扫到 ${banjiaItems.length} 条，但都被当前的过滤条件筛掉了（「隐藏已搬本店」或来源/站点/价格筛选）。关掉过滤可以看全部。`
             : "尚未扫描。打开顶部「定时扫描数据搬家」开关，或点右上角「立即扫描」。";
           return;
         }
@@ -2078,14 +2259,17 @@
               : usd
               ? `<span class="text-muted">${usd}</span>`
               : '<span class="text-muted">—</span>';
-            // 已搬店铺：只显示个数 + 是否含当前店。
-            // 【可勾与否只看一个判据：有没有搬到本店】再认领只会凭空多一条草稿（不可逆）。
-            // 跨站点**不禁**——那正是数据搬家的核心用途（把别人在 A 站的品搬到我的 B 站）。
+            // 已搬店铺：只显示个数 + 是否含当前店，**纯提示，不影响可勾与否**。
+            // 【为什么「已搬本店」也允许勾】2026-09-03 改：claimedShops 只到店铺粒度，
+            // 接口不给站点，而同店换站点是合法的再认领（跨站正是本功能的核心用途）。
+            // 原先按 mine 禁用复选框，把「已搬本店美国站、现在要搬哥伦比亚站」一起拦了。
+            // 现在徽章照旧标出来提醒「这行本店已经有了，确认不是同站重复再勾」，
+            // 判断交给用户——重复认领的后果是多一条草稿（可到采集箱删），不值得硬拦。
             const mine = claimedToCurrentShop(it);
             const cross = isCrossSite(it);
             const nShops = (it.claimedShops || []).length;
             const shopCell = mine
-              ? '<span class="badge text-bg-secondary" title="该行已经搬到当前选定的店铺，再认领会凭空多一条草稿，故不可勾选">已搬本店</span>'
+              ? '<span class="badge text-bg-secondary" title="该行已经搬到当前选定的店铺（平台只给到店铺粒度，不知道是哪个站点）。同店换站点仍可再搬，故仍可勾选；若确认是同店同站，重复认领只会多一条草稿">已搬本店</span>'
               : nShops
               ? `<span class="badge text-bg-light text-muted" title="已搬到 ${nShops} 个其它店铺（店铺 id：${esc(
                   (it.claimedShops || []).join("、")
@@ -2105,9 +2289,7 @@
             return `<tr>
               <td><input class="form-check-input banjia-pick" type="checkbox" value="${esc(
                 it.rowid
-              )}" ${banjiaChecked.has(it.rowid) ? "checked" : ""} ${
-              mine ? "disabled" : ""
-            } /></td>
+              )}" ${banjiaChecked.has(it.rowid) ? "checked" : ""} /></td>
               <td>${
                 it.img
                   ? // referrerpolicy 别删：1688 图床防盗链，理由见采集箱那张表的同一处注释
@@ -2156,10 +2338,59 @@
           [...banjiaChecked].forEach((k) => {
             if (!banjiaItems.some((i) => i.rowid === k)) banjiaChecked.delete(k);
           });
+          // 更新筛选下拉选项
+          updateBanjiaFilterOptions();
         }
         renderBanjiaStatus(d);
         renderBanjiaRows();
       }
+
+      // 更新数据搬家筛选下拉选项
+      function updateBanjiaFilterOptions() {
+        const platforms = [...new Set(banjiaItems.map(i => i.platform).filter(Boolean))].sort();
+        const sites = [...new Set(banjiaItems.map(i => i.site).filter(Boolean))].sort();
+
+        $("selBanjiaFilterPlatform").innerHTML =
+          '<option value="">全部来源</option>' +
+          platforms.map(p => {
+            const label = banjiaItems.find(i => i.platform === p)?.platformName || p;
+            return `<option value="${esc(p)}" ${banjiaFilters.platform === p ? "selected" : ""}>${esc(label)}</option>`;
+          }).join("");
+
+        $("selBanjiaFilterSite").innerHTML =
+          '<option value="">全部源站点</option>' +
+          sites.map(s => `<option value="${esc(s)}" ${banjiaFilters.site === s ? "selected" : ""}>${esc(s)}</option>`).join("");
+      }
+
+      // 数据搬家筛选事件
+      $("selBanjiaFilterPlatform").addEventListener("change", () => {
+        banjiaFilters.platform = $("selBanjiaFilterPlatform").value;
+        renderBanjiaRows();
+      });
+      $("selBanjiaFilterSite").addEventListener("change", () => {
+        banjiaFilters.site = $("selBanjiaFilterSite").value;
+        renderBanjiaRows();
+      });
+      $("inputBanjiaMinPrice").addEventListener("input", () => {
+        const val = parseFloat($("inputBanjiaMinPrice").value);
+        banjiaFilters.minPrice = isNaN(val) ? null : val;
+        renderBanjiaRows();
+      });
+      $("inputBanjiaMaxPrice").addEventListener("input", () => {
+        const val = parseFloat($("inputBanjiaMaxPrice").value);
+        banjiaFilters.maxPrice = isNaN(val) ? null : val;
+        renderBanjiaRows();
+      });
+      $("btnBanjiaClearFilter").addEventListener("click", () => {
+        banjiaFilters.platform = "";
+        banjiaFilters.site = "";
+        banjiaFilters.minPrice = null;
+        banjiaFilters.maxPrice = null;
+        $("inputBanjiaMinPrice").value = "";
+        $("inputBanjiaMaxPrice").value = "";
+        updateBanjiaFilterOptions();
+        renderBanjiaRows();
+      });
 
       async function loadBanjiaState() {
         try {
@@ -2212,7 +2443,7 @@
           if (dropped.length)
             showToast(
               "勾选已调整",
-              `有 ${dropped.length} 条勾选的商品已经搬到本店，被过滤隐藏，已取消勾选` +
+              `有 ${dropped.length} 条勾选的商品已经搬到本店（不分站点），被过滤隐藏，已取消勾选` +
                 (banjiaChecked.size ? `；仍有 ${banjiaChecked.size} 条待认领` : ""),
               "warning"
             );
@@ -2265,7 +2496,8 @@
       });
       $("chkBanjiaAll").addEventListener("change", () => {
         const on = $("chkBanjiaAll").checked;
-        // :not(:disabled) 是必须的：已搬到本店的行再认领只会多一条草稿
+        // :not(:disabled) 现在不筛掉任何行（「已搬本店」不再禁用勾选，见 renderBanjiaRows），
+        // 保留它只是防御：将来若真加了某种禁勾的行，全选不该把它一起勾上。
         document.querySelectorAll(".banjia-pick:not(:disabled)").forEach((b) => {
           b.checked = on;
           if (on) banjiaChecked.add(b.value);
@@ -2292,6 +2524,10 @@
         // 认领后草稿归属**选定站点**，三项属性按那个站点填，与源站点无关。
         const picked = shown.filter((i) => banjiaChecked.has(i.rowid));
         const cross = picked.filter((i) => isCrossSite(i));
+        // 【已搬本店的行现在可以勾】故要在 confirm 里点出来：平台只给到店铺粒度、
+        // 不给站点，所以这几条究竟是「同店换站点」（合法）还是「同店同站重复搬」
+        // （多一条草稿）只有用户自己知道。不拦，但必须让人看见数量。
+        const already = picked.filter((i) => claimedToCurrentShop(i));
         if (!picked.length) {
           // 【区分两种「没得认领」】上面两个监听器已经在换店铺/开过滤时清过勾选，
           // 故走到这里通常真的是没勾。但 banjiaChecked 非空却筛不出可见行仍有可能
@@ -2300,8 +2536,8 @@
           showToast(
             "无法认领",
             banjiaChecked.size
-              ? `勾选的 ${banjiaChecked.size} 条都不在当前显示的清单里（可能已搬到本店被过滤，` +
-                `或重扫后已离开列表）。请重新勾选要搬的商品`
+              ? `勾选的 ${banjiaChecked.size} 条都不在当前显示的清单里（重扫后已离开列表，` +
+                `或打开了「隐藏已搬本店」被过滤）。请重新勾选要搬的商品`
               : "请先勾选要搬到本店的商品",
             "warning"
           );
@@ -2326,6 +2562,9 @@
               `  1. 认领到店铺「${store}」站点「${site}」（创建 ${picked.length} 条草稿）\n` +
               (cross.length
                 ? `     其中 ${cross.length} 条是跨站点搬（源站点不是${site}，这是常规用途）\n`
+                : "") +
+              (already.length
+                ? `     其中 ${already.length} 条本店已经搬过（平台不给站点，若是同站重复搬会多出草稿）\n`
                 : "") +
               `  2. 批量填仓库 / 发货时效 / 运费模板（覆盖已有值）\n` +
               `  3. 批量发布 —— 商品在 Temu【真实上架】\n\n` +

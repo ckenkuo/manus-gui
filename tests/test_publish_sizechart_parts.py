@@ -185,7 +185,7 @@ async def test_缺列估算时提示词点明是哪一件(tmp_path, monkeypatch)
     info = _write_set_info(tmp_path)
     asked = {}
 
-    async def fake_ask_json(prompt, what="判断", retries=3, stage=None):
+    async def fake_ask_json(prompt, what="判断", retries=3, stage=None, **kw):
         asked["prompt"] = prompt
         return {"6-9M": {"袖长": 9.5}, "9-12M": {"袖长": 10}}
 

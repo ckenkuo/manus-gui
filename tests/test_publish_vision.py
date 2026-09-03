@@ -30,7 +30,7 @@ def _write(d, name: str, data: bytes) -> str:
     return p
 
 
-async def _no_llm(prompt, what="", retries=3, stage=None):
+async def _no_llm(prompt, what="", retries=3, stage=None, **kw):
     """本地路径的哨兵：这些用例本该零调用，真发出去就是本地定序失灵了。"""
     raise AssertionError(f"不该调用 LLM（{what}）：本地应能定出尺码对应")
 
@@ -115,7 +115,7 @@ async def test_数值码在本地定序不调模型(monkeypatch):
     """数值码本地取数字就能排，是确定性的，不该多花一次 LLM 调用。"""
     called = []
 
-    async def fake_ask(prompt, what="", retries=3, stage=None):
+    async def fake_ask(prompt, what="", retries=3, stage=None, **kw):
         called.append(what)
         return {"mapping": {}}
 
@@ -203,7 +203,7 @@ async def test_字母码交模型定对应(monkeypatch):
     """S/M/L 本地排不出，模型按数值走向给出对应后落库。"""
     seen = {}
 
-    async def fake_ask(prompt, what="", retries=3, stage=None):
+    async def fake_ask(prompt, what="", retries=3, stage=None, **kw):
         seen["prompt"] = prompt
         return {"mapping": {"S": 1, "M": 2, "L": 3}, "reason": "衣长递增配SML"}
 
@@ -224,7 +224,7 @@ async def test_字母码交模型定对应(monkeypatch):
 @pytest.mark.asyncio
 async def test_归一位次撞车时交模型(monkeypatch):
     """6M/6Y 归一后都含 6，本地排不出相对次序，交模型按月龄/岁语义判断。"""
-    async def fake_ask(prompt, what="", retries=3, stage=None):
+    async def fake_ask(prompt, what="", retries=3, stage=None, **kw):
         return {"mapping": {"6M": 1, "6Y": 2}, "reason": "月龄小于岁"}
 
     monkeypatch.setattr("app.publish.llm.ask_json", fake_ask)
@@ -247,7 +247,7 @@ async def test_归一位次撞车时交模型(monkeypatch):
 ])
 async def test_模型给的对应不可信时整体放弃(monkeypatch, resp, why):
     """半份对齐比没有更难排查，且会让同一张表混两种来源的数值，故不做部分采纳。"""
-    async def fake_ask(prompt, what="", retries=3, stage=None):
+    async def fake_ask(prompt, what="", retries=3, stage=None, **kw):
         return resp
 
     monkeypatch.setattr("app.publish.llm.ask_json", fake_ask)
@@ -265,7 +265,7 @@ async def test_身高码与年龄码混用交模型(monkeypatch):
     """80cm 与 2y 无换算关系（一个是长度、一个是时间），本地排不出可信序，交模型。"""
     asked = []
 
-    async def fake_ask(prompt, what="", retries=3, stage=None):
+    async def fake_ask(prompt, what="", retries=3, stage=None, **kw):
         asked.append(what)
         return {"mapping": {"80": 1, "2y": 2}, "reason": "身高80cm小于2岁"}
 
@@ -402,7 +402,7 @@ async def test_enrich_vision_落盘并统计(tmp_path, monkeypatch):
 
     seen = {}
 
-    async def fake_ask(prompt, images, what="判断", system=None, stage=None):
+    async def fake_ask(prompt, images, what="判断", system=None, stage=None, **kw):
         seen["images"] = images
         seen["prompt"] = prompt
         return {
@@ -447,7 +447,7 @@ async def test_enrich_vision_超上限截断报truncated(tmp_path, monkeypatch):
 
     sent = {}
 
-    async def fake_ask(prompt, images, what="判断", system=None, stage=None):
+    async def fake_ask(prompt, images, what="判断", system=None, stage=None, **kw):
         sent["n"] = len(images)
         return {}
 

@@ -31,7 +31,7 @@ def _no_sleep(monkeypatch):
 @pytest.mark.asyncio
 async def test_衣服实物logo和图案不算质检失败(monkeypatch):
     """选品阶段已人工过滤，实物绣标不是「待清理的文字层」，误报会让图退回原图。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         # 提示词必须明确把实物印花/刺绣排除在外，否则模型照旧误报
         assert "刺绣" in prompt and "印花" in prompt
         assert "不算问题" in prompt
@@ -45,7 +45,7 @@ async def test_衣服实物logo和图案不算质检失败(monkeypatch):
 @pytest.mark.asyncio
 async def test_残留中文单独回一个字段(monkeypatch):
     """residualChinese 决定重试发数，不能只混在 issues 文字里。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": True, "garbled": False,
                 "brokenSubject": False, "issues": "底部仍有中文说明"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
@@ -59,7 +59,7 @@ async def test_乱码要透出garbled字段(monkeypatch):
     `qc.get("garbled")` 恒为 None，给乱码加长重试形同虚设——而 ⑤b main-04 两发
     恰好全是 garbled，正是要救的那一类。
     """
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": False, "garbled": True,
                 "brokenSubject": False, "issues": "拼音残留"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
@@ -72,7 +72,7 @@ async def test_乱码要透出garbled字段(monkeypatch):
 @pytest.mark.asyncio
 async def test_破坏主体算不过但两个文字字段都是False(monkeypatch):
     """brokenSubject 只给 2 发，故它不能让任何文字类字段变 True。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": False, "garbled": False,
                 "brokenSubject": True, "issues": "袖子被抹掉"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
@@ -84,7 +84,7 @@ async def test_破坏主体算不过但两个文字字段都是False(monkeypatch
 @pytest.mark.asyncio
 async def test_模型只回旧的clean字段时不误判为干净(monkeypatch):
     """提示词换过多版，模型偶尔按老约定只回 clean；缺三个新字段时不能读成干净。"""
-    async def _fake(prompt, images, what="", system=None, stage=None):
+    async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"clean": False, "issues": "残留中文"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
@@ -141,7 +141,7 @@ def _desc_stub_real_qc(tmp_path, monkeypatch, model_replies, calls):
 
     seq = list(model_replies)
 
-    async def fake_model(prompt, images, what="", system=None, stage=None):
+    async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
         calls["qc"] = calls.get("qc", 0) + 1
         return seq.pop(0) if seq else {"residualChinese": False, "garbled": True,
                                        "brokenSubject": False, "issues": "还是不行"}
@@ -381,7 +381,7 @@ async def test_5b乱码走真实质检也给到四发(tmp_path, monkeypatch):
           "issues": ""}
     seq = [bad, bad, bad, ok]
 
-    async def fake_model(prompt, images, what="", system=None, stage=None):
+    async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
         calls["qc"] = calls.get("qc", 0) + 1
         return seq.pop(0) if seq else ok
 
@@ -424,7 +424,7 @@ async def test_5b质检未过绝不顶替原图(tmp_path, monkeypatch):
             f.write(b"garbled-output")
         return {"status": "ok", "output": out_path}
 
-    async def fake_model(prompt, images, what="", system=None, stage=None):
+    async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": False, "garbled": True, "brokenSubject": False,
                 "issues": "oOaLanTanAt"}
 

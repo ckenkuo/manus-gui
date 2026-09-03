@@ -207,6 +207,32 @@ def ahash_distance(a: int, b: int) -> int:
     return bin(a ^ b).count("1")
 
 
+def color_signature(path: str, size: int = 16) -> Optional[list]:
+    """图的颜色指纹：缩到 size×size 的 RGB 像素序列。读不出图返回 None。
+
+    【为什么不用 ahash 做颜色配对】ahash 先转灰度，而 SKC 分色要区分的恰恰是颜色：
+    同款服装的红版与蓝版灰度化后构图一致，ahash 距离常常是 0（2026-09-03 实测
+    product-969144784315：16 张主图里 main-08/09 的 ahash 完全相同、无法区分）。
+    保留 RGB 后同一实测集 16/16 命中，自身距离 1.7~3.1、次近 9.1~41，区分度干净。
+    ahash 仍留给判近重复（那里要的正是「不管颜色只看构图」）。
+    """
+    from PIL import Image
+    try:
+        with Image.open(path) as im:
+            return list(im.convert("RGB").resize((size, size), Image.LANCZOS).getdata())
+    except Exception as e:
+        logger.warning(f"计算颜色指纹失败（按无法判断处理）：{path} {e}")
+        return None
+
+
+def color_distance(a: list, b: list) -> float:
+    """两个颜色指纹的平均通道差（0~255，越小越像）。长度不等时返回 255（判为不像）。"""
+    if not a or not b or len(a) != len(b):
+        return 255.0
+    return sum(abs(x[0] - y[0]) + abs(x[1] - y[1]) + abs(x[2] - y[2])
+               for x, y in zip(a, b)) / (len(a) * 3)
+
+
 def is_near_duplicate(path_a: str, path_b: str,
                       max_distance: int = AHASH_MAX_DISTANCE) -> bool:
     """两张图是否近重复。任一张算不出哈希时返回 False（不判重复，理由见 ahash）。"""
@@ -317,7 +343,10 @@ def square_image(image_path: str, out_path: Optional[str] = None,
         side = min(w, h)
         left, top = (w - side) // 2, (h - side) // 2
         im = im.crop((left, top, left + side, top + side))
-        if side < target:
+        # 【修复】无论裁切后尺寸多大，统一缩放到 target×target
+        # 原逻辑 "if side < target" 会导致 800-1784 范围的图不被放大、直接保存小图
+        # 也会导致 >1785 的图不被缩小、浪费存储空间
+        if side != target:
             im = im.resize((target, target), Image.LANCZOS)
         im.save(out_path, quality=85)
     with Image.open(out_path) as im:

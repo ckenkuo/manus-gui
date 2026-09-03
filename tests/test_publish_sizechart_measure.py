@@ -78,7 +78,7 @@ async def test_源缺参数列时只补缺的列且不覆盖实测值(tmp_path, 
     })
     asked = {}
 
-    async def fake_ask_json(prompt, what="判断", retries=3, stage=None):
+    async def fake_ask_json(prompt, what="判断", retries=3, stage=None, **kw):
         asked["prompt"] = prompt
         # 故意连衣长也一起返回错值，验证不会盖掉源实测值
         return {"80": {"胸围全围": 66, "衣长": 999},
@@ -123,7 +123,7 @@ async def test_源参数齐全时不调模型(tmp_path, monkeypatch):
 async def test_源完全没有实测值时整表交模型(tmp_path, monkeypatch):
     info = _write_info(tmp_path, {})
 
-    async def fake_ask_json(prompt, what="判断", retries=3, stage=None):
+    async def fake_ask_json(prompt, what="判断", retries=3, stage=None, **kw):
         assert "（无）" in prompt  # 无已有实测列
         return {"80": {"衣长": 35, "胸围全围": 62},
                 "90": {"衣长": 38, "胸围全围": 66}}
@@ -162,7 +162,7 @@ async def test_源键带建议身高描述也能对上页面尺码(tmp_path, mon
 async def test_模型漏了某尺码时报错不填半残表(tmp_path, monkeypatch):
     info = _write_info(tmp_path, {"80": {"衣长": 35}})
 
-    async def fake_ask_json(prompt, what="判断", retries=3, stage=None):
+    async def fake_ask_json(prompt, what="判断", retries=3, stage=None, **kw):
         return {"80": {"胸围全围": 62}}  # 漏了 90
 
     monkeypatch.setattr("app.publish.llm.ask_json", fake_ask_json)

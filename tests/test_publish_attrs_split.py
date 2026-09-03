@@ -88,7 +88,7 @@ async def test_合并两组的changes与notes(monkeypatch, _info):
 
     calls = []
 
-    async def _fake(prompt, what="", stage=None):
+    async def _fake(prompt, what="", stage=None, **kw):
         calls.append(what)
         i = len(calls)
         return {"changes": [{"label": f"改{i}", "value": "A"}],
@@ -107,7 +107,7 @@ async def test_行少时只调一次(monkeypatch, _info):
 
     calls = []
 
-    async def _fake(prompt, what="", stage=None):
+    async def _fake(prompt, what="", stage=None, **kw):
         calls.append(what)
         return {"changes": [], "notes": []}
 
@@ -121,7 +121,7 @@ async def test_一组失败则整体失败(monkeypatch, _info):
     """不拿成功的那组凑合：属性填一半比不填更糟（缺的行会静默留空带到发布）。"""
     from app.publish import pipeline
 
-    async def _fake(prompt, what="", stage=None):
+    async def _fake(prompt, what="", stage=None, **kw):
         if "第2组" in what:
             raise RuntimeError("端点抖了")
         return {"changes": [{"label": "改1", "value": "A"}], "notes": []}
@@ -138,7 +138,7 @@ async def test_每组都走attrs阶段的模型(monkeypatch, _info):
 
     stages = []
 
-    async def _fake(prompt, what="", stage=None):
+    async def _fake(prompt, what="", stage=None, **kw):
         stages.append(stage)
         return {"changes": [], "notes": []}
 
@@ -154,7 +154,7 @@ async def test_每组的提示词只带自己那部分行(monkeypatch, _info):
 
     seen = []
 
-    async def _fake(prompt, what="", stage=None):
+    async def _fake(prompt, what="", stage=None, **kw):
         seen.append(prompt)
         return {"changes": [], "notes": []}
 

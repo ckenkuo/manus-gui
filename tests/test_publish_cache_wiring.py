@@ -31,10 +31,21 @@ class _FakeSession:
     async def eval_json(self, js, *a, **kw):
         if "productBasicInfo" in js and "ant-form-item" in js:
             return self.rows
-        if "选择类目" in js and "categories-item" in js:
+        # 【点击与读列必须靠 item.click() 区分，不能靠 categories-box/-item】
+        # 两段 JS 的类名高度重叠：_JS_CAT_COLUMNS（读列）与 _click_cat_in_column
+        # （点项）都含 'categories-box'，点项那段还含 'categories-item'。
+        # 靠类名分流会串台——优化后的 _click_cat_path 会轮询读列，读列被记成点击时
+        # clicks 涨到百万级；反之把点击当读列则 clicks 恒为 0。两种都会让
+        # 「第 3 级失败后就停」这条不变式看起来被打穿，而实际是替身的问题。
+        # item.click() 只出现在点项那段，是唯一可靠的判据。
+        if "item.click()" in js:
             self.clicks.append(js)
             return (self.click_results.pop(0) if self.click_results
                     else {"clicked": True})
+        if "categories-box" in js:
+            # 读列：假定点完第 N 级后列数变成 N+2（见 pipeline 类目区块开头的联动
+            # 实测），按已点次数给出「新列已挂上」的列数，让条件等待立刻收敛。
+            return {"ready": True, "n": len(self.clicks) + 2}
         if "选择类目" in js and "ant-modal-footer" in js:
             self.confirmed = True
             return {"confirmed": True}

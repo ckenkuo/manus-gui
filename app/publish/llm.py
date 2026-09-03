@@ -35,7 +35,9 @@ import json
 import os
 import tempfile
 import tomllib
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
+
+from pydantic import BaseModel, StringConstraints, ValidationError
 
 # 复用采集管道已实测的 JSON 解析（剥 ```json 围栏 + 兜底抓首个 {...}），避免重复实现。
 from app.collect.pipeline import _parse_json
@@ -301,9 +303,90 @@ _JSON_RETRY_HINT = (
     "工具调用、shell 命令或解释文字。第一个字符必须是 {，最后一个字符必须是 }。"
 )
 
+# 断尾专用提醒：正文以 { 开头却解析不出来，几乎都是模型没写完就收笔。这时重申
+# 「只输出 JSON」是白说——它本来就在输出 JSON，缺的是把它写完。
+# 2026-09-03 取证（offer 968804940018 阶段①视觉回填）：completion 2049 token 处
+# 断在 imageUnderstanding 中间，而该档 max_tokens 配的 32000 只用掉 6%，
+# finish_reason 不可能是 length，是模型自己收的笔（同批下一个商品早停在 1766）。
+# 故这条改为要求它把字段值写短、优先保证结构闭合——直接对着「写不完」下药，
+# 而不是去抬那个根本没用完的额度。
+_JSON_TRUNCATED_HINT = (
+    "\n\n【重申，最高优先级】上一次回答在中途断掉了、JSON 没有闭合。这次请把每个"
+    "字段的文字描述【尽量精简】（能少写就少写，不要任何解释），优先保证整个 JSON "
+    "结构完整、最后一个字符是 }。"
+)
+
+
+def _retry_hint(raw: str, why: str = "") -> str:
+    """按上一次响应的形态挑重试提醒：结构不对、断尾、吐废文要说的不是一回事。
+
+    【为什么不能三种共用一句】说错话是有代价的：对着断尾的响应重申「只输出 JSON」，
+    模型下一次照样写不完；反过来对着结构不对的响应喊「写短点」，它会把本来该填的
+    字段一起精简掉。故按形态分开给词，把话说到点上。
+    """
+    if why:
+        return (f"\n\n【重申，最高优先级】上一次回答的结构不对：{why}。这次请严格按"
+                "提示词末尾给出的 JSON 形状输出，字段名与值的类型都不要改。")
+    text = (raw or "").strip()
+    if text.startswith(("{", "```")):
+        return _JSON_TRUNCATED_HINT
+    return _JSON_RETRY_HINT
+
+
+# ---- 返回 JSON 的结构审查（Pydantic）--------------------------------------------
+# 【为什么解析成功之后还要再查一遍类型】形状对不上时下游一律【静默丢弃】：
+# extract._merge_vision 的 isinstance(got, dict) 不成立就跳过该字段、vision.plan_skc
+# 的非 dict 条目直接 continue、plan_desc 的 pos 类型不符也是 continue。表现全是
+# 「字段空/条目少 + 没人报错」，与 2026-09-03 那次断尾（见 _JSON_TRUNCATED_HINT）
+# 的下场一模一样——事后都分不清是模型没答对，还是压根没答。
+# 故解析之后按模型再查一遍，不合格与解析失败【同等对待】：都重问，
+# 别把脏结构往下游放，也别让它静默变成空值。
+#
+# 各判断点的期望结构用 Pydantic BaseModel 声明（项目本来就是 Pydantic v2，
+# 不自造 schema 格式）：类型即文档、嵌套结构自动递归、报错还自带字段路径
+# （rows.2.color 这种），拼进重试提示词正好能把话说到具体哪一个字段上。
+
+# 必填字符串：空串与漏填等价（如阶段⑥ 的 image），都不带任何信息，故一并拦掉。
+# 注意 dict/list 【不】要求非空——「这批图里没有尺码表」「一个颜色都没分出来」
+# 都是合法结论，要求非空等于逼模型编。
+NonEmptyStr = Annotated[str, StringConstraints(min_length=1, strip_whitespace=True)]
+
+
+def _check_result(data: dict, result_model: type[BaseModel]) -> str:
+    """按 Pydantic 模型校验解析出来的 JSON，通过返回空串，否则返回一句中文错因。
+
+    【校验用，不换掉返回值】调用方拿到的仍是原始 dict，不是 model 实例、也不是
+    model_dump() 的产物，两个理由：
+      1. 未声明的字段会被 model_dump 丢掉（extra 默认 ignore）。而条件字段恰恰
+         都没声明——_merge_vision 要读的 sizeMeasurementsRows / sizeMeasurementsByPart
+         / composition 全在此列，dump 一次就没了，等于修一个坑挖三个。
+      2. 各判断点的下游全是 .get() 读 dict，换成实例要动每一处取值逻辑，
+         而这次要修的是「模型答得不完整」，不是取值方式。
+    模型一律配 strict=True，所以「校验通过的 dict」在已声明字段上与 dump 出来的
+    等价，不存在放过去的值和校验的值不是一回事的问题——理由见下。
+
+    【为什么各模型必须 strict=True】Pydantic 默认的 lax 模式会做隐式转换：
+    2026-09-03 实测 pos 字段收到 "1"（字符串）和 true 都照样通过。而我们返回的是
+    原 dict、里面还是那个字符串，下游 plan_desc 的 `pos not in valid_pos` 依旧
+    不成立、依旧静默丢掉这条动作——校验通过了，坑一个没少填。strict 下这两种
+    输入都被判错、进而触发重问，才是「让模型输出符合预期」而不是「我们私下把
+    它转成符合预期」。后者掩盖问题，且转换后的值与返回的 dict 对不上。
+    """
+    try:
+        result_model.model_validate(data)
+        return ""
+    except ValidationError as e:
+        # 只取前 3 条：错误全量拼进提示词会很长，而模型一次能改对的也就头几个
+        parts = []
+        for err in e.errors()[:3]:
+            loc = ".".join(str(x) for x in err["loc"]) or "(根)"
+            parts.append(f"{loc}: {err['msg']}")
+        return "；".join(parts)
+
 
 async def ask_json(prompt: str, what: str = "判断", retries: int = 3,
-                   stage: Optional[str] = None) -> dict:
+                   stage: Optional[str] = None,
+                   result_model: Optional[type[BaseModel]] = None) -> dict:
     """单发提问并要求返回 JSON 对象，解析后返回 dict。
 
     what 只用于日志和报错信息，方便一眼看出是哪个判断点出的问题。
@@ -315,24 +398,35 @@ async def ask_json(prompt: str, what: str = "判断", retries: int = 3,
     采集侧的 judge_same_match 用的就是这条路，已在生产里跑住。
     所以调用方的 prompt 末尾务必写清「只输出JSON: {...}」。
 
-    解析失败重试 retries 次（每次追加 _JSON_RETRY_HINT），仍失败才抛 RuntimeError：
-    这些判断都在主流程上，返回个空 dict 会让调用方把错值写进表单，不如直接失败；
-    但单次抖动（模型吐了非 JSON 的废文）不该直接搞挂整个阶段。
+    解析失败或结构不合格（result_model，见 _check_result）都重试 retries 次，仍失败
+    才抛 RuntimeError：这些判断都在主流程上，返回个空 dict 会让调用方把错值写进表单，
+    不如直接失败；但单次抖动（模型吐了非 JSON 的废文、或字段类型给错）不该直接
+    搞挂整个阶段。result_model 不传就只查「能不能解析成 JSON」，与原行为一致。
     """
-    last_raw = ""
+    last_raw, last_why = "", ""
+    ask_prompt = prompt
     for attempt in range(1, retries + 1):
-        raw = await get_llm(stage).ask([Message.user_message(prompt)], stream=False)
+        raw = await get_llm(stage).ask(
+            [Message.user_message(ask_prompt)], stream=False)
         last_raw = raw or ""
         data = _parse_json(raw)
-        if data is not None:
-            return data
+        bad = ""
+        if data is None:
+            last_why = "JSON 解析失败"
+        else:
+            bad = _check_result(data, result_model) if result_model else ""
+            if not bad:
+                return data
+            last_why = f"JSON 结构不合格（{bad}）"
         logger.warning(
-            f"{what}：第 {attempt}/{retries} 次 JSON 解析失败，"
+            f"{what}：第 {attempt}/{retries} 次{last_why}，"
             f"原始响应（前 300 字）：{last_raw[:300]}"
         )
-        prompt += _JSON_RETRY_HINT
+        # 【每次都从原始 prompt 重拼，不累加】累加会让三次下来同时挂上「写短点」和
+        # 「别写废文」两条互相拉扯的提醒，模型照哪条都不对。
+        ask_prompt = prompt + _retry_hint(last_raw, bad)
     raise RuntimeError(
-        f"{what}：LLM 连续 {retries} 次未返回可解析的 JSON。"
+        f"{what}：LLM 连续 {retries} 次{last_why}。"
         f"最后一次原始响应（前 200 字）：{last_raw[:200]}"
     )
 
@@ -397,16 +491,30 @@ def image_ref(img: str) -> str:
 
 async def ask_json_with_images(
     prompt: str, images: list, what: str = "判断", system: Optional[str] = None,
-    stage: Optional[str] = None
+    stage: Optional[str] = None, retries: int = 3,
+    result_model: Optional[type[BaseModel]] = None
 ) -> dict:
     """带图单发提问并要求返回 JSON 对象，解析后返回 dict。
 
     images 里可以混着本地文件路径和 http(s) URL，一律过 image_ref 归一：调用方
     （如阶段① 视觉回填）拿到的就是 product-<offerId>/ 下的本地 jpg，不必自己转码。
 
-    与 ask_json 的差异只有「多传图 + 可选 system」两点，JSON 解析、报错措辞、
+    与 ask_json 的差异只有「多传图 + 可选 system」两点，JSON 解析、重试、报错措辞、
     「失败就抛不造兜底值」的取向完全一致——看图结论会一路带到属性/标题/选图，
     编个空 dict 出来比直接失败更糟。
+
+    【为什么补上重试：原先一次不成就抛】2026-09-03 取证 offer 968804940018 阶段①：
+    模型在 2049 completion token 处收笔，JSON 断在 imageUnderstanding 中间解析不出，
+    于是 imageUnderstanding / sizeChart / sizeMeasurements / complianceNotes 四个
+    字段全空，尺码表只好由阶段⑨ 凭空估算，错数值一路发上真店。同批下一个商品同样
+    早停（1766 token），只因它 content 是【全空】、撞上 app/llm.py 的「返空就重发」
+    保险才被救回——一个空、一个半截，同一个毛病两种下场，差的就是这里的重问。
+    注意 app/llm.py 那两道保险都只认「content 为空」，半截正文在那一层是漏网的，
+    而它也不该管：那层拿到的是裸字符串，判 JSON 完整性天然是本层的活。
+
+    【重试不重算 refs】图片下载/转码只做一次，重发只换提示词：一次带图请求要重传
+    整批 base64（阶段①最多 20 张），refs 重算等于再读一遍盘、再下一遍外链。
+    额度一个字不动——那次断尾时 32000 的额度只用掉 6%，抬额度是给没用完的桶加高桶壁。
 
     【前提：模型要在 app/llm.py 的 MULTIMODAL_MODELS 白名单里】不在名单里
     ask_with_images 直接抛 ValueError（不是静默丢图）。当前 [llm.publish] 配的
@@ -427,21 +535,42 @@ async def ask_json_with_images(
         raise RuntimeError(
             f"{what}：{n_bad}/{len(refs)} 张图取不到（源站图可能已失效）。"
             "调用方须先剔除取不到的图再重排位次，不能直接少传")
-    logger.info(f"{what}：视觉判断，传图 {len(refs)} 张")
-    raw = await llm.ask_with_images(
-        messages=[Message.user_message(prompt)],
-        images=refs,
-        system_msgs=[Message.system_message(system)] if system else None,
-        stream=False,
-        # 不指定则用配置段的 temperature：grok 配 0.0 保持确定性；Kimi 只接受 1
-        # （2026-08-21 实测给 0.0 直接 400），写死 0.0 会让 Kimi 视觉全挂
-    )
-    data = _parse_json(raw)
-    if data is None:
-        raise RuntimeError(
-            f"{what}：LLM 未返回可解析的 JSON。原始响应（前 200 字）：{(raw or '')[:200]}"
+    last_raw, last_why = "", ""
+    ask_prompt = prompt
+    for attempt in range(1, retries + 1):
+        logger.info(f"{what}：视觉判断，传图 {len(refs)} 张"
+                    + (f"（第 {attempt}/{retries} 次）" if attempt > 1 else ""))
+        raw = await llm.ask_with_images(
+            messages=[Message.user_message(ask_prompt)],
+            images=refs,
+            system_msgs=[Message.system_message(system)] if system else None,
+            stream=False,
+            # 不指定则用配置段的 temperature：grok 与 deepseek 两档都配 0.0（已是下限，
+            # 没有更低可调）；Kimi 只接受 1（2026-08-21 实测给 0.0 直接 400），写死
+            # 0.0 会让 Kimi 视觉全挂。
+            # 【温度 0 下重试仍然有效，靠的是换提示词而不是换采样】温度 0 是确定性
+            # 采样，原样重问理论上会拿回一模一样的断尾正文；_retry_hint 每次改写
+            # 提示词，这才是打破复现的手段——所以那几句提醒是功能，不是客套。
         )
-    return data
+        last_raw = raw or ""
+        data = _parse_json(raw)
+        bad = ""
+        if data is None:
+            last_why = "JSON 解析失败（多为正文断尾未闭合）"
+        else:
+            bad = _check_result(data, result_model) if result_model else ""
+            if not bad:
+                return data
+            last_why = f"JSON 结构不合格（{bad}）"
+        logger.warning(
+            f"{what}：第 {attempt}/{retries} 次{last_why}，"
+            f"原始响应（前 300 字）：{last_raw[:300]}"
+        )
+        ask_prompt = prompt + _retry_hint(last_raw, bad)
+    raise RuntimeError(
+        f"{what}：LLM 连续 {retries} 次{last_why}。"
+        f"最后一次原始响应（前 200 字）：{last_raw[:200]}"
+    )
 
 
 async def ask_text(prompt: str, what: str = "判断",

@@ -1147,8 +1147,13 @@ def get_settings() -> dict:
     读 service 的 prefs 文件（与另两个扫描、生图并发数同一份）。非法值一律回落默认
     并不报错：辅助设施的配置，坏了按默认跑。
 
-    【hideClaimed 默认开】本管线的用途是「找还没搬到我店的商品去搬」，前端据此把
-    claimedShops 里已含当前目标店铺的行标灰/隐藏。它只影响 UI 呈现、不用重扫
+    【hideClaimed 默认关】2026-09-03 改的：原先默认开，理由是「本管线的用途是找还没
+    搬到我店的商品去搬」。但那个判据是错的——`claimedShops` 只给 shopId，**不带站点**，
+    而「同一个店铺、搬到不同站点」是完全合法的常规操作（数据搬家的核心用途就是跨站，
+    见 claim_batch 的说明）。于是默认开会把「已搬到本店美国站、现在要搬到哥伦比亚站」
+    的行一并藏掉，且看不出原因——用户发布完商品后在清单里找不到它们就是这么来的。
+    现在默认关：宁可多显示几行让人自己判断，也不要用一个分不清站点的判据静默藏行。
+    开关保留（想过滤同店同站的重复行时仍可手动打开），只影响 UI 呈现、不用重扫
     （扫描本来就把 claimedShops 一并带回来了）。
     """
     from app.publish import service  # 延迟导入，与另两个扫描模块同一取向
@@ -1166,7 +1171,7 @@ def get_settings() -> dict:
         state = DEFAULT_STATE
     return {"enabled": cfg.get("enabled") is True,
             "intervalMinutes": interval, "state": state,
-            "hideClaimed": cfg.get("hideClaimed") is not False}
+            "hideClaimed": cfg.get("hideClaimed") is True}
 
 
 def set_settings(enabled=None, interval_minutes=None, state=None,

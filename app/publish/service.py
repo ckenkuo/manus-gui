@@ -984,7 +984,9 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
     if not ctx.get("info_path"):
         return {"status": "skipped", "note": "无 product-info.json，跳过清理"}
     info = _load_info(ctx["info_path"])
-    plan = vision.plan_clean(info, ctx["workdir"])
+    # 下限传 ⑦ 的行下限：⑤b 的产物是 ⑥⑦ 共用，只按 ⑥「一张素材图」算会让 ⑦ 的
+    # 颜色行凑不够合规图（见 vision.plan_clean 的说明）
+    plan = vision.plan_clean(info, ctx["workdir"], min_clean=SKC_ROW_MIN_IMAGES)
     items = plan.get("items") or []
     if not items:
         return {"status": "skipped", "note": plan.get("reason") or "无可清理项"}
@@ -1219,12 +1221,28 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
              if p not in have
              and not _note(p).get("duplicate")
              and (_note(p).get("kind") or "") not in vision._SKIP_KINDS]
-    # 干净图优先，其余按脏度——与 plan_skc 单色分支同一套排序取向；
-    # 尺寸不达标的排在最后（只有达标图不够时才轮到它们，由 batch_fit34 放大兜底）
-    cands.sort(key=lambda p: (os.path.basename(p) in size_bad,
-                              not _note(p).get("clean"),
-                              vision._dirty_score(_note(p))))
-    added = cands[:SKC_ROW_MIN_IMAGES - len(picked)]
+
+    def _key(p: str) -> tuple:
+        # 干净图优先，其余按脏度——与 plan_skc 同一套排序取向；
+        # 尺寸不达标的排在最后（只有达标图不够时才轮到它们，由 batch_fit34 放大兜底）
+        return (os.path.basename(p) in size_bad,
+                not _note(p).get("clean"),
+                vision._dirty_score(_note(p)))
+
+    need = SKC_ROW_MIN_IMAGES - len(picked)
+    # 【不合规图优先不用，凑不够才放回】带中文/水印/他人 logo 是 Temu 的硬红线，
+    # 原实现只把它们按 _dirty_score 排到后面、照样补进颜色行——等于 plan_skc 那边
+    # 刚排除掉，这里又补回来。现在先只用合规图，仍不足行下限才放回（整行不足 3 张
+    # 会让阶段⑫ save 被静默拦下，两害相权），放回的由 _st_skc 逐行查出来报人工确认。
+    added = sorted([p for p in cands if not vision.is_dirty(_note(p))], key=_key)[:need]
+    if len(added) < need:
+        extra = sorted([p for p in cands if vision.is_dirty(_note(p))],
+                       key=_key)[:need - len(added)]
+        if extra:
+            logger.warning(f"合规图只够补 {len(added)} 张，凑不满每行下限 "
+                           f"{SKC_ROW_MIN_IMAGES} 张，被迫补 {len(extra)} 张仍带"
+                           f"中文/水印/logo 的图：{[os.path.basename(p) for p in extra]}")
+            added += extra
     return picked + added, [os.path.basename(p) for p in added]
 
 
@@ -1275,9 +1293,13 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
                                f"（{sup.get('checkboxes')} 个颜色复选框、无图片位），"
                                "跳过 SKC 颜色图"})
         return {"status": "skipped", "note": "本类目无 SKC 颜色图位"}
-    plan = await vision.plan_skc(info, ctx["workdir"])
+    plan = await vision.plan_skc(info, ctx["workdir"], min_clean=SKC_ROW_MIN_IMAGES)
     rows = plan.get("rows") or []
     colors = [c for c in (info.get("colors") or []) if c]
+    if plan.get("dirtyUsed"):
+        logger.warning(f"SKC 候选池合规图不足，被迫放回：{plan['dirtyUsed']}"
+                       "（哪一行真用上了，见下面逐行的人工确认）")
+    notes_by_file = vision._notes_by_file(info)
     if not rows:
         await emit({"type": "manual_check", "stage": "skc",
                     "message": "视觉未给出任何颜色行选图，SKC 颜色图保持原样"})
@@ -1290,7 +1312,7 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "skipped", "note": plan.get("reason") or "无可替换行"}
     # skipped_rows：续跑时页面上已经是本轮图片、无需重换的行。它必须与 ok_rows 一起
     # 传给尺寸兜底——跳过的行图是达标的，再被兜底重做一遍就白干了。
-    ok_rows, fail_rows, skipped_rows = [], [], []
+    ok_rows, fail_rows, skipped_rows, dirty_rows = [], [], [], []
     for row in rows:
         kw = row["keyword"]
         if row.get("uncertain"):
@@ -1325,6 +1347,18 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
                                    "换图跳过（保存会被拦，请人工补图）"})
             fail_rows.append(kw)
             continue
+        # 【最终挂上去的图逐行查一次合规】图有三个来源（plan_skc 分的、_pad_row_images
+        # 补的、vision._usable 被迫放回的），只在某一处报必然漏。中文是 Temu 最硬的
+        # 红线，挂上去要等到阶段⑮ 发布被打回才知道，那时已经看不出是哪行的哪张图。
+        # 这里【不拦】：拦了整行就凑不够 3 张、save 反而被静默弹回（见 _pad_row_images）。
+        row_dirty = [os.path.basename(p) for p in picked
+                     if vision.is_dirty(notes_by_file.get(os.path.basename(p)) or {})]
+        if row_dirty:
+            dirty_rows.append(kw)
+            await emit({"type": "manual_check", "stage": "skc",
+                        "message": f"「{kw}」行有 {len(row_dirty)} 张图仍带中文/水印/"
+                                   f"logo（合规图凑不够 {SKC_ROW_MIN_IMAGES} 张，"
+                                   f"已按最优可用继续）：{'、'.join(row_dirty)}"})
         for i, src in enumerate(picked, 1):
             shutil.copy(src, os.path.join(prep, f"main-{i:02d}.jpg"))
         fitted = images.batch_fit34(prep)
@@ -1372,6 +1406,9 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
         note += f"（失败：{'、'.join(fail_rows)}）"
     if fixed:
         note += f"；尺寸兜底重做 {len(fixed)} 行：{'、'.join(fixed)}"
+    if dirty_rows:
+        # 进 note 是为了留在状态文件里：事后被 Temu 打回时能直接对上是哪几行
+        note += f"；{len(dirty_rows)} 行含不合规图：{'、'.join(dirty_rows)}"
     return {"status": "ok", "note": note}
 
 

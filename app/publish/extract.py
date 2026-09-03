@@ -35,6 +35,8 @@ import os
 import re
 from typing import Any, Callable, Optional
 
+from pydantic import BaseModel, ConfigDict
+
 from app.config import config, get_output_dir
 from app.logger import logger
 from app.publish.browser import J, BrowserSession
@@ -70,8 +72,31 @@ _VALUE_TRAPS = ("其他品牌", "有领标", "无领标", "有吊牌", "无吊�
 # 商品参数没有稳定容器，故用「找含已知键名的可见容器 + 按信息量打分」的启发式：
 # 最短容器可能只是摘要会截断，最长的是整页噪音，故按命中键数降序、再按长度升序取第一个。
 _JS_EXTRACT = """(() => {
-  const d = (((window.context||{}).result)||{}).data;
-  if (!d) return JSON.stringify({found: false});
+  // 【2026-09-03 增加诊断与多路径兼容】原先只检查 window.context.result.data，
+  // 但实测发现 result 存在但 data 不存在。增加诊断信息帮助排查，并尝试其他可能路径。
+  const ctx = window.context || {};
+  const result = ctx.result || {};
+
+  // 诊断信息：如果 data 不存在，记录 result 的结构
+  if (!result.data) {
+    const diag = {
+      found: false,
+      diagnostic: {
+        hasContext: typeof window.context !== 'undefined',
+        hasResult: typeof result !== 'undefined' && result !== null,
+        resultKeys: Object.keys(result),
+        resultType: typeof result,
+        // 尝试其他常见路径
+        hasContent: typeof result.content !== 'undefined',
+        hasModel: typeof result.model !== 'undefined',
+        // 打印 result 的前 500 字符样本
+        resultSample: JSON.stringify(result).substring(0, 500)
+      }
+    };
+    return JSON.stringify(diag);
+  }
+
+  const d = result.data;
   const gal = (d.gallery||{}).fields || {};
   const pack = (d.productPackInfo||{}).fields || {};
   const desc = (d.description||{}).fields || {};
@@ -79,6 +104,60 @@ _JS_EXTRACT = """(() => {
       .tradeWithoutPromotion||{}).skuMapOriginal||[])
     .map(s => ({spec: (s.specAttrs||'').replace(/&gt;/g, '>'),
                 price: s.discountPrice || s.price, stock: s.canBookCount}));
+
+  // 【提取颜色选择器的缩略图】2026-09-03 新增：当源商品用 MJ20/MJ21 这类编码或非中文
+  // 词命名颜色时，LLM 凭主图画面无法准确判断哪张图属于哪个颜色，必须从页面上颜色
+  // 选择器提取每个颜色的缩略图 URL，然后在阶段⑦按源商品顺序一一对应、不再调 LLM 猜。
+  // 颜色选择器常见形态：
+  //   - 带图的按钮/链接，每个颜色一个，包含 <img> 或背景图
+  //   - 容器通常在 .obj-content、.mod-detail-page、或包含「颜色」文字的区块里
+  // 提取策略：找所有可见的 img 元素，按「在颜色相关容器里 + 尺寸像缩略图（50~200px）」
+  // 筛选，再按它们的父元素文本内容提取颜色名。best-effort：提取不到就返回空数组，
+  // 阶段⑦会退回原先的 LLM 分配逻辑。
+  const colorImages = [];
+  try {
+    // 找包含「颜色」关键词的容器（多数页面会标注「颜色：」）
+    const containers = Array.from(document.querySelectorAll('.obj-content, .mod-detail-page, [class*="sku"]'));
+    for (const c of containers) {
+      const text = (c.textContent || '').replace(/\\s+/g, '');
+      if (!text.includes('颜色') && !text.includes('Color')) continue;
+
+      // 在这个容器里找所有可见的 img（尺寸像缩略图的）
+      const imgs = Array.from(c.querySelectorAll('img')).filter(img => {
+        const r = img.getBoundingClientRect();
+        return r.width >= 30 && r.width <= 250 && r.height >= 30 && r.height <= 250;
+      });
+
+      for (const img of imgs) {
+        const src = img.src || img.dataset.src || img.dataset.lazySrc || '';
+        if (!src || src.startsWith('data:')) continue;
+
+        // 颜色名：优先从父元素的 title/alt/aria-label/data-value 取，兜底用 textContent
+        let colorName = '';
+        let el = img;
+        for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
+          colorName = el.title || el.getAttribute('aria-label') ||
+                     el.dataset.value || el.dataset.title || '';
+          if (colorName) break;
+        }
+        if (!colorName) colorName = img.alt || '';
+        if (!colorName && img.parentElement) {
+          const t = (img.parentElement.textContent || '').trim();
+          if (t.length > 0 && t.length < 50) colorName = t;
+        }
+
+        if (colorName && src) {
+          colorImages.push({color: colorName.trim(), image: src});
+        }
+      }
+
+      // 只处理第一个命中的容器（避免把页面其它区块的图也抓进来）
+      if (colorImages.length > 0) break;
+    }
+  } catch (e) {
+    // 提取失败不影响主流程，colorImages 留空数组即可
+  }
+
   const els = Array.from(document.querySelectorAll('div, section, ul'));
   const cands = els.filter(el => el.offsetHeight > 0)
     .map(el => (el.textContent||'').replace(/\\s+/g, ' ').trim())
@@ -94,6 +173,7 @@ _JS_EXTRACT = """(() => {
     unitWeight: pack.unitWeight != null ? pack.unitWeight : null,
     detailUrl: desc.detailUrl || null,
     skuMap: skuMap,
+    colorImages: colorImages,
     attrText: cands.length ? cands[0] : null
   });
 })()"""
@@ -143,6 +223,13 @@ _RE_SIZE_HINT = re.compile(
     r"衣长|胸围|肩宽|袖长|裤长|裙长|腰围|臀围|摆长|裆|脚口|领围|尺码|尺寸"
     r"|建议身高|参考身高|适合身高|净重|体重"
     r"|\b\d{2,3}\s*cm\b|\b\d{1,2}\s*-\s*\d{1,2}\s*[my]\b",
+    re.I)
+
+# 详情文字里「可能有成分信息」的信号词：命中任一词就需要问模型提取成分。
+# 覆盖商家补充成分的常见写法：「成分：」「材质：」「面料：」「含量：」「棉」「涤」等。
+_RE_COMP_HINT = re.compile(
+    r"成分[:：]|材质[:：]|面料[:：]|含量[:：]|主面料"
+    r"|棉|涤|聚酯|氨纶|锦纶|粘纤|腈纶|羊毛|羊绒|莫代尔|亚麻|蚕丝|竹纤维",
     re.I)
 
 
@@ -385,6 +472,31 @@ def check_material_image(main_entries: list) -> dict:
         reasons.append(f"{w}x{h} 小于 800x800，需放大")
     return {**result, "needsProcessing": True,
             "reason": "；".join(reasons) + "（需调图片修改技能处理）"}
+
+
+# 阿里图床把缩放参数拼在文件名【后面】：原图 a.jpg，缩略图是 a.jpg_60x60.jpg、
+# a.jpg_100x100q90.jpg、a.jpg_.webp，还可能叠加多层。
+_IMG_SIZE_SUFFIX = re.compile(r"_\d+x\d+(?:[a-z]\d+)*(?:\.(?:jpg|jpeg|png|webp))?$", re.I)
+_IMG_FMT_SUFFIX = re.compile(r"_\.(?:jpg|jpeg|png|webp)$", re.I)
+
+
+def image_url_key(url: str) -> str:
+    """图 URL 归一成「同一张原图」的键：剥掉 CDN 尺寸/格式后缀、协议与查询串。
+
+    【用途：把颜色选择器的缩略图对到某张轮播主图】1688 的颜色缩略图多数就是某张主图
+    的缩放版，剥掉后缀两边能精确对上。这比按顺序对应或比画面都可靠——不需要阈值、
+    不受方形裁切影响（2026-09-03 实测：主图 1080×1440 被方形裁切成缩略图后，与自己
+    的颜色距离 28、与另一张图只有 0.75，画面比对在这种形态下会大面积错配）。
+    对不上时才轮到画面比对，见 vision._match_color_thumbs。
+    """
+    u = (url or "").split("?")[0].strip()
+    u = re.sub(r"^https?://", "", u)
+    for _ in range(4):                 # 后缀可叠加（a.jpg_60x60.jpg_.webp）
+        nu = _IMG_SIZE_SUFFIX.sub("", _IMG_FMT_SUFFIX.sub("", u))
+        if nu == u:
+            break
+        u = nu
+    return u.lower()
 
 
 def _download_image(url: str, dst_path: str, retries: int = 3) -> int:
@@ -758,6 +870,52 @@ async def extract_product(
     with open(os.path.join(outdir, "raw.json"), "w", encoding="utf-8") as f:
         json.dump(raw, f, ensure_ascii=False, indent=2)
 
+    # 【颜色缩略图】2026-09-03：适配器从页面颜色选择器提取到 {颜色名: 图URL}，这里
+    # 【下载到本地】再落盘。阶段⑦ 是拿缩略图跟主图比 ahash 画面来定该颜色的首图
+    # （见 vision._match_color_thumbs：1688 的颜色缩略图通常就是某张轮播主图的缩略版），
+    # 比哈希必须有本地文件；而 vision 是纯判断层、刻意不碰网络，故下载只能在这一步做。
+    # 【为什么不按顺序对应就完事】main-NN 的编号来自轮播 offerImgList、colors 的顺序
+    # 来自 skuMapOriginal 的 specAttrs 首现序，两个独立来源没有任何东西保证一致。
+    # 落盘形状 {颜色名: {"url":…, "file": "color-NN.jpg"}}。旧产物只有裸 URL 字符串，
+    # 阶段⑦ 认得那个形状（按「本地无图」处理、该颜色退回 LLM 判断），故不必迁移。
+    # 文件名前缀刻意不用 main-/desc-：那两个前缀是 dedup_images 与 vision._main_files
+    # 的识别键，颜色缩略图混进去会被当成商品图参与选图和去重。
+    # 主图 URL 归一键 → 本地文件名。下载失败的图不进表（文件不存在，配上也没用）。
+    main_by_key = {}
+    for i, u in enumerate(main_imgs, 1):
+        fn = f"main-{i:02d}.jpg"
+        if os.path.isfile(os.path.join(outdir, fn)):
+            main_by_key.setdefault(image_url_key(u), fn)
+
+    color_images = {}
+    for i, (cname, curl) in enumerate(
+            ((prod.extra or {}).get("colorImages") or {}).items(), 1):
+        entry = {"url": curl}
+        # 【先按 URL 精确对】颜色缩略图多数就是某张主图的缩放版，剥掉尺寸后缀就能对上
+        mf = main_by_key.get(image_url_key(curl)) if isinstance(curl, str) else None
+        if mf:
+            entry["mainFile"] = mf
+        elif with_images and isinstance(curl, str) and curl.startswith("http"):
+            # URL 对不上（商家单独上传的色卡图）：下载下来留给阶段⑦ 比画面
+            fn = f"color-{i:02d}.jpg"
+            # best-effort：下不动就只留 URL，阶段⑦ 那个颜色配不上而已，不该拖垮提取
+            try:
+                if _download_image(curl, os.path.join(outdir, fn)):
+                    entry["file"] = fn
+                else:
+                    logger.warning(f"{fn}（颜色「{cname}」）缩略图下载失败或源站 404，"
+                                   "阶段⑦ 该颜色将退回 LLM 判断")
+            except Exception as e:
+                logger.warning(f"{fn}（颜色「{cname}」）缩略图下载异常，"
+                               f"阶段⑦ 该颜色将退回 LLM 判断：{e}")
+        color_images[cname] = entry
+    if color_images:
+        by_url = sum(1 for v in color_images.values() if v.get("mainFile"))
+        by_file = sum(1 for v in color_images.values() if v.get("file"))
+        logger.info(f"颜色缩略图 {len(color_images)} 个：{by_url} 个按 URL 直接对上主图，"
+                    f"{by_file} 个已下载留给阶段⑦ 比画面，"
+                    f"{len(color_images) - by_url - by_file} 个无从配对")
+
     info = {
         # 【offerId 保留】它是 1688 时代的键名，人工排查与既有 product-info.json 都在用；
         # 新增 productId 与 platformName 而不是改名，免得动下游任何一处读法
@@ -778,6 +936,8 @@ async def extract_product(
         "skus": pivot,
         "colors": colors,
         "sizes": sizes,
+        # 颜色缩略图：{颜色名: {"url", "file"}}，阶段⑦ 拿 file 跟主图比 ahash 定首图
+        "colorImages": color_images,
         # 详情描述里的纯文字（多数商品是纯图详情，故常为空串）。留着是因为有商家把整张
         # 尺码表打成明文，enrich_desc_text 从这里抽 sizeMeasurements——那份数据比识图
         # 更可信（商家白纸黑字写的，没有 OCR 误差）。取证见 desc_text_of。
@@ -875,7 +1035,7 @@ _VISION_PROMPT = """商品标题：{title}
 下面按顺序给你 {n} 张图，编号与文件名对应：
 {listing}
 
-请完成四件事，合并成一个 JSON 返回：
+请完成五件事，合并成一个 JSON 返回：
 
 1. imageUnderstanding —— 看懂商品实物：
    - "product"：一句话说明品类/款式/版型（如「男童短袖 POLO 衫 + 长裤两件套，翻领拼色」）
@@ -914,17 +1074,62 @@ _VISION_PROMPT = """商品标题：{title}
    这个字段【很重要】：填平台尺码表时套装要填两张，两张的数值必须各按自己那件来，
    混用会给买家一份错尺码表。sizeMeasurements 仍照上面填（多张表时取第一张即可）。
 
-4. complianceNotes —— 逐张标注合规风险（Temu 不接受中文/水印/他人 logo）：
+4. composition —— 【面料成分信息】（洗水标/吊牌/成分说明图）：
+   图里若有洗水标、吊牌或成分说明，提取其中的纤维名与百分比。分两种情况：
+
+   (a) 单一成分（整个商品统一成分，常见于洗水标特写）：
+       {{"main": {{"<纤维名>": <百分比数值>}}}}
+       例如洗水标写「35% Cotton 65% Polyester」→ {{"main": {{"Cotton": 35, "Polyester": 65}}}}
+       或中文「棉 35% 涤纶 65%」→ {{"main": {{"棉": 35, "涤纶": 65}}}}
+
+   (b) 按款式/颜色区分（不同款式成分不同，常见于多款吊牌并列）：
+       {{"byVariant": {{"<款式/颜色名>": {{"<纤维名>": <百分比数值>}}}}}}
+       例如图里有两张吊牌：卡通款「35% Cotton 65% Polyester」、花边款「82% Cotton 18% Polyester」
+       → {{"byVariant": {{"卡通款": {{"Cotton": 35, "Polyester": 65}},
+                         "花边款": {{"Cotton": 82, "Polyester": 18}}}}}}
+
+   成分提取规则：
+   - 纤维名照抄图里的写法（中英文都可，不要自己翻译或归一）；
+   - 百分比只填数字，不带 % 符号；
+   - 图里只写纤维名没给百分比时，不要编造数值、留空；
+   - 如果按款式区分，款式名尽量与「源商品颜色」对齐，但不强制——图里怎么写就怎么记录；
+   - 图里压根没有成分标签时返回 {{}}，【不要按商品照片猜材质】。
+
+5. complianceNotes —— 逐张标注合规风险（Temu 不接受中文/水印/他人 logo）：
    "files"：[{{"file": "<文件名>", "chinese": true/false, "watermark": true/false,
-   "logo": true/false, "kind": "<模特实拍|平铺|细节|尺码表|中文海报|工厂图|其它>",
+   "logo": true/false, "kind": "<模特实拍|平铺|细节|尺码表|洗水标|吊牌|中文海报|工厂图|其它>",
    "clean": true/false, "note": "<10字内>"}}]
    clean=true 的判据：无任何中文文字、无水印、无他人品牌 logo，且画面就是商品本身
    （阶段⑥ 挑素材图、阶段⑪ 删描述图直接读这个字段）。
 
 只输出 JSON：{{"imageUnderstanding": {{...}}, "sizeChart": {{...}},
 "sizeMeasurements": {{...}}, "sizeMeasurementsRows": {{...}},
-"sizeMeasurementsByPart": [...],
+"sizeMeasurementsByPart": [...], "composition": {{...}},
 "complianceNotes": {{"files": [...]}}}}"""
+
+class VisionResult(BaseModel):
+    """阶段① 视觉回填的必答字段（校验与重试见 llm._check_result）。
+
+    【为什么只声明这四个】它们对应提示词里的 1/2/3/5 条，任何商品都该有答案——
+    没有尺码表就回 {}，那也是答案。而 sizeMeasurementsRows（只有「没有尺码列的
+    表」才用得上）、sizeMeasurementsByPart（只有套装才有两件）、composition
+    （只有拍到成分标签才有）都是条件字段，声明成必填等于逼模型编。
+    未声明的字段不受影响：extra 默认 ignore，模型照答、_merge_vision 照读
+    （返回的是原始 dict，不是 model_dump 的产物，见 _check_result）。
+
+    【这道闸拦的是哪一类】2026-09-03 offer 968804940018 那次是整份断尾、解析就
+    过不去；但同一个毛病还有一种更隐蔽的形态——模型只答完 imageUnderstanding 就
+    规规矩矩收尾，JSON 完全合法、解析通过，_merge_vision 挨个 isinstance(got, dict)
+    查下来全不成立，于是尺码字段静默留空，日志只报「尺码参考 0 | 实测尺寸 0」。
+    那种解析这关拦不住，只能靠这里。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    imageUnderstanding: dict
+    sizeChart: dict
+    sizeMeasurements: dict
+    complianceNotes: dict
 
 
 def dedup_images(outdir: str) -> tuple[list, dict]:
@@ -1321,6 +1526,9 @@ async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
     只填【原本为空】的字段：手工补过或上一轮已填的值优先，不被新一轮覆盖——
     人工标注的合规结论比模型的可靠，覆盖掉等于把人的工作抹了。
 
+    【2026-09-02 新增成分合并】视觉识别的成分写进 compositionFromVision，优先级
+    低于 compositionFromText（详情文字白纸黑字 > OCR 识图有误差）。
+
     重复图（dupes）在这里补齐：模型只看了唯一图，重复文件要继承首见文件的标注，
     并额外标 duplicate=true / clean=false。标 clean=false 是刻意的：重复图对
     阶段⑥⑦⑪ 来说等于「不该再用的图」，让它进不了候选，比留 clean=true 更安全。
@@ -1334,6 +1542,16 @@ async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
         if isinstance(got, dict) and got and not info.get(key):
             info[key] = got
         stat[key] = len(info.get(key) or {})
+
+    # 成分信息：只在没有 compositionFromText 时才写（文字优先）
+    comp = vision.get("composition")
+    comp_count = 0
+    if isinstance(comp, dict) and (comp.get("main") or comp.get("byVariant")):
+        if not info.get("compositionFromText"):
+            info["compositionFromVision"] = comp
+            comp_count = len(comp.get("main") or {}) + sum(
+                len(v) for v in (comp.get("byVariant") or {}).values())
+    stat["composition"] = comp_count
 
     # 表格没有尺码列时走行表那一支（见 _rows_to_measurements）。排在直填之后：
     # 有尺码键的表是原生更可靠的形态，只在它没填上时才推对应关系。
@@ -1447,7 +1665,8 @@ async def enrich_vision(
         n=len(names), listing=listing,
     )
     vision = await ask_json_with_images(
-        prompt, uniq, what="阶段①视觉回填", system=_VISION_SYSTEM, stage="extract"
+        prompt, uniq, what="阶段①视觉回填", system=_VISION_SYSTEM, stage="extract",
+        result_model=VisionResult,
     )
 
     stat = await _merge_vision(info, vision, dupes)
@@ -1464,9 +1683,11 @@ async def enrich_vision(
         f"实测尺寸 {stat['sizeMeasurements']}"
         + (f"（分件 {stat['sizeMeasurementsByPart']} 件）"
            if stat.get('sizeMeasurementsByPart') else "")
+        + (f" | 成分 {stat['composition']} 项" if stat.get('composition') else "")
         + f" | 合规标注 {stat['complianceNotes']} "
         f"（干净图 {stat['cleanFiles']}）"
     )
+    return result
     return result
 
 
@@ -1498,13 +1719,14 @@ _DESC_TEXT_SYSTEM = (
 
 _DESC_TEXT_PROMPT = """商品标题：{title}
 源商品尺码（SKU 里的尺码，仅供对照，不必强行凑齐）：{sizes}
+源商品颜色/款式（SKU 里的颜色，仅供对照）：{colors}
 
 下面是该商品详情描述里的纯文字内容：
 ----
 {text}
 ----
 
-请从这段文字里提取两样东西，合并成一个 JSON 返回：
+请从这段文字里提取三样东西，合并成一个 JSON 返回：
 
 1. sizeMeasurements —— 各尺码的【平铺实测尺寸】（衣长/胸围/袖长/肩宽/裤长等，单位 cm）：
    {{"<尺码>": {{"<参数名>": <数值>}}}}
@@ -1516,14 +1738,32 @@ _DESC_TEXT_PROMPT = """商品标题：{title}
 2. sizeChart —— 尺码的【身高体重参考】（如「建议身高100-110cm」「体重20-25斤」）：
    {{"<尺码>": "<身高/体重参考原文>"}}
 
+3. composition —— 【面料成分信息】，分两种情况：
+   (a) 单一成分（整个商品统一成分）：
+       {{"main": {{"<纤维名>": <百分比数值>}}}}
+       例如「成分：35%棉 65%涤纶」→ {{"main": {{"棉": 35, "涤纶": 65}}}}
+
+   (b) 按款式/颜色区分（不同款式成分不同）：
+       {{"byVariant": {{"<款式/颜色名>": {{"<纤维名>": <百分比数值>}}}}}}
+       例如「卡通卫衣 成分：35棉65涤纶 花边卫裤 成分：82棉18涤」→
+       {{"byVariant": {{"卡通卫衣": {{"棉": 35, "涤纶": 65}}, "花边卫裤": {{"棉": 82, "涤纶": 18}}}}}}
+
+   成分提取规则：
+   - 纤维名照抄文字里的写法（棉/涤纶/聚酯纤维/氨纶 等），不要自己归一或改名；
+   - 百分比只填数字，不带 % 符号；
+   - 如果文字只说「棉」没给百分比，就不要编造数值、留空该纤维；
+   - 如果按款式区分，款式名尽量与「源商品颜色/款式」里的写法对齐（如源有「卡通工装衣」，
+     文字写「卡通卫衣」，优先用源的写法），但不强制——文字里怎么写就怎么记录；
+   - 如果文字里压根没有成分信息，返回 {{}}。
+
 注意：
 - 这段文字里可能压根没有尺码表（只有洗涤说明、发货说明、店铺宣传之类），
-  那就两个字段都返回 {{}}，【不要硬凑】；
+  那就 sizeMeasurements 和 sizeChart 都返回 {{}}，【不要硬凑】；
 - 文字里若出现「跳码规则」「允差」「供应商尺寸」这类非尺码列，不要把它们
   当成某个尺码的值；
 - 只有一个尺码时也照样返回（那就是单尺码商品）。
 
-只输出 JSON：{{"sizeMeasurements": {{...}}, "sizeChart": {{...}}}}"""
+只输出 JSON：{{"sizeMeasurements": {{...}}, "sizeChart": {{...}}, "composition": {{...}}}}"""
 
 
 def _clean_meas(raw) -> dict:
@@ -1558,13 +1798,77 @@ def _clean_meas(raw) -> dict:
     return out
 
 
+def _clean_composition(raw) -> dict:
+    """把模型给的成分清成标准结构，脏条目直接丢。
+
+    返回结构：{"main": {纤维: 百分比}, "byVariant": {款式: {纤维: 百分比}}}
+    两个字段都可能为空（文字里压根没成分信息）。
+
+    过滤规则：
+    - 纤维名非空、百分比能转成 0-100 的数
+    - 单个款式成分合计不校验 100%（可能源只写主成分，差额由阶段④补足）
+    - 结构异常的整组丢弃（宁缺毋滥，避免把脏数据当实测值填进表单）
+    """
+    out = {"main": {}, "byVariant": {}}
+    if not isinstance(raw, dict):
+        return out
+
+    # 处理 main（单一成分）
+    main = raw.get("main")
+    if isinstance(main, dict):
+        cleaned = {}
+        for fiber, pct in main.items():
+            name = str(fiber or "").strip()
+            if not name:
+                continue
+            try:
+                num = float(str(pct).strip())
+                if 0 <= num <= 100:
+                    # 整数就写整数
+                    cleaned[name] = int(num) if num == int(num) else num
+            except (TypeError, ValueError):
+                continue
+        if cleaned:
+            out["main"] = cleaned
+
+    # 处理 byVariant（按款式区分）
+    by_var = raw.get("byVariant")
+    if isinstance(by_var, dict):
+        cleaned_vars = {}
+        for variant, comp in by_var.items():
+            var_name = str(variant or "").strip()
+            if not var_name or not isinstance(comp, dict):
+                continue
+            cleaned_comp = {}
+            for fiber, pct in comp.items():
+                name = str(fiber or "").strip()
+                if not name:
+                    continue
+                try:
+                    num = float(str(pct).strip())
+                    if 0 <= num <= 100:
+                        cleaned_comp[name] = int(num) if num == int(num) else num
+                except (TypeError, ValueError):
+                    continue
+            if cleaned_comp:
+                cleaned_vars[var_name] = cleaned_comp
+        if cleaned_vars:
+            out["byVariant"] = cleaned_vars
+
+    return out
+
+
 async def enrich_desc_text(info_path: str, overwrite: bool = True) -> dict:
-    """从 descText（详情纯文字）里抽 sizeMeasurements / sizeChart，原地更新 info。
+    """从 descText（详情纯文字）里抽 sizeMeasurements / sizeChart / composition，原地更新 info。
 
     【与视觉回填的关系：文字优先】descText 里抽到的是商家白纸黑字写的实测值，没有
     OCR 这道误差，故它【可以覆盖】视觉回填的同名字段——这与项目既有的「源实测优于
     模型估算」是同一条取向（见 pipeline.add_sizechart 的取数顺序）。但只覆盖本次真正
     抽到内容的那个字段：抽到空表时绝不拿空去清掉视觉已填好的值。
+
+    【2026-09-02 新增成分提取】商家常在详情文字里补充成分信息，特别是按款式/颜色区分
+    成分的情况（如「卡通卫衣 成分：35棉65涤纶 花边卫裤 成分：82棉18涤」）。这份数据
+    写进 compositionFromText，优先级高于源属性的 mainComposition（源属性只能记单一值）。
 
     人工补过的值仍然优先：`_merge_vision` 那条「不覆盖已有值」的规矩针对的是模型之间，
     而人工标注比任何模型都可靠。本函数无从分辨某个值是人填的还是视觉填的，故提供
@@ -1585,19 +1889,23 @@ async def enrich_desc_text(info_path: str, overwrite: bool = True) -> dict:
         return {"status": "skipped", "reason": "详情描述没有文字内容（纯图详情）",
                 "infoPath": info_path}
 
-    # 关键词闸：文字里连一个尺码相关词都没有时不必问模型。多数纯文字详情写的是发货/
-    # 洗涤/售后说明，发一次调用只为得到两个空表，纯属白花钱。
-    if not _RE_SIZE_HINT.search(text):
-        return {"status": "skipped", "reason": f"详情文字 {len(text)} 字里没有尺码相关词",
+    # 关键词闸：文字里既没有尺码词也没有成分词时不必问模型。
+    has_size_hint = bool(_RE_SIZE_HINT.search(text))
+    has_comp_hint = bool(_RE_COMP_HINT.search(text))
+
+    if not has_size_hint and not has_comp_hint:
+        return {"status": "skipped",
+                "reason": f"详情文字 {len(text)} 字里没有尺码或成分相关词",
                 "infoPath": info_path, "textLen": len(text)}
 
     data = await ask_json(
         _DESC_TEXT_PROMPT.format(
             title=info.get("title") or "（无）",
             sizes=json.dumps(info.get("sizes") or [], ensure_ascii=False),
+            colors=json.dumps(info.get("colors") or [], ensure_ascii=False),
             text=text[:4000],   # 兜住极长文字详情；尺码表都在开头，截尾不影响
         ),
-        what="阶段①b 详情文字尺码表", stage="extract_text",
+        what="阶段①b 详情文字提取", stage="extract_text",
     )
 
     meas = _clean_meas(data.get("sizeMeasurements"))
@@ -1605,6 +1913,7 @@ async def enrich_desc_text(info_path: str, overwrite: bool = True) -> dict:
            for k, v in (data.get("sizeChart") or {}).items()
            if str(k or "").strip() and str(v or "").strip()} \
         if isinstance(data.get("sizeChart"), dict) else {}
+    comp = _clean_composition(data.get("composition"))
 
     filled = {}
     for key, got in (("sizeMeasurements", meas), ("sizeChart", ref)):
@@ -1616,11 +1925,36 @@ async def enrich_desc_text(info_path: str, overwrite: bool = True) -> dict:
     if filled["sizeMeasurements"]:
         info["sizeMeasurementsSource"] = "descText"
 
+    # 成分写入：只在真抽到数据时才写（空字典不覆盖已有值）
+    comp_count = 0
+    if comp.get("main") or comp.get("byVariant"):
+        info["compositionFromText"] = comp
+        comp_count = len(comp.get("main") or {}) + sum(
+            len(v) for v in (comp.get("byVariant") or {}).values())
+        filled["composition"] = comp_count
+    else:
+        filled["composition"] = 0
+
     with open(info_path, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
 
-    logger.info(f"详情文字尺码回填：实测尺寸 {len(meas)} 档 / 身高体重参考 {len(ref)} 档"
-                f"（文字 {len(text)} 字）"
-                + ("" if filled["sizeMeasurements"] else "；未写入（抽到空表或已有值）"))
+    log_parts = []
+    if filled["sizeMeasurements"]:
+        log_parts.append(f"实测尺寸 {len(meas)} 档")
+    if filled["sizeChart"]:
+        log_parts.append(f"身高体重参考 {len(ref)} 档")
+    if filled["composition"]:
+        main_cnt = len(comp.get("main") or {})
+        var_cnt = len(comp.get("byVariant") or {})
+        if main_cnt and var_cnt:
+            log_parts.append(f"成分 {comp_count} 项（单一 + {var_cnt} 款式）")
+        elif main_cnt:
+            log_parts.append(f"成分 {main_cnt} 项（单一）")
+        elif var_cnt:
+            log_parts.append(f"成分（{var_cnt} 款式）")
+
+    logger.info(f"详情文字回填：{' / '.join(log_parts) if log_parts else '无有效数据'}"
+                f"（文字 {len(text)} 字）")
     return {"status": "ok", "infoPath": info_path, "textLen": len(text),
-            "measurements": meas, "sizeChart": ref, "filled": filled}
+            "measurements": meas, "sizeChart": ref, "composition": comp,
+            "filled": filled}
