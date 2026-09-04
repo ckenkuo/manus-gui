@@ -721,6 +721,16 @@
                 ></span>
                 <i class="bi bi-play-fill"></i> 开始发布
               </button>
+              <!-- 暂停按钮：只在批次跑着时显示（startBatch 成功后 remove d-none）。
+                   暂停是「商品间」粒度——当前商品跑完后才真正停，点下那一刻按钮先变
+                   「继续」并提示「当前商品完成后暂停」，后端 paused 事件到了才写「已暂停」。 -->
+              <button
+                id="btnPause"
+                class="btn btn-warning btn-sm d-none"
+                title="暂停发布：当前商品跑完后不再开始下一个（不打断正在填的商品）。点「继续」接着跑剩余商品"
+              >
+                <i class="bi bi-pause-fill"></i> 暂停
+              </button>
               <span id="statusText" class="text-muted small ms-2"></span>
             </div>
           </div>
@@ -931,6 +941,9 @@
       // 发布页前端：POST /publish/batch 拿 job_id，进度经 SSE 消费 service 的结构化事件。
       const $ = (id) => document.getElementById(id);
       let evtSource = null;
+      // 当前发布作业的 job_id 与暂停标志：暂停/继续按钮要按 job_id 调后端，finishRun 要清掉。
+      let currentJobId = null;
+      let paused = false;
       // products: index(1 起) -> {offer, title, stages: {stage: {status, elapsed_s, note}}, status}
       let products = {};
 
@@ -3157,6 +3170,13 @@
               ? "text-warning"
               : "";
           logLine(data.message || "", cls);
+        } else if (type === "paused") {
+          // 后端在【真正停住】时发这条（当前商品已收尾），此刻才把文案从「暂停中」改成「已暂停」。
+          $("statusText").textContent = "已暂停";
+          logLine("已暂停：点「继续」接着发布剩余商品", "text-warning");
+        } else if (type === "resumed") {
+          $("statusText").textContent = "发布中…";
+          logLine("继续发布", "text-info");
         } else if (type === "aborted") {
           logLine(`❌ 中止：${data.reason}`, "text-danger");
           showToast("发布中止", data.reason, "danger");
@@ -3171,6 +3191,10 @@
         $("startSpinner").classList.add("d-none");
         $("statusText").textContent = "";
         $("btnStart").disabled = false;
+        // 批次结束没有可暂停的对象：隐藏暂停按钮、清掉 job_id 与暂停标志。
+        $("btnPause").classList.add("d-none");
+        paused = false;
+        currentJobId = null;
         if (summary && (summary.ok != null || summary.fail != null)) {
           showToast(
             "批次结束",
@@ -3180,6 +3204,47 @@
           );
         }
       }
+
+      // 暂停按钮两种形态：跑批中显示「暂停」（黄），请求暂停后显示「继续」（绿）。
+      // 参数 isPaused 是「是否已请求暂停」，不是「当前是否真的停住」——真正停住由
+      // 后端 paused 事件告知（onEvent 里改 statusText），按钮在点下去那一刻就切到「继续」。
+      function renderPauseBtn(isPaused) {
+        $("btnPause").innerHTML = isPaused
+          ? '<i class="bi bi-play-fill"></i> 继续'
+          : '<i class="bi bi-pause-fill"></i> 暂停';
+        $("btnPause").className =
+          "btn btn-sm " + (isPaused ? "btn-success" : "btn-warning");
+      }
+
+      // 调后端暂停/恢复接口。want=true 暂停、want=false 继续。
+      async function setPaused(want) {
+        if (!currentJobId) return;
+        $("btnPause").disabled = true;
+        try {
+          const r = await fetch(`/publish/batch/${currentJobId}/pause`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paused: want }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          paused = d.paused;
+          renderPauseBtn(paused);
+          // 暂停是商品间粒度：点「暂停」时当前商品还在跑，得说明真正停住要等它跑完。
+          $("statusText").textContent = paused ? "当前商品完成后暂停…" : "发布中…";
+          if (paused)
+            showToast(
+              "暂停中",
+              "当前商品完成后将暂停，不再开始下一个；点「继续」接着发布",
+              "warning"
+            );
+        } catch (e) {
+          showToast("暂停/继续失败", String(e).replace(/^Error:\s*/, ""), "danger");
+        } finally {
+          $("btnPause").disabled = false;
+        }
+      }
+      $("btnPause").addEventListener("click", () => setPaused(!paused));
 
       async function startBatch() {
         const tasks = parseTasks($("inputTasks").value);
@@ -3247,6 +3312,10 @@
             }),
           });
           const { job_id } = await r.json();
+          currentJobId = job_id;
+          paused = false;
+          $("btnPause").classList.remove("d-none");
+          renderPauseBtn(false);
           evtSource = new EventSource(`/publish/batch/${job_id}/events`);
           [
             "batch_start",
@@ -3258,6 +3327,8 @@
             "batch_done",
             "log",
             "aborted",
+            "paused",
+            "resumed",
           ].forEach((ev) =>
             evtSource.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)))
           );

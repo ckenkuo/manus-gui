@@ -113,7 +113,7 @@ class DescAction(BaseModel):
     model_config = ConfigDict(strict=True)
 
     pos: int
-    action: Literal["keep", "delete", "replace"]
+    action: Literal["keep", "delete", "replace", "sizechart"]
 
 
 class DescPlan(BaseModel):
@@ -336,11 +336,15 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
         parts = ["移除图片中所有水印、店铺名、拍摄者账号文字和他人品牌 logo"
                  "（含商品吊牌/标牌上的品牌字样）"]
         if n.get("chinese"):
-            # 商品图上的中文若是有效信息（如尺码标注）直接删会丢信息，故先英化再删装饰性中文
-            # 标点要单独点出来：只说「中文文字」时模型会留下『』这类中日韩标点，
-            # 过不了 check_cleaned（理由见 images._NO_CJK_PUNCT）
+            # 商品图上的中文若是商品介绍/说明类（材质成分、尺码、工艺、卖点、使用说明等）直接删
+            # 会丢信息，故先英化保留再删非商品信息；材质/质量特写图上的说明正是商品要传达的信息，
+            # 绝不能当装饰抹掉（2026-09-03 用户要求）。范围用开放措辞、别只列举几个类别——
+            # 用户明确「商品介绍只要不违规都翻译」。标点要单独点出来：只说「中文文字」时模型会
+            # 留下『』这类中日韩标点，过不了 check_cleaned（理由见 images._NO_CJK_PUNCT）
             parts.append("图中若有中文文字，翻译成简洁英文并原位替换，字体风格和排版尽量保持一致；"
-                         "属于店铺宣传/装饰性质的中文直接移除；"
+                         "凡是商品介绍、说明类文字（材质成分、工艺、尺寸、功能卖点、使用说明、注意事项等）"
+                         "都翻译保留、不要删除；"
+                         "仅水印、店铺名、拍摄者账号文字、他人品牌 logo 这类非商品信息直接移除；"
                          "中文标点（『』「」、，。！？等）也必须一并去掉或换成英文标点")
         parts.append("商品主体、配色、图案和构图完全不变，被移除处按周围内容自然补全")
         cands.append((_dirty_score(n),
@@ -658,18 +662,34 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
 
     listing = "\n".join(f"第{m['pos']} 张（pos={m['pos']}）" for m in mods)
     all_pos = [m["pos"] for m in mods]
+    # 尺码表图/尺寸图的处置随「实测尺寸有没有识别到」而变：没识别到时（sizeMeasurements
+    # 为空，阶段⑨ 靠模型估算）它是买家唯一的准确尺码来源，要英化 + cm→英寸后保留；已识别到
+    # （平台尺码表已有真实数据）时照旧删除。故 prompt 与动作枚举都按此开关裁剪。
+    # 【尺寸图也走 sizechart 动作】非服装类（手提袋/包包/玩具/杂货）没有平台尺码表栏，
+    # 买家要凭描述区那张标注长宽高的尺寸示意图了解整体大小，故它和服装尺码表一样要
+    # 英化 + cm→英寸后保留、不能当「与商品无关的图」删（2026-09-04 用户要求）。非服装
+    # 类 sizeMeasurements 恒为空，天然落在 size_missing 这条分支，无需单开开关。
+    size_missing = not bool((info or {}).get("sizeMeasurements"))
+    sizechart_line = (
+        '- "sizechart"：尺码表图或尺寸图（标注商品尺码/长宽高/规格尺寸的图，服装尺码表、'
+        "包包玩具的尺寸示意图都算）——保留，但把图中中文翻译成英文、并把长度单位 cm "
+        "换算成英寸(in)后替换（买家靠它选码或了解整体尺寸，别删）；\n"
+        '- "delete"：工厂/公司介绍、与商品无关的图、与前面重复出现的图——直接删；\n'
+        if size_missing else
+        '- "delete"：工厂/公司介绍、尺码表、与商品无关的图、与前面重复出现的图——直接删；\n'
+    )
+    acts_enum = "keep|delete|replace" + ("|sizechart" if size_missing else "")
     prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
 
 下面是该商品详情描述区的 {len(mods)} 张图，按页面展示顺序，序号就是 pos：
 {listing}
 
 Temu 半托管发布只关心商品图，请逐张决定动作：
-- "delete"：工厂/公司介绍、尺码表、与商品无关的图、与前面重复出现的图——直接删；
-- "replace"：图本身是商品展示图，但含中文文字、水印、店铺名或他人品牌 logo
+{sizechart_line}- "replace"：图本身是商品展示图，但含中文文字、水印、店铺名或他人品牌 logo
   ——保留画面，把中文英化并移除水印后替换；
 - "keep"：干净的商品图（无中文/水印/他人 logo）——保留。
 
-只输出 JSON：{{"actions": [{{"pos": 1, "action": "keep|delete|replace",
+只输出 JSON：{{"actions": [{{"pos": 1, "action": "{acts_enum}",
 "reason": "<10字内>"}}]}}
 actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     # pos 必须是整数：模型偶尔回字符串 "1"，下面 `pos not in valid_pos` 不成立就把
@@ -689,9 +709,13 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
             continue
         if act == "delete":
             delete.append(pos)
-        elif act == "replace":
-            replace.append({"pos": pos, "url": valid_pos[pos]["url"],
-                            "reason": (a.get("reason") or "")[:40]})
+        elif act in ("replace", "sizechart"):
+            rep = {"pos": pos, "url": valid_pos[pos]["url"],
+                   "reason": (a.get("reason") or "")[:40]}
+            if act == "sizechart":
+                # 尺码表图要英化 + cm→英寸，替换时用专用提示词（见 service._prepare_desc_image）
+                rep["sizechart"] = True
+            replace.append(rep)
         else:
             keep.append(pos)
     missed = [p for p in valid_pos if p not in delete
@@ -720,6 +744,62 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     if unreachable:
         out["unreachable"] = sorted(unreach)
     return out
+
+
+async def translate_size_texts(texts: list, info: Optional[dict] = None) -> dict:
+    """把疑似尺码的文字模块翻译成英文、并把长度单位 cm 换算成英寸。
+
+    texts: [{"idx": "0", "text": "..."}]（调用方已用 extract._RE_SIZE_HINT 筛过，只传
+    尺码文字）。返回 {"status": "ok", "plan": [{"idx", "action": "translate",
+    "text", "reason"}]}，plan 只含 translate 动作（删除/保留由调用方按 idx 归属决定）。
+
+    【为什么单独一个函数而不是恢复旧的 plan_desc_text】旧版对文字模块做「删/译/留」
+    全量分类，2026-09-01 起用户只要求删除、不再英化保留；这次只恢复【尺码】这一类
+    （当实测尺寸没识别到、平台尺码表靠估算时，描述区尺码原文是买家唯一准确来源）。
+    判「是不是尺码」用 extract._RE_SIZE_HINT 确定性完成，这里只做翻译 + 单位换算。
+
+    【cm 必须换算成英寸】2026-09-04 用户要求：海外买家看 cm 陌生，尺码数值按 1cm≈0.39in
+    换算成英寸（保留 1 位小数），翻译与换算一步做完，避免再跑一次文本调用。
+    """
+    items = [t for t in (texts or []) if (t.get("text") or "").strip()]
+    if not items:
+        return {"status": "ok", "plan": []}
+
+    listing = "\n\n".join(
+        f"[模块 idx={t['idx']}]\n{(t.get('text') or '')[:600]}" for t in items)
+    prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
+
+下面是该商品描述区的 {len(items)} 个「尺码文字模块」原文（从 1688 采集带过来的）：
+
+{listing}
+
+请把每个模块翻译成**自然的英文**，要求：
+1. 保留原有分行与尺码档位对应关系（如 80/90/100 各自的一行/一段）；
+2. 长度单位 cm 一律换算成英寸 in，数值保留 1 位小数（如 59cm → 23.2in）；只换算长度，
+   胸围/腰围等全围仍按全围写、不要当半围；
+3. 只翻译尺码/尺寸相关信息，不要添加价格、折扣、运费、年份等原文没有的内容；
+4. 每个模块译文不超过 500 字符（平台上限），超了就精简次要信息。
+
+只输出 JSON：{{"plan": [{{"idx": "<原样照抄模块 idx>", "text": "<英文译文>"}}]}}
+plan 必须覆盖上面每一个模块。"""
+
+    data = await ask_json(prompt, what="阶段⑬尺码文字英化", stage="desc")
+
+    valid = {str(t["idx"]): t for t in items}
+    plan, seen = [], set()
+    for p in data.get("plan") or []:
+        if not isinstance(p, dict):
+            continue
+        idx = str(p.get("idx"))
+        if idx not in valid or idx in seen:
+            continue
+        text = (p.get("text") or "").strip()
+        if not text:
+            continue
+        seen.add(idx)
+        plan.append({"idx": idx, "action": "translate", "text": text,
+                     "reason": "尺码英化"})
+    return {"status": "ok", "plan": plan}
 
 
 async def check_cleaned(image_path: str) -> dict:

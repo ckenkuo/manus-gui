@@ -70,6 +70,12 @@ LLM_CHOICES = {
     # 限流打死（每发 503）时本档全绿，故它是 grok 挂掉时的同网关替补。
     "packy-deepseek": {"config_name": "publish-packy-deepseek",
                        "label": "DeepSeek 视觉（Packy）"},
+    # Gemini 官网直连（CDP 驱动已登录 Chrome 的 gemini.google.com 页签），不经反代/
+    # 官方 API，绕开反代封号风险。backend="gemini-web" 标记它不走 app.llm.LLM 的
+    # HTTP 链路，而是 app/gemini_web.py 的浏览器对话（见 get_llm 的分流）。
+    # 官网一次问话最多 10 个附件（图片），超过会在 GeminiWebClient.ask 里报错。
+    "gemini-web": {"config_name": "publish-gemini-web", "label": "Gemini 官网（CDP 直连）",
+                   "backend": "gemini-web"},
 }
 _DEFAULT_CHOICE = "grok"
 _LLM_PREFS_PATH = os.path.join("workspace", "publish_llm.json")
@@ -209,6 +215,8 @@ def _choice_multimodal(choice: str) -> bool:
     """
     from app.llm import MULTIMODAL_MODELS
 
+    if LLM_CHOICES[choice].get("backend") == "gemini-web":
+        return True  # 官网对话天然能看图，不查 HTTP 白名单
     section = (config.llm or {}).get(LLM_CHOICES[choice]["config_name"])
     return bool(section) and getattr(section, "model", "") in MULTIMODAL_MODELS
 
@@ -235,6 +243,14 @@ def list_llm_choices() -> list:
     active = get_llm_choice()
     out = []
     for cid, meta in LLM_CHOICES.items():
+        if meta.get("backend") == "gemini-web":
+            # 官网直连不走 config.toml 段，可用性取决于「CDP 里有没有已登录的 gemini
+            # 页签」；这里不每次探测、先视为可用，真正调用时连接失败会给出明确报错。
+            out.append({
+                "id": cid, "label": meta["label"], "model": "gemini.google.com",
+                "available": True, "active": cid == active, "multimodal": True,
+            })
+            continue
         section = (config.llm or {}).get(meta["config_name"])
         out.append({
             "id": cid,
@@ -265,15 +281,91 @@ def active_llm_label() -> str:
     return f"{base}（阶段覆盖：{detail}）"
 
 
-def get_llm(stage: Optional[str] = None) -> LLM:
-    """取该阶段该用的 LLM 单例（进程级，按 config_name 缓存）。
+def _content_text(m) -> str:
+    """从 Message 对象或 dict 里取纯文本内容（多模态 content 只取 text 段）。
+
+    Gemini 官网对话只收一段文本，故把发布管线的 messages/system_msgs 压平成纯文本。
+    """
+    c = getattr(m, "content", None)
+    if c is None and isinstance(m, dict):
+        c = m.get("content")
+    if isinstance(c, str):
+        return c.strip()
+    if isinstance(c, list):
+        return " ".join(
+            seg.get("text") or "" for seg in c
+            if isinstance(seg, dict) and seg.get("text")
+        ).strip()
+    return ""
+
+
+def _messages_to_text(messages, system_msgs=None) -> str:
+    """把 messages + system_msgs 拼成一段 prompt。
+
+    官网对话没有 system role，故 system 文本直接排在前面（发布管线视觉阶段的 _SYS
+    本就是完整的角色设定句子，原样前置即可，无需加「系统：」前缀）。
+    """
+    chunks = []
+    for m in (system_msgs or []):
+        t = _content_text(m)
+        if t:
+            chunks.append(t)
+    for m in (messages or []):
+        t = _content_text(m)
+        if t:
+            chunks.append(t)
+    return "\n\n".join(chunks)
+
+
+class GeminiWebLLM:
+    """把 Gemini 官网对话适配成 app.llm.LLM 的 ask / ask_with_images 接口。
+
+    发布管线的 ask_json / ask_json_with_images 只调这两个方法（签名对齐 LLM），
+    故适配器只实现它们，让所有判断点零改动就能切到官网直连。
+
+    与 HTTP LLM 的差异：
+    - 官网无 system role，system_msgs 由 _messages_to_text 拼进 prompt 开头；
+    - 每次调用新建一次 CDP 连接、用完断开——先保证正确，批量发布的长连接复用
+      待确认要用它跑生产批次后再参照 app/publish/browser.py 的 BrowserSession 优化。
+    """
+
+    async def ask(self, messages, system_msgs=None, stream=False, temperature=None):
+        from app.gemini_web import GeminiWebClient
+
+        prompt = _messages_to_text(messages, system_msgs)
+        async with GeminiWebClient() as g:
+            return await g.ask(prompt)
+
+    async def ask_with_images(self, messages, images, system_msgs=None,
+                              stream=False, temperature=None):
+        from app.gemini_web import GeminiWebClient
+
+        prompt = _messages_to_text(messages, system_msgs)
+        # images 是 image_ref 产出的 data URL 列表，GeminiWebClient 已能直接收 data URL
+        async with GeminiWebClient() as g:
+            return await g.ask(prompt, images=images)
+
+
+_GEMINI_WEB: Optional[GeminiWebLLM] = None
+
+
+def get_llm(stage: Optional[str] = None):
+    """取该阶段该用的 LLM（HTTP 单例或 gemini-web 适配器，按选择分流）。
 
     stage 传 service.STAGES 的阶段 id（见 LLM_STAGES）：配了覆盖用覆盖的模型，
     没配就用全局默认。不传 stage 等于「用全局默认」，供尚未细分的调用点沿用。
 
     切换模型即切换 config_name——不同选择是不同单例，互不污染，也无需重置。
+    gemini-web 不是 HTTP LLM，返回共享的 GeminiWebLLM 适配器（见其 docstring）。
     """
-    return LLM(config_name=LLM_CHOICES[get_stage_choice(stage)]["config_name"])
+    choice = get_stage_choice(stage)
+    meta = LLM_CHOICES[choice]
+    if meta.get("backend") == "gemini-web":
+        global _GEMINI_WEB
+        if _GEMINI_WEB is None:
+            _GEMINI_WEB = GeminiWebLLM()
+        return _GEMINI_WEB
+    return LLM(config_name=meta["config_name"])
 
 
 def reset_token_counters() -> None:

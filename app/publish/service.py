@@ -134,7 +134,9 @@ from app.publish.pipeline import (
     accessory_colors_from_rows,
     desc_delete,
     desc_map,
+    desc_text_apply,
     desc_text_delete_all,
+    desc_text_map,
     desc_replace,
     desc_save,
     ensure_desc_closed,
@@ -688,13 +690,15 @@ def _replan_desc_by_url(pre_plan: dict, mods: list) -> dict:
     """
     # plan_desc 的 delete 只回 pos，要还原成 URL 得靠预热时那份 modules 的映射，
     # 故 _prewarm_desc 会把它翻成 deleteUrls 一起落下来（见那边）。
-    act_by_url, reason_by_url = {}, {}
+    act_by_url, reason_by_url, sizechart_by_url = {}, {}, {}
     for u in pre_plan.get("deleteUrls") or []:
         act_by_url[u] = "delete"
     for r in pre_plan.get("replace") or []:
         if r.get("url"):
             act_by_url[r["url"]] = "replace"
             reason_by_url[r["url"]] = r.get("reason") or ""
+            if r.get("sizechart"):
+                sizechart_by_url[r["url"]] = True
 
     delete, replace = [], []
     for m in mods:
@@ -708,8 +712,10 @@ def _replan_desc_by_url(pre_plan: dict, mods: list) -> dict:
         # 尺寸按页面现测重算：keep 但不达标的照 plan_desc 的规矩改判 replace + 放大
         too_small = bool(m.get("tooSmall"))
         if act == "replace":
-            replace.append({"pos": pos, "url": u,
-                            "reason": reason_by_url.get(u, "")})
+            rep = {"pos": pos, "url": u, "reason": reason_by_url.get(u, "")}
+            if sizechart_by_url.get(u):
+                rep["sizechart"] = True
+            replace.append(rep)
         elif too_small:
             replace.append({"pos": pos, "url": u, "needsUpscale": True,
                             "reason": f"尺寸 {m.get('size')} 不符合描述图要求："
@@ -1339,10 +1345,25 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"「{kw}」行按颜色只分到 {len(row['images'])} 张，"
                                    f"补 {len(padded)} 张同款图凑够每行下限 "
                                    f"{SKC_ROW_MIN_IMAGES} 张"})
-        if len(picked) < SKC_ROW_MIN_IMAGES:
-            # 全库可用图都不够 3 张，补不上来。这属于源商品图太少，只能人工处理
-            await emit({"type": "manual_check", "stage": "skc",
+        # 【复制兜底：源商品图本身太少时复制主图凑够下限】_pad_row_images 已把同款
+        # 其它主图（含被迫放回的脏图）都补进来了，仍不足 3 张说明全商品没有第 3 张
+        # 可用图。用户明确要求：这种时候复制一张已有图放后面凑数，而不是跳过留原图
+        # 等保存被拦。复制的是 picked[0]（plan_skc 保证首位是该颜色主图），只补到
+        # 下限就停；下面 enumerate 会把同一路径 copy 成两张内容相同的 main-NN。
+        if picked and len(picked) < SKC_ROW_MIN_IMAGES:
+            dup = SKC_ROW_MIN_IMAGES - len(picked)
+            logger.info(f"「{kw}」行只有 {len(picked)} 张可用图，"
+                        f"复制主图 {os.path.basename(picked[0])} 补 {dup} 张凑够下限")
+            await emit({"type": "log", "stage": "skc",
                         "message": f"「{kw}」行只有 {len(picked)} 张可用图，"
+                                   f"复制主图补 {dup} 张凑够每行下限 "
+                                   f"{SKC_ROW_MIN_IMAGES} 张"})
+            picked = picked + [picked[0]] * dup
+        if not picked:
+            # 一张可用图都没有（workdir 下无非重复、非尺码表/工厂图的主图），复制也
+            # 无从下手，只能人工处理
+            await emit({"type": "manual_check", "stage": "skc",
+                        "message": f"「{kw}」行没有任何可用图，"
                                    f"补不到每行下限 {SKC_ROW_MIN_IMAGES} 张，"
                                    "换图跳过（保存会被拦，请人工补图）"})
             fail_rows.append(kw)
@@ -1738,10 +1759,13 @@ async def _st_variant(ctx: dict, session: BrowserSession, emit) -> dict:
 
 async def _st_stock(ctx: dict, session: BrowserSession, emit) -> dict:
     r = await set_stock(session, ctx["info_path"],
+                        site=ctx.get("site") or "",
                         sku_judge=await _await_prewarm(ctx, "stock"))
     if r.get("status") == "error":
-        return {"status": "fail",
-                "note": f"[{r.get('stage')}] {(r.get('reason') or r.get('err') or '')}"[:200]}
+        note = f"[{r.get('stage')}] {(r.get('reason') or r.get('err') or '')}"
+        if r.get("available"):
+            note += f" | 可用: {r.get('available')}"
+        return {"status": "fail", "note": note[:200]}
     if r.get("status") == "validation-error":
         await emit({"type": "manual_check", "stage": "stock",
                     "message": f"库存部分行未通过回读校验：{str(r)[:120]}"})
@@ -1979,9 +2003,16 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 【重试要加码提示词，不能原样再发一遍】残留中文说明上一发没把那块文案吃掉，
         # 同样的话再说一次只是赌随机性；把「上一发残留了什么」当成新约束喂回去，
         # 命中率明显高于原样重发（同 llm._JSON_RETRY_HINT 的取向）。
-        prompt = None
+        # 第一发走【翻译优先】而非 DEFAULT_CLEAN_PROMPT 的「移除中文」：描述区这些图是
+        # plan_desc 判 replace 的商品图，图上中文多是材质成分/工艺/卖点等有效信息，该翻译
+        # 成英文原位保留，不能看到中文就消除（2026-09-03 用户要求）。
+        # 尺码表图（plan_desc 标了 sizechart）用专用提示词：额外要求 cm 换算成英寸，
+        # 买家按它选码（见 images.SIZECHART_TRANSLATE_PROMPT）。
+        base = (images.SIZECHART_TRANSLATE_PROMPT if rep.get("sizechart")
+                else images.DEFAULT_TRANSLATE_PROMPT)
+        prompt = base
         if attempt > 1 and last_issues:
-            prompt = images.DEFAULT_CLEAN_PROMPT + _retry_hint(last_issues, cjk_left)
+            prompt = base + _retry_hint(last_issues, cjk_left)
         try:
             # desc_mode：按描述图口径出图与收尾，不套服装 1340x1785 闸门
             # （见 images.edit_image 的 desc_mode 说明）
@@ -2075,6 +2106,65 @@ def _size_evidence(info: dict, texts: list) -> str:
     return detail
 
 
+async def _keep_size_text(session, info_for_desc, emit) -> tuple:
+    """⑬ 实测尺寸缺失时的文字模块处理：尺码文字英化 + cm→英寸后保留，其余照删。
+
+    当 ①b/视觉 没从文字/图片识别到实测尺寸（sizeMeasurements 为空）、阶段⑨ 只能靠
+    模型估算时，描述区里商家白纸黑字写的尺码原文是买家唯一的准确来源，删掉就丢了
+    （与 _size_evidence 同款取证）。故这里把命中 _RE_SIZE_HINT 的尺码模块英化并把
+    cm 换算成英寸后保留，其余模块（采集残留 JSON、店铺宣传等）照旧删除。
+
+    返回 (text_note, n_text_deleted)。尺码文字翻译失败的按 best-effort 保留中文原文
+    并发 manual_check 交人工（删掉比留中文更糟，买家连对照都没得看）。
+    """
+    tm = await desc_text_map(session)
+    if tm.get("status") != "ok":
+        logger.warning(f"文字模块枚举失败（保留原文，继续图片处理）：{str(tm)[:150]}")
+        return "文字模块处理异常", 0
+    texts = [t for t in (tm.get("texts") or []) if str(t.get("idx") or "").strip()]
+    size_texts = [t for t in texts
+                  if extract._RE_SIZE_HINT.search(t.get("text") or "")]
+    if not size_texts:
+        tr = await desc_text_delete_all(session)
+        n = len(tr.get("deleted") or [])
+        note = f"文字模块 删 {n}"
+        if tr.get("failed"):
+            note += f" / 失败 {len(tr['failed'])}"
+            await emit({"type": "manual_check", "stage": "desc",
+                        "message": f"文字模块删除有 {len(tr['failed'])} 项未成功"
+                                   f"（原文仍留在页面上）：{str(tr['failed'])[:150]}"})
+        logger.info(f"描述文字模块处理完成：{note}")
+        return note, n
+
+    tplan = await vision.translate_size_texts(size_texts, info_for_desc)
+    acts = list(tplan.get("plan") or [])
+    translated_idx = {a["idx"] for a in acts}
+    size_idx = {t["idx"] for t in size_texts}
+    for t in texts:
+        if t["idx"] in translated_idx:
+            continue
+        # 尺码文字但没译成（模型漏判/译文空）：保留中文原文，不删（删掉丢唯一准确来源）
+        acts.append({"idx": t["idx"], "text": "",
+                     "action": "keep" if t["idx"] in size_idx else "delete"})
+    tr = await desc_text_apply(session, acts)
+    n_tr = len(tr.get("translated") or [])
+    n_del = len(tr.get("deleted") or [])
+    kept_cn = sum(1 for a in acts if a["action"] == "keep")
+    note = f"文字模块 尺码英化 {n_tr} / 删 {n_del}"
+    if kept_cn:
+        note += f" / 保留中文原文 {kept_cn}"
+        await emit({"type": "manual_check", "stage": "desc",
+                    "message": f"{kept_cn} 段尺码文字未能英化、已保留中文原文，"
+                               f"请人工确认或改为英文"})
+    if tr.get("failed"):
+        note += f" / 失败 {len(tr['failed'])}"
+        await emit({"type": "manual_check", "stage": "desc",
+                    "message": f"文字模块处理有 {len(tr['failed'])} 项未成功"
+                               f"（原文仍留在页面上）：{str(tr['failed'])[:150]}"})
+    logger.info(f"描述文字模块处理完成：{note}")
+    return note, n_del
+
+
 async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     m = await desc_map(session, ctx["info_path"])
     if m.get("status") != "ok":
@@ -2090,33 +2180,29 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     # 重排；而图片侧按源 URL 现查 pos（_resolve_desc_pos）、删除时内部重建 idx
     # 映射，不受影响。反序则要多读一遍 data-idx。
     #
-    # 【文字模块一律删除，不再英化保留】2026-09-01 用户明确要求：描述区所有文字板块
-    # 全部移除。此前是交 LLM 判「采集残留 JSON 删 / 尺码对照表英化保留」，现在不再
-    # 分类——尺码值早在 ①b 就抽进 product-info.json、⑨ 已据此填完平台尺码表（⑨ 在 ⑬
-    # 之前跑），描述区那份纯文本只是冗余副本，且是中文残留的高发处；顺带省掉一次 LLM
-    # 调用。
+    # 【文字模块默认一律删除，实测尺寸缺失时尺码文字英化保留】2026-09-01 用户要求
+    # 描述区所有文字板块移除（此前是交 LLM 判「采集残留 JSON 删 / 尺码对照表英化
+    # 保留」）。2026-09-04 再细化：当 ①b/视觉 没识别到实测尺寸（sizeMeasurements 为空、
+    # ⑨ 靠估算）时，描述区里的尺码文字是买家唯一准确来源，改为英化 + cm→英寸后保留，
+    # 其余照删；已识别到实测尺寸时（平台尺码表已有真实数据）仍全部删除。
     #
     text_note, n_text_deleted = "", 0
     try:
-        tr = await desc_text_delete_all(session)
-        if tr.get("status") == "error":
-            logger.warning(f"文字模块枚举失败（保留原文，继续图片处理）：{str(tr)[:150]}")
-            text_note = "文字模块处理异常"
-        elif tr.get("found"):
-            n_text_deleted = len(tr.get("deleted") or [])
-            text_note = f"文字模块 删 {n_text_deleted}"
-            ev = _size_evidence(info_for_desc, tr.get("texts") or [])
-            if ev:
-                text_note += " / 疑似尺码原文已记日志"
-                await emit({"type": "manual_check", "stage": "desc",
-                            "message": f"描述文字模块写着尺码、但源数据里没有实测尺寸"
-                                       f"（⑨ 尺码表是模型估算的），请核对："
-                                       f"{ev[:200]}"})
-            if tr.get("failed"):
-                text_note += f" / 失败 {len(tr['failed'])}"
-                await emit({"type": "manual_check", "stage": "desc",
-                            "message": f"文字模块删除有 {len(tr['failed'])} 项未成功"
-                                       f"（原文仍留在页面上）：{str(tr['failed'])[:150]}"})
+        if not info_for_desc.get("sizeMeasurements"):
+            text_note, n_text_deleted = await _keep_size_text(session, info_for_desc, emit)
+        else:
+            tr = await desc_text_delete_all(session)
+            if tr.get("status") == "error":
+                logger.warning(f"文字模块枚举失败（保留原文，继续图片处理）：{str(tr)[:150]}")
+                text_note = "文字模块处理异常"
+            elif tr.get("found"):
+                n_text_deleted = len(tr.get("deleted") or [])
+                text_note = f"文字模块 删 {n_text_deleted}"
+                if tr.get("failed"):
+                    text_note += f" / 失败 {len(tr['failed'])}"
+                    await emit({"type": "manual_check", "stage": "desc",
+                                "message": f"文字模块删除有 {len(tr['failed'])} 项未成功"
+                                           f"（原文仍留在页面上）：{str(tr['failed'])[:150]}"})
             logger.info(f"描述文字模块处理完成：{text_note}")
     except Exception as e:
         # 文字模块不是必填内容，删不掉就留着，不能拖垮整个描述阶段
@@ -2801,6 +2887,7 @@ async def run_batch(
     do_publish: bool = False,
     price: str = "",
     keep_video: bool = True,
+    pause_ctrl=None,
 ) -> dict:
     """批量发布编排入口，返回 {"ok", "fail", "batch"}。
 
@@ -2821,7 +2908,14 @@ async def run_batch(
     「全球」这一项（那是 Temu 后台的域名级区域，不是站点，见 app/publish/shops.py），
     默认值一路走到 _select_store_and_site 必然抛「未找到站点」。宁可这里就拦下来
     报清楚，也不要跑到阶段②才炸。
+
+    pause_ctrl：可选的暂停控制器，需实现 `async wait_if_paused()`。Web 侧把 PublishJob
+    传进来（内部按 paused 标志阻塞到 resume），CLI 不传＝永不暂停。只在【商品之间】
+    检查——不打断正在跑的商品：单个商品表单填到一半就停，会让页面停在半填状态，
+    而阶段里的 LLM/生图调用也无法安全取消，与其留一个难恢复的烂摊子，不如让当前
+    商品跑完、停在一个干净的收尾边界（商品跑完要么已落库、要么记了 fail 状态）。
     """
+
     prefs = load_prefs()
     store = store or prefs.get("store") or ""
     site = site or prefs.get("site") or ""
@@ -2880,6 +2974,11 @@ async def run_batch(
     try:
         await session.open()
         for i, task in enumerate(tasks, 1):
+            # 暂停闸门：放在循环最顶部，暂停时当前商品已经收尾，这里阻塞到恢复为止。
+            # 暂停期间 session 一直开着（不 close），恢复后下方 ensure_cdp_alive 会兜住
+            # 「暂停太久 CDP 掉线」的情况。
+            if pause_ctrl is not None:
+                await pause_ctrl.wait_if_paused()
             if not await ensure_cdp_alive(retries=CDP_PING_RETRIES, wait=5.0):
                 await _emit(on_progress, {"type": "aborted",
                                           "reason": f"CDP 连续 {CDP_PING_RETRIES} 次连不上，批次中止"})

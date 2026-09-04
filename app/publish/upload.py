@@ -244,16 +244,29 @@ async def _curl_put(put_url: str, file_path: str, sign: str, ctype: str,
 
     timeout 可调是为视频加的：图片那档 120s 够用，而视频最大 500M，
     按保守带宽估要几分钟（见 upload_video 里按体积算超时那段）。
+
+    【瞬态网络故障要重试】2026-09-04 实测：keep 描述图转存时 COS PUT 偶发
+    DNS 解析失败（curl: (6) Could not resolve host: wxalbum-xxx.cos.ap-shanghai
+    .myqcloud.com），一次失败就放弃会让那张图永久保留 1688 外链、desc_save 每轮
+    报「仍有外链图未转存」。DNS / 连接重置 / TLS 被拦这类错误是瞬态的，重试即恢复，
+    故加 --retry + --retry-all-errors：裸 --retry 不重试 DNS 失败（error 6）和
+    连接拒绝（error 7），必须显式 --retry-all-errors 才覆盖到。
+    尺寸不达标那类确定性拒绝不在这里——那是 upload_image 的 size-check 闸门，
+    本就该一次拒绝、不做无谓重试。
+
+    subprocess 的 timeout 要覆盖住重试：--retry 2 是「首次 + 2 次重试」共 3 次尝试，
+    故上限放大 3 倍；这只是守护上限，正常一次 PUT 成功远快于此。
     """
     import asyncio
 
     def _run():
         return subprocess.run(
             ["curl.exe", "-sS", "-X", "PUT", "--max-time", str(timeout),
+             "--retry", "2", "--retry-delay", "1", "--retry-all-errors",
              "-H", f"Authorization: {sign}",
              "-H", f"Content-Type: {ctype}",
              "--data-binary", f"@{file_path}", put_url],
-            capture_output=True, timeout=timeout + 20,
+            capture_output=True, timeout=(timeout + 20) * 3,
         )
 
     return await asyncio.to_thread(_run)

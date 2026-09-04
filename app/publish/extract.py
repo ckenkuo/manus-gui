@@ -116,42 +116,29 @@ _JS_EXTRACT = """(() => {
   // 阶段⑦会退回原先的 LLM 分配逻辑。
   const colorImages = [];
   try {
-    // 找包含「颜色」关键词的容器（多数页面会标注「颜色：」）
-    const containers = Array.from(document.querySelectorAll('.obj-content, .mod-detail-page, [class*="sku"]'));
-    for (const c of containers) {
-      const text = (c.textContent || '').replace(/\\s+/g, '');
-      if (!text.includes('颜色') && !text.includes('Color')) continue;
+    // 【2026-09-03 CDP 实测修正】颜色缩略图不在 .obj-content/.mod-detail-page 里，而在
+    // 「标题为『颜色』的 .feature-item」的 .sku-filter-button 中：button 的 textContent
+    // 就是完整唯一键（「G2110紫色」这类「货号+颜色」，与 skuMapOriginal 的 specAttrs
+    // 第一段一字不差），button 里的 img 是缩略图。旧实现按 .obj-content 容器 + img 的
+    // title/alt/data-value 取，两个条件这个页面都不满足（缩略图 button/img 上根本没这
+    // 些属性），于是 colorImages 恒空、阶段⑦ 只能退回 LLM 猜。故改成按 feature-item
+    // 定位、颜色名直接取 button 文本，key 天然与 colors 精确对应，配对不需要画面比对。
+    const items = Array.from(document.querySelectorAll('.feature-item'));
+    for (const fi of items) {
+      const titleEl = fi.querySelector('[class*="title"], [class*="name"], h3, h4');
+      const title = (titleEl ? titleEl.textContent : (fi.textContent || '')).replace(/\\s+/g, '');
+      if (!title.includes('颜色') && !title.includes('Color')) continue;
 
-      // 在这个容器里找所有可见的 img（尺寸像缩略图的）
-      const imgs = Array.from(c.querySelectorAll('img')).filter(img => {
-        const r = img.getBoundingClientRect();
-        return r.width >= 30 && r.width <= 250 && r.height >= 30 && r.height <= 250;
-      });
-
-      for (const img of imgs) {
-        const src = img.src || img.dataset.src || img.dataset.lazySrc || '';
+      const buttons = Array.from(fi.querySelectorAll('.sku-filter-button'));
+      for (const b of buttons) {
+        const img = b.querySelector('img');
+        const src = img ? (img.src || img.dataset.src || img.dataset.lazySrc || '') : '';
+        const name = (b.textContent || '').replace(/\\s+/g, '').trim();
         if (!src || src.startsWith('data:')) continue;
-
-        // 颜色名：优先从父元素的 title/alt/aria-label/data-value 取，兜底用 textContent
-        let colorName = '';
-        let el = img;
-        for (let i = 0; i < 3 && el; i++, el = el.parentElement) {
-          colorName = el.title || el.getAttribute('aria-label') ||
-                     el.dataset.value || el.dataset.title || '';
-          if (colorName) break;
-        }
-        if (!colorName) colorName = img.alt || '';
-        if (!colorName && img.parentElement) {
-          const t = (img.parentElement.textContent || '').trim();
-          if (t.length > 0 && t.length < 50) colorName = t;
-        }
-
-        if (colorName && src) {
-          colorImages.push({color: colorName.trim(), image: src});
-        }
+        if (!name || name.length > 50) continue;
+        colorImages.push({color: name, image: src});
       }
-
-      // 只处理第一个命中的容器（避免把页面其它区块的图也抓进来）
+      // 只处理第一个命中「颜色」的 feature-item，避免把尺码等其它维度抓进来
       if (colorImages.length > 0) break;
     }
   } catch (e) {
@@ -342,6 +329,17 @@ def parse_attrs(attr_text: Optional[str]) -> dict:
 # 不会出现补 0% 的空行。
 _PCT_RE = re.compile(r"\d+(?:\.\d+)?")
 
+# 「主面料成分」里可能出现的非纤维值：占位词（其它）或织物组织名（牛仔布）。
+# 这些映射不到 Temu 的纤维选项，一旦当 fiber 产出会让阶段④确定性覆盖失效（详见
+# parse_main_composition）。用「包含」匹配：卖家常写「100%牛仔」「牛仔布」这类带修饰的写法。
+# 注意别把真实纤维误收进来——「绒」字单独成词会误伤「羊绒」，故只列完整织物词
+# （摇粒绒/珊瑚绒/抓绒），不列单字。
+_COMP_NON_FIBER = (
+    "其它", "其他", "详见吊牌", "详见水洗标", "以实物为准", "混纺", "多种纤维",
+    "未注明", "见标", "牛仔", "针织", "梭织", "灯芯绒", "法兰绒", "摇粒绒",
+    "珊瑚绒", "抓绒", "雪纺", "蕾丝", "网纱", "毛呢", "呢子", "皮革", "仿皮", "麂皮",
+)
+
 # 源页面完全没写主面料成分时的默认纤维（2026-08-25 用户确认）。
 # 聚酯纤维是跨境服装最常见的面料，写它比让模型凭图猜一种更可复核；
 # 与 pipeline._COMP_FILLERS 的首选保持一致，避免「默认主成分」与「补差纤维」撞成同一根。
@@ -358,17 +356,30 @@ def parse_main_composition(attrs: dict) -> dict:
 
     【2026-08-25 改：缺失时不再返回 {}，而是给确定性默认值】用户结论——源页面一般
     只写一个含量（如聚酯纤维 90%），剩下的份额靠推断；**源什么都没写时一律按
-    聚酯纤维 100% 处理**，不要退回让模型自己编一组比例。故三种情形：
+    聚酯纤维 100% 处理**，不要退回让模型自己编一组比例。
+    【2026-09-04 增：占位词识别】「主面料成分」填的是「其它」「牛仔布」这类非纤维值
+    时，不产出假 fiber（fiber 置空 + assumed 标记），保留含量事实交阶段④ LLM 推断。
+    故四种情形：
+      0. 占位词/织物名   → fiber 空 + assumed，交 LLM 依据面料名称/品类推断（含量保留）
       1. 纤维 + 合法含量  → 按源值（percent < 100 时剩余份额由阶段④补差纤维）
       2. 有纤维、含量缺失或非法 → 该纤维 100%（源信息里有的就用，只是没给比例）
       3. 连纤维都没有      → 聚酯纤维 100%（assumed=True，最常见的跨境服装面料）
-    情形 2/3 打 assumed 标记，供提示词与日志区分「源事实」和「默认值」。
+    情形 0/2/3 打 assumed 标记，供提示词与日志区分「源事实」和「默认值」。
     """
     attrs = attrs or {}
     fiber = (attrs.get("主面料成分") or attrs.get("面料名称") or "").strip()
     raw = (attrs.get("主面料成分含量") or "").strip()
     m = _PCT_RE.search(raw) if raw else None
     pct = int(float(m.group())) if m else 0
+    # 【占位词/织物名 → 不产出假 fiber】卖家在「主面料成分」里常填「其它」「牛仔布」这类
+    # 非纤维值：占位词（其它）没有信息量，织物名（牛仔布）是组织结构不是纤维成分，
+    # 两者都映射不到 Temu 的纤维选项。硬存成 fiber 会让阶段④确定性覆盖失效、并把假纤维
+    # 喂给 LLM 误导它（2026-09-04 商品 1013502117778 实测：主面料成分=其它，一路掉到
+    # 保存被平台拒「百分比之和需等于100」）。这里 fiber 置空、保留含量事实，交阶段④ LLM
+    # 依据面料名称/品类/图片推断，并打 assumed 留痕。
+    if fiber and any(w in fiber for w in _COMP_NON_FIBER):
+        return {"fiber": "", "percent": pct if 0 < pct <= 100 else 0, "raw": raw,
+                "assumed": f"源主面料成分是「{fiber}」（非纤维成分），纤维交 LLM 推断"}
     if fiber and 0 < pct <= 100:
         return {"fiber": fiber, "percent": pct, "raw": raw}
     if fiber:
@@ -478,6 +489,9 @@ def check_material_image(main_entries: list) -> dict:
 # a.jpg_100x100q90.jpg、a.jpg_.webp，还可能叠加多层。
 _IMG_SIZE_SUFFIX = re.compile(r"_\d+x\d+(?:[a-z]\d+)*(?:\.(?:jpg|jpeg|png|webp))?$", re.I)
 _IMG_FMT_SUFFIX = re.compile(r"_\.(?:jpg|jpeg|png|webp)$", re.I)
+# 颜色缩略图后缀：1688 颜色选择器的缩略图是「原图 URL + _sum.jpg」（2026-09-03 CDP
+# 实测 971332999381 的 .sku-filter-button img src），不剥掉会对不上主图、掉进画面比对。
+_IMG_SUM_SUFFIX = re.compile(r"_sum\.(?:jpg|jpeg|png|webp)$", re.I)
 
 
 def image_url_key(url: str) -> str:
@@ -492,7 +506,7 @@ def image_url_key(url: str) -> str:
     u = (url or "").split("?")[0].strip()
     u = re.sub(r"^https?://", "", u)
     for _ in range(4):                 # 后缀可叠加（a.jpg_60x60.jpg_.webp）
-        nu = _IMG_SIZE_SUFFIX.sub("", _IMG_FMT_SUFFIX.sub("", u))
+        nu = _IMG_SUM_SUFFIX.sub("", _IMG_SIZE_SUFFIX.sub("", _IMG_FMT_SUFFIX.sub("", u)))
         if nu == u:
             break
         u = nu

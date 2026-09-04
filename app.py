@@ -1016,9 +1016,28 @@ class PublishJob:
         self.queue: asyncio.Queue = asyncio.Queue()
         self.done = False
         self.summary: dict = {}
+        # 暂停控制：paused 由 /publish/batch/{job_id}/pause 置位，_resume 事件负责唤醒。
+        # 初始不暂停，_resume 已 set——wait_if_paused 里 paused=False 时根本不看它。
+        self.paused = False
+        self._resume = asyncio.Event()
+        self._resume.set()
 
     async def push(self, event: dict):
         await self.queue.put(event)
+
+    async def wait_if_paused(self):
+        """暂停闸门：paused 置位时阻塞到 resume 事件（run_batch 每商品前调用）。
+
+        真正停住的那一刻发一条 paused 事件让前端把状态文案从「暂停中」切到「已暂停」；
+        恢复时发 resumed。两次事件走同一套 SSE 队列，前端刷新重连后仍能消费到积压的
+        事件、看到正确的暂停状态。事件在阻塞期间 push 不会卡死——queue 无限容量。
+        """
+        if not self.paused:
+            return
+        await self.push({"type": "paused"})
+        while self.paused:
+            await self._resume.wait()
+        await self.push({"type": "resumed"})
 
 
 publish_jobs: dict = {}
@@ -1066,7 +1085,7 @@ async def publish_batch(
                 tasks, store=store, site=site,
                 on_progress=_on_progress, from_stage=from_stage,
                 use_cache=use_cache, price=price, do_publish=do_publish,
-                keep_video=keep_video,
+                keep_video=keep_video, pause_ctrl=job,
             )
         except Exception as e:
             # run_batch 内部的中断已由 service 的告警钩子报过（aborted / product_done /
@@ -1111,6 +1130,27 @@ async def publish_batch_events(job_id: str):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.post("/publish/batch/{job_id}/pause")
+async def publish_batch_pause(job_id: str, paused: bool = Body(..., embed=True)):
+    """暂停 / 恢复某个发布作业。
+
+    暂停是「商品间」粒度：run_batch 在下一个商品开始前才调 wait_if_paused，故这里的
+    paused=True 只是置位标志，当前商品仍会跑完（不打断正在填的表单）。真正的停顿点
+    在 service 层，前端收到 paused 事件才算「已暂停」。恢复置位 _resume 事件即可。
+    """
+    job = publish_jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "作业不存在")
+    if job.done:
+        raise HTTPException(409, "批次已结束，无法暂停")
+    job.paused = paused
+    if paused:
+        job._resume.clear()
+    else:
+        job._resume.set()
+    return {"job_id": job_id, "paused": job.paused}
 
 
 # ---- 采集箱定时扫描（发布页顶部的开关 + 未编辑商品清单）-----------------------

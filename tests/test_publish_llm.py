@@ -110,6 +110,8 @@ def test_每个选择的模型都在多模态白名单里():
     from app.llm import MULTIMODAL_MODELS
 
     for cid, meta in llm.LLM_CHOICES.items():
+        if meta.get("backend") == "gemini-web":
+            continue  # 官网直连不走 HTTP 白名单（见 llm._choice_multimodal）
         section = (app_config.llm or {}).get(meta["config_name"])
         assert section is not None, f"{cid}: config 里没有 [llm.{meta['config_name']}] 段"
         assert section.model in MULTIMODAL_MODELS, (

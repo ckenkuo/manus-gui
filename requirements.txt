@@ -57,3 +57,16 @@ pyperclip~=1.8.2
 # 自带 win_amd64 的 ffmpeg.exe，不必装系统 ffmpeg（这台机器 PATH 里没有）；
 # 注意它【不带 ffprobe】，故 video.probe_video 要能只靠 ffmpeg 读元数据
 imageio-ffmpeg~=0.6.0
+
+# 补全：项目实际 import 但历史 requirements.txt 遗漏的顶级包（2026-09-03 重建 venv 时发现）
+# markdownify：浏览器 DOM → Markdown（browser_use_tool 提取页面内容）
+# openpyxl/pandas：Excel 读写与表格数据处理（orders pipeline / 图表工具）；
+#   注意 WPS DISPIMG 表仍走 wps_excel_tool，不能用 openpyxl 保存
+# pywin32/pygetwindow：Windows 剪贴板与窗口控制（browser_use_tool 的 paste_image / focus_window）
+# lxml：BeautifulSoup 的 HTML 解析后端（bing_search 用 "lxml"）
+markdownify~=0.14.1
+openpyxl~=3.1.5
+pandas~=2.2.3
+pywin32==312
+pygetwindow~=0.0.9
+lxml~=5.3

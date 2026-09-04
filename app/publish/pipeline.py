@@ -750,9 +750,23 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
         lambda d: d.get("ready"),
         timeout=8.0)
     if not filled.get("ready"):
+        # 顺手把 productBasicInfo 里实际存在的表单字段 dump 出来，方便定位为什么
+        # 找不到「商家账号」行（站点英文文案 / 平台改措辞 / 该行压根没渲染）。
+        labels = None
+        try:
+            labels = await session.eval_json(r"""(() => {
+                const sec = document.getElementById('productBasicInfo');
+                if (!sec) return {labels: []};
+                return {labels: Array.from(sec.querySelectorAll('.ant-form-item-label label'))
+                    .map(l => (l.getAttribute('title') || l.textContent || '').trim())
+                    .filter(Boolean)};
+            })()""")
+        except Exception:
+            logger.warning("等商家账号回填超时后 dump 表单字段失败")
         # 【不抛】这一步只是等待，判不出来就按原样继续——下方打开弹窗本身会报错，
         # 那条路径的诊断信息（含平台 toast）比在这里抛更有用。
         logger.warning(f"等商家账号回填超时（{filled.get('why') or filled}），"
+                       f"实际表单字段：{(labels or {}).get('labels')}，"
                        "仍继续尝试打开类目弹窗")
     await session.kill_stuck_modals()  # 上一轮残留的遮罩会挡住「选择分类」按钮
 
@@ -1087,16 +1101,53 @@ async def _visible_dropdown_near(session: BrowserSession, label: str,
     return await session.eval_json(js)
 
 
+async def _is_dropdown_open(session: BrowserSession, label: str,
+                            sel_idx: int = 0) -> bool:
+    """检测目标字段第 sel_idx 个下拉自身是否处于打开态（.ant-select-open）。
+
+    为什么不用「行附近是否有可见浮层」（_visible_dropdown_near）判打开：
+    .ant-select-dropdown 是懒渲染的——点击后 .ant-select-open 立即加上，但浮层要
+    一帧后才挂上；且重复点击 toggle 关闭后浮层还会残留几帧（幽灵浮层）。用浮层位置
+    判打开会把「别的字段残留的幽灵浮层」误当成「本字段已打开」，正是 2026-09-04
+    「上装成分/下装成分」错位写入、保存报「上装成分不能重复选择」的根因。
+    .ant-select-open 是 Vue 内部打开态的直接标记，与浮层渲染时机无关。
+    """
+    js = r"""(() => {
+      const it = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
+          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
+        || Array.from(document.querySelectorAll('.ant-form-item'))
+          .find(el => { const l = el.querySelector('.ant-form-item-label label');
+            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
+      if (!it) return JSON.stringify({open: false, reason: 'row-not-found'});
+      const sels = Array.from(it.querySelectorAll('.ant-select'));
+      const s = sels[__IDX__] || sels[0];
+      return JSON.stringify({open: !!s && s.classList.contains('ant-select-open')});
+    })()""".replace("__LABEL__", J(label)).replace("__IDX__", str(sel_idx))
+    d = await session.eval_json(js)
+    return bool(d.get("open"))
+
+
 async def _open_attr_dropdown(session: BrowserSession, label: str,
                               sel_idx: int = 0) -> dict:
-    """点开指定属性行的下拉，以「行附近是否有可见浮层」为准做幂等打开。
+    """点开指定属性行的下拉，以「目标下拉自身的 .ant-select-open」为准做幂等打开。
 
     已打开则不重复点（重复点会 toggle 关掉）；点了没开就再点一次——Vue 内部状态与
     视觉停靠态错位时第一次点击会反向 toggle（原脚本实测）。
     sel_idx：成分类复合字段行内第 N 个下拉（0 起）。
+
+    【2026-09-04 修】打开态判断从「行附近是否有可见浮层」改成「目标下拉自身的
+    .ant-select-open」，并在点开前先清一轮残留浮层。理由：浮层懒渲染 + 关闭后残留，
+    用浮层位置判打开会把别的字段残留的幽灵浮层误当成本字段已打开，随后
+    _click_dropdown_option 的「距行最近」浮层定位就点到了错字段——上装成分/下装成分/
+    材质三个字段相邻且共用同一份纤维列表，「棉」这类在多个字段浮层都首屏可见的选项
+    必现错位（保存报「XX成分不能重复选择」）。清残留保证点开后页面上只有本字段这
+    一个浮层，下游的浮层定位就不会再选错。
     """
-    if (await _visible_dropdown_near(session, label)).get("found"):
+    if await _is_dropdown_open(session, label, sel_idx):
         return {"opened": True, "already": True}
+    # 没打开：先清残留浮层（park 停靠 + Escape 关 Vue 内部态），再点开。
+    await _park_ghost_dropdowns(session)
+    await _press_escape(session)
     js_click = r"""(() => {
       const it = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
           .find(el => el.getAttribute('data-attr-label') === __LABEL__)
@@ -1117,12 +1168,12 @@ async def _open_attr_dropdown(session: BrowserSession, label: str,
         r = await session.eval_json(js_click)
         if not r.get("dispatched"):
             return {"opened": False, **r}
-        # 等浮层真出现，而不是固定 sleep(0.5)：收敛信号与原先 sleep 之后那次检查
-        # 完全相同（_visible_dropdown_near），0.5s 成为超时上限（见 _poll_until）
+        # 等目标下拉自身的 .ant-select-open 出现（浮层渲染有时滞，但打开态 class
+        # 点击即生效，比等浮层更及时）
         seen = await _poll_until(
-            lambda: _visible_dropdown_near(session, label),
-            lambda d: d.get("found"), timeout=0.5)
-        if seen.get("found"):
+            lambda: _is_dropdown_open(session, label, sel_idx),
+            lambda d: d, timeout=0.5)
+        if seen:
             return {"opened": True, "attempts": attempt}
     return {"opened": False, "reason": "open-verify-failed"}
 
@@ -1143,7 +1194,17 @@ async def _read_active_options(session: BrowserSession, label: str,
     await _press_escape(session)
     r = await _open_attr_dropdown(session, label)
     if not r.get("opened"):
-        return []
+        # 页面渲染慢时第一次点不开（下拉组件未挂载 / 浮层未渲染），等一会再试一次
+        # （2026-09-04 商品 998669429087：必填行下拉点不开，重试能救回渲染慢的）
+        await asyncio.sleep(1.0)
+        r = await _open_attr_dropdown(session, label)
+    if not r.get("opened"):
+        if not with_meta:
+            return []
+        # 重试一次仍点不开才按二元组契约返回，让调用方走 open-failed / 重读为空 的
+        # best-effort 兜底路径，而不是抛解包异常打断整个属性审核阶段。
+        return [], {"virtual": False, "scrollHeight": None,
+                    "scrolledToEnd": False, "complete": False}
     await asyncio.sleep(0.5)
     js = r"""(async () => {
       const sleep = ms => new Promise(res => setTimeout(res, ms));
@@ -4118,13 +4179,49 @@ def _normalize_sku_judge(judge: dict, info: dict) -> dict:
     return out
 
 
+def resolve_warehouse(site: str = "") -> str:
+    """按站点解析仓库名（阶段⑪「选择仓库」勾选哪一个）。
+
+    【为什么仓库名不能写死「飞特COL仓库」】编辑页仓库下拉的选项集合因站点而异
+    （bulkattr 已实测：哥伦比亚站「飞特COL仓库 / 哥伦比亚-新势力」、秘鲁站「飞特PE仓库」、
+    美国站「嘉运美东仓库」）。写死一个名字，非该站点的商品在下拉里找不到匹配项，
+    _JS_PICK_WAREHOUSE 报 no-option、整单未落库。故仓库名按站点查 config.toml 的
+    [publish.warehouse_by_site] 映射，站点未配时退回 [publish].warehouse 的全局默认，
+    再没有才用代码内兜底「飞特COL仓库」。
+
+    site 取 --site 的站点名（如「美国」）。页面上「美国」与「美国站」两种写法都出现，
+    这里归一去掉尾部「站」再查。
+    """
+    default = "飞特COL仓库"
+    try:
+        import tomllib
+
+        from app.config import config_search_dirs
+        for d in config_search_dirs():
+            p = d / "config.toml"
+            if not p.exists():
+                continue
+            with open(p, "rb") as f:
+                data = tomllib.load(f)
+            pub = data.get("publish") or {}
+            default = str(pub.get("warehouse") or default)
+            by_site = pub.get("warehouse_by_site") or {}
+            if site:
+                key = site[:-1] if site.endswith("站") else site
+                if key in by_site:
+                    return str(by_site[key])
+    except Exception as e:
+        logger.warning(f"读取 [publish] 站点仓库映射失败（退回默认）：{e}")
+    return default
+
+
 async def set_stock(session: BrowserSession, info_path: str,
-                    stock: str = "100", warehouse: str = "飞特COL仓库",
-                    sku_judge: Optional[dict] = None) -> dict:
+                    stock: str = "100", warehouse: str = "",
+                    site: str = "", sku_judge: Optional[dict] = None) -> dict:
     """阶段⑪：仓库/库存/SKU分类批量填写。
 
     完整流程（2026-08-18用户确认）：
-    1. 选择仓库：勾选目标仓库（默认「飞特COL仓库」），**勾选后库存列才渲染**
+    1. 选择仓库：勾选目标仓库（按站点解析，见 resolve_warehouse），**勾选后库存列才渲染**
     2. 填库存：统一值（默认100），等仓库勾选后 input[name=stock] 出现
     3. SKU分类：按标题+套装件数交 LLM 判断（单品/同款多件/混合套装 + 数量 + 单位）
     4. 包装清单：逐行填「配件名 + 件数」，件数之和必须等于第 3 步的数量（平台强校验，
@@ -4133,6 +4230,8 @@ async def set_stock(session: BrowserSession, info_path: str,
     sku_judge：提前预热的 SKU 分类判断结果（见 service._run_prewarm），给了就不再
     问模型。它的输入与页面无关（只有标题和套装件数），故预热与现场同值。
     """
+    warehouse = warehouse or resolve_warehouse(site)
+
     with open(info_path, encoding="utf-8") as f:
         info = json.load(f)
 
@@ -5086,6 +5185,10 @@ _ATTR_PROMPT = """你是跨境电商商品属性审核助手。下面是 1688 �
    你给的数值不作准；里衬/里料/辅料/填充类字段不受源主面料含量约束。
    【源没给含量时】不要自己拆成两行去编比例：程序会按「该纤维 100%」单行写入
    （源连主面料成分都没写时按聚酯纤维 100%）。此时主面料字段只需给第 1 行。
+   【源主面料成分是占位词/非纤维时】（main_composition 的 fiber 为空、assumed 会说明，
+   如「其它」「牛仔布」这类）：不要照搬占位词，依据「源商品参数」里的面料名称/工艺 +
+   图片理解摘要 + 品类常识推断具体纤维（如面料名称=牛仔布 → 牛仔通常棉为主，给出
+   「棉 + 聚酯纤维」这类常见配比并合计 100%），reason 注明「源成分无效，按面料/品类推断」。
    【按款式区分的成分】若「源主面料成分」给出了 byVariant（不同颜色/款式成分不同），
    根据表单中已填的颜色/款式，从 byVariant 里匹配对应的成分组。匹配规则：
    - 先看表单「颜色」字段 current 值是否与 byVariant 某个键部分匹配（如表单填「卡通工装衣」，
@@ -5421,9 +5524,17 @@ def _validate_attr_changes(changes: list, attrs: list,
                 rejected.append(reject)
                 valid = [v for v in valid if v["label"] != label]
                 continue
-            logger.warning(
-                f"{label}: 源主纤维「{main_comp.get('fiber')}」不在 options 内，"
-                "退回模型给数 + 合计校验")
+            # 【区分两种退回】fiber 为空 = 源是「其它」这类占位词（parse 阶段已识别、
+            # 打 assumed），此时不该说「不在 options 内」——那会误导成选项列表缺纤维；
+            # 实际是源没有可确定的纤维，只能靠 LLM 依据面料名称/品类/图片推断。
+            if main_comp.get("fiber"):
+                logger.warning(
+                    f"{label}: 源主纤维「{main_comp.get('fiber')}」不在 options 内，"
+                    "退回模型给数 + 合计校验")
+            else:
+                logger.warning(
+                    f"{label}: 源主面料成分无效（{main_comp.get('assumed') or '占位词'}），"
+                    "交 LLM 依据面料名称/品类/图片推断成分")
         # 先合并同一根纤维的多行：模型可能同时给出「涤纶 80%」和「聚酯纤维 20%」，
         # 那是同一根纤维的两种写法，平台不接受同字段两行同纤维（2026-08-24 实测报错），
         # 正解是合并成一行 100%。合并后再算合计，多数情况直接就等于 100 了。
@@ -9002,6 +9113,58 @@ _JS_DESC_TEXT_MAP = r"""(() => {
 })()"""
 
 
+# 改写 data-idx 为 __IDX__ 的文字模块内容。
+#
+# 【必须走右侧面板的 textarea】模块自身的 div.desc-content 不是 contenteditable、
+# 也不是 input，直接改 innerText 保存时不生效（组件状态没变）。流程是：
+# 点左侧 .using-item → 右侧 .smt-content-right 渲染「文字模块」面板 → 写它的
+# textarea.ant-input。写完必须派发 input 事件，否则 Vue 不同步、保存后回到原文
+# （本项目其它表单字段同样的坑，见 _js_fill_by_label）。
+#
+# 500 字符是面板自己标的上限（「总字符数:160 / 500」），超了平台会截断，
+# 故调用方传进来前就该截好；这里再兜一刀，避免静默截断。
+_JS_DESC_TEXT_SET = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const m = __MODAL__;
+  if (!m) return JSON.stringify({status: 'error', reason: '编辑器不在'});
+  const item = m.querySelector('.using-item[data-idx="__IDX__"]');
+  if (!item) return JSON.stringify({status: 'error', reason: 'using-item-not-found'});
+  item.scrollIntoView({block: 'center'});
+  await sleep(300);
+  item.click();
+  await sleep(1200);            // 面板渲染有入场过程，读太早拿不到 textarea
+
+  const panel = m.querySelector('.smt-content-right');
+  if (!panel) return JSON.stringify({status: 'error', reason: 'panel-not-found'});
+  const ta = panel.querySelector('textarea.ant-input, textarea');
+  if (!ta) return JSON.stringify({status: 'error', reason: 'textarea-not-found'});
+
+  const before = ta.value;
+  const text = __TEXT__;
+  if (text.length > 500) {
+    return JSON.stringify({status: 'error', reason: 'text-too-long',
+                           len: text.length});
+  }
+  // 原生 setter + input 事件：Vue 只认事件，直接赋 value 不同步
+  const desc = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype, 'value');
+  desc.set.call(ta, text);
+  ta.dispatchEvent(new Event('input', {bubbles: true}));
+  ta.dispatchEvent(new Event('change', {bubbles: true}));
+  await sleep(600);
+
+  // 回读：面板 textarea 与模块本体都要变（后者证明组件真的同步了）
+  const mod = m.querySelector(
+    '.smt-content-center .smt-desc-content[data-idx="__IDX__"] .desc-content');
+  return JSON.stringify({
+    status: 'ok', before: before.slice(0, 80),
+    readback: ta.value.slice(0, 80),
+    modText: mod ? (mod.innerText || '').trim().slice(0, 80) : null,
+    filled: ta.value.trim() === text.trim(),
+  });
+})()"""
+
+
 # 描述图序号（pos，从 1 起）到左侧「使用中模块」列表 data-idx 的映射表。
 #
 # 【为什么不能拿 pos-1 当 data-idx】描述区是【图文混排】的：每个内容模块都是一个
@@ -9219,6 +9382,68 @@ async def desc_text_delete_all(session: BrowserSession) -> dict:
     return {"status": "ok" if not failed else "partial",
             "deleted": deleted, "failed": failed, "found": len(idxs),
             "texts": texts}
+
+
+async def desc_text_apply(session: BrowserSession, plan: list) -> dict:
+    """阶段⑬ 按计划处理文字模块：英化改写 / 删除 / 保留。
+
+    plan: [{"idx": "0", "action": "translate"|"delete"|"keep",
+            "text": "<translate 时的英文正文>", "reason": "..."}]
+    idx 用 desc_text_map 返回的 data-idx 原值。
+
+    【顺序：先全部 translate，再倒序 delete】两个动作都按 data-idx 寻址，而删除
+    会让后续 data-idx 重排。先删就会把待翻译项的 idx 改掉，写到别的模块上去。
+    删除本身倒序（大→小），理由同 desc_delete。
+
+    单项失败不拖垮整体（best-effort）：记进 failed 继续，交调用方决定是否告警。
+    描述文字不是必填项，改不动就保留原文，比中断整个商品划算。
+    """
+    st = await _desc_ensure_open(session)
+    if st.get("err"):
+        return {"status": "error", **st}
+
+    translated, deleted, failed, kept = [], [], [], []
+
+    # 1) 先改写（此时 data-idx 还没被删除动作扰动）
+    for p in plan:
+        if (p.get("action") or "") != "translate":
+            continue
+        idx, text = str(p.get("idx")), (p.get("text") or "").strip()
+        if not text:
+            failed.append({"idx": idx, "err": "translate 但没给 text"})
+            continue
+        if len(text) > 500:
+            text = text[:500]          # 面板上限，超了平台会静默截断
+            logger.warning(f"文字模块 idx={idx} 译文超 500 字符，已截断")
+        r = await session.eval_json(
+            _JS_DESC_TEXT_SET.replace("__MODAL__", _JS_DESC_MODAL)
+                             .replace("__IDX__", idx)
+                             .replace("__TEXT__", J(text)))
+        if r.get("status") == "ok" and r.get("filled"):
+            translated.append({"idx": idx, "text": text[:60],
+                               "reason": p.get("reason", "")})
+        else:
+            failed.append({"idx": idx, "action": "translate", **r})
+            logger.warning(f"文字模块 idx={idx} 改写失败：{r.get('reason') or r}")
+
+    # 2) 再倒序删除
+    dels = sorted({str(p.get("idx")) for p in plan
+                   if (p.get("action") or "") == "delete"},
+                  key=lambda x: int(x) if str(x).isdigit() else 0, reverse=True)
+    for idx in dels:
+        r = await session.eval_json(
+            _JS_DESC_DELETE.replace("__MODAL__", _JS_DESC_MODAL)
+                           .replace("__IDX__", idx))
+        if r.get("err") or not r.get("deleted"):
+            failed.append({"idx": idx, "action": "delete", **r})
+            logger.warning(f"文字模块 idx={idx} 删除失败：{r.get('err') or r}")
+        else:
+            deleted.append(idx)
+
+    kept = [str(p.get("idx")) for p in plan if (p.get("action") or "") == "keep"]
+    return {"status": "ok" if not failed else "partial",
+            "translated": translated, "deleted": deleted,
+            "kept": kept, "failed": failed}
 
 
 async def desc_save(session: BrowserSession) -> dict:
