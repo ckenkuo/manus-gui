@@ -214,7 +214,11 @@ class BrowserSession:
             raise RuntimeError(f"CDP 连上了但没有 context（{self.cdp_url}）")
         ctx = self._browser.contexts[0]
         host = url_hint.split("//", 1)[-1].split("/", 1)[0]
-        cands = [p for p in ctx.pages if host in (p.url or "")]
+        # 【跳过编辑页签】失败保留的编辑页签里可能还有未落库的表单，被这里复用再导航
+        # 就会把那份现场冲掉（见 park_edit_tab）。故只复用非编辑页的店小秘页签，
+        # 编辑页签一律留给人工接手。
+        cands = [p for p in ctx.pages
+                 if host in (p.url or "") and "/popTemu/edit" not in (p.url or "")]
         self._page = cands[0] if cands else await ctx.new_page()
         if not cands:
             logger.info(f"未找到店小秘页签，新开一个（{url_hint}）")
@@ -250,6 +254,52 @@ class BrowserSession:
             )
         except Exception:
             return False
+
+    @property
+    def edit_page_open(self) -> bool:
+        """当前工作页是否停在店小秘编辑页（可能还带着未落库的表单修改）。
+
+        给 service 层判断「商品失败后要不要保留这个页签」——编辑页上有已填好但没
+        落库的表单，下一个商品再 navigate 就会冲掉；草稿列表/采集页/源站没有值得
+        留的现场。用 URL 即时判而不存标志位：save/_publish_landed 那类「开临时页签
+        再切回」的操作会换 self._page，存标志位容易不同步（见 park_edit_tab）。
+        """
+        try:
+            return bool(self._page is not None
+                        and not self._page.is_closed()
+                        and "/popTemu/edit" in (self._page.url or ""))
+        except Exception:
+            return False
+
+    async def park_edit_tab(self) -> dict:
+        """把当前（编辑页）页签原样留在浏览器里不关，另开一个新页签作为工作页。
+
+        【为什么需要】商品保存/发布失败时编辑页上还留着已填好但未落库的表单，直接
+        让下一个商品 navigate 会把这份现场冲掉、白烧一轮 token；把页签留在 Chrome
+        里，人工能接着处理。新页签先导航到店小秘首页（后续各阶段会自行导航），
+        这一步失败也 best-effort——最坏停在 about:blank，后续 navigate 照样能走。
+        """
+        try:
+            ctx = self._browser.contexts[0]
+            page = await ctx.new_page()
+        except Exception as e:
+            logger.warning(f"保留编辑页签失败（忽略，继续用当前页签）：{e}")
+            return {"ok": False, "err": str(e)}
+        self._page = page
+        self._watch_page(page)
+        try:
+            self._cdp = await ctx.new_cdp_session(page)
+        except Exception as e:
+            logger.warning(f"新页签重建 CDP 会话失败（忽略）：{e}")
+        try:
+            await page.goto(DIANXIAOMI_HOST, wait_until="domcontentloaded",
+                            timeout=30 * 1000)
+        except Exception as e:
+            logger.warning(f"新页签导航店小秘首页失败（后续阶段会自行导航）：{e}")
+        await self.fix_hidden_tab()
+        await self.install_toast_watch()
+        logger.info(f"已保留编辑页签，另开新页签作为工作页：{self._page.url}")
+        return {"ok": True, "url": self._page.url}
 
     async def close(self) -> None:
         """只断开 CDP 连接，不关用户的浏览器和页签（best-effort，坏了不影响主流程）。"""

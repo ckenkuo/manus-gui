@@ -3027,6 +3027,16 @@ async def run_batch(
                 ok += 1
             else:
                 fail += 1
+                # 【失败保留编辑页签】编辑页上还留着未落库的表单，直接进下一个商品会
+                # navigate 冲掉这份现场（等于关页签重开、从头再来）。故把页签原样
+                # 留在浏览器里给人工接着处理，另开新页签跑后面的商品。
+                if session.edit_page_open:
+                    parked = await session.park_edit_tab()
+                    if parked.get("ok"):
+                        await _emit(on_progress, {
+                            "type": "log", "level": "warning",
+                            "message": (f"[{key}] 商品失败，编辑页签已保留（含未保存的修改），"
+                                        "后续商品在新页签继续；请人工到该页签接着处理")})
             await _emit(on_progress, {"type": "product_done", "index": i, "total": total,
                                       "offer": key, "rowid": r.get("rowid"),
                                       # title 原先只在 product_start 里（前端自己记着）。

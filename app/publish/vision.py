@@ -321,7 +321,20 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
     want = max(1, int(min_clean or 1))
     clean_n = sum(1 for p in mains
                   if (notes.get(os.path.basename(p)) or {}).get("clean"))
-    if clean_n >= want:
+    # 【颜色主图强制清理】颜色缩略图 URL 精确对应的 mainFile 是「该颜色的权威归属」，
+    # 带中文/水印也必须清——不清则阶段⑦ 配不上该颜色（2026-09-04 1071736188944：
+    # 8 个颜色的 mainFile 全是带中文的图，却因为干净图已够下限被整段跳过，全配不上）。
+    # 与「缺口张数」是两套目标：前者是颜色归属必需，后者是凑够行下限的通用图。
+    color_main = {v.get("mainFile") for v in (info.get("colorImages") or {}).values()
+                  if isinstance(v, dict) and v.get("mainFile")}
+
+    def _color_dirty(p: str) -> bool:
+        n = notes.get(os.path.basename(p)) or {}
+        return (os.path.basename(p) in color_main
+                and not n.get("clean")
+                and (n.get("kind") or "") not in _SKIP_KINDS)
+
+    if clean_n >= want and not any(_color_dirty(p) for p in mains):
         return {"status": "ok", "items": [],
                 "reason": f"已有 {clean_n} 张干净图（够 {want} 张下限），无需清理"}
 
@@ -353,12 +366,17 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
     if not cands:
         return {"status": "ok", "items": [],
                 "reason": "脏图全是重复图/尺码表/工厂图，无可清理项"}
-    # 脏度轻的排前面（成功率高），只取缺口张数——凑够下限就停
+    # 脏度轻的排前面（成功率高）；颜色主图的脏图必须清，其余只取缺口张数凑够下限
     cands.sort(key=lambda t: t[0])
     need = want - clean_n
-    items = [it for _, it in cands[:need]]
+    must = [it for _, it in cands if it["file"] in color_main]
+    rest = [it for _, it in cands if it["file"] not in color_main]
+    items = must + rest[:max(0, need - len(must))]
     reason = ""
-    if len(cands) > need:
+    if must:
+        reason = (f"干净图 {clean_n} 张，清 {len(items)}/{len(cands)} 张脏图"
+                  f"（含颜色主图 {len(must)} 张），另有 {len(cands) - len(items)} 张留着不清")
+    elif len(cands) > need:
         reason = (f"干净图 {clean_n} 张不足 {want} 张，只清缺口 {need} 张"
                   f"（另有 {len(cands) - need} 张脏图留着不清）")
     return {"status": "ok", "items": items, "reason": reason}

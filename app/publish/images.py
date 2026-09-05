@@ -306,7 +306,15 @@ def _fit_min_size(im, min_w: int = CLOTH_MIN_W, min_h: int = CLOTH_MIN_H):
     w, h = im.size
     sc = max(min_w / w, min_h / h)
     if sc > 1:
-        im = im.resize((round(w * sc), round(h * sc)), Image.LANCZOS)
+        nw, nh = round(w * sc), round(h * sc)
+        # 【留余量】round 可能把宽恰好落在 min_w 边界（800×1.675=1340），而平台
+        # 「不能小于 1340」的校验会把 =1340 也拦下（2026-09-05 1071736188944 发布
+        # 报「服装类图片尺寸不能小于1340px*1785px」就是它）。宽或高仍 == 下限时 +1，
+        # 保证严格大于；宽高同加 1px，3:4 比例偏差 1px 在容差内。
+        if nw <= min_w or nh <= min_h:
+            nw += 1
+            nh += 1
+        im = im.resize((nw, nh), Image.LANCZOS)
     return im
 
 

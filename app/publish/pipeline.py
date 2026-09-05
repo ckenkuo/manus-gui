@@ -417,8 +417,13 @@ def cat_clues(info: Optional[dict]) -> str:
         if sizes:
             shown = "、".join(str(s) for s in list(sizes)[:8])
             tier = size_tier(sizes)
-            note = {"baby": "（月龄码/岁码/身高码 = 婴幼童，不可能是成人商品）",
-                    "adult": "（成人字母码）"}.get(tier, "")
+            if tier == "baby" and _has_older_than_one_year(sizes):
+                # 岁码 ≥2 岁是童装不是婴儿：明确写「非婴儿」，免得 LLM 把「婴幼童」
+                # 读成「婴儿服饰」这个类目分支（2026-09-04 5~8 岁被分进婴儿类目）。
+                note = "（岁码 2 岁及以上 = 童装，非婴儿，也不可能是成人商品）"
+            else:
+                note = {"baby": "（月龄码/岁码/身高码 = 婴幼童，不可能是成人商品）",
+                        "adult": "（成人字母码）"}.get(tier, "")
             bits.append(f"源商品尺码: {shown}{note}")
     except Exception as e:
         logger.warning(f"提取类目年龄线索失败（不影响类目判断）：{e}")
@@ -434,7 +439,7 @@ _CAT_PROMPT = """你是跨境电商类目分类助手。根据商品标题，从
 
 规则：
 1. 若商品标题表明是套装类商品（含"套装""两件套""三件套""套裙"等），候选中有套装/两件套类类目时，必须优先选套装类类目，而不是按单品材质/上衣/裤子归类。
-2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时，商品必为婴幼童/童装，禁止选女士/男士等成人分支；源尺码是 S/M/L/XL 等成人字母码时，禁止选婴儿/女童/男童分支。
+2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时，商品必为婴幼童/童装，禁止选女士/男士等成人分支；源尺码是 S/M/L/XL 等成人字母码时，禁止选婴儿/女童/男童分支。源尺码里出现 2 岁及以上的岁码（2y/3T/5岁/7-8岁）时，商品必为童装（女童/男童），禁止选「婴儿」分支；只有月龄码（≤12m，如 6-9m/9-12m）或 1 岁码（1y/1岁/12m）才可能是婴儿。
 3. "其他（...）"类目只有在所有其他候选都语义不符时才能选；只要存在更具体的候选（如按裙/长裤/短裤、开衫/套头衫区分），就必须选最具体匹配的那个，依据标题中的实体信息判断（如"牛仔裤"=长裤下装）。
 4. 商品的风格属性（运动/休闲/正装/居家）要与类目分支一致：运动风商品（含"运动""卫衣""POLO""卫裤""速干"等）应优先进"运动服/休闲运动"这类分支。
 5. 【重要】选择时必须综合本级名字和它的子类目：若某候选本身不如另一个贴切，但其子类目里有明显更匹配商品的项，应选它。反之，某候选名字看着匹配但子类目全都不符，则不该选。
@@ -542,7 +547,7 @@ _CAT_FROM_CACHE_PROMPT = """你是跨境电商类目分类助手。下面是本�
 
 规则：
 1. 若商品标题表明是套装类商品（含"套装""两件套""三件套""套裙"等），清单中有套装/两件套类叶子类目时，必须优先选它，而不是按单品材质/上衣/裤子归类。
-2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。路径中任何一级的性别或年龄段与商品不符，这条路径就不能选。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时商品必为婴幼童/童装，成人分支的路径一概不能选；反之成人字母码（S/M/L/XL）不能选婴儿/童装分支。
+2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。路径中任何一级的性别或年龄段与商品不符，这条路径就不能选。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时商品必为婴幼童/童装，成人分支的路径一概不能选；反之成人字母码（S/M/L/XL）不能选婴儿/童装分支。源尺码里出现 2 岁及以上的岁码（2y/3T/5岁/7-8岁）时，商品必为童装（女童/男童），禁止选「婴儿」分支；只有月龄码（≤12m，如 6-9m/9-12m）或 1 岁码（1y/1岁/12m）才可能是婴儿。
 3. "其他（...）"类叶子类目只有在清单里所有更具体的候选都语义不符时才能选。
 4. 商品的风格属性（运动/休闲/正装/居家）要与路径分支一致：运动风商品（含"运动""卫衣""POLO""卫裤""速干"等）应走"运动服/休闲运动"这类分支。
 5. 【重要】要逐级复核整条路径，不是只看叶子名。叶子名看着匹配但中间某一级（品类大类、性别、年龄段、风格分支）与商品不符的，不能选。
@@ -1430,7 +1435,10 @@ async def _click_dropdown_option(session: BrowserSession, label: str,
       if (Math.abs(drops[0].r.top - rowY) > 600)
         return JSON.stringify({clicked: false, reason: 'dropdown-too-far'});
       const opt = Array.from(drops[0].d.querySelectorAll('.ant-select-item-option'))
-        .find(o => (o.textContent || '').trim() === __VALUE__);
+        .find(o => {
+          const c = o.querySelector('.ant-select-item-option-content');
+          return ((c || o).textContent || '').trim() === __VALUE__;
+        });
       if (!opt) return JSON.stringify({clicked: false, reason: 'option-not-rendered',
         value: __VALUE__});
       opt.click();
@@ -1463,7 +1471,10 @@ async def _scroll_click_option(session: BrowserSession, label: str,
         drops.sort((a, b) => Math.abs(a.r.top - rowY) - Math.abs(b.r.top - rowY));
       const target = drops[0].d;
       const hitNow = () => Array.from(target.querySelectorAll('.ant-select-item-option'))
-        .find(o => (o.textContent || '').trim() === __VALUE__);
+        .find(o => {
+          const c = o.querySelector('.ant-select-item-option-content');
+          return ((c || o).textContent || '').trim() === __VALUE__;
+        });
       const holder = target.querySelector('.rc-virtual-list-holder');
       if (!holder) {
         const h = hitNow();
@@ -2425,6 +2436,28 @@ def size_tier(sizes) -> str:
     if adult and not baby:
         return "adult"
     return ""
+
+
+def _has_older_than_one_year(sizes) -> bool:
+    """尺码里是否出现「2 岁及以上」的岁码（2y / 3T / 5岁 / 7-8岁…）。
+
+    【为什么单独判】size_tier 把岁码一律归进 baby（婴幼童），但类目树上「婴儿」与
+    「女童/男童」是平级分支：岁码 ≥2 岁（2-3y、3T、5岁、6岁…）的商品是童装，绝不属于
+    婴儿——婴儿类目只在 ≤1 岁（1y/1岁/12m 及以下）时成立。2026-09-04 实测（尺码 5岁/
+    6岁/7岁/8岁 被分进婴儿类目）就是缺了这道「非婴儿」信号。
+    只认岁码（y/t/岁/yr/year），月龄码（m/月）与身高码不在此判——月龄码 18-24m 与
+    身高码 90cm 这类灰色地带留给 LLM，这里只掐最硬、最无争议的岁码。
+    """
+    for raw in (sizes or []):
+        t = str(raw).strip()
+        if not _RE_YEAR_SIZE.match(t):
+            continue
+        # _RE_YEAR_SIZE 的数字部分不是捕获组（它的 group(1) 是单位），这里单独抠
+        # 首段数字判岁数：5岁→5、2-3y→2、7-8岁→7，>1 即为童装而非婴儿。
+        num = re.match(r"\d{1,2}", t)
+        if num and int(num.group(0)) > 1:
+            return True
+    return False
 
 
 # ---- 配件色（变种表里缺源数据的颜色）识别 -----------------------------------
@@ -5779,6 +5812,14 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
         # 【触发闸是 optionsFrom == "cache"，不是 use_cache】现场刚读来的选项立刻点不中，
         # 重读大概率还是同一份、救不回来；缓存来的可能隔了好几天，重读才有意义。
         # 这样非缓存路径保持零改动。
+        if r.get("status") == "error":
+            # live 行写失败原先静默成 result:error，排查点不中（如填充纺织纤维成分）时
+            # 看不到是 row-not-found / option-not-rendered / dropdown-too-far 里的哪一种。
+            # 缓存行下面会走重读/重试，这里只补 live 行的 reason 日志，不改行为。
+            src = row_map.get(c["label"], {}).get("optionsFrom")
+            if src != "cache":
+                logger.warning(f"{c['label']} 写入失败（{src or '无来源'}行，不重试）: "
+                               f"{r.get('reason') or r.get('stage') or r.get('err') or ''}")
         if (r.get("status") == "error"
                 and row_map.get(c["label"], {}).get("optionsFrom") == "cache"):
             if c.get("num") is not None:
@@ -6253,9 +6294,15 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 会再带出下一层行（里衬成分选定后出现其百分比）。故 _fill_linkage_rows 内部循环
     # 重扫直到不再冒新行，上限 _LINKAGE_MAX_ROUNDS 轮防耗时失控；仍有残留的由下面
     # 的必填复扫报人工。别改回「只跑一轮」——那会让第二层行静默留空到保存才炸。
+    # 【pre_labels 只收第一轮可见的行】隐藏行（visible=False，如「材质」依赖「是否纺
+    # 织品」这类开关字段、开关未选时行不显示）第一轮 dump_attrs 会跳过它们的 options、
+    # 主轮 LLM 无从填值；若把它们的 label 也塞进 pre_labels（即 seen），补填轮会因
+    # 「label 已在 seen」而永远不重扫——等主轮改选开关、这些行联动显示出来时，就只能
+    # 留空到末尾复扫报人工（2026-09-04 猫窝「材质」漏填即此）。只收可见行，隐藏行
+    # 会在联动显示后进入补填轮正常补上。
     fill = await _fill_linkage_rows(
-        session, {a["label"] for a in attrs}, info, main_comp,
-        cat_path, use_cache=use_cache, site=site)
+        session, {a["label"] for a in attrs if a.get("visible") is not False},
+        info, main_comp, cat_path, use_cache=use_cache, site=site)
     result["linkageFilled"] = fill.get("applied") or []
     result["linkageNewRequired"] = fill.get("newRequired") or []
     if fill.get("compFailed"):
@@ -6710,6 +6757,22 @@ async def save(session: BrowserSession, rowid: str = "") -> dict:
                 "confirmDialog": confirm}
 
     after = await _draft_update_time(session, rowid) if rowid else None
+    # 【保存成功前先查错误 toast】「服装类图片尺寸不能小于1340px*1785px」这类是平台
+    # 弹的 toast（.ant-message），不是 .ant-form-item-explain-error 锚点，只靠 errors
+    # 会漏判、save 误报成功（2026-09-05 1071736188944：save 落库、发布才报尺寸）。
+    # toast 哨兵按 t_click 时间窗回捞，命中「错误/不能」等关键词即判保存失败——
+    # 与 publish_now 的拒绝判据同一套词，两个关口口径一致。
+    bad_toasts = [t for t in browser.recent_toasts(since=t_click)
+                  if any(w in t for w in ("失败", "错误", "不能", "请先", "请选择"))]
+    if bad_toasts:
+        reason = "保存被平台拒绝：" + "；".join(bad_toasts[:3])
+        logger.error(f"保存失败，平台提示：{bad_toasts[:3]}")
+        return {"status": "validation-error",
+                "reason": reason[:400],
+                "platformToasts": bad_toasts,
+                "updateTime": {"before": before, "after": after},
+                "messages": feedback.get("messages"), "confirmDialog": confirm}
+
     # 更新时间只在两次都读到、且相等时才判定「没落库」：读不到（None）属证据缺失，
     # 不能当失败——列表分页/筛选变化都可能读不到那一行。
     if before and after and before == after:
@@ -7859,7 +7922,7 @@ _JS_SKC_ROW_STATE = r"""(() => {
   const sec = document.getElementById('skuAttrsInfo');
   if (!sec) return JSON.stringify({err: '找不到变种属性区块'});
   const row = Array.from(sec.querySelectorAll('tr'))
-    .find(tr => (tr.textContent || '').includes(__KEY__));
+    .find(tr => ((tr.querySelector('td') || {}).textContent || '').trim() === __KEY__.trim());
   if (!row) return JSON.stringify({err: '找不到颜色行: ' + __KEY__});
   const imgs = Array.from(row.querySelectorAll('img'))
     .filter(im => (im.currentSrc || im.src || '').startsWith('http'));
@@ -7882,7 +7945,7 @@ _JS_SKC_DEL_FIRST = r"""(async () => {
   const sec = document.getElementById('skuAttrsInfo');
   if (!sec) return JSON.stringify({err: '找不到变种属性区块'});
   const row = Array.from(sec.querySelectorAll('tr'))
-    .find(tr => (tr.textContent || '').includes(__KEY__));
+    .find(tr => ((tr.querySelector('td') || {}).textContent || '').trim() === __KEY__.trim());
   if (!row) return JSON.stringify({err: '找不到颜色行'});
   const cells = Array.from(row.querySelectorAll('.single-image'))
     .filter(c => Array.from(c.querySelectorAll('img'))
@@ -7923,7 +7986,7 @@ _JS_SKC_BTN_SCROLL = r"""(() => {
   const sec = document.getElementById('skuAttrsInfo');
   if (!sec) return JSON.stringify({err: '找不到变种属性区块'});
   const row = Array.from(sec.querySelectorAll('tr'))
-    .find(tr => (tr.textContent || '').includes(__KEY__));
+    .find(tr => ((tr.querySelector('td') || {}).textContent || '').trim() === __KEY__.trim());
   if (!row) return JSON.stringify({err: '找不到颜色行'});
   const btn = Array.from(row.querySelectorAll('button'))
     .find(b => (b.textContent || '').includes('选择图片'));
@@ -7945,7 +8008,7 @@ _JS_SKC_BTN_SCROLL = r"""(() => {
 _JS_SKC_BTN_POS = r"""(() => {
   const sec = document.getElementById('skuAttrsInfo');
   const row = Array.from(sec.querySelectorAll('tr'))
-    .find(tr => (tr.textContent || '').includes(__KEY__));
+    .find(tr => ((tr.querySelector('td') || {}).textContent || '').trim() === __KEY__.trim());
   if (!row) return JSON.stringify({err: '找不到颜色行'});
   const btn = Array.from(row.querySelectorAll('button'))
     .find(b => (b.textContent || '').includes('选择图片'));
@@ -8187,7 +8250,7 @@ _JS_SCROLL_SETTLED = r"""(async () => {
   const sec = document.getElementById('skuAttrsInfo');
   if (!sec) return JSON.stringify({err: '找不到变种属性区块'});
   const row = Array.from(sec.querySelectorAll('tr'))
-    .find(tr => (tr.textContent || '').includes(__KEY__));
+    .find(tr => ((tr.querySelector('td') || {}).textContent || '').trim() === __KEY__.trim());
   if (!row) return JSON.stringify({err: '找不到颜色行'});
   const top = () => Math.round(row.getBoundingClientRect().top);
   const t0 = performance.now();
@@ -9309,8 +9372,11 @@ _JS_DESC_SAVE = r"""(async () => {
   const small = [];
   imgs.forEach((i, k) => {
     const w = i.naturalWidth || 0, h = i.naturalHeight || 0;
-    // 0 表示还没加载完，按「读不到」跳过而不是当成不达标
-    if (!w || !h) return;
+    // 0 表示还没加载完；1 表示源图失效/懒加载占位（浏览器只拿到 1 像素的占位图），
+    // 两者都是「没读到真实图片」，按「读不到」跳过而不是当成不达标。
+    // 2026-09-04 实测（836739130561）：1688 源图 404 后编辑页渲染成 1x1 占位，
+    // naturalWidth=1 被误判成「两边 < 480」整单未落库。
+    if (w < 2 || h < 2) return;
     const ratio = w / h;
     if (w < __MINW__ || h < __MINH__ || ratio < __RMIN__ || ratio > __RMAX__)
       small.push({pos: k + 1, size: w + 'x' + h, ratio: Math.round(ratio * 1000) / 1000});

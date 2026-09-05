@@ -1049,6 +1049,11 @@ _VISION_PROMPT = """商品标题：{title}
 下面按顺序给你 {n} 张图，编号与文件名对应：
 {listing}
 
+【文件名的唯一来源】上面清单里冒号后面就是每张图唯一的文件名（形如 main-01.jpg /
+desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名的字段（imageUnderstanding
+的 images 键、complianceNotes 的 file、duplicates 的元素）都必须【逐字照抄】清单里那个
+文件名原文——含前缀和编号，【严禁】按「第 N 张」的序号自己编 main-N 之类的名字。
+
 请完成五件事，合并成一个 JSON 返回：
 
 1. imageUnderstanding —— 看懂商品实物：
@@ -1116,10 +1121,16 @@ _VISION_PROMPT = """商品标题：{title}
    clean=true 的判据：无任何中文文字、无水印、无他人品牌 logo，且画面就是商品本身
    （阶段⑥ 挑素材图、阶段⑪ 删描述图直接读这个字段）。
 
+6. duplicates —— 【同一画面】的重复图（画面内容完全一样，只是尺寸/裁切/压缩不同）：
+   [[重复文件名, 首见文件名], ...]，首见文件是这一组里编号最前、画面最完整的那张。
+   判据【只看画面内容】：同一件商品、同一构图、同一图案与颜色，才算重复。
+   【同款不同颜色/不同图案的图不算重复】——哪怕都是挂拍平铺、构图高度一致，只要
+   颜色或图案不同，就各自保留、不要写进 duplicates。图里没有重复就返回 []。
+
 只输出 JSON：{{"imageUnderstanding": {{...}}, "sizeChart": {{...}},
 "sizeMeasurements": {{...}}, "sizeMeasurementsRows": {{...}},
 "sizeMeasurementsByPart": [...], "composition": {{...}},
-"complianceNotes": {{"files": [...]}}}}"""
+"complianceNotes": {{"files": [...]}}, "duplicates": [[...], ...]}}"""
 
 class VisionResult(BaseModel):
     """阶段① 视觉回填的必答字段（校验与重试见 llm._check_result）。
@@ -1162,17 +1173,13 @@ def dedup_images(outdir: str) -> tuple[list, dict]:
     读的就是 main-NN（素材图取轮播第一张），标注挂在 desc 上它就找不到、还会因为
     duplicate 标记把 main-01 判成不可用。故先按 main/desc 分组再按编号排。
 
-    【两轮去重：md5 精确 + ahash 近重复】md5 只抓字节完全相同的副本，抓不到同一张
-    摄影的不同裁切/压缩版本——2026-08-24 实测 product-957056453209 的 main-04 是
-    main-06 的 3:4 中心裁切，md5 不同，两张都被挂进同一个 SKC 颜色行（成品页可见
-    两张重复图）。故 md5 轮之后补一轮 ahash 近重复检测，理由与阈值见 images.ahash。
-
-    【近重复组保留像素面积最大的那张，不是首见的那张】这是与 md5 轮刻意不同的取向：
-    md5 相同意味着字节一致、留谁都一样，所以按 main 优先的首见规则即可；而近重复
-    组里各版本尺寸不同，留大图能避开后续 fit_34 放大小图造成的画质损失（实测样本里
-    main-06 是 1920×1920 原图、main-04 只有 750×1000）。
-    但【main 图优先于 desc 图】仍然压在面积之前——阶段⑥⑦ 只认 main-NN，留下 desc
-    会让这批画面对它们彻底不可见（见上一段的字典序踩坑，同一个道理）。
+    【只做 md5 精确去重，近重复改由 LLM 理解判断】2026-09-04 起移除了 ahash 近重复
+    轮：ahash 是灰度感知哈希，分不清颜色/图案，会把「同款不同颜色」的平铺图、以及
+    「商家重复上传给不同颜色的主图」误判成重复——前者被错误合并，后者（颜色主图）被
+    标 duplicate 后阶段⑦ 配不上颜色（1071736188944 短裤套装 8 色全配不上就是它）。
+    故本函数只保留 md5 轮（字节相同的副本，确定性、绝不误伤）；「画面相似但字节不同」
+    的近重复，交给 enrich_vision 的 LLM 看全图后按语义判断，见 _VISION_PROMPT 的
+    duplicates 字段与 _merge_vision 的合并。_dedup_near 保留但不再被调用，理由同上。
     """
     import hashlib
 
@@ -1194,15 +1201,6 @@ def dedup_images(outdir: str) -> tuple[list, dict]:
         seen[digest] = f
         uniq.append(path)
 
-    uniq, near = _dedup_near(uniq)
-    dupes.update(near)
-    # md5 轮里指向「被近重复轮淘汰掉的文件」的映射要改指向存活者，否则
-    # complianceNotes 里 duplicateOf 会指到一个不在 uniq 里的名字，
-    # 阶段⑪ 顺着它找首见文件的标注就找不到。
-    for dup, src_name in list(dupes.items()):
-        hop = near.get(src_name)
-        if hop:
-            dupes[dup] = hop
     return uniq, dupes
 
 
@@ -1534,7 +1532,8 @@ async def _rows_to_measurements(rows_obj, sizes: list,
     return out, note
 
 
-async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
+async def _merge_vision(info: dict, vision: dict, dupes: dict,
+                        names: Optional[list] = None) -> dict:
     """把视觉判断结果并进 info 的四个字段，返回回填统计。
 
     只填【原本为空】的字段：手工补过或上一轮已填的值优先，不被新一轮覆盖——
@@ -1551,9 +1550,28 @@ async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
     （见 _rows_to_measurements）。其余各支都是纯本地的字典搬运。
     """
     stat = {}
+    # 【幻影文件名还原】LLM 有时不照抄清单文件名，而按「第 N 张」的序号编 main-N
+    # （把 desc-01 写成 main-15）。这里把 main-N 映射回第 N 张的真实文件名 names[N-1]；
+    # 真实文件名原样返回、映射不上的也原样返回（下游按查不到处理，不静默丢弃）。
+    real_names = names or []
+
+    def _real_file(f: str) -> str:
+        if not real_names or f in real_names:
+            return f
+        m = re.match(r'^main-(\d+)\.(jpg|jpeg|png|webp)$', f, re.I)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(real_names):
+                return real_names[idx]
+        return f
+
     for key in ("imageUnderstanding", "sizeChart", "sizeMeasurements"):
         got = vision.get(key)
         if isinstance(got, dict) and got and not info.get(key):
+            if key == "imageUnderstanding" and isinstance(got.get("images"), dict):
+                got = {**got,
+                       "images": {_real_file(k): v
+                                  for k, v in got["images"].items()}}
             info[key] = got
         stat[key] = len(info.get(key) or {})
 
@@ -1600,15 +1618,43 @@ async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
     notes = vision.get("complianceNotes") or {}
     files = notes.get("files") if isinstance(notes, dict) else None
     if isinstance(files, list) and files and not (info.get("complianceNotes") or {}).get("files"):
-        by_name = {e.get("file"): e for e in files if isinstance(e, dict) and e.get("file")}
-        for dup, src in dupes.items():
+        by_name = {}
+        for e in files:
+            if isinstance(e, dict) and e.get("file"):
+                rf = _real_file(str(e["file"]))
+                by_name[rf] = {**e, "file": rf}
+        # 【颜色主图不标 duplicate】颜色缩略图 URL 精确对应的 mainFile 是「该颜色的
+        # 权威归属」——商家把它挂在这个颜色下，即使画面与别的图相同（重复上传给不同
+        # 颜色）也不该被去重合并掉，否则 vision._usable 会按 duplicate 过滤、阶段⑦
+        # 配不上该颜色（2026-09-04 1071736188944 短裤套装：8 个颜色的 mainFile 全是
+        # 重复图，被去重标 duplicate 后颜色全配不上）。这里仍继承首见文件的画面理解
+        # （省图片 token），但不加 duplicate/duplicateOf、不置 clean:false。
+        color_main = {v.get("mainFile") for v in (info.get("colorImages") or {}).values()
+                      if isinstance(v, dict) and v.get("mainFile")}
+        # 【近重复由 LLM 判断】dedup_images 现在只做 md5 精确去重，「画面相似但字节不同」
+        # 的近重复由视觉回填的 LLM 判（_VISION_PROMPT 第 6 条 duplicates），这里合并进
+        # 局部 all_dupes 一起标 duplicate。LLM 看的是 md5 去重后的全图，能按画面语义
+        # 区分「同款不同颜色」——那是 ahash 灰度哈希分不清、会误伤的（见 dedup_images）。
+        # 不改 dupes 参数：result["duplicates"] 仍只报字节相同的副本，LLM 的近重复
+        # 只体现在 complianceNotes 的 duplicate 标记里。
+        all_dupes = dict(dupes)
+        for pair in (vision.get("duplicates") or []):
+            if not isinstance(pair, (list, tuple)) or len(pair) < 2:
+                continue
+            d, s = str(pair[0]), str(pair[1])
+            if s in by_name and d not in all_dupes:
+                all_dupes[d] = s
+        for dup, src in all_dupes.items():
             base = by_name.get(src)
             if base:
                 # file 必须改成 dup 自己的名字：直接 {**base} 会把 src 的 file 带过来，
                 # 于是 desc-01 的标注写着 file=main-01，阶段⑥⑦⑪ 按文件名查就查不到。
-                by_name[dup] = {**base, "file": dup, "duplicate": True,
-                                "duplicateOf": src, "clean": False,
-                                "note": f"与 {src} 重复"}
+                if dup in color_main:
+                    by_name[dup] = {**base, "file": dup}
+                else:
+                    by_name[dup] = {**base, "file": dup, "duplicate": True,
+                                    "duplicateOf": src, "clean": False,
+                                    "note": f"与 {src} 重复"}
         info["complianceNotes"] = {
             "files": [by_name[k] for k in sorted(by_name)],
             "cleanFiles": sorted(k for k, v in by_name.items() if v.get("clean")),
@@ -1621,7 +1667,7 @@ async def _merge_vision(info: dict, vision: dict, dupes: dict) -> dict:
 
 
 async def enrich_vision(
-    info_path: str, max_images: int = 20, overwrite: bool = False
+    info_path: str, max_images: int = 40, overwrite: bool = False
 ) -> dict:
     """视觉回填阶段①的看图空占位字段，原地更新 product-info.json，返回统计。
 
@@ -1640,6 +1686,11 @@ async def enrich_vision(
     双空表，日志只报「尺码参考 0 | 实测尺寸 0」，看不出是模型没认出来还是压根没看到
     （complianceNotes 里那 4 个文件名一条标注都没有，事后才反推出来）。
     截断是静默的，故一并补了 warning 日志把被丢的文件名打出来。
+
+    【2026-09-05 上限从 20 提到 40】去掉了 ahash 近重复轮（近重复改由 LLM 判），
+    md5 去重后剩下的图比原来多——原来被 ahash 合并掉的「同图不同尺寸/压缩」版本
+    现在都留给 LLM 看，长图商品更容易顶到 20。提到 40 让 LLM 真看全；代价是图片
+    token 与请求体变大（单张 800×800 约 425 token，40 张约 1.7 万，仍在可控范围）。
 
     overwrite=True 才会重填已有值：默认不覆盖，人工补过的标注比模型的可靠。
     """
@@ -1683,7 +1734,7 @@ async def enrich_vision(
         result_model=VisionResult,
     )
 
-    stat = await _merge_vision(info, vision, dupes)
+    stat = await _merge_vision(info, vision, dupes, names=names)
     with open(info_path, "w", encoding="utf-8") as f:
         json.dump(info, f, ensure_ascii=False, indent=2)
 

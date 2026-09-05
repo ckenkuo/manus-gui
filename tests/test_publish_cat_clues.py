@@ -36,6 +36,19 @@ def test_成人码与童装码互斥():
     assert src == "baby" and page == "adult" and src != page
 
 
+@pytest.mark.parametrize("sizes, expect", [
+    (["5岁", "6岁", "7岁", "8岁"], True),   # 2026-09-04 被误分进婴儿类目的那一单
+    (["2-3y", "3T"], True),
+    (["7-8岁"], True),
+    (["1y", "1岁", "12m"], False),           # 1 岁及以下仍是婴儿候选
+    (["6-9m", "9-12m"], False),
+    (["18-24m", "12-18m"], False),           # 月龄码不在此判（灰色地带留给 LLM）
+    ([], False),
+])
+def test_岁码超过一岁判定(sizes, expect):
+    assert pipeline._has_older_than_one_year(sizes) is expect
+
+
 # ---- cat_clues -------------------------------------------------------------
 
 _INFO = {
@@ -49,6 +62,19 @@ _INFO = {
 def test_线索含年龄段与档位():
     c = pipeline.cat_clues(_INFO)
     assert "婴幼童" in c and "6-9m" in c and "不可能是成人商品" in c
+
+
+def test_岁码两岁及以上标注非婴儿():
+    """5~8 岁童装尺码，线索必须显式带「非婴儿」，拦住婴儿类目分支。"""
+    c = pipeline.cat_clues({"attributes": {}, "sizes": ["5岁", "6岁", "7岁", "8岁"]})
+    assert "非婴儿" in c and "童装" in c
+
+
+def test_一岁及以下不标注非婴儿():
+    """月龄码/1 岁码仍是婴儿候选，不该被误标「非婴儿」。"""
+    for sizes in (["6-9m", "9-12m"], ["1y", "1岁"], ["12m"]):
+        c = pipeline.cat_clues({"attributes": {}, "sizes": sizes})
+        assert "非婴儿" not in c
 
 
 def test_没有尺码也没有年龄属性时线索为空():

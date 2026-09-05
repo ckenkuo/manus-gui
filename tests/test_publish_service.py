@@ -611,6 +611,8 @@ async def test_run_batch_单商品失败不拖垮批次(tmp_path, monkeypatch):
             return None
         def is_alive(self):
             return True
+        # run_batch 失败路径会读它判断要不要保留编辑页签；此处恒 False 即不触发
+        edit_page_open = False
     monkeypatch.setattr(service, "BrowserSession", _FakeSession)
     monkeypatch.setattr(service, "reset_token_counters", lambda: None)
 

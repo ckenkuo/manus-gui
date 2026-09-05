@@ -116,14 +116,14 @@ def test_order_preserved(tmp_path):
     assert [os.path.basename(p) for p in uniq] == ["main-01.jpg", "main-02.jpg", "main-03.jpg"]
 
 
-def test_dedup_images_rehops_md5_map(tmp_path):
-    """md5 映射指向的首见文件若被近重复轮淘汰，映射要改指存活者。
+def test_dedup_images_md5_only_keeps_near_duplicates(tmp_path):
+    """去掉了 ahash 近重复轮：放大版 main-02 不再被合并，dedup_images 只做 md5 字节去重。
 
-    否则 complianceNotes 的 duplicateOf 指到一个不在 uniq 里的名字，
-    阶段⑪ 顺着它找首见标注就找不到。
+    近重复改由 enrich_vision 的 LLM 判断（_VISION_PROMPT 的 duplicates），故 dedup_images
+    只合并字节相同的副本，duplicateOf 恒指向仍在 uniq 里的首见文件（无需 rehop）。
     """
     # main-01 是大图；desc-01 与 main-01 字节完全相同（md5 轮把 desc-01 → main-01）；
-    # main-02 是 main-01 的放大版（面积更大，近重复轮会淘汰 main-01 保留 main-02）。
+    # main-02 是 main-01 的放大版（字节不同，保留在 uniq，不再被 ahash 合并）。
     big = _photo(str(tmp_path / "main-01.jpg"), 600, 800, seed=0)
     import shutil
     shutil.copy(big, str(tmp_path / "desc-01.jpg"))
@@ -132,6 +132,5 @@ def test_dedup_images_rehops_md5_map(tmp_path):
 
     uniq, dupes = dedup_images(str(tmp_path))
     names = [os.path.basename(p) for p in uniq]
-    assert names == ["main-02.jpg"], names
-    # 三个映射都必须指向存活的 main-02
-    assert dupes == {"main-01.jpg": "main-02.jpg", "desc-01.jpg": "main-02.jpg"}, dupes
+    assert names == ["main-01.jpg", "main-02.jpg"], names
+    assert dupes == {"desc-01.jpg": "main-01.jpg"}, dupes

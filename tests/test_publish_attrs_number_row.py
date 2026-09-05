@@ -190,18 +190,24 @@ async def test_主轮已有的行不算联动新增(_stub_dom, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_已填的联动行不再补(_stub_dom, monkeypatch):
-    """只补 current 以 '(' 开头（未填）的行；已填的不动，避免覆盖平台预选值。"""
+async def test_有预填值的联动行也会被审但不改(_stub_dom, monkeypatch):
+    """2026-09-03 起：联动行无论有无预填值都扫、交 LLM 审，LLM 无改动时不碰页面。
+
+    预填值可能是平台默认（如「里衬成分」默认棉），默认值未必合适，不能靠「已填就不扫」
+    跳过——那会让错的默认值一路带到保存。
+    """
     s = _FakeSession([_sel_row("里衬成分", current="棉")])
     called = []
 
     async def _ask(*a, **kw):
         called.append(1)
-        return {}
+        return {}  # LLM 判断预填值「棉」合适，无 change
 
     monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
     r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
-    assert r["newRequired"] == [] and called == []
+    assert called == [1]                     # 扫到并审过，不因预填值跳过
+    assert r["applied"] == []                # 无 change，不写入
+    assert r["newRequired"] == ["里衬成分"]   # 仍记录扫到的行，交末尾复扫
 
 
 @pytest.mark.asyncio

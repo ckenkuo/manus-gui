@@ -190,8 +190,8 @@ async def main() -> int:
     p.add_argument("info_json", help="product-info.json 路径")
     p.add_argument("--overwrite", action="store_true",
                    help="重填已有值（默认只填空字段）")
-    p.add_argument("--max-images", type=int, default=20,
-                   help="一次请求最多传几张唯一图（默认20）")
+    p.add_argument("--max-images", type=int, default=40,
+                   help="一次请求最多传几张唯一图（默认40）")
     p = sub.add_parser("enrich-desc-text",
                        help="从详情纯文字抽尺码表（只读，不看图）")
     p.add_argument("info_json", help="product-info.json 路径")
