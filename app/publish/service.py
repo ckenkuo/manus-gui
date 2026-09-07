@@ -172,7 +172,6 @@ ProgressCB = Optional[Callable[[dict], Union[None, Awaitable[None]]]]
 STATE_DIR = os.path.join("workspace", "publish-state")
 PREFS_PATH = os.path.join("workspace", "publish_prefs.json")
 
-PRODUCT_TIMEOUT = 1800   # 单商品 15 阶段含多次 LLM + 图片上传/生图，给足 30 分钟
 CDP_PING_RETRIES = 3     # 每商品前的 CDP 健康检查次数（对齐 collect 侧）
 
 # 生图并发的默认值与上限（实际值由用户在发布页配置，见 get_image_concurrency）
@@ -770,7 +769,7 @@ async def _run_prewarm(ctx: dict, emit) -> None:
         return await estimate_pack(info, need_dims=True, need_weight=True)
 
     async def _stock():
-        return await judge_sku_category(info)
+        return await judge_sku_category(info, cat_path=ctx.get("cat_path"))
 
     async def _desc():
         return await _prewarm_desc(ctx, info, emit)
@@ -1652,9 +1651,11 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
     /^尺码表2?$/，见 pipeline._JS_SIZECHART_LOCATE），第 3 件起没有位置。丢弃是平台
     结构决定的事实，但不能静默——否则人工复核时看不出「有 3 件、只进了 2 件」。
     """
-    judge = await _await_prewarm(ctx, "stock") or {}
+    judge = ctx.get("sku_judge") or await _await_prewarm(ctx, "stock") or {}
+    if judge:
+        ctx["sku_judge"] = judge
     # skuCat 2=同款多件 3=混合套装 都算套装（平台按「不止一件」判，不区分同款与否）
-    is_set = str(judge.get("skuCat", "1")) in ("2", "3")
+    is_set_by_judge = str(judge.get("skuCat", "1")) in ("2", "3")
     # 包装清单的件别（已归一到平台词表，见 _normalize_sku_judge）；顺序即两张表的顺序
     packing = [x.get("name", "") for x in (judge.get("packing") or [])]
     cats = [_size_category_for(n) for n in packing]
@@ -1695,6 +1696,20 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
                                    "（源表头与可选参数语义对不上，或源数据与商品严重不符），"
                                    "已全部改交模型估算，源真实尺码未采用，请人工核对尺码表"})
 
+    # 【多重防线判定是否为套装】
+    # 1. 大模型/预热判定：skuCat 为 2(同款多件) 或 3(混合套装)
+    # 2. 页面 DOM 事实：编辑页实际上渲染了 2 张尺码表栏位（charts >= 2）。页面有第二张栏位
+    #    却不填，平台服务端必定打回「套装尺码模板数量不合法 / 尺码表2也需要设置」
+    # 3. 平台已选类目：阶段③已选定类目，若类目路径包含「两件套/三件套/四件套/多件套/套装」
+    # 4. 标题特征：包含「两件套/三件套/四件套/多件套/套装」
+    cat_str = " > ".join(str(c) for c in (ctx.get("cat_path") or []))
+    is_set_by_cat = any(k in cat_str for k in ("两件套", "三件套", "四件套", "多件套", "套装"))
+    is_set_by_dom = (r.get("charts", 1) >= 2)
+    title_str = ctx.get("title") or ""
+    is_set_by_title = any(k in title_str for k in ("两件套", "三件套", "四件套", "多件套", "套装"))
+
+    is_set = is_set_by_judge or is_set_by_dom or is_set_by_cat or is_set_by_title
+
     if not is_set:
         return {"status": "ok", "note": note}
 
@@ -1708,7 +1723,20 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
                                f"或改小 SKU分类件数"})
 
     # 套装：补第二张表（分类取清单第二件；同款多件时两件相同，跟随第一件）
-    cat2 = cats[1] if len(cats) > 1 else (cats[0] if cats else None)
+    # 当模型漏判导致清单只有 1 件、但平台/类目已明确是套装时：两张表绝不能选相同分类，
+    # 按常见两件套互补推导第二张表的分类（如第一件是连体衣/下装，第二件选上装）。
+    if len(cats) > 1:
+        cat2 = cats[1]
+    elif len(cats) == 1:
+        first_cat = cats[0]
+        if first_cat in ("下装", "半身裙", "连体衣"):
+            cat2 = "上装"
+        elif first_cat in ("上装", "马甲"):
+            cat2 = "下装"
+        else:
+            cat2 = None
+    else:
+        cat2 = None
     r2 = await add_sizechart(session, ctx["info_path"], which=1, category=cat2,
                              cat_path=ctx.get("cat_path"))
     if r2.get("status") != "ok":
@@ -1791,9 +1819,11 @@ async def _st_variant(ctx: dict, session: BrowserSession, emit) -> dict:
 
 
 async def _st_stock(ctx: dict, session: BrowserSession, emit) -> dict:
+    sku_judge = ctx.get("sku_judge") or await _await_prewarm(ctx, "stock")
     r = await set_stock(session, ctx["info_path"],
                         site=ctx.get("site") or "",
-                        sku_judge=await _await_prewarm(ctx, "stock"))
+                        sku_judge=sku_judge,
+                        cat_path=ctx.get("cat_path"))
     if r.get("status") == "error":
         note = f"[{r.get('stage')}] {(r.get('reason') or r.get('err') or '')}"
         if r.get("available"):
@@ -3043,15 +3073,10 @@ async def run_batch(
             await _emit(on_progress, {"type": "product_start", "index": i, "total": total,
                                       "offer": key, "title": task.get("title") or ""})
             try:
-                r = await asyncio.wait_for(
-                    publish_one(session, task, store, site, on_progress,
-                                index=i, total=total, from_stage=from_stage,
-                                use_cache=use_cache, do_publish=do_publish,
-                                price=price, keep_video=keep_video),
-                    timeout=PRODUCT_TIMEOUT)
-            except asyncio.TimeoutError:
-                r = {"status": "fail", "rowid": task.get("rowid"), "failed_stage": "",
-                     "note": f"超过 {PRODUCT_TIMEOUT}s 单商品超时"}
+                r = await publish_one(session, task, store, site, on_progress,
+                                      index=i, total=total, from_stage=from_stage,
+                                      use_cache=use_cache, do_publish=do_publish,
+                                      price=price, keep_video=keep_video)
             except Exception as e:
                 logger.exception(f"[{key}] 商品级异常")
                 r = {"status": "fail", "rowid": task.get("rowid"), "failed_stage": "",

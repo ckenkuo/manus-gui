@@ -4248,7 +4248,7 @@ _PACKING_ACCESSORY_WORDS = [
 ]
 
 
-async def judge_sku_category(info: dict) -> dict:
+async def judge_sku_category(info: dict, cat_path: Optional[list] = None) -> dict:
     """判 SKU 分类 + 包装清单，返回 {"skuCat","qty","unit","packing":[{name,qty}],"reason"}。
 
     【为什么从 set_stock 里抽出来】它只看标题与套装件数/类型，与仓库、库存那两步
@@ -4269,10 +4269,35 @@ async def judge_sku_category(info: dict) -> dict:
 
     title = info.get("title", "")
     attrs = info.get("attributes") or {}
+    img_prod = str((info.get("imageUnderstanding") or {}).get("product") or "").strip()
+    elem = str(attrs.get("元素") or "").strip()
+    tz_pieces = attrs.get("套装件数")
+    tz_type = attrs.get("套装类型")
+
+    # 【套装件数不能盲目默认为单件】1688 源商品极少有名为「套装件数」的属性，
+    # 缺失时硬填「单件」会误导大模型把两件套判成单品（2026-09-07 商品 1013502117778 取证：
+    # 标题短袖+背带裤两件套、类目女童牛仔两件套，却因「套装件数：单件」被模型判为 skuCat=1）。
+    # 缺失时明确标注未注明，并把视觉理解、元素属性与类目一并喂给模型。
+    pieces_desc = str(tz_pieces).strip() if tz_pieces else "未注明（请结合标题、图片视觉理解与类目综合判断）"
+    type_desc = str(tz_type).strip() if tz_type else "未注明"
+
+    info_lines = [
+        f"- 标题：{title}",
+        f"- 套装件数：{pieces_desc}",
+        f"- 套装类型：{type_desc}",
+    ]
+    if elem:
+        info_lines.append(f"- 元素/属性：{elem}")
+    if cat_path:
+        info_lines.append(f"- 平台类目：{' > '.join(str(c) for c in cat_path)}")
+    if img_prod:
+        info_lines.append(f"- 图片视觉理解：{img_prod}")
+    info_block = "\n".join(info_lines)
+
     # 【品类识别：服装走词表、非服装走 LLM】预热时 cat_path 不可用，只能 title-only。
     # 按品类给包装清单的选词引导，替代原先笼统的「不是服装不要选服装词」——服装走
     # 既有细则，非服装按实际品类指路，避免仿真花/宠物窝被逼成服装词。
-    cat = await classify_category(title, None)
+    cat = await classify_category(title, cat_path)
     if cat == "apparel":
         cat_guidance = ""
     elif cat == "pet_supply":
@@ -4296,8 +4321,7 @@ async def judge_sku_category(info: dict) -> dict:
                         "对应项时，才给一个最接近的同品类通用词（不要跨品类硬凑）。\n")
     prompt = (
         "你是跨境电商 Listing 专家。店小秘 Temu 半托管发布时需要为每个 SKU 填写「SKU分类」和「包装清单」。\n\n"
-        f"商品信息：\n- 标题：{title}\n- 套装件数：{attrs.get('套装件数', '单件')}"
-        f"\n- 套装类型：{attrs.get('套装类型', '无')}\n\n"
+        f"商品信息：\n{info_block}\n\n"
         "SKU分类选项：1=单品（一个SKU只含一件商品） 2=同款多件（多件相同商品） 3=混合套装（多件不同商品组合）\n"
         "单位选项：1=件 2=双 3=包\n\n"
         "包装清单：逐项列出这个 SKU 实际装了哪些件，每项给配件名和件数。\n"
@@ -4432,9 +4456,12 @@ def _category_keyword_of(selected: str) -> Optional[str]:
     return None
 
 
-def _pick_part_measurements(parts: list, category: Optional[str],
-                            which: int) -> tuple[dict, str]:
+async def _pick_part_measurements(parts: list, category: Optional[str],
+                                  which: int, selected: str = "") -> tuple[dict, str]:
     """从分件实测表里挑出第 which 张平台尺码表该用的那一份，返回（实测表, 部件名）。
+
+    selected：平台弹窗里实际选中并回读的完整分类名（「男童装-马甲」），词表配不上
+    时喂给模型配对——完整名比 category 关键词多带类目前缀，信息更全。
 
     【为什么必须按部件挑、不能两张表都吃同一份】2026-08-29 真站取证（1688 商品
     1058585588864，T恤+牛仔背带裙两件套）：源详情图上明明分开给了两张表——
@@ -4445,20 +4472,86 @@ def _pick_part_measurements(parts: list, category: Optional[str],
     错尺码表——上衣的衣长被套到了连衣裙上。这与 _ACCESSORY_SIZE_CATEGORY 上方那段
     「两张一样等于给买家一份错尺码表」是同一个坑的另一半（分类分了、数值没分）。
 
-    配对优先按【尺码分类关键词】：分类是本张表实际强制的测量维度，用它配比用序号配
+    配对按【尺码分类关键词】：分类是本张表实际强制的测量维度，用它配比用序号配
     可靠——包装清单的件序（便服上衣 + 半身裙）与源图部件序（连衣裙 在前、上衣 在后）
-    并不保证一致，本商品就正好是反的。分类配不上时才退回按序号取，那至少还能让两张
-    表拿到不同的数据（比同源好），并由调用方把实际用了哪个部件报进结果供人工复核。
+    并不保证一致，本商品就正好是反的。词表配不上时【升模型配对】（部件名是商家随手
+    写的自由文本，词表永远穷举不完，见 _match_part_by_llm 的取证）；模型也判不出才
+    退回按序号取，那至少还能让两张表拿到不同的数据（比同源好），并由调用方把实际
+    用了哪个部件报进结果供人工复核。
     """
     if not parts:
         return {}, ""
+    if len(parts) == 1:
+        # 只有一张分件表时没什么可配的，两张平台表都用它（与序号兜底的结果一致，
+        # 但省掉一次必然没有信息量的模型调用）
+        e = parts[0]
+        return e.get("measurements") or {}, e.get("part", "")
     if category:
         for e in parts:
             if _size_category_for_part(e.get("part", "")) == category:
                 return e.get("measurements") or {}, e.get("part", "")
+        # 词表配不上：升模型按「量的是不是同一件」配对
+        idx = await _match_part_by_llm(selected or category, parts)
+        if idx is not None:
+            e = parts[idx]
+            return e.get("measurements") or {}, e.get("part", "")
     idx = which if which < len(parts) else len(parts) - 1
     e = parts[idx]
     return e.get("measurements") or {}, e.get("part", "")
+
+
+# 交模型做部件配对时的提示词。词表兜不住的部件名才走这里（见 _match_part_by_llm）。
+_PART_MATCH_PROMPT = """你是服装套装尺码表的部件配对助手。
+
+套装商品的每一件要在平台各填一张尺码表。当前要填的这张表，平台实际选中的尺码分类是：{category}
+源商品详情里按部件分开给了 {n} 张实测尺寸表：
+{part_lines}
+
+请判断这张平台尺码表应该取哪一张源部件表。规则：
+1. 按「量的是不是同一件」判断：部件名是商家随手写的自由文本，与平台分类叫法可能
+   不同（如平台分类「马甲」，源部件写的是「上衣」）；
+2. 部件名判不准时看测量参数：量胸围/衣长/肩宽的是上半身件，量腰围/臀围/裤长/裙长
+   的是下半身件，上下身都量的是连身件；
+3. 没有一张源表对应这件（如套装有 3 件、源只给了 2 张表），index 回答 -1，不要硬配。
+
+只输出严格JSON，不要其他文字：{{"index": 数字}}（index 是上面源部件表的序号，从 0 开始）"""
+
+
+async def _match_part_by_llm(category: str, parts: list) -> Optional[int]:
+    """分类词表配不上任何源部件时，问模型这张表该取哪张分件实测表；判不出返回 None。
+
+    【为什么不继续补词表、要升模型】部件名是 1688 商家在图上随手写的自由文本
+    （坎肩/小褂/马甲/背心都可能是同一件），词表永远穷举不完——2026-09-08 商品
+    1050772789299（牛仔马甲+长裤两件套）：平台分类选了「马甲」，源部件写的是
+    「上衣」，词表配不上掉到序号兜底，给马甲表拿了【裤子】的实测值，与平台要的
+    胸围全围/衣长一列都对不上、整表改走凭空估算。这与 _map_params_by_llm 同一
+    取向：配对只是选个序号，输入输出都极短（一次几百 token），比拿错件划算。
+    喂模型的线索除了部件名还有每张表的测量参数名：参数名比部件名诚实（量臀围/
+    裤长的必是下装），部件名写成「部件A」也配得对。
+
+    best-effort：失败一律吞掉返回 None（调用方随后掉序号兜底），同 _map_params_by_llm。
+    """
+    from app.publish.llm import ask_json
+
+    lines = []
+    for i, e in enumerate(parts):
+        params = sorted({p for row in (e.get("measurements") or {}).values()
+                         for p in (row or {})})
+        lines.append(f"{i}. 部件「{e.get('part', '')}」（参数：{'、'.join(params)}）")
+    try:
+        data = await ask_json(
+            _PART_MATCH_PROMPT.format(category=category, n=len(parts),
+                                      part_lines="\n".join(lines)),
+            what="尺码表部件配对", stage="sizechart")
+        idx = int((data or {}).get("index", -1))
+    except Exception as e:
+        logger.warning(f"尺码表部件配对失败（掉序号兜底）：{e}")
+        return None
+    if 0 <= idx < len(parts):
+        logger.info(f"尺码表部件配对（模型）：分类「{category}」→ 源部件"
+                    f"「{parts[idx].get('part', '')}」")
+        return idx
+    return None
 
 
 def _canon_accessory(name: str) -> str:
@@ -4620,7 +4713,8 @@ def resolve_warehouse(site: str = "") -> str:
 
 async def set_stock(session: BrowserSession, info_path: str,
                     stock: str = "100", warehouse: str = "",
-                    site: str = "", sku_judge: Optional[dict] = None) -> dict:
+                    site: str = "", sku_judge: Optional[dict] = None,
+                    cat_path: Optional[list] = None) -> dict:
     """阶段⑪：仓库/库存/SKU分类批量填写。
 
     完整流程（2026-08-18用户确认）：
@@ -4666,7 +4760,7 @@ async def set_stock(session: BrowserSession, info_path: str,
     # 3. SKU分类：交 LLM 判断（预热命中就直接用，见 judge_sku_category）
     # 预热结果也过一遍归一：预热是 2026-08-27 之前写的结构（可能没有 packing 字段），
     # 且缓存/续跑会带回老结果，不归一就会拿着空清单去填。
-    judge = _normalize_sku_judge(sku_judge, info) if sku_judge else await judge_sku_category(info)
+    judge = _normalize_sku_judge(sku_judge, info) if sku_judge else await judge_sku_category(info, cat_path=cat_path)
     if sku_judge:
         logger.info("SKU分类沿用提前预热的判断结果，跳过本阶段 LLM 调用")
     cat, qty, unit = str(judge.get("skuCat", "1")), str(judge.get("qty", 1)), str(judge.get("unit", "1"))
@@ -5657,15 +5751,41 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     if not sel.get("ok"):
         return {"status": "error", "reason": f"尺码分类选择失败: {sel}"}
 
+    # 【套装按部件取数】源图分开给了「部件：上衣」「部件：连衣裙」两张表时（见
+    # extract._VISION_PROMPT 的 sizeMeasurementsByPart），两张平台尺码表各取自己那件；
+    # 只有扁平表时照旧共用（那本就是一张合表）。真站取证见 _pick_part_measurements。
+    # 配对放在勾参数复选框【之前】：勾哪些可选参数也按本张表那件的参数名判——原先
+    # 固定拿 parts[0]，第一件是裤子时连马甲表都按裤子的参数名去勾（2026-09-08
+    # 取证 1050772789299，马甲+长裤两件套）。
+    parts = info.get("sizeMeasurementsByPart") or []
+    part_used = ""
+    if parts:
+        # 配对键取【平台实际选中的分类】：category 可能是 None（跟随预选），
+        # 而 sel 里的选中值是刚回读的事实。
+        # source='only-option' 时 category 非空却【没被采纳】（关键词落空、下拉只有
+        # 唯一选项，见 _JS_SET_SIZECHART_CAT 里那段）——此时拿 category 去配对会用一个
+        # 平台并未选中的词，故一律以回读值为准。
+        key = (None if sel.get("source") == "only-option" else category) \
+            or _category_keyword_of(sel.get("selected") or "")
+        picked, part_used = await _pick_part_measurements(
+            parts, key, which, selected=sel.get("selected") or "")
+        if picked:
+            src_meas = picked
+            logger.info(f"尺码表{which + 1} 取源分件实测表「{part_used}」"
+                        f"（分类 {sel.get('selected')}）")
+        else:
+            src_meas = info.get("sizeMeasurements") or {}
+    else:
+        src_meas = info.get("sizeMeasurements") or {}
+
     # 【按源数据主动勾选「尺码参数」复选框】弹窗上方那排参数是【可选】的，平台默认只勾
     # 了分类默认集（背带裤默认勾「领围」），源数据能覆盖的其它部位（裤长/胸围全围/臀围
     # 全围…）默认都没勾。原先代码只读已渲染的 thead、等于只认默认勾的那几项，源数据全
     # 被浪费（offer 1074392045040：源 8 列全在却改估一个「领围」）。源参数列表来自
     # product-info.json、不依赖页面渲染，故这里在读 thead 前先把「源能覆盖的」勾上、
     # 「默认勾中但源没有的」取消掉，再读表格。源参数列表只在勾选这一步用一次，真正的
-    # 取值仍走下面分件/扁平那套逻辑。
-    src_for_pick = (info.get("sizeMeasurementsByPart") or [{}])[0].get("measurements") \
-        or info.get("sizeMeasurements") or {}
+    # 取值仍用上面配对好的那份（src_meas）。
+    src_for_pick = src_meas
     src_param_names = sorted({p for row in src_for_pick.values()
                               for p in (row or {})})
     if src_param_names:
@@ -5715,29 +5835,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # 衣长/裤长两列（店家套了套装模板），弹窗按类目强制的胸围全围/袖长一个都没有。原先
     # 「有源数据就必须全齐，否则报错要人工清空字段走兜底」——源给了一半反倒比完全没有更糟。
     # 改为源给的照用（实测值比估算准），只把缺的那几列问模型，人工不必再介入。
-    #
-    # 【套装按部件取数】源图分开给了「部件：上衣」「部件：连衣裙」两张表时（见
-    # extract._VISION_PROMPT 的 sizeMeasurementsByPart），两张平台尺码表各取自己那件；
-    # 只有扁平表时照旧共用（那本就是一张合表）。真站取证见 _pick_part_measurements。
-    parts = info.get("sizeMeasurementsByPart") or []
-    part_used = ""
-    if parts:
-        # 配对键取【平台实际选中的分类】：category 可能是 None（跟随预选），
-        # 而 sel 里的选中值是刚回读的事实。
-        # source='only-option' 时 category 非空却【没被采纳】（关键词落空、下拉只有
-        # 唯一选项，见 _JS_SET_SIZECHART_CAT 里那段）——此时拿 category 去配对会用一个
-        # 平台并未选中的词，故一律以回读值为准。
-        key = (None if sel.get("source") == "only-option" else category) \
-            or _category_keyword_of(sel.get("selected") or "")
-        picked, part_used = _pick_part_measurements(parts, key, which)
-        if picked:
-            src_meas = picked
-            logger.info(f"尺码表{which + 1} 取源分件实测表「{part_used}」"
-                        f"（分类 {sel.get('selected')}）")
-        else:
-            src_meas = info.get("sizeMeasurements") or {}
-    else:
-        src_meas = info.get("sizeMeasurements") or {}
+    # （分件配对已在勾选参数之前完成，src_meas 就是本张表那件的数据）
     src_norm = {norm_size(k): (v or {}) for k, v in src_meas.items()}
     # 【源尺寸表的尺码键与弹窗尺码完全对不上时，忽略源数据、纯模型估算】SKU 是均码
     # 而源尺码表是小号/大号（1072309635629）这类：源数据是另一套尺码，塞给模型只会
@@ -5830,7 +5928,8 @@ async def add_sizechart(session: BrowserSession, info_path: str,
             "categorySource": sel.get("source"),
             "params": params, "measureSource": gen, "estimated": need,
             "partUsed": part_used, "sourceUnused": source_unused,
-            "data": norm, "formText": final.get("text")}
+            "data": norm, "formText": final.get("text"),
+            "charts": final.get("charts", st.get("charts", 1))}
 
 
 # 属性审核提示词：七条规则全部来自原 skill 的实战积累，别精简。

@@ -14,7 +14,7 @@ import asyncio
 from app.publish import service as S
 
 
-def _run(monkeypatch, judge, r0, r1):
+def _run(monkeypatch, judge, r0, r1, ctx_extra=None, calls=None):
     """跑一次 _st_sizechart，返回（结果, 事件列表）。r0/r1 是两张表的假返回。"""
     events = []
 
@@ -22,6 +22,8 @@ def _run(monkeypatch, judge, r0, r1):
         events.append(ev)
 
     async def fake_add(session, info_path, category=None, name=None, which=0, cat_path=None):
+        if calls is not None:
+            calls.append({"which": which, "category": category})
         return dict(r1 if which else r0, which=which)
 
     async def fake_prewarm(ctx, key):
@@ -29,7 +31,12 @@ def _run(monkeypatch, judge, r0, r1):
 
     monkeypatch.setattr(S, "add_sizechart", fake_add)
     monkeypatch.setattr(S, "_await_prewarm", fake_prewarm)
-    r = asyncio.run(S._st_sizechart({"info_path": "x"}, None, emit))
+    ctx = {"info_path": "x"}
+    if ctx_extra:
+        ctx.update(ctx_extra)
+    r = asyncio.run(S._st_sizechart(ctx, None, emit))
+    if ctx_extra is not None and isinstance(ctx_extra, dict):
+        ctx_extra.update(ctx)
     return r, events
 
 
@@ -102,3 +109,50 @@ def test_单件不填第二张也不报任何护栏(monkeypatch):
     assert r["status"] == "ok"
     assert "尺码表2" not in r["note"]
     assert not [e for e in events if e.get("type") == "manual_check"]
+
+
+def test_模型误判单品但类目是两件套时强制补第二张(monkeypatch):
+    """当模型被误导判为 skuCat=1，但类目是「女童牛仔两件套」时，必须强制补第二张表。"""
+    judge = {"skuCat": "1", "packing": [{"name": "护胸背带裤", "qty": 1}]}
+    ctx_extra = {"cat_path": ["服装、鞋靴和珠宝饰品", "女童时尚", "女童服装", "女童牛仔两件套"]}
+    calls = []
+    r, events = _run(monkeypatch, judge, _ok("A", _D1), _ok("A2", _D2),
+                     ctx_extra=ctx_extra, calls=calls)
+    assert r["status"] == "ok"
+    assert "尺码表2" in r["note"]
+    assert len(calls) == 2
+    assert calls[0]["which"] == 0 and calls[1]["which"] == 1
+    # 第一张是护胸背带裤(连体衣)，第二张推导为互补的「上装」
+    assert calls[1]["category"] == "上装"
+
+
+def test_模型误判单品但页面DOM有两张表时强制补第二张(monkeypatch):
+    """页面实际渲染了「尺码表2」（charts >= 2）时，不填必被平台拒，必须强制补。"""
+    judge = {"skuCat": "1", "packing": [{"name": "便服上衣", "qty": 1}]}
+    r0 = dict(_ok("A", _D1), charts=2)
+    calls = []
+    r, events = _run(monkeypatch, judge, r0, _ok("A2", _D2), calls=calls)
+    assert r["status"] == "ok"
+    assert "尺码表2" in r["note"]
+    assert len(calls) == 2
+    # 第一张是便服上衣(上装)，第二张推导为互补的「下装」
+    assert calls[1]["category"] == "下装"
+
+
+def test_模型误判单品但标题为套装时强制补第二张(monkeypatch):
+    judge = {"skuCat": "1", "packing": [{"name": "长裤", "qty": 1}]}
+    ctx_extra = {"title": "女童牛仔爱心背带裤套装2026新款洋气短袖破洞爱心牛仔背带裤"}
+    calls = []
+    r, events = _run(monkeypatch, judge, _ok("A", _D1), _ok("A2", _D2),
+                     ctx_extra=ctx_extra, calls=calls)
+    assert r["status"] == "ok"
+    assert "尺码表2" in r["note"]
+    assert len(calls) == 2
+    assert calls[1]["category"] == "上装"
+
+
+def test_消费预热后将judge保存在ctx供后续阶段复用(monkeypatch):
+    judge = {"skuCat": "3", "packing": [{"name": "T恤", "qty": 1}, {"name": "长裤", "qty": 1}]}
+    ctx_extra = {}
+    r, events = _run(monkeypatch, judge, _ok("A", _D1), _ok("A2", _D2), ctx_extra=ctx_extra)
+    assert ctx_extra.get("sku_judge") == judge
