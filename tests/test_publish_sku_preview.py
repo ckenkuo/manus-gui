@@ -133,6 +133,36 @@ def test_大图但非方形判bad():
     assert _row(0, "某色", 1600, 1200)["bad"] is True
 
 
+def test_状态脚本带行级换图入口():
+    """坏行要能分流「有 trigger 能换图」与「无 trigger 继承图」——后者
+    sku_preview_replace_row 报「该行没有预览图 trigger」，service 据此不判 fail
+    （2026-09-06 两单宠物窝 0/19、0/6 全卡在这里）。"""
+    assert "hasTrigger" in P._JS_SKU_PREVIEW_STATE
+    assert "sku-image-box.ant-dropdown-trigger" in P._JS_SKU_PREVIEW_STATE
+
+
+@pytest.mark.asyncio
+async def test_坏行全无换图入口判ok不fail(monkeypatch, tmp_path):
+    """坏行全无 trigger 时是继承图（共享主图），不判 fail，只记 manual_check 交人工。"""
+    async def fake_state(session):
+        return {"supported": True, "rows": [
+            {"i": 0, "color": "洛克黄", "url": "https://x.jpg", "w": 600, "h": 600,
+             "bad": True, "empty": False, "hasTrigger": False},
+        ], "previewIdx": 0, "colorIdx": 1}
+
+    events = []
+
+    async def emit(ev):
+        events.append(ev)
+
+    # service 模块 import 的是自己的名字，mock 要打在 S 上而不是 P 上
+    monkeypatch.setattr(S, "sku_preview_state", fake_state)
+    r = await S._st_sku_preview({"workdir": str(tmp_path)}, None, emit)
+    assert r["status"] == "ok"
+    assert any(e.get("type") == "manual_check" and e.get("stage") == "sku_preview"
+               for e in events)
+
+
 # ---- 3) 续跑实况判定：⑦b 与 ⑥⑦ 必须分开判 ------------------------------------
 
 def _live(**kw):

@@ -148,6 +148,13 @@ def test_size_kind_generic():
     assert k["expert"] and k["fit"] and k["step"]
 
 
+def test_size_kind_pet_supply():
+    """非服装（宠物窝）走 _NONAPPAREL_KIND 数据映射，返回几何推理身份而非按字母码误判成人。"""
+    k = _guess_size_kind("四季通用", ["S", "M", "L"], cat="pet_supply")
+    assert k["nonapparel"] is True
+    assert "宠物" in k["expert"]
+
+
 # ---- 尺码表模板名去年份（回归） -------------------------------------------
 
 def test_strip_dated_keeps_season():

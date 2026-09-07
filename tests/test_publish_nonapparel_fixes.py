@@ -90,17 +90,15 @@ def test_标题猜不出时返回空():
 def test_提示词不再强制服装通用词():
     """提示词里那句「才给一个最接近的服装通用词」是把仿真花逼成上衣的直接原因。
 
-    改成「同品类通用词」并显式点出「不是服装时不要选服装词」。
-    断言只看【真正进提示词的字符串行】——注释里为记录病史仍会提到「服装通用词」，
-    按整段源码判会被注释误伤。
+    改成「同品类通用词」并显式点出「不是服装时不要选服装词」。2026-09-06 起这段
+    引导抽成按品类分支的 cat_guidance 变量（赋值语句，不再是 prompt 字符串行），
+    故改查整个函数源码，仍只断「有没有这些有害/有益措辞」这一件事。
     """
     import inspect
-    lines = [l.strip() for l in inspect.getsource(P.judge_sku_category).split("\n")]
-    prompt_lines = [l for l in lines if l.startswith(('"', "'", 'f"', "f'"))]
-    prompt = "\n".join(prompt_lines)
-    assert "服装通用词" not in prompt
-    assert "同品类通用词" in prompt
-    assert "不是服装时不要选服装词" in prompt
+    src = inspect.getsource(P.judge_sku_category)
+    assert "服装通用词" not in src
+    assert "同品类通用词" in src
+    assert "不是服装时不要选服装词" in src
 
 
 def test_模型未给清单时按标题补而不是补上衣():

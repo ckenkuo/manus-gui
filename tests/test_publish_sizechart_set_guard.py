@@ -21,7 +21,7 @@ def _run(monkeypatch, judge, r0, r1):
     async def emit(ev):
         events.append(ev)
 
-    async def fake_add(session, info_path, category=None, name=None, which=0):
+    async def fake_add(session, info_path, category=None, name=None, which=0, cat_path=None):
         return dict(r1 if which else r0, which=which)
 
     async def fake_prewarm(ctx, key):

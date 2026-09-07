@@ -2579,6 +2579,22 @@ _JS_SIZE_GROUP_STATES = r"""(() => {
   return JSON.stringify([]);
 })()"""
 
+# 颜色维的全部选项 + 勾选态。与 _JS_SIZE_GROUP_STATES 同构，只是换找「颜色」组
+# （排除「颜色表」，同 _JS_UNCHECK_COLOR 的判据）。剔伪变种要同时看颜色/尺码两维——
+# 伪 SKU 可能是尺码（「2XL:尺寸参考选项图」），也可能是颜色（「短袖款式随机」）。
+_JS_COLOR_GROUP_STATES = r"""(() => {
+  const items = Array.from(document.querySelectorAll('#skuAttrsInfo .ant-form-item'));
+  for (const it of items) {
+    const labEl = it.querySelector('.ant-form-item-label');
+    const lab = (labEl ? labEl.textContent : '').trim();
+    if (lab === '颜色' || (lab.includes('颜色') && !lab.includes('颜色表'))) {
+      const cbs = Array.from(it.querySelectorAll('label.d-checkbox'));
+      if (cbs.length) return JSON.stringify(cbs.map(l => ({t: (l.textContent||'').trim(), c: !!l.querySelector('input').checked})));
+    }
+  }
+  return JSON.stringify([]);
+})()"""
+
 # 【为什么要单独探「区块在不在」】上面那段返回空数组有两种完全不同的成因，而阶段⑧
 # 对它们的正确处置相反：
 #   1. 变种属性区压根没渲染（类目失效/还在加载）→ 真异常，必须报错
@@ -2734,6 +2750,270 @@ async def drop_accessory_colors(session: BrowserSession,
 
 
 
+def _norm_color_name(s: str) -> str:
+    """颜色名归一（比对用）：剥空白/连字符/标点、转小写。
+
+    源颜色「白色-good动物城」与页面颜色「白色-good动物城replay」只差平台后缀
+    replay，名字本体一致；不做完整翻译、只按归一后前缀/子串匹配（见 _identify_fake_colors）。
+    """
+    return re.sub(r"[\s\-_/·、,，]+", "", str(s or "")).lower()
+
+
+def _strip_replay(s: str) -> str:
+    """剥掉页面颜色名尾部的 replay 后缀（店小秘认领加标），返回比对用基名。"""
+    t = str(s or "").strip()
+    return t[:-6] if t.lower().endswith("replay") else t
+
+
+async def _identify_fake_colors(session: BrowserSession, color_states: list,
+                                info_path: str) -> list:
+    """颜色维伪选项视觉识别：每个颜色喂「源名+代表图」给视觉模型判是不是真款式。
+
+    【为什么要带图】2026-09-07 商品 1052702353345 的「短袖款式随机」，缩略图对应主图
+    main-16.jpg 是一件印着「店内库存 随机款式 随机码数 介意勿拍」的衣服——名字再起得
+    正常（比如叫「白色-热卖款」），文字图也藏不住。纯文本判只能抓「名字本身就暴露」的，
+    抓不到「名不符图」的。
+
+    【输入用源颜色键，不用页面名】colorImages / colors 用的是源颜色名（「短袖款式随机」），
+    页面复选框是加了 replay 后缀的自定义项（「短袖款式随机replay」），两者靠
+    _norm_color_name + 前缀匹配对上。代表图取 colorImages[c].mainFile 指向的本地主图
+    （阶段①已落盘），没有 mainFile 时退到裸 URL（ask_json_with_images 会下载）。
+
+    【视觉兜底文本】图全取不到（无色板/本地图缺失）时退回纯文本判，与尺码维同一提示词。
+    返回源颜色名列表（调用方再映射回页面名去反选）。
+    """
+    from app.publish.llm import ask_json, ask_json_with_images
+
+    # 页面上勾选着哪些颜色（伪选项只有已勾选才需要剔；未勾的不用管）
+    page_checked = [str(s.get("t") or "").strip() for s in (color_states or [])
+                    if s.get("c") and str(s.get("t") or "").strip()]
+    if not page_checked:
+        return []
+
+    # 源颜色 → 代表图（mainFile 本地路径优先，裸 URL 兜底）
+    info = {}
+    if info_path:
+        try:
+            with open(info_path, encoding="utf-8") as f:
+                info = json.load(f)
+        except Exception as e:
+            logger.warning(f"读 product-info.json 失败，颜色伪识别退纯文本：{e}")
+    workdir = os.path.dirname(os.path.abspath(info_path)) if info_path else ""
+    src_colors = [c for c in (info.get("colors") or []) if c]
+    color_images = info.get("colorImages") or {}
+
+    def _rep_image(c: str) -> str:
+        entry = color_images.get(c)
+        if isinstance(entry, dict):
+            mf = (entry.get("mainFile") or "").strip()
+            if mf:
+                fp = os.path.join(workdir, mf)
+                if os.path.isfile(fp):
+                    return fp
+            u = (entry.get("url") or "").strip()
+            if u:
+                return u
+        elif isinstance(entry, str) and entry.strip():
+            return entry.strip()
+        return ""
+
+    # 只把「页面上勾着的颜色」里能对上源颜色的喂给模型（伪颜色必在已勾选的里）。
+    # 映射：页面名剥 replay → 归一，与源颜色归一后做前缀/全等匹配。
+    pairs = []   # (源颜色名, 页面名, 代表图)
+    for src in src_colors:
+        ns = _norm_color_name(src)
+        page = next((p for p in page_checked
+                     if _norm_color_name(_strip_replay(p)) == ns
+                     or _norm_color_name(p).startswith(ns)
+                     or ns.startswith(_norm_color_name(_strip_replay(p)))), None)
+        if page is not None:
+            pairs.append((src, page, _rep_image(src)))
+    # 页面上勾着但源 colors 里对不上的（认领带进来的自定义项）：用页面名本身当名字也喂进去，
+    # 伪选项「短袖款式随机replay」若在源 colors 缺席，这条兜底让它也能被判。
+    paired_pages = {p for _, p, _ in pairs}
+    for p in page_checked:
+        if p not in paired_pages:
+            base = _strip_replay(p)
+            pairs.append((base, p, _rep_image(base)))
+
+    if not pairs:
+        return []
+
+    rule = (
+        "【伪颜色】不是某个真实可售的具体款式，而是商家挂的占位项。典型：\n"
+        "- 图上或名字是「随机发货 / 款式随机 / 颜色随机 / 店内库存随机 / 介意勿拍」——不指定款式；\n"
+        "- 图是一张「尺码表 / 尺寸参考 / 说明文字图」，不是商品本身。\n"
+        "【不要误判】图是真实商品、名字是某个具体款式/颜色（哪怕带 replay 后缀）就不算伪。"
+        "宁可漏判，别把真款式当伪。"
+    )
+    names = [src for src, _, _ in pairs]
+    imgs = [img for _, _, img in pairs]
+
+    try:
+        if any(imgs):
+            # 全量图+文一次判：位次与颜色名一一对应。缺图的颜色不给图会错位，
+            # 故只保留「有图」的配对进视觉请求；没图的配对落入下方文本兜底合并。
+            with_img = [(s, p, i) for s, p, i in pairs if i]
+            if with_img:
+                vn = [s for s, _, _ in with_img]
+                vi = [i for _, _, i in with_img]
+                listing = "\n".join(f"第{k+1}张 = 「{n}」" for k, n in enumerate(vn))
+                prompt = (
+                    "你是电商发布审核助手。下面每个颜色配了它在源站的代表图，"
+                    "判断哪些颜色是【伪颜色】（不是真实可售款式）。\n\n" + rule +
+                    f"\n\n颜色与图的对应：\n{listing}\n\n"
+                    "只输出JSON：{\"fake\": [\"<伪颜色名，与上面名字完全一致>\", ...]}，没有就 {\"fake\": []}"
+                )
+                data = await ask_json_with_images(
+                    prompt, vi, what="伪颜色视觉识别", stage="fix_sizes")
+                fake = [str(x).strip() for x in ((data or {}).get("fake") or [])]
+                # 只认确实喂进去的名字
+                return [f for f in fake if f in vn]
+            return []
+        # 一张图都没有：退回纯文本
+        prompt = (
+            "你是电商发布助手。下面是某商品的颜色选项名，判断哪些是【伪颜色】。\n\n" + rule +
+            f"\n\n颜色选项：{json.dumps(names, ensure_ascii=False)}\n\n"
+            "只输出JSON：{\"fake\": [\"<伪颜色名，与上面完全一致>\", ...]}，没有就 {\"fake\": []}"
+        )
+        data = await ask_json(prompt, what="伪颜色识别(文本)", stage="fix_sizes")
+        fake = [str(x).strip() for x in ((data or {}).get("fake") or [])]
+        return [f for f in fake if f in names]
+    except Exception as e:
+        logger.warning(f"伪颜色识别失败，按没有伪颜色放行：{e}")
+        return []
+
+
+async def _drop_fake_variants(session: BrowserSession,
+                              size_states: list,
+                              info_path: str = "") -> dict:
+    """阶段⑧前置：把混进颜色/尺码维的伪变种选项反选掉。
+
+    源商品会把不是可售规格的东西当成一个选项挂着卖，认领后混进变种维：
+      - 尺码维：「2XL:尺寸参考选项图」（2026-09-07 商品 1071369483770）——商家把
+        尺寸表图当成尺码选项，让买家下单时勾选查看。
+      - 颜色维：「短袖款式随机」（2026-09-07 商品 1052702353345）——「随机发货」占位，
+        不是某个具体图案。它每个尺码都有价（9.9，比真实图案的 18.9 便宜一半）、
+        8 行全 filled，drop_acc 的「单行有源数据」判据抓不到。
+    这类伪行留在表里会拖出无换图入口 / 无真实归属的行，⑦b 报「该行没有预览图 trigger」、
+    ⑦a 因它不在另一维而反选不到。故在勾选对齐前先反选，让平台重建变种表把伪行抹掉。
+
+    【判据交 LLM，不写死词表】2026-09-07 用户明确：硬编码词表容易误伤
+    「XL（参考尺码表）」这类真实尺码、也盖不住「随机」这类没固定词形的占位。
+    输入用页面【原始文本】——norm_size 会把「2XL:尺寸参考选项图」归一成「2XL」、
+    丢掉伪特征；颜色文本同理不能归一。
+
+    【两维判法不同】颜色维走【视觉】（_identify_fake_colors：喂每个颜色的源名+代表图，
+    抓「名字正常但图是随机/尺码表文字图」的）；尺码维走【纯文本】（同码共用颜色图，
+    按图判尺码会把正常尺码全误判，且「尺寸参考选项图」这类名字本身就带「参考图」字样，
+    文本足够判出）。
+
+    best-effort：识别失败 / 点了没生效都不拦整单，记日志即放（与 drop_acc 对
+    missed 的取向一致）。返回 {"colors": [...], "sizes": [...]}（各自实际反选掉的原文）。
+    """
+    from app.publish.llm import ask_json
+
+    def _texts(states):
+        return [t for t in (str(s.get("t") or "").strip() for s in (states or [])) if t]
+
+    # 尺码维直接用 fix_sizes 已读到的 states0（不重复 eval）；颜色维单独读一次。
+    sizes = _texts(size_states)
+    try:
+        color_states = await session.eval_json(_JS_COLOR_GROUP_STATES)
+    except Exception as e:
+        logger.warning(f"读颜色组勾选态失败，伪颜色不剔：{e}")
+        color_states = []
+    colors = _texts(color_states if isinstance(color_states, list) else [])
+    if not sizes and not colors:
+        return {"colors": [], "sizes": []}
+
+    # 颜色维：视觉判伪，返回【源颜色名】，需映射回页面名（加 replay 后缀那个）去反选
+    fake_color_srcs = []
+    if colors:
+        fake_color_srcs = await _identify_fake_colors(session, color_states, info_path)
+    # 源名 → 页面名：剥 replay 归一后全等/前缀匹配
+    def _to_page(src: str) -> str:
+        ns = _norm_color_name(src)
+        for p in colors:
+            if (_norm_color_name(_strip_replay(p)) == ns
+                    or _norm_color_name(p).startswith(ns)
+                    or ns.startswith(_norm_color_name(_strip_replay(p)))):
+                return p
+        return ""
+    fake_colors = []
+    for s in fake_color_srcs:
+        pg = _to_page(s)
+        if pg:
+            fake_colors.append(pg)
+        else:
+            logger.warning(f"伪颜色「{s}」在页面颜色组里找不到对应项，未反选")
+
+    # 尺码维：纯文本判伪
+    fake_sizes = []
+    if sizes:
+        sprompt = "\n".join([
+            "你是电商发布助手。下面是某商品在 Temu 后台「尺码」维的全部选项。",
+            "判断哪些是【伪尺码】——不是真实可售的尺码，而是商家挂的占位项，",
+            "典型是「尺寸参考图 / 尺码表图 / 参考选项图 / size chart / 尺寸表」这类"
+            "让买家查看的图片或说明，名称里常带「图 / 参考 / 表 / chart」。",
+            "注意别把真实尺码误判成伪尺码：含「参考」的正常尺码"
+            "（如「XL(参考尺码表)」「均码 参考身高」）只要本身是个可售尺码就【不算】。",
+            "",
+            f"尺码选项：{json.dumps(sizes, ensure_ascii=False)}",
+            "",
+            "只输出JSON：{\"fake\": [\"<与上面某一项完全一致的原文>\", ...]}，没有就 {\"fake\": []}",
+        ])
+        try:
+            sdata = await ask_json(sprompt, what="伪尺码识别", stage="fix_sizes")
+            fake_sizes = [x for x in (str(t).strip() for t in ((sdata or {}).get("fake") or []))
+                          if x in sizes]
+        except Exception as e:
+            logger.warning(f"伪尺码识别失败，按没有伪尺码放行：{e}")
+
+    checked = {str(s.get("t") or "").strip(): bool(s.get("c")) for s in (size_states or [])}
+    if isinstance(color_states, list):
+        checked.update({str(s.get("t") or "").strip(): bool(s.get("c")) for s in color_states})
+
+    dropped_colors, dropped_sizes = [], []
+
+    async def _wait_rebuild():
+        n_before = (await session.eval_json(_JS_SKU_ROW_COUNT)).get("n", 0)
+        for _ in range(12):  # 1.2s / 0.1s
+            await asyncio.sleep(0.1)
+            if (await session.eval_json(_JS_SKU_ROW_COUNT)).get("n", 0) != n_before:
+                break
+
+    for name in fake_colors:
+        if not checked.get(name):
+            logger.info(f"伪颜色「{name}」本来就未勾选，无需反选")
+            continue
+        r = await session.eval_json(_JS_UNCHECK_COLOR.replace("__WANT__", J(name)))
+        # eval 返回非 dict（异常/兜底桩）时当没点到，记警告放行——不拦整单
+        if not isinstance(r, dict) or not r.get("found"):
+            logger.warning(f"伪颜色「{name}」在颜色复选框里找不到，未反选")
+            continue
+        if r.get("checked"):
+            logger.warning(f"伪颜色「{name}」点了反选但仍是勾选态")
+            continue
+        dropped_colors.append(name)
+        logger.info(f"已反选伪颜色「{name}」（随机发货之类占位，不发它的 SKU）")
+        await _wait_rebuild()
+
+    for name in fake_sizes:
+        if not checked.get(name):
+            logger.info(f"伪尺码「{name}」本来就未勾选，无需反选")
+            continue
+        r = await session.eval_json(_JS_CLICK_SIZE_CB.replace("__T__", J(name)))
+        if not r.get("clicked"):
+            logger.warning(f"伪尺码「{name}」在尺码复选框里点不到，未反选")
+            continue
+        dropped_sizes.append(name)
+        logger.info(f"已反选伪尺码「{name}」（尺寸参考图之类占位，不发它的 SKU）")
+        await _wait_rebuild()
+
+    return {"colors": dropped_colors, "sizes": dropped_sizes}
+
+
 async def fix_sizes(session: BrowserSession, info_path: str,
                     max_rounds: int = 25) -> dict:
     """阶段⑧：尺码勾选修正，使勾选状态与源商品 SKU 一致。
@@ -2809,6 +3089,14 @@ async def fix_sizes(session: BrowserSession, info_path: str,
                 "catMismatch": mismatch,
                 "pageSizes": [s["t"] for s in states0]}
 
+    # 1.5) 【剔伪变种】源商品会把非可售规格混进颜色/尺码维（尺码维「2XL:尺寸参考选项图」、
+    # 颜色维「短袖款式随机」），认领后被带进变种表。它不是可售规格：留在表里会拖出
+    # 无换图入口的伪行，⑦b 报「该行没有预览图 trigger」、⑦a 因它不在另一维而反选不到。
+    # 故在勾选对齐前先反选，让平台重建变种表，伪行连同 SKC 图位一起消失。
+    # 判据交 LLM 做语义判断，不写死词表；best-effort，识别失败就当没有，不拦整单。
+    # 详见 _drop_fake_variants docstring。
+    dropped_fake = await _drop_fake_variants(session, states0, info_path)
+
     # 2) 勾选修正
     toggles = []
     for _ in range(max_rounds):
@@ -2853,6 +3141,10 @@ async def fix_sizes(session: BrowserSession, info_path: str,
     final_count = (await session.eval_json(_JS_SKU_ROW_COUNT)).get("n", 0)
     result = {"status": "ok", "wantedSizes": wanted, "toggled": toggles,
               "rowCount": final_count}
+    if dropped_fake and (dropped_fake.get("colors") or dropped_fake.get("sizes")):
+        # 剔掉的伪变种单出一个键：它不是源规格、不算 missing，但要让调用方与日志
+        # 能看到「这次从变种组里拿掉了什么」——它本该消失，不是异常。
+        result["droppedFake"] = dropped_fake
     if missing:
         # missing 单出一个键：调用方（service._st_fix_sizes）要据此发 manual_check，
         # 从 warning 字符串里再解析回来既脆又没必要（2026-08-29 起）。
@@ -3226,6 +3518,9 @@ _APPAREL_WORDS = (
     "服装", "服饰", "童装", "女装", "男装", "内衣", "内裤", "上装", "下装",
     "外套", "夹克", "卫衣", "毛衣", "衬衫", "T恤", "背心", "吊带", "裤", "裙",
     "连体衣", "泳装", "泳衣", "睡衣", "家居服", "袜", "围巾", "手套",
+    # 「衫」是高频服装特征字，覆盖针织衫/POLO衫/T恤衫/汗衫等一大批，且几乎只出现在
+    # 服装词里（排除词里没有含「衫」的），加一个字能省掉这些服装词走 LLM 品类识别。
+    "衫",
 )
 
 # 排除词：命中这些就不按服装处理，优先于 _APPAREL_WORDS。
@@ -3246,6 +3541,58 @@ def _is_apparel(cat_path, title: str) -> bool:
     if any(w in blob for w in _APPAREL_EXCLUDE):
         return False
     return any(w in blob for w in _APPAREL_WORDS)
+
+
+# 品类标签集合（classify_category 的输出域）。
+# 词表快路径判服装返回 "apparel"，LLM 意图识别作为兜底也能输出 "apparel"（词表漏判
+# 的服装词如「针织衫」靠它兜住）或非服装细分标签。开放集合：下游 _NONAPPAREL_KIND
+# 按标签映射到工作流，未映射标签落 other 通用兜底，新增标签不破坏任何调用方。
+_CATEGORY_TAGS = ("apparel", "pet_supply", "home", "toy", "floral_decor", "shoe", "bag", "other")
+
+
+async def classify_category(title: str, cat_path=None) -> str:
+    """统一品类识别：服装走词表快速路径，词表未命中走 LLM 意图识别。
+
+    【为什么分层】服装词（服装/服饰/裤/裙/卫衣…）大多是封闭集合，词表又快又稳；但
+    服装词表本身也难穷尽（针织衫/POLO衫/马甲…），故词表判非服装后再交一次轻量 LLM，
+    让它既能兜住漏判的服装（输出 apparel），又能细分开放集合的非服装品类（宠物窝/
+    鱼缸/帐篷…），避免每加一个就补词表。set_variant 的同步路径 _is_apparel 仍独立。
+
+    返回品类标签字符串：_CATEGORY_TAGS 之一。
+    """
+    if _is_apparel(cat_path, title):
+        return "apparel"
+    return await _llm_classify_nonapparel(title, cat_path)
+
+
+async def _llm_classify_nonapparel(title: str, cat_path=None) -> str:
+    """LLM 意图识别品类（词表快速路径未命中时），输出 _CATEGORY_TAGS 里的标签。
+
+    提示词只列「标签 → 代表词」的少量示例做引导，不枚举具体品类词：模型按语义把
+    「鱼缸」归 pet_supply、「针织衫」归 apparel、「帐篷」归 home/other。输出不落在
+    _CATEGORY_TAGS 里时落 other（兜底，别让一个非法标签带下水）。
+    """
+    from app.publish.llm import ask_json
+
+    clue = " > ".join(str(x) for x in (cat_path or [])) if cat_path else ""
+    prompt = (
+        "你是商品品类识别助手。判断这个商品的品类，只输出一个品类标签。\n\n"
+        "可选标签（括号内是代表词示例，不是穷举，按语义归位即可）：\n"
+        "- apparel（服装、服饰、针织衫、T恤、裤、裙、袜、围巾等穿戴类）\n"
+        "- pet_supply（宠物窝、猫窝、狗床、宠物垫、猫爬架、猫砂盆、鸟笼、鱼缸等宠物生活用品）\n"
+        "- home（家居、家纺、家具、收纳、厨房用品、灯具等家居类）\n"
+        "- toy（玩具、积木、玩偶、拼图、模型等）\n"
+        "- floral_decor（仿真花、假花、花束、摆件、装饰画、饰品、挂饰等装饰类）\n"
+        "- shoe（鞋、靴、拖鞋等鞋类）\n"
+        "- bag（包、箱包、背包、行李箱等箱包类）\n"
+        "- other（以上都不贴切）\n\n"
+        f"商品标题：{title}\n"
+        + (f"类目路径线索：{clue}\n" if clue else "")
+        + "\n只输出JSON：{\"category\": \"<标签>\"}"
+    )
+    data = await ask_json(prompt, what="品类识别", stage="category")
+    tag = str((data or {}).get("category") or "").strip().lower()
+    return tag if tag in _CATEGORY_TAGS else "other"
 
 
 def _order_dims(dims) -> list:
@@ -3922,6 +4269,31 @@ async def judge_sku_category(info: dict) -> dict:
 
     title = info.get("title", "")
     attrs = info.get("attributes") or {}
+    # 【品类识别：服装走词表、非服装走 LLM】预热时 cat_path 不可用，只能 title-only。
+    # 按品类给包装清单的选词引导，替代原先笼统的「不是服装不要选服装词」——服装走
+    # 既有细则，非服装按实际品类指路，避免仿真花/宠物窝被逼成服装词。
+    cat = await classify_category(title, None)
+    if cat == "apparel":
+        cat_guidance = ""
+    elif cat == "pet_supply":
+        cat_guidance = ("本商品是宠物窝/垫/床类，包装清单选宠物相关项或随货附件"
+                        "（说明书/胶水等），不要选服装词。\n")
+    elif cat == "home":
+        cat_guidance = ("本商品是家居用品，包装清单选随货附件（说明书/电池/胶水等）"
+                        "或装饰类对应项，不要选服装词。\n")
+    elif cat == "toy":
+        cat_guidance = ("本商品是玩具，包装清单选随货附件（说明书/电池/胶水等），"
+                        "不要选服装词。\n")
+    elif cat == "floral_decor":
+        cat_guidance = ("本商品是仿真花艺/摆件/饰品，包装清单选「仿真花」「摆件」"
+                        "「装饰品」等，不要选服装词。\n")
+    elif cat == "shoe":
+        cat_guidance = ("本商品是鞋类，包装清单选鞋类相关项，不要选服装词。\n")
+    elif cat == "bag":
+        cat_guidance = ("本商品是箱包，包装清单选随货附件，不要选服装词。\n")
+    else:  # other
+        cat_guidance = ("本商品不是服装时不要选服装词，按实际品类选；词表里实在没有"
+                        "对应项时，才给一个最接近的同品类通用词（不要跨品类硬凑）。\n")
     prompt = (
         "你是跨境电商 Listing 专家。店小秘 Temu 半托管发布时需要为每个 SKU 填写「SKU分类」和「包装清单」。\n\n"
         f"商品信息：\n- 标题：{title}\n- 套装件数：{attrs.get('套装件数', '单件')}"
@@ -3935,12 +4307,10 @@ async def judge_sku_category(info: dict) -> dict:
         "注意易错项：普通款上衣选「便服上衣」（正式/西装款才选「西装上衣」）；"
         "外套按款式选「夹克」「防寒夹克」或「大衣」（没有「外套」这一项）；"
         "袜子按长度选「短袜」「中筒袜」「长筒袜」（没有「袜子」这一项）。\n"
-        # 【不能再要求「给服装通用词」】2026-08-28 仿真花摆件被这句逼成「便服上衣」。
-        # 词表已含非服装段，且平台下拉是全局可搜的，非服装商品有真实词可选。
-        "【本商品不是服装时不要选服装词】按商品实际品类选：仿真花束/花艺摆件选"
-        "「仿真花」或「摆件」，家居装饰件选「装饰品」，随货的说明书/电池等附件"
-        "各有对应项。\n"
-        "词表里实在没有对应项时，才给一个最接近的同品类通用词（不要跨品类硬凑）。\n"
+        # 【按品类给包装清单选词引导】见上方 cat_guidance——非服装不再笼统一句
+        # 「不是服装不要选服装词」，而是按品类指路（2026-08-28 仿真花摆件曾被逼成
+        # 「便服上衣」，故词表已含非服装段、且这里按品类引导）。
+        f"{cat_guidance}"
         "示例：牛仔上衣+牛仔裙两件套 → skuCat=3, qty=2, "
         'packing=[{"name":"便服上衣","qty":1},{"name":"半身裙","qty":1}]；'
         '单件连衣裙 → skuCat=1, qty=1, packing=[{"name":"连衣裙","qty":1}]。\n\n'
@@ -4279,7 +4649,12 @@ async def set_stock(session: BrowserSession, info_path: str,
         opt = await session.eval_json(_JS_PICK_WAREHOUSE.replace("__WH__", J(warehouse)))
         if opt.get("err"):
             return {"status": "error", "stage": "warehouse-option", **opt}
-        if warehouse not in (opt.get("selected") or []):
+        # 【回读用双向 includes 对齐，不能精确 not in】_JS_PICK_WAREHOUSE 找选项用
+        # includes 模糊匹配，选中的是页面真实文本；这里若用精确 not in，仓库名只要
+        # 有「仓/仓库」这类字面漂移，JS 侧已点中、回读却判「未选中」，卡在第一步
+        # 不往下填库存。2026-09-06 美国站 6 单全卡在这里（截图取证仓库其实已勾上）。
+        selected = opt.get("selected") or []
+        if not any(warehouse in s or s in warehouse for s in selected):
             return {"status": "error", "stage": "warehouse",
                     "reason": "勾选后回读未选中", **opt}
 
@@ -4565,6 +4940,106 @@ _JS_SIZECHART_PARAMS = r"""(() => {
   return JSON.stringify({params, sizes});
 })()"""
 
+# 弹窗上方那排「尺码参数」是【可选复选框】，不是分类写死的必填列：勾选哪几项，下面的
+# 表格就渲染出哪几列输入框。原先代码只读已渲染的 thead（_JS_SIZECHART_PARAMS），
+# 等于只认「平台默认勾上的那几项」，源数据能覆盖的其它部位（裤长/胸围全围/臀围全围…）
+# 一个都没勾、全被浪费——2026-09-07 offer 1074392045040（男婴背带裤）就是这么把源
+# 8 列全丢掉、改交模型凭空估一个「领围」的。故先读出这排可选参数与各自勾中态。
+#
+# 定位拿「尺码参数」四个字做锚（form-item 行），不依赖具体类名：antd 的 Checkbox.Group
+# 各版本类名有浮动（ant-checkbox-group / ant-checkbox-wrapper），但 label 文字是稳定的。
+_JS_SIZECHART_AVAILABLE_PARAMS = r"""(() => {
+  const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
+    .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
+  let wrap = null;
+  for (const w of _scList) {
+    const r = w.getBoundingClientRect();
+    if (r.width === 0) continue;
+    const hit = document.elementFromPoint(r.x + r.width / 2, Math.min(r.y + 300, innerHeight - 10));
+    if (hit && w.contains(hit)) { wrap = w; break; }
+  }
+  if (!wrap) wrap = _scList[_scList.length - 1];
+  if (!wrap) return JSON.stringify({found: false});
+  // 「尺码参数」form-item 行：拿 label 文字锚定，再收这一行里所有 checkbox
+  const item = Array.from(wrap.querySelectorAll('.ant-form-item'))
+    .find(it => {
+      const lab = it.querySelector('.ant-form-item-label');
+      return lab && (lab.textContent || '').includes('尺码参数');
+    });
+  const scope = item || wrap;
+  const out = [];
+  scope.querySelectorAll('.ant-checkbox-wrapper').forEach(cw => {
+    const name = (cw.textContent || '').trim();
+    if (!name) return;
+    out.push({name,
+              checked: cw.classList.contains('ant-checkbox-wrapper-checked')
+                       || !!cw.querySelector('.ant-checkbox-checked'),
+              disabled: cw.classList.contains('ant-checkbox-wrapper-disabled')
+                        || !!cw.querySelector('.ant-checkbox-disabled')});
+  });
+  return JSON.stringify({found: out.length > 0, params: out});
+})()"""
+
+# 勾选/取消勾选「尺码参数」复选框，让表格渲染出目标列。
+# 目标 = 源数据能覆盖的部位（LLM 语义匹配勾上）；平台默认勾上但源没有的部位（领围）
+# 取消勾选——那是平台默认集对背带裤的误判，留着只会填进一个对不上实物的凭空估算值。
+# 取消勾选刻意保守：只动「源数据存在、但平台默认勾上的这个部位源没有」的那几项，
+# 不碰任何非默认、或已被勾选且有值的项（避免误伤平台真正强制的项）。
+_JS_SET_SIZECHART_PARAMS = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const toCheck = __CHECK__;       // 要勾上的参数名列表
+  const toUncheck = __UNCHECK__;   // 要取消勾选的参数名列表
+  const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
+    .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
+  let wrap = null;
+  for (const w of _scList) {
+    const r = w.getBoundingClientRect();
+    if (r.width === 0) continue;
+    const hit = document.elementFromPoint(r.x + r.width / 2, Math.min(r.y + 300, innerHeight - 10));
+    if (hit && w.contains(hit)) { wrap = w; break; }
+  }
+  if (!wrap) wrap = _scList[_scList.length - 1];
+  if (!wrap) return JSON.stringify({ok: false, reason: 'no-modal'});
+  const item = Array.from(wrap.querySelectorAll('.ant-form-item'))
+    .find(it => {
+      const lab = it.querySelector('.ant-form-item-label');
+      return lab && (lab.textContent || '').includes('尺码参数');
+    });
+  const scope = item || wrap;
+  const wrappers = Array.from(scope.querySelectorAll('.ant-checkbox-wrapper'));
+  const byName = name => wrappers.find(cw => (cw.textContent || '').trim() === name);
+  const isChecked = cw => cw.classList.contains('ant-checkbox-wrapper-checked')
+                          || !!cw.querySelector('.ant-checkbox-checked');
+  const isDisabled = cw => cw.classList.contains('ant-checkbox-wrapper-disabled')
+                           || !!cw.querySelector('.ant-checkbox-disabled');
+  const changed = [], skipped = [], failed = [];
+  const clickBox = async cw => {
+    const inner = cw.querySelector('.ant-checkbox-input') || cw;
+    ['mousedown','mouseup','click'].forEach(t =>
+      cw.dispatchEvent(new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+    await sleep(500);
+  };
+  // 先勾上要勾的，再取消勾选要取消的（一次操作完再统一等表格重渲）
+  for (const name of toCheck) {
+    const cw = byName(name);
+    if (!cw) { failed.push(name + '(无此项)'); continue; }
+    if (isDisabled(cw)) { skipped.push(name + '(禁用)'); continue; }
+    if (isChecked(cw)) { continue; }   // 已勾上，幂等跳过
+    await clickBox(cw);
+    if (isChecked(cw)) changed.push(name); else failed.push(name + '(勾选未生效)');
+  }
+  for (const name of toUncheck) {
+    const cw = byName(name);
+    if (!cw) { continue; }                       // 本就无此项，不算失败
+    if (isDisabled(cw)) { skipped.push(name + '(禁用,未取消)'); continue; }
+    if (!isChecked(cw)) { continue; }            // 本就没勾，幂等跳过
+    await clickBox(cw);
+    if (!isChecked(cw)) changed.push('-' + name); else failed.push(name + '(取消未生效)');
+  }
+  await sleep(800);   // 等表格按新勾选集重渲出输入列
+  return JSON.stringify({ok: failed.length === 0, changed, skipped, failed});
+})()"""
+
 _JS_FILL_SIZECHART = r"""(async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const tplName = __NAME__;
@@ -4796,14 +5271,119 @@ async def _map_params_by_llm(targets: list, sources: list) -> dict:
     return out
 
 
-def _guess_size_kind(title: str, sizes: list) -> dict:
-    """按尺码字样与标题推断人群档位，供估算提示词用。
+# 交模型做「源表头 → 弹窗可选参数」的语义勾选判断。与 _map_params_by_llm 的分工：
+# 那个是在【参数已确定要填】的前提下映射名字；这个是在【该勾哪几项】上做取舍——
+# 弹窗那排「尺码参数」是可选复选框，源表头又是商家随手写的（裤长①/胸围③/肩带⑧），
+# 精准/词表匹配经常勾不到正确的可选项，故交 LLM 按「是不是同一个身体部位」语义判断。
+_PARAM_PICK_PROMPT = """你是服装尺码表整理助手。
 
-    判据优先级：尺码里出现 cm 身高档（80/90/…/160）或标题含童装词 → 童装；
-    出现成人字母码（XS/S/M/L/XL）或标题含成人词 → 成人；都不明确 → 通用。
-    只影响提示词措辞（专家身份、版型、档差描述），判错不会写坏数据，
-    故不做严格校验、也不报错。
+商品：{title}
+平台「添加尺码表」弹窗里，尺码参数是一排【可选复选框】，勾上哪几项表格就出现哪几列。
+下面列出全部可选项（当前默认勾中项单独标注）：
+{options}
+
+源商品（1688 详情长图）自带的实测尺码表，表头有这些列（商家随手写的，可能带序号/单位/别名）：
+{sources}
+
+请判断：哪些可选参数【源表里有对应的真实测量列】、应该勾上让源实测值填进去。规则：
+1. 只从上面列出的可选项里挑，不要编造名字；
+2. 按身体部位语义匹配，不看字面是否相同——「胸围③」对应「胸围全围」、「裤长①」对应「裤长」、
+   「裤长②(内侧)」对应「裤内长」、「裤腿⑤」对应「大腿围全围」这类；
+3. 【量的是不同部位就不勾】宁可少勾：源只有裤长/胸围/臀围时，不要勾「领围/肩宽/衣长」这些源没有的；
+4. 「领围」这种平台默认勾中、但源表里根本没有该部位时，【绝不】因为它默认勾着就保留。
+
+输出两部分（可选项原文照抄，勾不到的留空数组）：
+{{"check": ["<源有对应、该勾上的参数>", ...], "uncheck": ["<默认勾中但源没有该部位、应取消的参数>", ...]}}"""
+
+
+async def _pick_params_by_llm(title: str, available: list, src_params: list) -> dict:
+    """问 LLM 源表头该勾弹窗里哪几项「尺码参数」，返回 {"check": [...], "uncheck": [...]}。
+
+    【为什么要语义匹配】源表头是商家随手写的自由文本（裤长①/胸围③/肩带⑧/前裆⑥…），
+    弹窗可选参数是另一套规范词（裤长/胸围全围/裤内长…），两套词汇不重合、精准匹配经常
+    勾不到正确的可选项（真站取证 offer 1074392045040：源 8 列全在，却因没人勾「裤长/
+    胸围全围」而全被浪费）。语义判断「是不是同一个部位」正是 LLM 的强项，与
+    _map_params_by_llm 的取向一致（名称对齐问名字，比退到凭空估算划算）。
+
+    结果只保留「确实是 available 里列出的可选项」的项：模型偶尔会顺手编一个可选项里
+    没有的参数名，放过去会让勾选 JS 找不到复选框、白点一轮。
+
+    best-effort：失败一律吞掉返回空（调用方随后照旧按当前勾中集填），不让一个辅助的
+    勾选判断把整个阶段⑨ 搞挂。
     """
+    from app.publish.llm import ask_json
+
+    if not available or not src_params:
+        return {}
+    options = "、".join(
+        f"{p['name']}{'（默认勾中）' if p.get('checked') else ''}" for p in available)
+    try:
+        data = await ask_json(
+            _PARAM_PICK_PROMPT.format(
+                title=title, options=options, sources="、".join(src_params)),
+            what="尺码参数勾选判断", stage="sizechart")
+    except Exception as e:
+        logger.warning(f"尺码参数勾选判断失败（照旧按当前勾中集填）：{e}")
+        return {}
+    valid = {p["name"] for p in available}
+    out = {}
+    for key in ("check", "uncheck"):
+        vals = [v for v in (data.get(key) or []) if isinstance(v, str) and v in valid]
+        if vals:
+            out[key] = vals
+    if out:
+        logger.info("尺码参数勾选判断（模型）：勾上 "
+                    + "、".join(out.get("check", []) or ["（无）"])
+                    + "；取消 " + "、".join(out.get("uncheck", []) or ["（无）"]))
+    return out
+
+
+# 非服装品类标签 → 尺码表估算的「专家身份」参数。
+# 数据驱动：加新品类的专属工作流只在 dict 加一行；未映射标签落 other 通用兜底。
+# 所有条目都带 nonapparel=True——非服装走几何推理提示词（直径→长宽、体重→净重）。
+_NONAPPAREL_KIND = {
+    "pet_supply": {"expert": "宠物用品尺寸专家",
+                   "fit": "宠物窝/垫/床类（圆形或方形）",
+                   "step": "尺寸随码数递增，圆形商品直径即长=宽",
+                   "nonapparel": True},
+    "home": {"expert": "家居用品尺寸专家",
+             "fit": "家居/家具类（长宽高）",
+             "step": "尺寸随码数递增",
+             "nonapparel": True},
+    "toy": {"expert": "玩具尺寸专家",
+            "fit": "玩具/模型类",
+            "step": "尺寸随码数递增",
+            "nonapparel": True},
+    "floral_decor": {"expert": "家居装饰尺寸专家",
+                     "fit": "仿真花/摆件/装饰类",
+                     "step": "尺寸随码数递增",
+                     "nonapparel": True},
+    "shoe": {"expert": "鞋类尺码专家",
+             "fit": "鞋靴类（鞋码）",
+             "step": "尺码随码数递增",
+             "nonapparel": True},
+    "bag": {"expert": "箱包尺寸专家",
+            "fit": "箱包类（长宽高）",
+            "step": "尺寸随码数递增",
+            "nonapparel": True},
+    "other": {"expert": "商品尺寸专家",
+              "fit": "通用商品（长宽高/重量）",
+              "step": "尺寸随码数递增",
+              "nonapparel": True},
+}
+
+
+def _guess_size_kind(title: str, sizes: list, cat: str = "apparel") -> dict:
+    """按【品类标签】与尺码字样推断估算提示词的专家身份。
+
+    cat 是 classify_category 的品类标签。非 apparel（宠物/家居/玩具…）直接查
+    _NONAPPAREL_KIND 数据映射，不再用词表猜——那是 LLM 意图识别的结果，避免
+    「每加一个非服装品类就补词表」的膨胀（2026-09-06 宠物窝 sizechart 失败后收敛）。
+    apparel 才按尺码字样细分童装/成人（年龄段与品类是正交维度，这里只做服装内档位）。
+    只影响提示词措辞，判错不会写坏数据，故不做严格校验、也不报错。
+    """
+    if cat != "apparel":
+        return dict(_NONAPPAREL_KIND.get(cat, _NONAPPAREL_KIND["other"]))
     joined = " ".join(str(x) for x in (sizes or []))
     is_kid = bool(re.search(r"\b(80|90|100|110|120|130|140|150|160)\s*cm", joined, re.I)
                   or re.search(r"童|宝宝|婴|幼|kid|child|toddler|girls?|boys?", title, re.I))
@@ -4870,7 +5450,8 @@ def _check_measurements(est: dict, sizes: list, need: list) -> list:
 async def _estimate_measurements(title: str, size_ref: dict, sizes: list,
                                  need: list, known: dict,
                                  part: str = "",
-                                 src_rows: Optional[dict] = None) -> dict:
+                                 src_rows: Optional[dict] = None,
+                                 cat_path=None) -> dict:
     """按身高体重参考 + 已有实测列，估算弹窗缺的那几个测量参数。
 
     走 llm.ask_json：它内部用 get_llm()，自动跟随发布页 UI 的模型下拉，顺带白拿
@@ -4908,30 +5489,53 @@ async def _estimate_measurements(title: str, size_ref: dict, sizes: list,
         rest = {p: v for p, v in row.items() if p not in aligned_names}
         if rest:
             raw_lines.append(f"- {s}：" + "、".join(f"{p}{v}" for p, v in rest.items()))
-    raw_text = ("\n源商品同一件衣服的其它实测量法（参数名与平台不同，不要照抄名字，"
+    raw_text = ("\n源商品同一件商品的其它实测量法（参数名与平台不同，不要照抄名字，"
                 "只作量级与档差参照——估算值必须与它们协调、不能量级失真）：\n"
                 + "\n".join(raw_lines) + "\n") if raw_lines else ""
-    # 【别写死童装】档差随人群变：童装按身高 10cm 一档，成人按胸围 4cm 一档，
-    # 套错档会让整表系统性失真。本管线确实跑成人女装（见 set_titles 的真站取证
-    # offer 846106032776），故按尺码字样与标题推断，拿不准按通用处理。
-    kind = _guess_size_kind(title, sizes)
+    # 【品类识别：服装走词表、非服装走 LLM】现场 cat_path 可用（auto_cat 已判类目），
+    # 传下去让 classify_category 更准；续跑拿不到就退标题。品类决定 _guess_size_kind
+    # 的身份，非服装（宠物/家居/玩具）走几何推理提示词。
+    cat = await classify_category(title, cat_path)
+    kind = _guess_size_kind(title, sizes, cat)
+    # 【非服装换一套措辞与推理规则】宠物窝的「宽/净重/长」，源数据常写成「直径」
+    # 「长*宽*高」与「适用体重」，服装提示词的「试穿参考/全围」对它们毫无意义，
+    # 模型看到直径也不会知道长=宽=直径（2026-09-06 宠物窝两单 sizechart 全卡在
+    # 估算补不齐宽/净重/长）。故非服装换成几何推理引导。
+    nonapparel = bool(kind.get("nonapparel"))
     # 部件提示放在标题之后、参考数据之前：先让模型知道「只看这一件」再读数据
     part_text = (f"本次只估算这个套装里的【{part}】这一件，测量值必须是这一件的"
                  f"（不要按套装里另一件的版型给）。\n"
                  if part else "")
+    if nonapparel:
+        ref_label = "源商品提供的参考信息（适用体重/直径/长宽高）："
+        known_label = "源商品已给出的实测尺寸（同一件商品，估算须与之协调）："
+        meas_label = "实际测量值（单位cm，净重单位克）"
+        rules = (f"1. 符合{kind['fit']}，数值随尺码单调递增、梯度合理"
+                 f"（{kind['step']}）；\n"
+                 "2. 源数据是「直径/铺开直径/展开直径」时，圆形商品长=宽=直径"
+                 "（如直径55cm即长55、宽55）；\n"
+                 "3. 源数据是「长*宽*高」格式时，按顺序拆成对应维度；\n"
+                 "4. 「净重」是商品自重（克），不是宠物体重——从适用体重（斤）或"
+                 "包装重量推理；\n"
+                 "5. 每个尺码都要给，且只给上面列出的参数；\n")
+    else:
+        ref_label = "源商品提供的试穿参考（身高/体重）："
+        known_label = "源商品已给出的实测尺寸（同一件衣服，估算须与之协调）："
+        meas_label = "实际成衣测量值（单位cm）"
+        rules = (f"1. 符合{kind['fit']}，数值随尺码单调递增、梯度合理"
+                 f"（相邻尺码{kind['step']}）；\n"
+                 "2. 全围类参数（胸围/腰围/臀围全围）是绕一圈的全围，不是半围——"
+                 "半围写成全围会差一倍，这是买家退货的高发成因；\n"
+                 "3. 每个尺码都要给，且只给上面列出的参数；\n")
     prompt = (
         f"你是{kind['expert']}。商品：{title}\n"
         f"{part_text}"
-        f"源商品提供的试穿参考（身高/体重）：\n{ref_text}\n\n"
-        f"源商品已给出的实测尺寸（同一件衣服，估算须与之协调）：\n{known_text}\n"
+        f"{ref_label}\n{ref_text}\n\n"
+        f"{known_label}\n{known_text}\n"
         f"{raw_text}\n"
-        f"请给出尺码 {'/'.join(sizes)} 的实际成衣测量值（单位cm）："
+        f"请给出尺码 {'/'.join(sizes)} 的{meas_label}："
         f"{'、'.join(need)}。\n"
-        f"要求：1. 符合{kind['fit']}，数值随尺码单调递增、梯度合理"
-        f"（相邻尺码{kind['step']}）；\n"
-        "2. 全围类参数（胸围/腰围/臀围全围）是绕一圈的全围，不是半围——"
-        "半围写成全围会差一倍，这是买家退货的高发成因；\n"
-        "3. 每个尺码都要给，且只给上面列出的参数；\n"
+        f"要求：{rules}"
         f"只输出严格JSON，不要其他文字："
         f"{{\"{sizes[0]}\":{{\"{need[0]}\":x}},...}}"
     )
@@ -4972,7 +5576,8 @@ def _sc_js(template: str, which: int) -> str:
 async def add_sizechart(session: BrowserSession, info_path: str,
                         category: Optional[str] = None,
                         name: Optional[str] = None,
-                        which: int = 0) -> dict:
+                        which: int = 0,
+                        cat_path=None) -> dict:
     """阶段⑨：添加尺码表（尺码分类 + 测量参数填表）。
 
     which：填第几张表（0=「尺码表」，1=「尺码表2」）。套装商品平台要求两张都填，
@@ -5052,7 +5657,37 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     if not sel.get("ok"):
         return {"status": "error", "reason": f"尺码分类选择失败: {sel}"}
 
-    # 读取参数列表和尺码行
+    # 【按源数据主动勾选「尺码参数」复选框】弹窗上方那排参数是【可选】的，平台默认只勾
+    # 了分类默认集（背带裤默认勾「领围」），源数据能覆盖的其它部位（裤长/胸围全围/臀围
+    # 全围…）默认都没勾。原先代码只读已渲染的 thead、等于只认默认勾的那几项，源数据全
+    # 被浪费（offer 1074392045040：源 8 列全在却改估一个「领围」）。源参数列表来自
+    # product-info.json、不依赖页面渲染，故这里在读 thead 前先把「源能覆盖的」勾上、
+    # 「默认勾中但源没有的」取消掉，再读表格。源参数列表只在勾选这一步用一次，真正的
+    # 取值仍走下面分件/扁平那套逻辑。
+    src_for_pick = (info.get("sizeMeasurementsByPart") or [{}])[0].get("measurements") \
+        or info.get("sizeMeasurements") or {}
+    src_param_names = sorted({p for row in src_for_pick.values()
+                              for p in (row or {})})
+    if src_param_names:
+        avail = await session.eval_json(_JS_SIZECHART_AVAILABLE_PARAMS)
+        available = avail.get("params") or []
+        if available:
+            pick = await _pick_params_by_llm(title, available, src_param_names)
+            to_check = pick.get("check") or []
+            to_uncheck = pick.get("uncheck") or []
+            if to_check or to_uncheck:
+                setr = await session.eval_json(
+                    _JS_SET_SIZECHART_PARAMS
+                    .replace("__CHECK__", J(to_check))
+                    .replace("__UNCHECK__", J(to_uncheck)))
+                if setr.get("changed"):
+                    logger.info("尺码参数勾选已调整：" + "、".join(setr["changed"]))
+                if not setr.get("ok"):
+                    logger.warning(f"尺码参数勾选部分未生效（照旧按当前集填）：{setr}")
+        else:
+            logger.info("弹窗未读到可选「尺码参数」复选框（可能本平台无此项），照旧按当前集填")
+
+    # 读取参数列表和尺码行（勾选调整后，thead 反映的是新的参数集）
     meta = await session.eval_json(_JS_SIZECHART_PARAMS)
     params, sizes = meta.get("params", []), meta.get("sizes", [])
     if not params or not sizes:
@@ -5104,6 +5739,15 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     else:
         src_meas = info.get("sizeMeasurements") or {}
     src_norm = {norm_size(k): (v or {}) for k, v in src_meas.items()}
+    # 【源尺寸表的尺码键与弹窗尺码完全对不上时，忽略源数据、纯模型估算】SKU 是均码
+    # 而源尺码表是小号/大号（1072309635629）这类：源数据是另一套尺码，塞给模型只会
+    # 让它拿错档位、连弹窗尺码都估不齐。忽略源数据后模型从标题/图片推理弹窗尺码的尺寸。
+    size_keys = {norm_size(s) for s in sizes}
+    if src_norm and not (set(src_norm) & size_keys):
+        logger.warning(f"源尺寸表尺码 {list(src_norm)[:5]} 与弹窗尺码 {list(size_keys)[:5]} "
+                       f"完全对不上，忽略源尺寸、纯模型估算")
+        src_meas = {}
+        src_norm = {}
     norm = {k: _align_params(v) for k, v in src_norm.items()}
     need = [p for p in params
             if any(p not in (norm.get(norm_size(s)) or {}) for s in sizes)]
@@ -5124,9 +5768,22 @@ async def add_sizechart(session: BrowserSession, info_path: str,
                 need = [p for p in params
                         if any(p not in (norm.get(norm_size(s)) or {}) for s in sizes)]
 
+    # 【源数据一列都没用上的异常】源给了实测尺寸，平台参数却一个都对不上
+    # （need 覆盖了全部 params）：经过上面 LLM 勾选后仍出现，说明源表头连语义匹配
+    # 都对不上任何可选项（或源数据与商品严重不符）。源数据全白费意味着买家拿到一份
+    # 维度对不上实物的尺码表，必须报出来交人工复核，不能静默填。
+    source_unused = bool(src_meas) and bool(need) and set(need) == set(params)
+    if source_unused:
+        logger.warning(
+            "尺码表参数与源实测尺寸一列都没对上（源有数据却全走估算）："
+            "平台参数 " + "、".join(params)
+            + "；源参数 " + "、".join(sorted(
+                {k for row in src_norm.values() for k in (row or {})})))
+
     if need:
         est = await _estimate_measurements(title, size_ref, sizes, need, norm,
-                                           part=part_used, src_rows=src_norm)
+                                           part=part_used, src_rows=src_norm,
+                                           cat_path=cat_path)
         for s in sizes:
             key = norm_size(s)
             row = dict(norm.get(key) or {})
@@ -5172,7 +5829,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
             "tplName": tpl_name, "category": sel.get("selected"),
             "categorySource": sel.get("source"),
             "params": params, "measureSource": gen, "estimated": need,
-            "partUsed": part_used,
+            "partUsed": part_used, "sourceUnused": source_unused,
             "data": norm, "formText": final.get("text")}
 
 
@@ -7242,10 +7899,20 @@ _JS_LIVE_STATE = r"""(async () => {
   const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
   const host = u => { try { return new URL(u, location.href).host; } catch (e) { return ''; } };
 
-  // ⑤ 标题：基本信息区有非空文本输入即算已填
-  const basic = document.getElementById('productBasicInfo');
-  const titleLens = Array.from((basic || document).querySelectorAll('input, textarea'))
-    .map(i => (i.value || '').trim().length).filter(n => n > 0);
+  // ⑤ 标题：按 label 定位「英文标题」框——它空或含中文（非 ASCII）都说明英文标题
+  // 成果已丢/未填，要重跑。不能抓基本信息区所有框：中文标题框（产品标题）本来就
+  // 该填中文，抓它会恒判「含中文」、让 titles 每次续跑都白重跑。
+  const _labelVal = (label) => {
+    const it = Array.from(document.querySelectorAll('.ant-form-item'))
+      .find(el => {
+        const l = el.querySelector('.ant-form-item-label label');
+        return l && (l.getAttribute('title')||l.textContent||'').trim() === label;
+      });
+    const inp = it ? it.querySelector('input:not([type=hidden]), textarea') : null;
+    return inp ? (inp.value || '').trim() : '';
+  };
+  const enTitle = _labelVal('英文标题');
+  const titleHasCjk = !!enTitle && Array.from(enTitle).some(c => c.charCodeAt(0) > 127);
 
   // ⑧ 尺码勾选：变种信息表的行数（0 行 → ⑨⑩⑪ 全都无处可填，必须从 ⑧ 起重跑）
   const sku = document.getElementById('skuDataInfo');
@@ -7394,7 +8061,8 @@ _JS_LIVE_STATE = r"""(async () => {
     catListText: catListText,
     catUnset: catListText.includes('未选择分类'),
     catDeleted: catDeleted,
-    titleFilled: titleLens.length > 0,
+    titleFilled: !!enTitle,
+    titleHasCjk: titleHasCjk,
     skuRowCount: skuRows.length,
     skuFilledRows: skuFilled,
     skuCodeCount: skuCodeInps.length,
@@ -8745,6 +9413,9 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
     rows.push({i: i, color: iColor >= 0 ? txt(tds[iColor]) : '',
                url: im ? (im.currentSrc || im.src || '') : '',
                w: w, h: h, empty: empty,
+               // 行级换图入口：变种表只有部分行（颜色主行）有 trigger，其余行共享
+               // 主图、无独立换图入口（2026-09-06 两单宠物窝全卡在这里，见 _st_sku_preview）
+               hasTrigger: !!cell.querySelector('.sku-image-box.ant-dropdown-trigger'),
                bad: known && (!square || w < MIN || h < MIN)});
   });
   return JSON.stringify({rows: rows, heads: heads,

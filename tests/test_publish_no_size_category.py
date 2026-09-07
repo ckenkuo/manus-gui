@@ -134,7 +134,7 @@ def test_无尺码表栏时阶段九跳过(monkeypatch):
     async def emit(ev):
         events.append(ev)
 
-    async def fake_add(session, info_path, category=None, name=None, which=0):
+    async def fake_add(session, info_path, category=None, name=None, which=0, cat_path=None):
         return {"status": "error", "reason": "no-sizechart-item", "which": which,
                 "charts": 0}
 
@@ -153,7 +153,7 @@ def test_尺码表其它失败仍算失败(monkeypatch):
     async def emit(ev):
         pass
 
-    async def fake_add(session, info_path, category=None, name=None, which=0):
+    async def fake_add(session, info_path, category=None, name=None, which=0, cat_path=None):
         return {"status": "error", "reason": "添加尺码表弹窗未打开"}
 
     async def fake_prewarm(ctx, key):

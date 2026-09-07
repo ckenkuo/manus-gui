@@ -97,6 +97,9 @@ LLM_STAGES = [
     # 与 ① 分开登记而不是共用，正因为它不看图——能走快档模型，没必要跟着视觉档一起慢。
     {"id": "extract_text", "label": "①b 详情文字尺码表", "vision": False},
     {"id": "auto_cat", "label": "③ 产品类目", "vision": False},
+    # 品类识别（pipeline.classify_category 的非服装细分）：纯文本、轻量，服务⑨尺码表
+    # 估算与⑪ SKU分类的品类分流。单独登记好让用户能用快档模型跑这个高频小判断。
+    {"id": "category", "label": "品类识别（尺码/SKU分流）", "vision": False},
     {"id": "attrs", "label": "④ 属性审核", "vision": False},
     {"id": "titles", "label": "⑤ 标题生成", "vision": False},
     {"id": "clean_images", "label": "⑤b 图片英化质检", "vision": True},

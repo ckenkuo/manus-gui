@@ -132,6 +132,9 @@ async def main() -> int:
     p = sub.add_parser("fix-sizes", help="尺码勾选修正（写入）")
     p.add_argument("rowid")
     p.add_argument("info_json", help="product-info.json 路径")
+    p = sub.add_parser("fix-sizes-here", help="尺码勾选修正：对当前已打开的编辑页跑"
+                                              "（不 open_edit，需已在 CDP 打开该页）")
+    p.add_argument("info_json", help="product-info.json 路径")
     p = sub.add_parser("fix-sku-code", help="SKU货号重写为纯英文（写入）")
     p.add_argument("rowid")
     p = sub.add_parser("set-variant", help="变种信息批量填写（写入）")
@@ -364,6 +367,24 @@ async def main() -> int:
                 logger.info(
                     f"尺码勾选完成 | 源尺码 {len(r['wantedSizes'])} 个 | "
                     f"切换 {len(r['toggled'])} 次 | SKU 表 {r['rowCount']} 行"
+                    + (f" | 剔除伪尺码 {r['droppedFake']}" if r.get("droppedFake") else "")
+                )
+            else:
+                logger.error(f"尺码勾选失败: {r.get('reason')}")
+        elif args.cmd == "fix-sizes-here":
+            # 已在 CDP 打开该编辑页，不再 open_edit（会把当前标签导航走）；
+            # 但 BrowserSession.open() 可能挑到草稿列表页，需显式接管编辑页签。
+            ad = await session.adopt_open_page("popTemu/edit")
+            if not ad.get("ok"):
+                logger.error(f"没找到已打开的编辑页签：{ad}")
+                return 2
+            r = await fix_sizes(session, args.info_json)
+            print(json.dumps(r, ensure_ascii=False, indent=2))
+            if r.get("status") == "ok":
+                logger.info(
+                    f"尺码勾选完成 | 源尺码 {len(r['wantedSizes'])} 个 | "
+                    f"切换 {len(r['toggled'])} 次 | SKU 表 {r['rowCount']} 行"
+                    + (f" | 剔除伪尺码 {r['droppedFake']}" if r.get("droppedFake") else "")
                 )
             else:
                 logger.error(f"尺码勾选失败: {r.get('reason')}")

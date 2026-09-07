@@ -488,7 +488,7 @@ def _stale_form_stages(live: dict) -> list:
     if live.get("catUnset") or live.get("catDeleted"):
         return list(_FORM_ONLY_STAGES)
     stale = []
-    if not live.get("titleFilled"):
+    if not live.get("titleFilled") or live.get("titleHasCjk"):
         stale.append("titles")
     # ⑥⑦ 图片类：变种属性区一张图都没有说明素材图与 SKC 换图都丢了。
     # ⑤b clean_images 是它们的上游产物提供者，跟着一起重跑（它自己会判「已有干净图」跳过）。
@@ -1463,6 +1463,12 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
     rows = st.get("rows") or []
     prev_idx, color_idx = st.get("previewIdx"), st.get("colorIdx")
     bad = [r for r in rows if r.get("bad") and r.get("url")]
+    # 【bad 行按有无换图入口分流】变种表只有颜色主行有 trigger（换图入口），其余行
+    # 共享主图、无独立入口。无 trigger 的行 sku_preview_replace_row 报「该行没有
+    # 预览图 trigger」，无法自动换图，单独记 manual_check 交人工核对、不判 fail
+    # （2026-09-06 两单宠物窝 0/19、0/6 全卡在这里，整单被这一处拖死）。
+    bad_trigger = [r for r in bad if r.get("hasTrigger")]
+    bad_inherited = [r for r in bad if not r.get("hasTrigger")]
     # 空图位（本行有换图入口却一张图都没有）：平台会拒「请上传预览图」，是确定性的
     # 不合格。这里【没有源图可下载合规化】——认领本该把每行的图带过来，没带过来时
     # 本阶段无从凭空造图，故只能如实判 fail 让人处理，绝不能算进「均已满足」。
@@ -1505,7 +1511,15 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
     os.makedirs(prep, exist_ok=True)
 
     ok_rows, fail_rows = [], []
-    for r in bad:
+    if bad_inherited:
+        tags = "、".join(
+            f"第 {r['i'] + 1} 行" + (f"「{r.get('color')}」" if r.get("color") else "")
+            for r in bad_inherited[:8])
+        await emit({"type": "manual_check", "stage": "sku_preview",
+                    "message": f"{len(bad_inherited)} 行预览图不合规且无换图入口"
+                               f"（继承主图）：{tags}。这些行共享主图、无法单独换图，"
+                               "替换主图后应自动更新，若发布仍报预览图尺寸请人工核对"})
+    for r in bad_trigger:
         i, color = r["i"], r.get("color") or ""
         tag = f"第 {i + 1} 行" + (f"「{color}」" if color else "")
         raw = os.path.join(prep, f"row{i:02d}-raw.jpg")
@@ -1552,12 +1566,14 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"{tag} 预览图替换失败[{rep.get('stage')}]："
                                    f"{str(rep)[:120]}"})
 
-    note = f"{len(ok_rows)}/{len(bad)} 行预览图已合规化"
+    note = f"{len(ok_rows)}/{len(bad_trigger)} 行预览图已合规化"
+    if bad_inherited:
+        note += f"（另有 {len(bad_inherited)} 行继承图无换图入口，已提醒人工核对）"
     if fail_rows:
         note += f"（失败：{'、'.join(fail_rows)}）"
-    # 一行都没成功时判 fail：预览图不合规是平台硬校验，发布必被拒，
-    # 报 ok 会让状态文件说谎（同 ⑦ 的取向：拦下的与真失败要分得开）
-    return {"status": "ok" if ok_rows else "fail", "note": note}
+    # 无换图入口的继承行不算失败（共享主图、无法也无须单独换图，已单独 manual_check）；
+    # 有入口的行只要都成功（或本就没有有入口的坏行）就算 ok。
+    return {"status": "ok" if (ok_rows or not bad_trigger) else "fail", "note": note}
 
 
 async def _st_fix_sizes(ctx: dict, session: BrowserSession, emit) -> dict:
@@ -1579,6 +1595,12 @@ async def _st_fix_sizes(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "fail", "note": (r.get("reason") or "")[:200]}
     wanted = r.get("wantedSizes") or []
     note = f"源尺码 {len(wanted)} 个 | SKU 表 {r.get('rowCount')} 行"
+    # 剔除的伪变种（颜色维「款式随机」/尺码维「尺寸参考图」之类占位项）要让人在 note 里
+    # 看见拿掉了什么；它不是源规格、不算 missing，剔除是预期行为，只报出来不 manual_check。
+    dropped_fake = r.get("droppedFake") or {}
+    fake_txt = "、".join((dropped_fake.get("colors") or []) + (dropped_fake.get("sizes") or []))
+    if fake_txt:
+        note += f" | 已剔除伪选项 {fake_txt}"
     # 【部分源尺码在页面没有对应框：要报出来，不能只进返回值】fix_sizes 的
     # warning 原先被这里整个丢掉，note 只写「源尺码 5 个 | SKU 表 4 行」——
     # 少的那个尺码是谁、少没少，全靠人去对这两个数字。
@@ -1638,7 +1660,8 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
     cats = [_size_category_for(n) for n in packing]
 
     r = await add_sizechart(session, ctx["info_path"],
-                            category=cats[0] if cats else None)
+                            category=cats[0] if cats else None,
+                            cat_path=ctx.get("cat_path"))
     if r.get("status") != "ok":
         # 【第一张表栏都没有 → 本类目不要尺码表，skipped 而不是失败】原先只对
         # 「尺码表2」缺栏宽容（下方那个分支），第一张缺栏仍算 fail。2026-08-28 真站
@@ -1662,6 +1685,15 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
             note += f" | 源部件 {r.get('partUsed')}"
         if est:
             note += f" | 模型估算 {'、'.join(est)}"
+        # 【源数据一列都没用上】源有实测尺寸、平台参数却全走估算：尺码分类与商品维度
+        # 对不上（背带裤归上装→参数变领围），源真实尺码全被丢弃。这是要人工介入的异常，
+        # 不是普通「缺几列估算」，单独发一条 manual_check 而不是只混在 note 里。
+        if r.get("sourceUnused"):
+            note += " | 源数据未采用(待复核)"
+            await emit({"type": "manual_check", "stage": "sizechart",
+                        "message": "源商品有实测尺码数据，但平台尺码表参数一列都没对齐上"
+                                   "（源表头与可选参数语义对不上，或源数据与商品严重不符），"
+                                   "已全部改交模型估算，源真实尺码未采用，请人工核对尺码表"})
 
     if not is_set:
         return {"status": "ok", "note": note}
@@ -1677,7 +1709,8 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
 
     # 套装：补第二张表（分类取清单第二件；同款多件时两件相同，跟随第一件）
     cat2 = cats[1] if len(cats) > 1 else (cats[0] if cats else None)
-    r2 = await add_sizechart(session, ctx["info_path"], which=1, category=cat2)
+    r2 = await add_sizechart(session, ctx["info_path"], which=1, category=cat2,
+                             cat_path=ctx.get("cat_path"))
     if r2.get("status") != "ok":
         if r2.get("reason") == "no-sizechart-item":
             # 该类目只有一张表栏：平台不会按套装校验第二张，不算失败

@@ -1208,6 +1208,17 @@ def test_stale判定_类目有效时不重跑类目():
     assert "titles" in stale and "fix_sizes" in stale
 
 
+def test_stale判定_标题含中文时重跑标题():
+    """标题「已填」但含中文（回退到源标题、英文成果丢了）也要重跑 ⑤——2026-09-07
+    续跑时 save 被拒「标题中含有中文字符」，根因就是 titleFilled 只看非空不看中文。"""
+    live = {"rendered": True, "titleFilled": True, "titleHasCjk": True,
+            "skuRowCount": 8, "skuFilledRows": 8, "sizechartAdded": True,
+            "attrImgCount": 6, "shippingSet": True, "descImgCount": 9,
+            "descForeignCount": 0, "skuCodeCount": 8, "skuCodeBad": 0}
+    stale = service._stale_form_stages(live)
+    assert "titles" in stale
+
+
 def test_stale判定_实况读不到时连类目一起保守重跑():
     assert set(service._stale_form_stages({"rendered": False})) == set(service._FORM_ONLY_STAGES)
 
