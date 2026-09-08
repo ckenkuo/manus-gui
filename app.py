@@ -2,6 +2,7 @@ import asyncio
 import os
 import threading
 import tomllib
+import traceback
 import uuid
 import webbrowser
 import json
@@ -876,6 +877,7 @@ from app.publish import llm as publish_llm
 from app.publish import cache as publish_cache
 from app.publish import shops as publish_shops
 from app.publish import alert as publish_alert
+from app.error_report import report
 from app.publish.pipeline import resolve_warehouse
 
 
@@ -1119,6 +1121,7 @@ async def publish_batch(
             # run_batch 里，此时已经出不来了，故这一处要自己发一发，否则 Web 端跑批
             # 崩了群里一点动静都没有。
             await publish_alert.alert_batch_crash(str(e), store=store, site=site)
+            await report("publish", message=str(e), traceback=traceback.format_exc())
             await job.push({"type": "aborted", "reason": f"发布异常：{e}"})
         finally:
             job.done = True

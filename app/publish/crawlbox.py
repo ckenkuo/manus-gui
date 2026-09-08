@@ -65,6 +65,7 @@ import asyncio
 import json
 import os
 import time
+from typing import Optional
 
 from app.config import config
 from app.logger import logger
@@ -91,9 +92,10 @@ INTERVAL_DEFAULT = 30
 INTERVAL_MIN = 5
 INTERVAL_MAX = 1440
 
-# 单次扫描最多取多少条 / 每页多少条。实测未认领 395 条、全部 1751 条，取 200 够覆盖
-# 一批的量级，且避免把上千行塞进前端表格卡住浏览器（与 collectbox 同取值同理由）。
-SCAN_LIMIT = 200
+# 单次扫描取多少条 / 每页多少条。None = 全量（翻页到 totalPage 为止），不再设上限。
+# 历史上一度限 200 以避免把上千行塞进前端表格卡住浏览器（与 collectbox 同取值同理由）；
+# 现已改为全量扫描。
+SCAN_LIMIT = None
 PAGE_SIZE = 50
 
 # 扫描结果落盘位置：与 collectbox 的扫描缓存同目录（都是「店小秘那边的客观事实」），
@@ -251,7 +253,7 @@ def _source_info(source_url: str) -> dict:
             "productId": pid, "offerId": pid}
 
 
-async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
+async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMIT,
                     session: BrowserSession = None) -> dict:
     """扫一次未认领列表，返回 {"items", "scanned_at", "state", "counts", "total", ...}。
 
@@ -284,9 +286,10 @@ async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
             rows: list = []
             stat: dict = {}
             page_no = 1
-            while len(rows) < limit:
+            while limit is None or len(rows) < limit:
+                page_size = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(rows))
                 d = await session.eval_json(
-                    _JS_LIST, arg=[param, page_no, min(PAGE_SIZE, limit - len(rows))])
+                    _JS_LIST, arg=[param, page_no, page_size])
                 if not d.get("ok"):
                     raise RuntimeError(
                         f"列表接口失败：{d.get('status') or d.get('msg') or d}")
@@ -298,7 +301,11 @@ async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
                     break
                 page_no += 1
 
-        for r in rows[:limit]:
+            # 全量（limit=None）翻到 totalPage 为止；显式传 limit 时按 limit 截断。
+            if limit is not None:
+                rows = rows[:limit]
+
+        for r in rows:
             src = _source_info(r.get("sourceUrl") or "")
             result["items"].append({
                 # 主键：采集记录 id（idStr）。**不是 rowid**——未认领的行还没有草稿，

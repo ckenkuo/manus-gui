@@ -119,6 +119,7 @@ import shutil
 import time
 from typing import Awaitable, Callable, Optional, Union
 
+from app.error_report import report
 from app.logger import logger
 from app.publish import alert, cache, extract, images, video as videolib, vision
 from app.publish.sources import base as sources_base
@@ -288,6 +289,8 @@ def _alert_hook(on_progress: ProgressCB, store: str, site: str,
                 await alert.alert_batch_aborted(
                     event.get("reason") or "", store=store, site=site,
                     done=stat["done"], total=total)
+                await report("publish", stage="", item="",
+                             message=str(event.get("reason") or ""))
             elif t == "product_done":
                 stat["done"] += 1
                 if event.get("status") == "fail":
@@ -299,6 +302,9 @@ def _alert_hook(on_progress: ProgressCB, store: str, site: str,
                         store=store, site=site, rowid=event.get("rowid"),
                         index=event.get("index") or 0, total=event.get("total") or total,
                         elapsed_s=event.get("elapsed_s") or 0.0)
+                    await report("publish", stage=stage_name,
+                                 item=str(event.get("offer") or ""),
+                                 message=str(event.get("note") or ""))
             elif t == "batch_done" and int(event.get("fail") or 0) > 0:
                 await alert.alert_batch_done(
                     ok=int(event.get("ok") or 0), fail=int(event.get("fail") or 0),

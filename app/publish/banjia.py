@@ -49,6 +49,7 @@ import json
 import os
 import re
 import time
+from typing import Optional
 
 from app.config import config
 from app.logger import logger
@@ -89,10 +90,9 @@ INTERVAL_DEFAULT = 30
 INTERVAL_MIN = 5
 INTERVAL_MAX = 1440
 
-# 单次扫描最多取多少条。【比另两个清单调大】数据搬家池实测 1796 条（未认领 1067），
-# 是采集箱的数倍——它是平台给的公共池，不像采集箱那样靠自己采集攒出来。
-# 取 300 是个折中：够挑一批，又不会把上千行塞进前端表格卡住浏览器。
-SCAN_LIMIT = 300
+# 单次扫描取多少条。None = 全量（翻页到 totalPage 为止），不再设上限。
+# 历史上一度限 300（数据搬家池实测 1796 条，比另两个清单大得多）；现已改为全量扫描。
+SCAN_LIMIT = None
 PAGE_SIZE = 50
 
 CACHE_DIR = str(config.workspace_root / "publish-cache")
@@ -352,7 +352,7 @@ def _source_info(source_url: str) -> dict:
             "productId": pid, "offerId": pid}
 
 
-async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
+async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMIT,
                     session: BrowserSession = None) -> dict:
     """扫一次数据搬家清单，返回 {"items", "scanned_at", "state", "counts", "total", ...}。
 
@@ -386,9 +386,10 @@ async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
             param = (BANJIA_STATES.get(state) or {}).get("param")
             rows: list = []
             page_no = 1
-            while len(rows) < limit:
+            while limit is None or len(rows) < limit:
+                page_size = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(rows))
                 d = await session.eval_json(
-                    _JS_LIST, arg=[param, page_no, min(PAGE_SIZE, limit - len(rows))])
+                    _JS_LIST, arg=[param, page_no, page_size])
                 if not d.get("ok"):
                     raise RuntimeError(
                         f"列表接口失败：{d.get('status') or d.get('msg') or d}")
@@ -423,7 +424,11 @@ async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
                 logger.warning(f"数据搬家站点名求解失败（保留已知映射）：{e}")
                 result["siteNames"] = dict(_site_names)
 
-        for r in rows[:limit]:
+            # 全量（limit=None）翻到 totalPage 为止；显式传 limit 时按 limit 截断。
+            if limit is not None:
+                rows = rows[:limit]
+
+        for r in rows:
             src = _source_info(r.get("sourceUrl") or "")
             sv = r.get("siteValue") or ""
             result["items"].append({

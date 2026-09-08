@@ -22,7 +22,9 @@ import argparse
 import asyncio
 import json
 import sys
+import traceback
 
+from app.error_report import report
 from app.logger import logger
 from app.publish import alert
 from app.publish.service import STAGES, run_batch, set_image_concurrency
@@ -155,6 +157,7 @@ async def main() -> int:
                             keep_video=not args.no_video, warehouse=args.warehouse)
     except Exception as e:
         await alert.alert_batch_crash(str(e), store=args.store, site=args.site)
+        await report("publish", message=str(e), traceback=traceback.format_exc())
         raise
     logger.info(f"批次结束：{r}")
     return 0 if r.get("fail") == 0 else 1

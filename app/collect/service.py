@@ -43,6 +43,7 @@ if TYPE_CHECKING:
 from app.agent.manus import Manus
 from app.cloud_docs import remember as remember_cloud_doc
 from app.config import PROJECT_ROOT, config, config_search_dirs
+from app.error_report import attach
 from app.logger import logger
 
 # 区域未确认异常与活动/订单侧共用同一个类型，三条管线的 UI/CLI 可用同一套 except 转成
@@ -1816,6 +1817,8 @@ async def run_batch(
       use_pipeline=True 走确定性管道（推荐），失败自动退回 agent 兜底。
     - Excel 被占用 / 清单为空 / CDP 不可用（仅 1688 模式）→ 抛结构化事件并提前返回，不空跑。
     """
+    # 失败事件切面：aborted / product_done fail 自动上报公网 MySQL（best-effort，坏了不影响采集）。
+    on_progress = attach(on_progress, "collect")
     prefs = load_prefs()
     doc_mode = normalize_doc_mode(doc_mode)
     # 落点：显式 > prefs > config > 默认（bottom）。与 doc_mode 同一套「四处来源」取向。

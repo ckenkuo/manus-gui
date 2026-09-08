@@ -69,6 +69,7 @@ from app.activity import pipeline  # 以模块引用调用其函数，便于测�
 # 复用采集 service 已实测的 CDP 护栏 / 进度回调 / LLM token 清零，避免重复实现。
 from app.collect.service import CDP_URL, _emit, ensure_cdp_alive, reset_pipeline_llms
 from app.config import PROJECT_ROOT, config_search_dirs
+from app.error_report import attach
 from app.logger import logger
 from app.tool.wps_excel_tool import WpsExcelTool
 
@@ -947,6 +948,8 @@ async def run_activity_batch(
     - flux_page/activity_page：测试注入用；均为 None 时走 CDP 连真实调试 Chrome 的已打开标签。
     返回汇总 {done, skip, fail, results:[每 SPU 结果], exec:执行遍汇总 或 None}。
     """
+    # 失败事件切面：aborted / product_done fail 自动上报公网 MySQL（best-effort）。
+    on_progress = attach(on_progress, "activity")
     bm = _normalize_margin(min_margin)
     if bm is None:
         bm = global_min_margin()

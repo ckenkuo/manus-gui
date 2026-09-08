@@ -448,3 +448,22 @@ warehouse = "飞特COL仓库"
 [publish.alert]
 enabled = true
 webhook = ""
+
+# 管线错误集中上报到公网 MySQL（app/error_report.py，切面 + 注解式）。
+# 多台 PC 同时跑采集/订单/活动/发布四条管线时，把「主流程失败」（商品失败/批次
+# 中止/批次异常退出）结构化写进同一张表，方便按 pipeline/stage/item/machine 聚合
+# 排查、针对性改代码。best-effort：未启用或写库失败只告警、绝不中断主流程。
+# enabled 默认 false，需显式置 true 且 host/database 非空才启用。
+# 真实值只写进 gitignored 的 config.toml；公网直连建议 MySQL 开 SSL / IP 白名单 /
+# SSH 隧道，并用独立只写账号（仅 INSERT + 建表权限），勿用 root。
+[error_report]
+enabled = false
+host = ""
+port = 3306
+user = ""
+password = ""
+database = ""
+# 表名由代码自动 CREATE TABLE IF NOT EXISTS；只允许字母数字下划线
+table = "pipeline_errors"
+# 可选：同一台机器跑多实例/多账号时用于区分（留空则只用 hostname 区分机器）
+instance = ""

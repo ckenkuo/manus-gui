@@ -70,3 +70,7 @@ pandas~=2.2.3
 pywin32==312
 pygetwindow~=0.0.9
 lxml~=5.3
+
+# 管线错误集中上报到公网 MySQL（app/error_report.py，切面 + 注解式）
+# 纯 Python、Windows 无编译负担；未安装时上报静默跳过、不影响主流程
+pymysql~=1.1.1

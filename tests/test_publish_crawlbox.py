@@ -252,7 +252,8 @@ async def test_源价两种币种都留(scan_cache):
 
 @pytest.mark.asyncio
 async def test_翻页到取满limit为止(scan_cache):
-    """totalPage>1 时要接着翻，但不能超过 limit（避免上千行塞进前端表格）。"""
+    """totalPage>1 时要接着翻；显式传 limit 时取满就停、最后一页只请求剩余条数。
+    （默认 SCAN_LIMIT=None 是全量扫描，此测试专测显式 limit 仍能截断的分页语义。）"""
     class _Paged(_FakeSession):
         async def eval_json(self, code, arg=None, **kw):
             if "crawl/list.json" in code:

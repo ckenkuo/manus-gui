@@ -33,6 +33,7 @@ from app.collect.service import (
 )
 from app.cloud_docs import remember as remember_cloud_doc
 from app.config import PROJECT_ROOT, config, config_search_dirs, get_output_dir
+from app.error_report import attach
 from app.logger import logger
 from app.orders import pipeline, upload
 from app.orders.kdocs_sheet import KdocsSheet
@@ -948,6 +949,8 @@ async def run_orders_batch(
     已登记的订单号当水位，翻页追上就停，不必每次全量翻十几页。sheet_map 分流模式下水位
     有歧义（见 read_known_order_nos），一律退全量 sweep 靠判重兜底，行为与改动前一致。
     """
+    # 失败事件切面：aborted / write_failed 自动上报公网 MySQL（best-effort）。
+    on_progress = attach(on_progress, "orders")
     cfg = load_orders_config()
     # 本批写本地表还是协作文档：doc_mode 显式给 local/cloud 就钉死，不给则按链接形态和
     # config 自动判（见 resolve_doc_target）。本地模式下挑不出登记表则 workbook 为空，

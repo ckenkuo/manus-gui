@@ -70,6 +70,7 @@ import json
 import os
 import re
 import time
+from typing import Optional
 
 from app.config import config
 from app.logger import logger
@@ -98,9 +99,9 @@ INTERVAL_DEFAULT = 30
 INTERVAL_MIN = 5
 INTERVAL_MAX = 1440
 
-# 单次扫描最多取多少条。分页要多发几次请求、且待发布通常是几十条的量级，
-# 取 200 足够覆盖，避免有人把 503 条草稿全拉进前端表格卡住浏览器。
-SCAN_LIMIT = 200
+# 单次扫描取多少条。None = 全量（翻页到 totalPage 为止），不再设上限。
+# 历史上一度限 200 以避免把上千行塞进前端表格卡住浏览器；现已改为全量扫描。
+SCAN_LIMIT = None
 PAGE_SIZE = 50
 
 # 编辑进度探测的并发批大小。实测 60 个并发 0.2 秒（4ms/个），瓶颈完全不在这里；
@@ -441,7 +442,7 @@ async def probe_edited(session: BrowserSession, rowids: list) -> dict:
     return out
 
 
-async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
+async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMIT,
                     session: BrowserSession = None, probe: bool = True) -> dict:
     """扫一次列表，返回 {"items", "scanned_at", "state", "counts", "total", "error"}。
 
@@ -473,9 +474,10 @@ async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
             await session.navigate(list_url(state))
             rows: list = []
             page_no = 1
-            while len(rows) < limit:
+            while limit is None or len(rows) < limit:
+                page_size = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(rows))
                 d = await session.eval_json(
-                    _JS_LIST, arg=[state, page_no, min(PAGE_SIZE, limit - len(rows))])
+                    _JS_LIST, arg=[state, page_no, page_size])
                 if not d.get("ok"):
                     raise RuntimeError(
                         f"列表接口失败：{d.get('status') or d.get('msg') or d}")
@@ -515,14 +517,18 @@ async def scan_once(state: str = DEFAULT_STATE, limit: int = SCAN_LIMIT,
             except Exception as e:
                 logger.warning(f"站点名对齐失败（将显示数字）：{e}")
 
+            # 全量（limit=None）翻到 totalPage 为止；显式传 limit 时按 limit 截断。
+            if limit is not None:
+                rows = rows[:limit]
+
             # 编辑进度：本功能的核心筛选维度，逐个 rowid 查详情（见 probe_edited）。
             # 【必须在锁内】它也用同一个 CDP 页面，放到锁外会与下一轮扫描/发布作业抢页面。
             edited_map: dict = {}
             if probe:
                 edited_map = await probe_edited(
-                    session, [r.get("rowid") for r in rows[:limit]])
+                    session, [r.get("rowid") for r in rows])
 
-        for r in rows[:limit]:
+        for r in rows:
             sv = r.get("siteValue")
             src = _source_info(r.get("sourceUrl") or "")
             prog = edited_map.get(r.get("rowid") or "") or {
