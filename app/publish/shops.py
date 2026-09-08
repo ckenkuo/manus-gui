@@ -28,6 +28,14 @@
 列的是**具体国家站点**，其中没有「全球」这一项，弹窗默认自动勾「美国」。
 所以站点没有可用的默认值，UI 必须强制用户选。
 
+【仓库与店铺/站点又不同：有现成接口，但参数要自己拼】站点定下来后，仓库走
+POST /api/popTemuCategory/warehouseList.json（表单：siteIdStr + shopId），
+秒级返回该店该站点的真实仓库列表。两个参数的来路：shopId 就是 userIn.json
+shopMap 的店铺 id；siteIdStr 没有任何接口下发（抓包/存储/chunk 全排过），
+只能照前端 chunk 里的站点常量表做字面量映射（见 SITE_ID_MAP 的注释）。
+2026-09-08 起发布页在选定店铺+站点后联查仓库让用户手选，阶段⑪不再靠
+config 映射猜名字（猜错就是整单「仓库没选到」）。
+
 缓存取向与 cache.py 一致：只缓存「平台给的客观事实」，坏了、缺了当未命中重探，
 全程 best-effort 吞异常——枚举失败只该让下拉空着并提示，绝不能让页面打不开。
 """
@@ -49,6 +57,7 @@ from app.publish.browser import (
 # 缓存根照 cache.py 的取向：只定一个根常量，子路径由函数拼，便于单测 monkeypatch。
 CACHE_DIR = str(config.workspace_root / "publish-cache")
 _SITES_NAME = "shop-sites.json"
+_WAREHOUSES_NAME = "shop-warehouses.json"
 
 # Temu 店在 shopMap 里的 platform 值。平台没换过这个历史代号，写死并在筛不到时
 # 退回「不筛平台」——否则店小秘哪天改了代号，下拉会直接空掉且看不出原因。
@@ -387,7 +396,163 @@ async def list_sites(session: BrowserSession, store: str,
             logger.warning(f"关闭认领弹窗失败（忽略）：{e}")
 
 
-# ---- 对外入口（给 app.py 的两个接口用）---------------------------------------
+# ---- 仓库枚举（纯接口，不开弹窗）----------------------------------------------
+# 【siteIdStr 没有接口可拿，只能字面量映射】warehouseList.json 要 siteIdStr + shopId
+# 两个参数。shopId 现成（userIn.json 的 shopMap）；siteIdStr 翻遍抓包响应、页面
+# HTML、localStorage/IndexedDB 都没有（2026-09-08 实探 247 个请求），它只以前端
+# chunk 常量的形式存在（constant-*.js 的站点表，label/value/level 结构）。
+# 故把那张表抄成字面量。已用接口响应逐条核对过：美国=100、哥伦比亚=164、秘鲁=163、
+# 欧盟=27 个 id 逗号串（响应 siteName 与表键一一对应）。
+#
+# 键用【认领弹窗的站点名】——我们的站点下拉就是那份名单（见 list_sites）。弹窗名
+# 与 chunk 表键的差异三处，抄表时已经抹平：
+#   1. 弹窗多数不带「站」后缀（美国/哥伦比亚/日本…），表里全带，抄成弹窗名；
+#   2. 表里「澳大利亚,新西兰站」是合并项（值 "103,104"），弹窗是两项，各取单 id；
+#   3. 弹窗「欧盟站（27站）」= 表里 27 个 id 的逗号串（warehouseList 接受逗号串，
+#      逐子站各返回一条，见 _JS_WAREHOUSE_LIST 的去重）。
+# 平台新开站点时这里会查不到——list_warehouses 报错文案会指回这张表。
+SITE_ID_MAP = {
+    "美国": "100", "加拿大": "101", "英国": "102", "澳大利亚": "103",
+    "新西兰": "104", "日本": "118", "墨西哥": "110", "哥伦比亚": "164",
+    "越南": "187", "沙特站": "120", "菲律宾站": "127", "瑞士站": "114",
+    "阿联酋站": "122", "挪威站": "124", "卡塔尔站": "130", "以色列站": "135",
+    "南非站": "136", "秘鲁站": "163", "科威特站": "123", "格鲁吉亚站": "165",
+    "厄瓜多尔站": "178", "马来西亚站": "126", "塞尔维亚站": "153", "摩尔多瓦站": "154",
+    "阿塞拜疆站": "167", "智利站": "125", "阿曼站": "133", "泰国站": "129",
+    "巴林站": "134", "黑山站": "155", "波黑站": "158", "北马其顿站": "192",
+    "亚美尼亚站": "166", "毛里求斯站": "170", "摩洛哥站": "171", "约旦站": "131",
+    "冰岛站": "156", "巴拿马站": "176", "文莱站": "188", "吉尔吉斯坦站": "194",
+    "阿尔巴尼亚站": "159",
+    "欧盟站（27站）": ("105,106,107,109,112,137,111,138,108,142,113,139,140,"
+                       "143,145,116,146,141,115,144,150,148,147,149,151,117,152"),
+}
+
+
+def _site_id_str(site: str) -> str:
+    """站点名 → warehouseList.json 的 siteIdStr；查不到抛 RuntimeError。
+
+    归一只做「去/加尾部站字」这一档：UI 传的是弹窗名（美国），CLI 习惯带站
+    （美国站，resolve_warehouse 那边也容忍这种写法），两种都得能查。
+    """
+    name = (site or "").strip()
+    sid = SITE_ID_MAP.get(name)
+    if not sid:
+        sid = SITE_ID_MAP.get(name[:-1]) if name.endswith("站") \
+            else SITE_ID_MAP.get(name + "站")
+    if not sid:
+        raise RuntimeError(
+            f"站点「{site}」没有 siteId 映射（平台新开了站点或前端站点表改版），"
+            f"请按前端 chunk 的站点常量表更新 shops.SITE_ID_MAP"
+        )
+    return sid
+
+
+# 表单编码 POST（该接口换 JSON body 会 400，与 crawl/list.json 同坑）。
+# data 为 null 表示该店该站点没有可用仓库（实测澳新站）；欧盟传逗号串会逐子站
+# 各返回一条，仓库名跨条目按序去重（实测各子站仓库集相同，但并集写法不依赖这个巧合）。
+_JS_WAREHOUSE_LIST = r"""(async (args) => {
+  const [siteIds, shopId] = args;
+  try {
+    const r = await fetch('/api/popTemuCategory/warehouseList.json', {
+      method: 'POST', credentials: 'include',
+      headers: {'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'},
+      body: 'siteIdStr=' + encodeURIComponent(siteIds)
+          + '&shopId=' + encodeURIComponent(shopId),
+    });
+    if (!r.ok) return JSON.stringify({ok: false, status: r.status});
+    const d = await r.json();
+    if (d.code !== 0) return JSON.stringify({ok: false, code: d.code, msg: d.msg || ''});
+    const names = [];
+    for (const entry of (d.data || [])) {
+      for (const w of (entry.warehouseList || [])) {
+        const n = (w.name || '').trim();
+        if (n && !names.includes(n)) names.push(n);
+      }
+    }
+    return JSON.stringify({ok: true, warehouses: names});
+  } catch (e) { return JSON.stringify({ok: false, err: String(e).slice(0, 200)}); }
+})"""
+
+
+async def list_warehouses(session: BrowserSession, store: str, site: str) -> dict:
+    """查某店铺在某站点的可选仓库列表（纯接口，秒级、无副作用）。
+
+    返回 {"store", "site", "warehouses": [仓库名]}；该站点无可用仓库时 warehouses
+    为空列表（不是错误——澳新站实测如此，UI 按「查不到仓库」展示并允许不选）。
+    """
+    site_ids = _site_id_str(site)  # 未配映射在这里就报清楚
+    stores = await list_stores(session)
+    hit = next((s for s in stores if s.get("name") == store), None)
+    if not hit:
+        avail = [s.get("name") for s in stores]
+        raise RuntimeError(f"店小秘账号下没有店铺「{store}」，可选：{avail}")
+    data = await session.eval_json(_JS_WAREHOUSE_LIST,
+                                   arg=[site_ids, str(hit.get("id") or "")])
+    if not data.get("ok"):
+        raise RuntimeError(
+            f"查询仓库列表失败：{data.get('msg') or data.get('err') or data.get('status')}"
+        )
+    return {"store": store, "site": site, "warehouses": data.get("warehouses") or []}
+
+
+# ---- 仓库缓存（磁盘）----------------------------------------------------------
+# 与站点缓存同一个取向：仓库列表是平台侧的客观事实、变更频率低（新租仓才会变），
+# 缓存后页面秒开；查不到想刷新时 UI 有 refresh 入口。
+
+def _warehouses_path() -> str:
+    return os.path.join(CACHE_DIR, _WAREHOUSES_NAME)
+
+
+def load_warehouses_cache() -> dict:
+    """读整份「店铺|站点 → 仓库列表」缓存；缺失/损坏一律返回空 dict（当未命中）。"""
+    try:
+        with open(_warehouses_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        entries = data.get("entries")
+        return entries if isinstance(entries, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        logger.warning(f"仓库缓存损坏，当未命中：{e}")
+        return {}
+
+
+def save_warehouses_cache(store: str, site: str, warehouses: list) -> None:
+    """把某店铺+站点的仓库列表写进缓存（原子替换，只覆盖该键那一条）。
+
+    空列表不落盘：查不到仓库（澳新站）不是值得记的事实，下次重查一次而已；
+    真记下来反而把「后来新配了仓库」挡住。写失败只告警。
+    """
+    if not store or not site or not warehouses:
+        return
+    try:
+        with _lock:
+            path = _warehouses_path()
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                data = {}
+            entries = data.get("entries")
+            if not isinstance(entries, dict):
+                entries = {}
+            entries[f"{store}|{site}"] = {"warehouses": list(warehouses),
+                                          "updated_at": _now()}
+            data["entries"] = entries
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = f"{path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+    except Exception as e:
+        logger.warning(f"仓库缓存写入失败（忽略）：{e}")
+
+
+# ---- 对外入口（给 app.py 的 /publish/stores|sites|warehouses 用）--------------
 
 _CDP_HINT = ("连不上调试 Chrome（9222）。请确认已登录店小秘的 Chrome "
              "带 --remote-debugging-port=9222 运行。")
@@ -438,4 +603,35 @@ async def fetch_sites(store: str, refresh: bool = False) -> dict:
     save_sites_cache(store, got["sites"], got.get("default") or "")
     return {"store": store, "sites": got["sites"],
             "default": got.get("default") or "",
+            "cached": False, "updated_at": _now()}
+
+
+async def fetch_warehouses(store: str, site: str, refresh: bool = False) -> dict:
+    """给 /publish/warehouses 用：优先读缓存，未命中（或 refresh）才调接口重查。
+
+    返回 {"store", "site", "warehouses", "cached": bool, "updated_at": str}。
+    不开弹窗，故不需要 _probe_lock——两次 fetch 都是只读秒级操作，
+    与站点探测「独占页面开弹窗」的性质不同。
+    """
+    if not store:
+        raise ValueError("store 不能为空")
+    if not site:
+        raise ValueError("site 不能为空")
+    if not refresh:
+        entry = load_warehouses_cache().get(f"{store}|{site}") or {}
+        warehouses = entry.get("warehouses") or []
+        if warehouses:
+            return {"store": store, "site": site, "warehouses": warehouses,
+                    "cached": True, "updated_at": entry.get("updated_at") or ""}
+
+    if not await ensure_cdp_alive():
+        raise RuntimeError(_CDP_HINT)
+    session = BrowserSession()
+    await session.open()
+    try:
+        got = await list_warehouses(session, store, site)
+    finally:
+        await session.close()
+    save_warehouses_cache(store, site, got["warehouses"])
+    return {"store": store, "site": site, "warehouses": got["warehouses"],
             "cached": False, "updated_at": _now()}

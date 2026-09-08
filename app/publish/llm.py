@@ -101,6 +101,9 @@ LLM_STAGES = [
     # 估算与⑪ SKU分类的品类分流。单独登记好让用户能用快档模型跑这个高频小判断。
     {"id": "category", "label": "品类识别（尺码/SKU分流）", "vision": False},
     {"id": "attrs", "label": "④ 属性审核", "vision": False},
+    # ④b 主纤维归一化：把「棉混纺」「涤棉」这类源「主面料成分」合成词/占位词归约成
+    # 确定主纤维。单独登记以便用快档模型跑这个轻量判断，不并进属性审核那种几十字段的慢档。
+    {"id": "comp_norm", "label": "④b 成分纤维归一（合成词→主纤维）", "vision": False},
     {"id": "titles", "label": "⑤ 标题生成", "vision": False},
     {"id": "clean_images", "label": "⑤b 图片英化质检", "vision": True},
     {"id": "material", "label": "⑥ 素材图选图", "vision": True},

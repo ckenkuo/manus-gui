@@ -31,6 +31,10 @@ async def test_取不到的图不参与判断且不错位(monkeypatch):
         return "" if url.endswith("/3.jpg") else _DATA
 
     async def fake_ask(prompt, images, what="", system=None, stage=None, **kw):
+        # keep 侧中文复核（plan_desc 收尾的第二遍调用）：本用例不验它，
+        # 一律回全干净，且不能覆盖上面记录的初判调用现场
+        if "复核" in what:
+            return {"dirty": []}
         seen["prompt"] = prompt
         seen["n_images"] = len(images)
         # 模型按 listing 里给的 pos 回答（真实序号，跳过 3）
@@ -65,6 +69,9 @@ async def test_取不到的图不进尺寸兜底(monkeypatch):
         return "" if url.endswith("/1.jpg") else _DATA
 
     async def fake_ask(prompt, images, what="", system=None, stage=None, **kw):
+        # keep 侧中文复核（plan_desc 收尾的第二遍调用）：本用例不验它，一律回全干净
+        if "复核" in what:
+            return {"dirty": []}
         return {"actions": [{"pos": 2, "action": "keep"}]}
 
     monkeypatch.setattr(vision, "image_ref", fake_ref)
@@ -87,6 +94,9 @@ async def test_兜底理由用真实判据不写死尺寸(monkeypatch):
     mods[0]["sizeReasons"] = ["宽高比 0.428 超出 0.5~2.0"]
 
     async def fake_ask(prompt, images, what="", system=None, stage=None, **kw):
+        # keep 侧中文复核（plan_desc 收尾的第二遍调用）：本用例不验它，一律回全干净
+        if "复核" in what:
+            return {"dirty": []}
         return {"actions": [{"pos": 1, "action": "keep"}]}
 
     monkeypatch.setattr(vision, "image_ref", lambda u: _DATA)

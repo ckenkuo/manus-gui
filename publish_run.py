@@ -86,6 +86,9 @@ async def main() -> int:
     ap.add_argument("--info", default="", help="product-info.json 路径（--rowid 模式必填）")
     ap.add_argument("--store", default="", help="目标店铺名（如 Pawly）")
     ap.add_argument("--site", default="", help="目标站点（必填，如 美国；店小秘没有「全球」站点）")
+    ap.add_argument("--warehouse", default="",
+                    help="⑪ 选择仓库要勾的仓库名（须是该店该站点仓库列表里的真实选项）；"
+                         "不给则按 config 的 [publish] 站点映射选择")
     ap.add_argument("--price", default="",
                     help="⑩ 变种表申报价（人民币），不给按 188.88；建议售价按它 ÷7 折算")
     ap.add_argument("--from-stage", default="",
@@ -149,7 +152,7 @@ async def main() -> int:
         r = await run_batch(tasks, store=args.store, site=args.site,
                             on_progress=_print_progress, from_stage=args.from_stage,
                             do_publish=args.publish, price=args.price,
-                            keep_video=not args.no_video)
+                            keep_video=not args.no_video, warehouse=args.warehouse)
     except Exception as e:
         await alert.alert_batch_crash(str(e), store=args.store, site=args.site)
         raise

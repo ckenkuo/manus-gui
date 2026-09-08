@@ -337,6 +337,9 @@ async def test_plan_skc_无颜色直接空计划(tmp_path):
 @pytest.mark.asyncio
 async def test_plan_desc_动作分桶且漏判保留(monkeypatch):
     async def _fake(prompt, images, what="", system=None, stage=None, **kw):
+        # keep 侧中文复核（plan_desc 收尾的第二遍调用）：本用例不验它，一律回全干净
+        if "复核" in what:
+            return {"dirty": []}
         return {"actions": [
             {"pos": 1, "action": "delete", "reason": "工厂图"},
             {"pos": 2, "action": "replace", "reason": "中文"},
@@ -984,6 +987,9 @@ async def test_货号是中文时单独重跑货号阶段(tmp_path, monkeypatch)
 async def test_plan_desc_干净小图改判放大(monkeypatch):
     """模型判 keep 的干净图，尺寸不达标也必须换掉——内容与尺寸是两条正交判据。"""
     async def _fake(prompt, images, what="", system=None, stage=None, **kw):
+        # keep 侧中文复核（plan_desc 收尾的第二遍调用）：本用例不验它，一律回全干净
+        if "复核" in what:
+            return {"dirty": []}
         return {"actions": [{"pos": 1, "action": "keep", "reason": "干净"},
                             {"pos": 2, "action": "keep", "reason": "干净"}]}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)

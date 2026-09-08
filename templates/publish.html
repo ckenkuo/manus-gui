@@ -640,6 +640,29 @@
                 <option value="">（先选店铺）</option>
               </select>
             </div>
+            <!-- 仓库列：选定店铺+站点后联查 warehouseList 接口让用户手选，
+                 选中的值直接给阶段⑪——不再靠 config 映射猜名字（猜错就是整单
+                 「仓库没选到」，2026-09-06 美国站 6 单全卡在这）。 -->
+            <div class="col-6 col-md-2">
+              <label class="form-label small text-muted mb-1">
+                仓库
+                <a
+                  href="#"
+                  id="lnkReloadWarehouses"
+                  class="text-decoration-none ms-1"
+                  title="重新查询该店铺该站点的仓库（新租了仓库时点这里）"
+                  ><i class="bi bi-arrow-clockwise"></i></a
+                >
+                <span id="whHint" class="text-muted"></span>
+              </label>
+              <select
+                id="selWarehouse"
+                class="form-select form-select-sm"
+                title="仓库来自店小秘 warehouseList 接口（选定店铺+站点后联查，秒级）。查到了就必须选；查不到的站点（如澳新）可留空，阶段⑪退回 config 站点映射"
+              >
+                <option value="">（先选店铺与站点）</option>
+              </select>
+            </div>
             <div class="col-6 col-md-2">
               <label class="form-label small text-muted mb-1">模型</label>
               <select
@@ -657,7 +680,9 @@
                 >按阶段指定模型<span id="stageLlmCount"></span></a
               >
             </div>
-            <div class="col-6 col-md-2">
+            <!-- 续跑/申报价各收 1 列给仓库腾位：续跑选项短（全新跑/⑪ 库存SKU）、
+                 申报价是 6 位数字输入，col-md-1 都够用（下拉选项按内容宽度渲染）。 -->
+            <div class="col-6 col-md-1">
               <label class="form-label small text-muted mb-1">从阶段续跑</label>
               <select
                 id="selFromStage"
@@ -667,7 +692,7 @@
             </div>
             <!-- 申报价：⑩ 变种表的申报价（人民币），留空按 188.88。
                  建议售价由后端按它 ÷7 折算成美元，两列一起变，不用另填。 -->
-            <div class="col-6 col-md-2">
+            <div class="col-6 col-md-1">
               <label class="form-label small text-muted mb-1">申报价</label>
               <input
                 id="inputPrice"
@@ -1210,6 +1235,9 @@
       // 往返、且会与「站点按店铺变化」的联动抢时序。
       const LS_STORE = "publish.store";
       const LS_SITE = "publish.site";
+      // 仓库记忆按「店铺|站点」分键：仓库列表是两个值共同决定的，记一个全局值
+      // 换店/换站后会回填出一个不在列表里的名字（与站点回填的失效场景同理）。
+      const LS_WAREHOUSE = "publish.wh.";
       // 申报价同样记住上次输入：一批商品往往同一个申报口径，每次重填一遍纯属摩擦。
       const LS_PRICE = "publish.price";
       // 自动发布开关也记住选择。【只有显式存过 "0" 才算关】——默认开是产品决定，
@@ -1264,6 +1292,7 @@
         if (!store) {
           sel.innerHTML = '<option value="">（先选店铺）</option>';
           hint.textContent = "";
+          loadWarehouses("", "");
           return;
         }
         sel.disabled = true;
@@ -1281,6 +1310,7 @@
           const sites = d.sites || [];
           if (!sites.length) {
             sel.innerHTML = '<option value="">（该店铺没有可选站点）</option>';
+            loadWarehouses(store, "");
             return;
           }
           // 选中优先级：上次选的（仍在该店站点里）> 弹窗默认勾选的 > 不预选。
@@ -1301,9 +1331,69 @@
           hint.textContent = d.cached
             ? `（${sites.length} 个 · 缓存）`
             : `（${sites.length} 个 · 已探测）`;
+          // 站点定下来才查得到仓库（接口要 shopId+siteId），故在站点渲染完联动
+          loadWarehouses(store, sel.value);
         } catch (e) {
           sel.innerHTML = '<option value="">（探测失败）</option>';
+          loadWarehouses(store, "");
           showToast("站点探测失败", String(e).replace(/^Error:\s*/, ""), "danger");
+        } finally {
+          sel.disabled = false;
+        }
+      }
+
+      // 仓库下拉：店铺+站点选定后联查（接口秒级，与站点探测的重量级不同）。
+      // 查不到/失败不阻塞主流程——阶段⑪ 退回 config 站点映射的老路。
+      async function loadWarehouses(store, site, refresh = false) {
+        const sel = $("selWarehouse");
+        const hint = $("whHint");
+        if (!store || !site) {
+          sel.innerHTML = '<option value="">（先选店铺与站点）</option>';
+          hint.textContent = "";
+          return;
+        }
+        sel.disabled = true;
+        sel.innerHTML = `<option value="">（${
+          refresh ? "重新查询中…" : "读取中…"
+        }）</option>`;
+        hint.textContent = "";
+        try {
+          const url =
+            `/publish/warehouses?store=${encodeURIComponent(store)}` +
+            `&site=${encodeURIComponent(site)}` +
+            (refresh ? "&refresh=true" : "");
+          const r = await fetch(url);
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          const warehouses = d.warehouses || [];
+          if (!warehouses.length) {
+            // 该站点没有可用仓库（澳新站实测如此）：留空走 config 映射
+            sel.innerHTML =
+              '<option value="">（该站点查不到仓库，可留空）</option>';
+            return;
+          }
+          // 选中优先级：上次这个店+站选的（仍在列表里）> config 映射命中的 > 不预选。
+          // config 映射在这里只做推荐默认值——后端已核对过它在真实列表里才带出来。
+          const last =
+            localStorage.getItem(LS_WAREHOUSE + store + "|" + site) || "";
+          const want = warehouses.includes(last) ? last : d.default || "";
+          sel.innerHTML =
+            '<option value="">（请选择仓库）</option>' +
+            warehouses
+              .map(
+                (w) =>
+                  `<option value="${esc(w)}" ${
+                    w === want ? "selected" : ""
+                  }>${esc(w)}</option>`
+              )
+              .join("");
+          hint.textContent = d.cached
+            ? `（${warehouses.length} 个 · 缓存）`
+            : `（${warehouses.length} 个）`;
+        } catch (e) {
+          sel.innerHTML =
+            '<option value="">（查询失败，可留空按 config 映射）</option>';
+          showToast("仓库查询失败", String(e).replace(/^Error:\s*/, ""), "danger");
         } finally {
           sel.disabled = false;
         }
@@ -1316,6 +1406,7 @@
       });
       $("selSite").addEventListener("change", () => {
         localStorage.setItem(LS_SITE, $("selSite").value);
+        loadWarehouses($("selStore").value, $("selSite").value);
         // 【换站点要重渲染数据搬家表】站点不影响「能不能勾」（跨站搬是常规用途），
         // 但影响站点列上那个「源站 → 目标站」的标注，故要重画。
         // 【换站点不再复查「已搬本店」】2026-09-03 去掉：原先这里会把已搬到本店的行
@@ -1324,6 +1415,12 @@
         // 留着它等于「一换站点就把刚勾的行全清掉并弹个说不通的提示」。
         // 剔除失效勾选只在换店铺时做（那时清单会重画），不在换站点时做。
         if (typeof renderBanjiaRows === "function") renderBanjiaRows();
+      });
+      $("selWarehouse").addEventListener("change", () => {
+        localStorage.setItem(
+          LS_WAREHOUSE + $("selStore").value + "|" + $("selSite").value,
+          $("selWarehouse").value
+        );
       });
       $("lnkReloadStores").addEventListener("click", (e) => {
         e.preventDefault();
@@ -1337,6 +1434,16 @@
           return;
         }
         loadSites(store, true);
+      });
+      $("lnkReloadWarehouses").addEventListener("click", (e) => {
+        e.preventDefault();
+        const store = $("selStore").value;
+        const site = $("selSite").value;
+        if (!store || !site) {
+          showToast("无法查询", "请先选择店铺与站点", "warning");
+          return;
+        }
+        loadWarehouses(store, site, true);
       });
       loadStores();
       $("inputPrice").value = localStorage.getItem(LS_PRICE) || "";
@@ -3269,6 +3376,18 @@
           showToast("无法开始", "请先选择站点（店小秘没有「全球」站点）", "warning");
           return;
         }
+        // 仓库查到了选项就必须选：不选就开工，阶段⑪ 只能退回 config 映射猜名字，
+        // 猜错就是整单「仓库没选到」——这个下拉就是为此加的。下拉只剩占位项
+        // （该站点查不到/查询失败）时允许留空走老逻辑。
+        const warehouse = $("selWarehouse").value;
+        if ($("selWarehouse").options.length > 1 && !warehouse) {
+          showToast(
+            "无法开始",
+            "请选择仓库（查不到仓库的站点才可留空）",
+            "warning"
+          );
+          return;
+        }
         // 【开着自动发布时确认一次】⑮ 是全流程唯一不可逆的一步（真实商家账号，
         // 上架后要下架才能改）。开关默认开，故很可能是「没注意就跑了」——确认框是
         // 这个默认值的配套约束，不是多余摩擦。关掉开关就不问（只落库，可反复重跑）。
@@ -3298,6 +3417,8 @@
               tasks,
               store,
               site,
+              // ⑪ 选择仓库：用户在仓库下拉里选的真实选项；空串＝后端按 config 站点映射
+              warehouse,
               from_stage: $("selFromStage").value,
               use_cache: $("chkUseCache").checked,
               // 空串＝后端用默认 188.88。前端不做数字校验：归一与范围闸都在

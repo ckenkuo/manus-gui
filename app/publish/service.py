@@ -1482,34 +1482,103 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
         await emit({"type": "manual_check", "stage": "sku_preview",
                     "message": f"{len(unknown)} 行预览图读不到尺寸（图未加载完），"
                                "未做合规化，若发布报预览图尺寸请人工确认"})
-    if empty and not bad:
-        tags = "、".join(
-            f"第 {r['i'] + 1} 行" + (f"「{r.get('color')}」" if r.get("color") else "")
-            for r in empty[:8])
-        await emit({"type": "manual_check", "stage": "sku_preview",
-                    "message": f"{len(empty)} 行预览图是空的（{tags}），"
-                               "认领未带图、本阶段无源图可合规化，"
-                               "保存会被平台拒「请上传预览图」，需人工补图"})
-        return {"status": "fail",
-                "note": f"{len(empty)}/{len(rows)} 行预览图为空（{tags}），"
-                        "认领未带图，保存必被拒「请上传预览图」"}
-    if not bad:
-        note = (f"{len(rows)} 行预览图均已满足 1:1 且不小于 "
-                f"{PREVIEW_MIN_SIDE}x{PREVIEW_MIN_SIDE}")
-        if empty:
-            note += f"（另有 {len(empty)} 行为空，已随不合规行一并处理）"
-        return {"status": "skipped", "note": note}
-
-    await emit({"type": "log", "stage": "sku_preview",
-                "message": f"{len(rows)} 行预览图里 {len(bad)} 行不合规"
-                           f"（非 1:1 或小于 {PREVIEW_MIN_SIDE}x{PREVIEW_MIN_SIDE}），"
-                           "逐行下载后做 1:1 合规化再换回"})
+    # 【空位补图】空图位（认领没带图 / 平台重建丢图）不再是「只能人工」：空格点击
+    # 就能出「空间图片」菜单（2026-09-08 真站取证，见 pipeline 的 FILL_SPACE），
+    # 有源图就能自动补上。源图按行的颜色从 colorImages 取 mainFile（本地已下载），
+    # 取不到回退到同颜色其它非空行的 url 下载——空位缺的正是「该行应有的一张图」，
+    # 同色行的图就是那张（单颜色商品尤其如此，offer 1011303528447 狗裙子 XL 行即此）。
+    fillable = [r for r in empty if r.get("hasFillSlot")]
+    unfillable = [r for r in empty if not r.get("hasFillSlot")]
 
     prep = os.path.join(ctx["workdir"], "sku-preview")
-    shutil.rmtree(prep, ignore_errors=True)
-    os.makedirs(prep, exist_ok=True)
+    need_work = bool(fillable or bad_trigger)
+    if need_work:
+        shutil.rmtree(prep, ignore_errors=True)
+        os.makedirs(prep, exist_ok=True)
 
     ok_rows, fail_rows = [], []
+    if not (fillable or unfillable or bad_trigger or bad_inherited):
+        note = (f"{len(rows)} 行预览图均已满足 1:1 且不小于 "
+                f"{PREVIEW_MIN_SIDE}x{PREVIEW_MIN_SIDE}")
+        return {"status": "skipped", "note": note}
+
+    if fillable:
+        # 源颜色图映射：colorImages[颜色].mainFile 是本地已下载文件名，优先用；读不到
+        # 或该颜色没映射就退化到同色行 url，不因读文件失败就判整段失败（best-effort）。
+        color_files = {}
+        try:
+            with open(ctx["info_path"], encoding="utf-8") as f:
+                info = json.load(f)
+            for c, v in (info.get("colorImages") or {}).items():
+                if isinstance(v, dict) and v.get("mainFile"):
+                    color_files[c] = v["mainFile"]
+        except Exception as e:
+            logger.warning(f"读 colorImages 失败（空位补图退化为同色行 url）：{e}")
+        await emit({"type": "log", "stage": "sku_preview",
+                    "message": f"{len(fillable)} 行预览图为空，尝试按颜色源图自动补图"})
+        for r in fillable:
+            i, color = r["i"], r.get("color") or ""
+            tag = f"第 {i + 1} 行" + (f"「{color}」" if color else "")
+            out = os.path.join(prep, f"fill{i:02d}.jpg")
+            src_path = None
+            mf = color_files.get(color)
+            if mf:
+                p = os.path.join(ctx["workdir"], mf)
+                if os.path.exists(p):
+                    src_path = p
+            if not src_path:
+                peer = next((x for x in rows
+                             if x.get("url") and not x.get("empty")
+                             and x.get("color") == color), None)
+                if peer:
+                    raw = os.path.join(prep, f"fill{i:02d}-raw.jpg")
+                    if extract._download_image(peer["url"], raw):
+                        src_path = raw
+            if not src_path:
+                logger.warning(f"预览图 {tag} 空位找不到同色源图，无法自动补图")
+                fail_rows.append(tag)
+                await emit({"type": "manual_check", "stage": "sku_preview",
+                            "message": f"{tag} 预览图为空且找不到同色源图，"
+                                       "无法自动补图，需人工补"})
+                continue
+            try:
+                sq = images.square_image(src_path, out_path=out)
+            except Exception as e:
+                logger.warning(f"预览图 {tag} 空位补图合规化失败：{e}")
+                fail_rows.append(tag)
+                await emit({"type": "manual_check", "stage": "sku_preview",
+                            "message": f"{tag} 预览图为空、补图合规化失败"
+                                       f"（{str(e)[:80]}），需人工补"})
+                continue
+            rep = await sku_preview_replace_row(
+                session, i, sq["output"], prev_idx,
+                color_idx=color_idx, expect_color=color, fill_empty=True)
+            if rep.get("status") == "ok":
+                ok_rows.append(tag)
+                logger.info(f"预览图 {tag} 空位已补图 {sq['outSize']}")
+            else:
+                fail_rows.append(tag)
+                logger.warning(
+                    f"预览图 {tag} 空位补图失败[{rep.get('stage') or '?'}]："
+                    f"{rep.get('err') or rep.get('detail') or ''} "
+                    f"| fileId={(rep.get('fileId') or '')[-40:]}")
+                await emit({"type": "manual_check", "stage": "sku_preview",
+                            "message": f"{tag} 预览图为空、补图失败"
+                                       f"[{rep.get('stage')}]，需人工补"})
+
+    if unfillable:
+        tags = "、".join(
+            f"第 {r['i'] + 1} 行" + (f"「{r.get('color')}」" if r.get("color") else "")
+            for r in unfillable[:8])
+        fail_rows.extend(f"第 {r['i'] + 1} 行" for r in unfillable)
+        await emit({"type": "manual_check", "stage": "sku_preview",
+                    "message": f"{len(unfillable)} 行预览图空且无补图入口（{tags}），需人工补"})
+
+    if bad_trigger or bad_inherited:
+        await emit({"type": "log", "stage": "sku_preview",
+                    "message": f"{len(rows)} 行预览图里 {len(bad)} 行不合规"
+                               f"（非 1:1 或小于 {PREVIEW_MIN_SIDE}x{PREVIEW_MIN_SIDE}），"
+                               "逐行下载后做 1:1 合规化再换回"})
     if bad_inherited:
         tags = "、".join(
             f"第 {r['i'] + 1} 行" + (f"「{r.get('color')}」" if r.get("color") else "")
@@ -1565,14 +1634,14 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"{tag} 预览图替换失败[{rep.get('stage')}]："
                                    f"{str(rep)[:120]}"})
 
-    note = f"{len(ok_rows)}/{len(bad_trigger)} 行预览图已合规化"
+    note = f"{len(ok_rows)} 行预览图已处理"
     if bad_inherited:
         note += f"（另有 {len(bad_inherited)} 行继承图无换图入口，已提醒人工核对）"
     if fail_rows:
         note += f"（失败：{'、'.join(fail_rows)}）"
-    # 无换图入口的继承行不算失败（共享主图、无法也无须单独换图，已单独 manual_check）；
-    # 有入口的行只要都成功（或本就没有有入口的坏行）就算 ok。
-    return {"status": "ok" if (ok_rows or not bad_trigger) else "fail", "note": note}
+    # 继承图无入口不算失败（共享主图、无法也无须单独换图，已单独 manual_check）；
+    # 空位补图 / 有入口换图 失败才算 fail——失败即保存必被拦「请上传预览图/尺寸」。
+    return {"status": "ok" if not fail_rows else "fail", "note": note}
 
 
 async def _st_fix_sizes(ctx: dict, session: BrowserSession, emit) -> dict:
@@ -1822,6 +1891,8 @@ async def _st_stock(ctx: dict, session: BrowserSession, emit) -> dict:
     sku_judge = ctx.get("sku_judge") or await _await_prewarm(ctx, "stock")
     r = await set_stock(session, ctx["info_path"],
                         site=ctx.get("site") or "",
+                        # 发布页仓库下拉选的真实选项优先；空串退回 config 站点映射
+                        warehouse=ctx.get("warehouse") or "",
                         sku_judge=sku_judge,
                         cat_path=ctx.get("cat_path"))
     if r.get("status") == "error":
@@ -2742,6 +2813,7 @@ async def publish_one(
     do_publish: bool = False,
     price: str = "",
     keep_video: bool = True,
+    warehouse: str = "",
 ) -> dict:
     """按 STAGES 顺序跑一个商品，返回 {"status", "rowid", "failed_stage", "note", "elapsed_s"}。
 
@@ -2790,6 +2862,10 @@ async def publish_one(
         # 与 use_cache/price 一样不进状态文件——「这批要不要视频」属于本次运行的决定，
         # 续跑不该继承上次的取向（上次删掉了，这次开着开关重跑就该重新处理）。
         "keep_video": keep_video,
+        # ⑪ 选择仓库：批次级参数（发布页仓库下拉的真实选项 / CLI --warehouse），
+        # 空串＝set_stock 里退回 config 站点映射。与 price 同理不进状态文件——
+        # 用哪个仓属于本次运行的决定，续跑不该继承。
+        "warehouse": warehouse,
         # ⑮ 要核 ⑭ save 的终态做前置判断，故把状态字典本身透给阶段函数
         # （同一个对象，主循环写完 stages[sid] 后 ⑮ 读到的就是最新值）
         "state": state,
@@ -2950,6 +3026,7 @@ async def run_batch(
     do_publish: bool = False,
     price: str = "",
     keep_video: bool = True,
+    warehouse: str = "",
     pause_ctrl=None,
 ) -> dict:
     """批量发布编排入口，返回 {"ok", "fail", "batch"}。
@@ -2966,6 +3043,11 @@ async def run_batch(
     的 parseTasks）。
 
     store/site：显式参数 > prefs 回填；成功启动后 save_prefs 记住本次选择。
+
+    warehouse：⑪「选择仓库」要勾的仓库名（发布页仓库下拉的真实选项，或 CLI
+    --warehouse）。空串＝退回 pipeline.resolve_warehouse 的 config 站点映射。
+    【不进 prefs】仓库是按店铺+站点的，记全局 prefs 换店/换站后会带出一个
+    该站点不存在的名字，比不填更糟（不填走映射还有命中的机会）。
 
     【site 没有默认值，两者都必填】原先默认「全球」，而店小秘认领弹窗里根本没有
     「全球」这一项（那是 Temu 后台的域名级区域，不是站点，见 app/publish/shops.py），
@@ -3014,6 +3096,12 @@ async def run_batch(
                               "store": store, "site": site, "batch": batch})
     await _emit(on_progress, {"type": "log", "level": "info",
                               "message": f"本次使用模型：{active_llm_label()}"})
+    # 仓库与模型同理要在开跑就写明：它决定 ⑪ 勾哪个仓，事后从阶段结论反推不如
+    # 开跑可见（用户指定=发布页下拉真实选项；未指定=config 站点映射猜）
+    await _emit(on_progress, {
+        "type": "log", "level": "info",
+        "message": (f"本次仓库：{warehouse}" if warehouse
+                    else "本次仓库：未指定（⑪ 按 config 站点映射选择）")})
     # 视频取向要在跑之前就报出来：这两条路线耗时差几十秒到几分钟每个商品，
     # 事后从阶段结论里反推不如开跑就写明（与「本次使用模型」同一处）
     await _emit(on_progress, {
@@ -3076,7 +3164,8 @@ async def run_batch(
                 r = await publish_one(session, task, store, site, on_progress,
                                       index=i, total=total, from_stage=from_stage,
                                       use_cache=use_cache, do_publish=do_publish,
-                                      price=price, keep_video=keep_video)
+                                      price=price, keep_video=keep_video,
+                                      warehouse=warehouse)
             except Exception as e:
                 logger.exception(f"[{key}] 商品级异常")
                 r = {"status": "fail", "rowid": task.get("rowid"), "failed_stage": "",

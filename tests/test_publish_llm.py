@@ -254,7 +254,7 @@ def test_list_stages_给UI的形状(_isolate_llm_prefs):
 #     与 ① 分开登记正因为它【不看图】——纯文本判断点能走快档模型，没必要跟视觉档一起慢。
 #   category：品类识别（classify_category 的非服装细分），在 ⑨⑪ 内部跑（2026-09-06 新增）。
 #     同样是纯文本小判断，单独登记好让用户能用快档模型跑。
-_NON_PIPELINE_STAGES = {"extract_text", "category"}
+_NON_PIPELINE_STAGES = {"extract_text", "category", "comp_norm"}
 
 
 def test_每个LLM阶段id都在service的STAGES里():

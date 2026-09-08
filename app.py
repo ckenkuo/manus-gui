@@ -876,6 +876,7 @@ from app.publish import llm as publish_llm
 from app.publish import cache as publish_cache
 from app.publish import shops as publish_shops
 from app.publish import alert as publish_alert
+from app.publish.pipeline import resolve_warehouse
 
 
 @app.get("/publish/stores")
@@ -906,6 +907,26 @@ async def publish_site_list(store: str, refresh: bool = False):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/publish/warehouses")
+async def publish_warehouse_list(store: str, site: str, refresh: bool = False):
+    """某店铺在某站点的可选仓库清单，供发布页「仓库」下拉渲染。
+
+    走 /api/popTemuCategory/warehouseList.json（秒级、无副作用），结果按
+    「店铺|站点」缓存到磁盘。响应里的 default 是 config 的 [publish] 站点仓库
+    映射——它现在只做「推荐默认值」（命中真实列表才带出来），不再是阶段⑪
+    盲目猜测的依据；查不到/未命中时前端不预选。
+    """
+    try:
+        r = await publish_shops.fetch_warehouses(store, site, refresh=refresh)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    mapped = resolve_warehouse(site)
+    r["default"] = mapped if mapped in (r.get("warehouses") or []) else ""
+    return r
 
 
 @app.get("/publish/llm")
@@ -1053,6 +1074,7 @@ async def publish_batch(
     price: str = Body("", embed=True),
     do_publish: bool = Body(True, embed=True),
     keep_video: bool = Body(True, embed=True),
+    warehouse: str = Body("", embed=True),
 ):
     """启动一批发布作业，返回 job_id；进度经 /publish/batch/{job_id}/events (SSE) 消费。
 
@@ -1061,6 +1083,10 @@ async def publish_batch(
     use_cache=False 时类目与属性都走全量读取（新品类首次跑、或怀疑缓存选错类目时用）。
     price 是 ⑩ 变种表的申报价（人民币），空串＝用管线默认 188.88；这里不做校验，
     交 pipeline.normalize_declare_price 归一（非法值退默认并告警，不让整批中断）。
+
+    warehouse 是 ⑪「选择仓库」要勾的仓库名：前端仓库下拉（/publish/warehouses
+    查出的真实选项）选什么就传什么；空串＝退回 config 的 [publish] 站点映射
+    （老逻辑，映射缺失时会在 ⑪ 报 no-option）。
 
     do_publish 是阶段⑮「立即发布」的闸门，【默认 True】——用户 2026-08-25 明确要求
     页面上给开关且默认开启、自动发布。原先本接口刻意不接这个参数（只有 CLI 有
@@ -1085,7 +1111,7 @@ async def publish_batch(
                 tasks, store=store, site=site,
                 on_progress=_on_progress, from_stage=from_stage,
                 use_cache=use_cache, price=price, do_publish=do_publish,
-                keep_video=keep_video, pause_ctrl=job,
+                keep_video=keep_video, warehouse=warehouse, pause_ctrl=job,
             )
         except Exception as e:
             # run_batch 内部的中断已由 service 的告警钩子报过（aborted / product_done /

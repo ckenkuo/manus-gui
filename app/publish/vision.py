@@ -124,6 +124,33 @@ class DescPlan(BaseModel):
     actions: list[DescAction]
 
 
+class DescAuditItem(BaseModel):
+    """阶段⑬ keep 复核里一张脏图的结论。
+
+    【pos 必须是真整数】同 DescAction 的坑：收到字符串 "1" 时复核结论对不上
+    真实 pos，含中文的图就继续漏在网上。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    pos: int
+    sizeTable: bool = False
+    what: str = ""
+
+
+class DescAudit(BaseModel):
+    """阶段⑬ keep 复核（专查中文，只列脏的）。"""
+
+    model_config = ConfigDict(strict=True)
+
+    dirty: list[DescAuditItem]
+
+
+# 中文复核每批传图数：复核是单任务判断、不需要跨图对比，小批量比一次几十张可靠
+# （初判 50 张一次过漏掉中文卡片的实测见 plan_desc 里的复核段注释）。
+_DESC_AUDIT_CHUNK = 8
+
+
 def _main_files(workdir: str) -> list:
     """workdir 下的 main-NN 图（绝对路径，按编号排序）。"""
     if not workdir or not os.path.isdir(workdir):
@@ -658,6 +685,16 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
     摘掉的图按 keep 处理并在 unreachable 里报出来：源图已从源站消失，英化/放大都
     无从下手（下载不到原图），只能留着原图交人工——⑬ 的 desc_save 会把它报成
     「仍有外链图未转存」，那条告警此时是准确的。
+
+    【keep 侧必须再过一道专查中文的复核】keep 与 needsUpscale 的共同点是【原画面
+    原样上架】：keep 走转存、needsUpscale 走纯几何放大，两条路都按设计不动画面，
+    save 又只校验「还是不是 1688 外链」——全链路没有任何环节再看一眼画面内容。
+    而初判是几十张图一次过、每张四选一，漏一张中文图它就径直上真店：2026-09-08
+    实测 offer 1013502117778，50 张里「商品信息/吊牌尺码」模特卡、两张中文尺码表
+    （450 宽破线、经尺寸兜底放大）、两张中文海报共 5 张全被判 keep 原样发布。
+    故收尾时对「将按原画面发布」的图做第二遍只查中文的复核（_audit_desc_keeps），
+    复核发现中文的一律改判生图英化（破线的摘掉 needsUpscale——纯放大救不了中文）。
+    replace/sizechart 的图要过 edit_image + check_cleaned 质检，不在复核范围。
     """
     mods = [m for m in (modules or []) if m.get("url")]
     if not mods:
@@ -757,11 +794,88 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
             replace.append({"pos": p, "url": valid_pos[p]["url"],
                             "needsUpscale": True, "reason": why[:60]})
         replace.sort(key=lambda r: r["pos"])
+
+    # ---- keep 侧中文复核（理由见 docstring 末段）----
+    # 复核对象是「将按原画面发布」的全部图：keep（转存）+ needsUpscale（纯放大）。
+    # 取不到的图（unreachable）没有 ref 可传，天然不在复核范围。
+    ref_by_pos = {m["pos"]: r for m, r in pairs}
+    audit_pos = [p for p in sorted(set(keep) | {r["pos"] for r in replace
+                                                if r.get("needsUpscale")})
+                 if p in ref_by_pos]
+    if audit_pos:
+        dirty = await _audit_desc_keeps(audit_pos, ref_by_pos, info)
+        if dirty:
+            keep = [p for p in keep if p not in dirty]
+            rep_by_pos = {r["pos"]: r for r in replace}
+            for p, d in dirty.items():
+                rep = rep_by_pos.get(p)
+                if rep is None:
+                    rep = {"pos": p, "url": valid_pos[p]["url"]}
+                    replace.append(rep)
+                    rep_by_pos[p] = rep
+                # 有中文就必须走生图英化：纯放大不动画面，中文会原样带出去
+                rep.pop("needsUpscale", None)
+                if d.get("sizeTable"):
+                    rep["sizechart"] = True
+                rep["reason"] = ("复核发现中文：" + (d.get("what") or ""))[:60]
+            replace.sort(key=lambda r: r["pos"])
+
     out = {"status": "ok", "delete": sorted(set(delete)),
            "replace": replace, "keep": sorted(set(keep) | unreach)}
     if unreachable:
         out["unreachable"] = sorted(unreach)
     return out
+
+
+async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
+                            info: Optional[dict] = None) -> dict:
+    """对「将按原画面发布」的描述图专查中文，返回 {pos: {"sizeTable", "what"}}（只含脏的）。
+
+    与初判分两遍的原因（单任务小批量比几十张混审可靠）见 plan_desc docstring 末段。
+    传图复用初判已解析好的 data URL（ref_by_pos），不重复下载。
+
+    【响应只列脏图、空数组即全干净】不采用「逐张回 verdicts」：那种形状下模型对
+    全干净的批次天然回 {"verdicts": []}，「全干净」与「没干活」无从区分，再把
+    漏答按脏处理就会每轮都重写一堆干净图。复核的可靠性靠「单任务 + 每批 8 张」
+    这个输入形状保证，不靠响应形状。
+    """
+    dirty: dict = {}
+
+    async def _one(chunk: list) -> None:
+        listing = "\n".join(f"第{p} 张（pos={p}）" for p in chunk)
+        prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
+
+下面是同一商品描述区里的 {len(chunk)} 张图，序号是 pos：
+{listing}
+
+它们初判为「干净的商品图」，将【原样】发布到 Temu 海外站。你的唯一任务：复核
+每张图上是否存在任何【中文字符或中文标点】——标题大字、小字说明、表格文字、
+水印、吊牌/标签上的字都算；英文、数字、符号不算。
+
+只输出 JSON：{{"dirty": [{{"pos": 1, "sizeTable": true/false,
+"what": "<10 字内说清中文在哪，如「模特信息卡全文」「左上角海报标题」>"}}]}}
+dirty 只列【有中文】的图（pos 必须从 {chunk} 里取），全部干净就返回空数组。
+sizeTable 表示该图是不是尺码表/尺寸示意图。
+拿不准一律算有中文——漏掉的代价是它原样发上真店。"""
+        data = await ask_json_with_images(
+            prompt, [ref_by_pos[p] for p in chunk], what="阶段⑬keep图中文复核",
+            system=_SYS, stage="desc", result_model=DescAudit)
+        for v in data.get("dirty") or []:
+            if not isinstance(v, dict):
+                continue
+            p = v.get("pos")
+            if p not in chunk or p in dirty:
+                continue
+            dirty[p] = {"sizeTable": bool(v.get("sizeTable")),
+                        "what": (v.get("what") or "")[:20]}
+
+    await asyncio.gather(*(_one(c) for c in
+                           (audit_pos[i:i + _DESC_AUDIT_CHUNK]
+                            for i in range(0, len(audit_pos), _DESC_AUDIT_CHUNK))))
+    if dirty:
+        logger.warning(f"阶段⑬中文复核：{len(dirty)} 张初判保留的图发现中文，"
+                       f"改判生图英化：pos {sorted(dirty)}")
+    return dirty
 
 
 async def translate_size_texts(texts: list, info: Optional[dict] = None) -> dict:

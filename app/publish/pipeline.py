@@ -5169,6 +5169,11 @@ _JS_FILL_SIZECHART = r"""(async () => {
   });
   const trs = Array.from(table.querySelectorAll('tbody tr'));
   const empty = [];
+  // 【平量/拉量同一单元格两个输入框都要填】2026-09-08 商品 875335387236（猫狗服饰）：
+  // 勾选「平量」+「拉量」两种测量方式后，同一参数单元格会渲染出上下两个输入框（平量/
+  // 拉量），接口要求两格要么都空、要么都填。源实测尺寸只有一组值（提取阶段要求值只填
+  // 单个数字），故把同一源值重复填进单元格每个输入框，拉量缺失就沿用平量值——只填第一
+  // 个 input 会留下空着的拉量格，点确定即被接口以「请全部填写」打回。
   trs.forEach(tr => {
     const tds = Array.from(tr.querySelectorAll('td'));
     const size = (tds[0].textContent||'').trim();
@@ -5176,10 +5181,10 @@ _JS_FILL_SIZECHART = r"""(async () => {
     for (const p of params) {
       const idx = colIdx[p];
       if (idx === undefined) continue;
-      const inp = tds[idx] ? tds[idx].querySelector('input') : null;
-      if (!inp) continue;
+      const inps = tds[idx] ? Array.from(tds[idx].querySelectorAll('input')) : [];
       const v = String(data[size][p] || '');
-      if (v && inp.value !== v) setVal(inp, v);
+      if (!v) continue;
+      inps.forEach(inp => { if (inp.value !== v) setVal(inp, v); });
     }
   });
   await sleep(600);
@@ -5190,8 +5195,8 @@ _JS_FILL_SIZECHART = r"""(async () => {
     for (const p of params) {
       const idx = colIdx[p];
       if (idx === undefined) continue;
-      const inp = tds[idx] ? tds[idx].querySelector('input') : null;
-      if (!inp || !inp.value) empty.push(`${size}-${p}`);
+      const inps = tds[idx] ? Array.from(tds[idx].querySelectorAll('input')) : [];
+      inps.forEach(inp => { if (!inp.value) empty.push(`${size}-${p}`); });
     }
   });
   return JSON.stringify({ok: empty.length === 0, empty});
@@ -6196,8 +6201,16 @@ def _rebuild_main_comp(label: str, items: list, opts: list, main_comp: dict) -> 
     # 用 _fiber_key 判同（同义归一）：_norm_fiber 只去括号，认不出涤纶=聚酯纤维
     used = _fiber_key(target)
     basis = "配料种类沿用模型判断"
-    second = next((i["value"] for i in items
-                   if _fiber_key(i.get("value", "")) != used and i.get("value") in opts), None)
+    # 【2026-09-08 增】聚焦推理纠正主纤维时（源「棉混纺」→主「棉」），模型在【原错误前提】下
+    # 选的那根配料（如它以为主涤纶→辅尼龙）不可沿用；改用聚焦推理一并归约的 fillFiber 优先，
+    # 映射失败/同纤维再退回原「沿用模型判断」逻辑。
+    fill_fiber = main_comp.get("fillFiber")
+    if fill_fiber and _fiber_key(fill_fiber) != used and fill_fiber in opts:
+        second = fill_fiber
+        basis = "配料种类由成分归一推理给出"
+    else:
+        second = next((i["value"] for i in items
+                       if _fiber_key(i.get("value", "")) != used and i.get("value") in opts), None)
     if not second:
         second, why = _infer_filler(main_comp.get("srcAttrs") or {}, target, opts, used)
         if second:
@@ -6563,6 +6576,9 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
                            c.get("num"), c.get("row") or 1, kind=kind)
         rec = {"label": c["label"], "value": c["value"],
                "num": c.get("num"), "row": c.get("row"),
+               # kind 必须进 rec：下方 comp_rows 统计成分行时靠 a["kind"]!=number 排除
+               # 数值行（里料克重等），漏存会让数值行被误当成分行触发裁行（2026-09-08 补）。
+               "kind": kind,
                "result": r.get("status"),
                "readback": _readback_current(r)}
         # 【触发闸是 optionsFrom == "cache"，不是 use_cache】现场刚读来的选项立刻点不中，
@@ -6959,6 +6975,96 @@ def _merge_composition_sources(info: dict) -> dict:
     return {**main_comp, "srcAttrs": info.get("attributes") or {}}
 
 
+# ④b 主纤维归约提示词：把源「主面料成分」里的合成词/占位词（「棉混纺」「涤棉」「牛仔布」）
+# 归约成确定主纤维。为何单开一次而非并进 _ATTR_PROMPT：见 _resolve_main_fiber 的说明。
+_COMP_NORM_PROMPT = """你是跨境服装的主纤维归约助手。源商品的「主面料成分」是某个无法
+直接映射到标准纤维选项的合成词/占位词（如「棉混纺」「涤棉」「牛仔布」），需要你结合
+材质名与品类常识推断出它的【主纤维】。
+
+源商品标题：{title}
+源商品参数（1688）：{src_attrs}
+源主面料成分原文：{raw}
+图片理解摘要：{image_understanding}
+
+推断要点：
+1. 「X混纺」指以 X 为主的混纺（「棉混纺」→ 主纤维「棉」；「涤棉混纺」按面料名称/图与占比判主次）。
+   「牛仔/针织/梭织」是织物组织不是纤维，主纤维按品类常识（牛仔多为棉；针织/梭织看面料名称）。
+2. 只给【一根】主纤维：优先取「主面料成分」里最明确的那根，其次「面料名称/工艺」，
+   都没有按该品类常识选最常见的那根（跨境服装最常是聚酯纤维）。
+3. 主纤维从下面常见纤维里选语义最贴近的一种：{fibers}
+4. 若源是混纺（如「X混纺」「X+Y」），除主纤维外还要推断一根【配料纤维】放进 filler（取语义
+   最贴近的一种；源实际是单一成分、无混纺时 filler 留空）。配料纤维也从下面常见纤维里选：{fibers}
+
+只输出JSON: {{"fiber": "主纤维名", "filler": "配料纤维名或空", "basis": "一句话依据（引用具体字段/特征）"}}"""
+
+
+async def _resolve_main_fiber(info: dict, main_comp: dict, comp_opts: list) -> dict:
+    """源主面料成分是「棉混纺」这类合成词/占位词、融合后仍解析不出确定 fiber 时，
+    单开一次聚焦 LLM 推理把主纤维归约出来并回填 main_comp.fiber，供 _rebuild_main_comp
+    做确定性比例覆盖（比例不再靠模型编）。
+
+    【为什么单开，不并进 _ATTR_PROMPT】阶段④审核一次处理几十个字段，成分只是顺带推断
+    的对象——「棉混纺」被推成「涤纶65+尼龙35」就是这么来的（2026-09-08 offer
+    911772292056 实测）。单开只喂成分相关线索，模型不受无关字段干扰；结果回填后仍由
+    _rebuild_main_comp 按源含量/默认值确定百分比，只把【主纤维种类】交给模型定。
+
+    【不硬编码合成词表】「X混纺」「X+Y混纺」「涤棉」这类组合无穷，程序无法穷举，也没必要。
+    把「这词到底是什么主纤维」交给大模型，配材质名/工艺/品类/图片摘要推理，再用
+    _match_fiber 把模型给的通用名映射到表单 options 里的写法（命中才回填）。
+
+    best-effort：推理异常或归约结果落不到 comp_opts 时，返回 main_comp 原样——
+    主流程照旧走「模型给数 + 合计校验」，绝不让这里失败中断发布。
+    """
+    import json as _json
+
+    from app.publish.llm import ask_json
+
+    # 取「主面料成分原文」当推理线索：main_comp.raw 记的是【含量】原文（如 "65%"），
+    # 不是成分词本身——真正要拆解的是源属性「主面料成分」（如「棉混纺」），故优先它。
+    raw = ((info.get("attributes") or {}).get("主面料成分")
+           or (main_comp.get("raw") or "")).strip()
+    if not raw:
+        return main_comp
+    src_attrs = {k: v for k, v in (info.get("attributes") or {}).items()
+                 if k in ("主面料成分", "主面料成分含量", "面料名称", "面料工艺", "材质")}
+    prompt = _COMP_NORM_PROMPT.format(
+        title=info.get("title"),
+        src_attrs=_json.dumps(src_attrs, ensure_ascii=False),
+        raw=raw,
+        image_understanding=_json.dumps(
+            info.get("imageUnderstanding", {}), ensure_ascii=False),
+        fibers="、".join(_FIBER_NAMES),
+    )
+    try:
+        data = await ask_json(prompt, what="成分纤维归一", stage="comp_norm")
+    except Exception as _e:
+        logger.warning(f"成分纤维归约失败（{_e}），按源占位词走原有「模型给数+合计校验」")
+        return main_comp
+    fiber = (data or {}).get("fiber") or ""
+    if not fiber:
+        return main_comp
+    target = _match_fiber(fiber, comp_opts)  # 映射到表单 options 写法，命中才回填
+    if not target:
+        logger.warning(f"成分归约到「{fiber}」在 options 里没有可落地写法，按源占位词走原路径")
+        return main_comp
+    new = dict(main_comp)
+    new["fiber"] = target
+    # 配料纤维也由聚焦推理一并归约并回填，供 _rebuild_main_comp 补差时优先用——
+    # 避免沿用模型在「原错误主纤维」前提下瞎挑的第二根（如把「棉混纺」配成尼龙）。
+    filler_raw = (data or {}).get("filler") or ""
+    if filler_raw:
+        filler_target = _match_fiber(filler_raw, comp_opts)
+        if filler_target and _fiber_key(filler_target) != _fiber_key(target):
+            new["fillFiber"] = filler_target
+    if not (new.get("percent") and 0 < new["percent"] < 100):
+        new["percent"] = 100
+    new["assumed"] = (f"源主面料成分是「{raw}」"
+                      f"（{data.get('basis') or '合成词'}），主纤维由 LLM 依材质名归约为「{target}」")
+    logger.info(f"成分纤维归一：源「{raw}」→ 主纤维「{target}」"
+                f"（{data.get('basis') or '依材质/品类'}）")
+    return new
+
+
 async def check_attrs(session: BrowserSession, info_path: str,
                       apply: bool = False, required_only: bool = True,
                       cat_path=None, use_cache: bool = True,
@@ -7004,6 +7110,20 @@ async def check_attrs(session: BrowserSession, info_path: str,
 
     # 【2026-09-02 改】整合所有来源的成分信息（详情文字 > 详情图 > 源属性 > 默认值）
     main_comp = _merge_composition_sources(info)
+    # 【2026-09-08 新增】源主面料成分是「棉混纺」这类合成词/占位词、融合后仍解析不出
+    # 确定主纤维（fiber 空）且非按款式区分时，单开一次聚焦 LLM 推理归约主纤维
+    # （不硬编码词表）；归约出选项写法后回填，走 _rebuild_main_comp 的确定性比例覆盖。
+    # options 取「含成分」的主面料字段（上装/下装成分）——表单里「材质」可能是弹力档位
+    # 而非纤维列表（见 _is_main_comp_label 说明），若只剩材质字段再回退取它。
+    if main_comp and not main_comp.get("fiber") and not main_comp.get("byVariant"):
+        comp_opts = next((a["options"] for a in attrs
+                          if "成分" in a["label"] and a.get("options")
+                          and _is_main_comp_label(a["label"])), None)
+        if not comp_opts:
+            comp_opts = next((a["options"] for a in attrs
+                              if _is_main_comp_label(a["label"]) and a.get("options")), None)
+        if comp_opts:
+            main_comp = await _resolve_main_fiber(info, main_comp, comp_opts)
     comp_src = main_comp.get("source", "attributes")
     if comp_src == "descText":
         logger.info(f"成分取自详情文字：{main_comp.get('fiber')} {main_comp.get('percent')}%"
@@ -9460,6 +9580,12 @@ async def skc_replace_row(session: BrowserSession, row_keyword: str, img_dir: st
 # 素材图菜单只有 4 项且没有这一项，故两者可明确区分（同 ⑦ 靠「应用到所有颜色」区分）。
 SKU_PREVIEW_MENU_ITEMS = ("空间图片", "应用到全部")
 
+# 空预览格的菜单（2026-09-08 真站取证）：与有图格的两处不同——【点击】展开而非
+# hover、共 5 项且【没有】「应用到全部」。独有特征是「引用产品轮播图」（素材图菜单
+# 4 项没有它、有图格 8 项菜单也没有它），故用它 + 「空间图片」就能唯一认出空格菜单。
+SKU_PREVIEW_EMPTY_MENU_ITEMS = ("本地图片", "空间图片", "网络图片",
+                                "引用产品轮播图", "引用采集图片")
+
 # 预览图要求：1:1 且不小于 800x800（页面素材图区原文，拒绝文案与之一致）
 PREVIEW_MIN_SIDE = 800
 
@@ -9501,21 +9627,29 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
     if (!cell) return;
     const im = Array.from(cell.querySelectorAll('img'))
       .find(x => (x.currentSrc || x.src || '').startsWith('http'));
-    const w = im ? (im.naturalWidth || 0) : 0;
-    const h = im ? (im.naturalHeight || 0) : 0;
+    const src = im ? (im.currentSrc || im.src || '') : '';
+    // 【空图位识别必须先于「图太小」判】店小秘空位占位符 addImg-*.jpg 也是 http 图、
+    // 尺寸 200x200（.no-img-status 类），按真实图判会落进 bad（200<800），而它其实
+    // 压根没图。2026-09-08 取证（offer 1011303528447 狗裙子，5 尺码里 XL 行空位）：
+    // 阶段⑦b 因此判「5 行均满足」静默放过，直到 ⑭ 保存才报「请上传预览图」。
+    const placeholder = /addImg[^/]*\.(jpg|jpeg|png)/i.test(src)
+      || !!cell.querySelector('.no-img-status');
+    const empty = placeholder || !im;
+    const w = empty ? 0 : (im.naturalWidth || 0);
+    const h = empty ? 0 : (im.naturalHeight || 0);
     // 未知尺寸(w/h=0)不判 bad：图没加载完不等于不合格
     const known = w > 0 && h > 0;
     const square = known && Math.abs(w / h - 1) < 0.01;
-    // 空图位：本行有换图入口(trigger)却没有任何 http 图源 —— 平台会拒「请上传预览图」。
-    // 与 known=false 的「图在加载」区分开（后者 im 存在、只是 naturalWidth 还是 0）。
-    const empty = !im && !!cell.querySelector('.sku-image-box.ant-dropdown-trigger');
     rows.push({i: i, color: iColor >= 0 ? txt(tds[iColor]) : '',
-               url: im ? (im.currentSrc || im.src || '') : '',
+               url: empty ? '' : src,
                w: w, h: h, empty: empty,
                // 行级换图入口：变种表只有部分行（颜色主行）有 trigger，其余行共享
                // 主图、无独立换图入口（2026-09-06 两单宠物窝全卡在这里，见 _st_sku_preview）
                hasTrigger: !!cell.querySelector('.sku-image-box.ant-dropdown-trigger'),
-               bad: known && (!square || w < MIN || h < MIN)});
+               // 空位补图入口：空格的 .single-image 图格【点击】即出「空间图片」菜单
+               // （与有图格的 hover trigger 是两种交互），据此判断空位能否自动补图。
+               hasFillSlot: !!cell.querySelector('.single-image'),
+               bad: !empty && known && (!square || w < MIN || h < MIN)});
   });
   return JSON.stringify({rows: rows, heads: heads,
                          previewIdx: iPrev, colorIdx: iColor,
@@ -9622,6 +9756,83 @@ _JS_OPEN_SKU_PREVIEW_SPACE = r"""(async () => {
 })()"""
 
 
+# 空预览格点开空间弹窗：点击图格（不是 hover trigger）展开 5 项菜单，点「空间图片」。
+#
+# 【与 _JS_OPEN_SKU_PREVIEW_SPACE 是两种交互，别混用】有图格靠 hover `.sku-image-box
+# .ant-dropdown-trigger` 出 8 项菜单；空图位没有那个 trigger，格子里是 `.single-image`
+# （占位符 addImg 图 + .no-img-status），【点击】它才出菜单，且菜单只有 5 项（没有
+# 「应用到全部」，独有「引用产品轮播图」）。2026-09-08 真站取证（offer 1011303528447
+# 狗裙子 XL 行空位）：点击 .img-out 出 ["本地图片","空间图片","网络图片",
+# "引用产品轮播图","引用采集图片"]，点「空间图片」打开的是同一个「从图片空间选择」
+# 弹窗（.img-item 20 个、_pick_from_space 可直接复用）。
+#
+# 除「点击 vs hover」外，其余与 _JS_OPEN_SKU_PREVIEW_SPACE 同构：按行下标定位、
+# 回传当前颜色名供调用方核对行序、轮询等菜单/弹窗。
+_JS_OPEN_SKU_PREVIEW_FILL_SPACE = r"""(async () => {
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+  const IDX = __IDX__, PREV = __PREV__, ICOLOR = __ICOLOR__;
+  const sku = document.getElementById('skuDataInfo');
+  if (!sku) return JSON.stringify({stage: 'locate', err: 'no-skuDataInfo'});
+  const t0 = sku.querySelector('table');
+  if (!t0) return JSON.stringify({stage: 'locate', err: 'no-table'});
+  const trs = Array.from(t0.querySelectorAll('tbody tr'));
+  const tr = trs[IDX];
+  if (!tr) return JSON.stringify({stage: 'locate', err: '行不存在: ' + IDX,
+                                  rowCount: trs.length});
+  const tds = Array.from(tr.children);
+  const cell = tds[PREV];
+  if (!cell) return JSON.stringify({stage: 'locate', err: '该行没有预览图单元格'});
+  const nowColor = ICOLOR >= 0 ? txt(tds[ICOLOR]) : '';
+  // 点击目标：空位的图格（.img-out 是 .single-image 内层、实测点它就能出菜单）
+  const box = cell.querySelector('.img-out') || cell.querySelector('.single-image') || cell;
+  const before = (() => {
+    const im = Array.from(cell.querySelectorAll('img'))
+      .find(x => (x.currentSrc || x.src || '').startsWith('http'));
+    return im ? (im.currentSrc || im.src || '') : '';
+  })();
+  box.scrollIntoView({block: 'center'});
+  await sleep(500);
+  // 【点击展开，不是 hover】空位没有 trigger，hover 无菜单；点击才出。
+  // 【必须用原生 box.click()，不能 dispatchEvent(new MouseEvent('click'))】2026-09-08
+  // 实跑（offer 1044697103545 宠物裙 3色×4码，L/XL 码 6 行空位）发现 dispatchEvent 的
+  // 合成 click 不触发店小秘空位菜单（轮询 3s 菜单仍 display:none），而 box.click() 原生
+  // 方法能正常展开 5 项菜单——两者同为 isTrusted=false，但组件只认原生 click 的事件链。
+  box.click();
+  const WANT = __ITEMS__;
+  let menu = null;
+  for (let k = 0; k < 30; k++) {
+    menu = Array.from(document.querySelectorAll('.ant-dropdown')).find(d => {
+      if (/display:\s*none/.test(d.getAttribute('style') || '')) return false;
+      const its = Array.from(d.querySelectorAll('.ant-dropdown-menu-item')).map(i => txt(i));
+      return WANT.every(w => its.includes(w));
+    });
+    if (menu) break;
+    await sleep(100);
+  }
+  if (!menu) return JSON.stringify({stage: 'menu', err: '点击后空位菜单未展开',
+                                    nowColor: nowColor});
+  const item = Array.from(menu.querySelectorAll('.ant-dropdown-menu-item'))
+    .find(i => txt(i) === '空间图片');
+  if (!item) return JSON.stringify({stage: 'menu', err: '菜单里没有「空间图片」项',
+                                    items: Array.from(
+                                      menu.querySelectorAll('.ant-dropdown-menu-item'))
+                                      .map(i => txt(i))});
+  item.click();
+  // 轮询等弹窗（与有图格同一组件实例，上限 6s 兜住慢的情况）
+  let opened = false;
+  for (let k = 0; k < 60; k++) {
+    await sleep(100);
+    opened = Array.from(document.querySelectorAll('.ant-modal'))
+      .some(m => m.offsetHeight > 0 &&
+        ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+    if (opened) break;
+  }
+  return JSON.stringify({stage: 'ok', opened: opened, nowColor: nowColor,
+                         srcBefore: before});
+})()"""
+
+
 # 回读某行预览图的 src 与尺寸（替换后的成功判据）
 _JS_SKU_PREVIEW_ROW_SRC = r"""(() => {
   const sku = document.getElementById('skuDataInfo');
@@ -9643,8 +9854,9 @@ _JS_SKU_PREVIEW_ROW_SRC = r"""(() => {
 async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
                                   image_path: str, preview_idx: int,
                                   color_idx: int = -1, expect_color: str = "",
-                                  full_cid: Optional[str] = None) -> dict:
-    """阶段⑦b 替换【一行】的 SKU 预览图：直传图床、悬停菜单选「空间图片」、弹窗选图。
+                                  full_cid: Optional[str] = None,
+                                  fill_empty: bool = False) -> dict:
+    """阶段⑦b 换/补【一行】的 SKU 预览图：直传图床、菜单选「空间图片」、弹窗选图。
 
     image_path 必须是【已做过合规化】的图（1:1 且 >=800x800，走 images.square_image）：
     与 ⑥⑦ 一致，本函数不代做合规化——那是纯本地的确定性变换，由调用方先做好，
@@ -9655,17 +9867,23 @@ async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
 
     expect_color 非空时核对该行【当前】颜色名是否与读到时一致，不一致就拒绝替换——
     Vue 重排过的话，挂上去就是挂到别的 SKU 上了。
+
+    fill_empty=True 时走【空位补图】交互：点击空格出菜单（不是 hover trigger），
+    见 _JS_OPEN_SKU_PREVIEW_FILL_SPACE 的取证。其余流程（上传/选图/回读判据）一致。
     """
     up = await upload_image(session, image_path, full_cid=full_cid)
     if up.get("status") != "ok":
         return {"status": "error", "stage": "upload", "row": row_idx, "upload": up}
 
+    open_js = _JS_OPEN_SKU_PREVIEW_FILL_SPACE if fill_empty else _JS_OPEN_SKU_PREVIEW_SPACE
+    menu_items = (SKU_PREVIEW_EMPTY_MENU_ITEMS if fill_empty
+                  else SKU_PREVIEW_MENU_ITEMS)
     opened = await session.eval_json(
-        _JS_OPEN_SKU_PREVIEW_SPACE
+        open_js
         .replace("__IDX__", J(row_idx))
         .replace("__PREV__", J(preview_idx))
         .replace("__ICOLOR__", J(color_idx))
-        .replace("__ITEMS__", J(list(SKU_PREVIEW_MENU_ITEMS)))
+        .replace("__ITEMS__", J(list(menu_items)))
         .replace("__TITLE__", J(SPACE_MODAL_TITLE))
     )
     # 行序核对放在开弹窗【之后】：菜单已经绑定到这一行了，此时若发现颜色对不上，
