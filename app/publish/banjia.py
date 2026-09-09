@@ -54,7 +54,7 @@ from typing import Optional
 from app.config import config
 from app.logger import logger
 from app.publish.browser import (DIANXIAOMI_HOST, PAGE_LOCK, BrowserSession,
-                                 ensure_cdp_alive, fill_js)
+                                 ensure_cdp_alive, eval_list_page, fill_js)
 # 只 import base（纯字符串判断），不 import sources 包本身——那会经 get_adapter 的
 # 延迟导入链拉起 Playwright，而本模块判平台只是个正则（与 crawlbox 同一取向）
 from app.publish.sources.base import platform_name, platform_of, source_id
@@ -94,6 +94,9 @@ INTERVAL_MAX = 1440
 # 历史上一度限 300（数据搬家池实测 1796 条，比另两个清单大得多）；现已改为全量扫描。
 SCAN_LIMIT = None
 PAGE_SIZE = 50
+# 翻页间隔（秒）：全量扫描要连翻几十页，页间留点间隔避免撞店小秘「系统繁忙」限流
+# （见 browser.eval_list_page 的退避重试，那边兜偶发，这边压频率）。
+PAGE_GAP = 0.5
 
 CACHE_DIR = str(config.workspace_root / "publish-cache")
 _SCAN_NAME = "banjia-scan.json"
@@ -388,8 +391,8 @@ async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMI
             page_no = 1
             while limit is None or len(rows) < limit:
                 page_size = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(rows))
-                d = await session.eval_json(
-                    _JS_LIST, arg=[param, page_no, page_size])
+                d = await eval_list_page(
+                    session, _JS_LIST, arg=[param, page_no, page_size])
                 if not d.get("ok"):
                     raise RuntimeError(
                         f"列表接口失败：{d.get('status') or d.get('msg') or d}")
@@ -399,6 +402,7 @@ async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMI
                 if page_no >= total_page or not d.get("rows"):
                     break
                 page_no += 1
+                await asyncio.sleep(PAGE_GAP)
             # 三个标签的计数单独发。**必须放在取列表之后**：cur 要传当前标签的真实行数
             # （= 刚拿到的 totalSize），服务端拿它做减法推另外两个数（见 COUNTS_API）。
             # 负数/0 这类明显不对的结果直接丢掉不写进 counts——宁可前端不显示计数，

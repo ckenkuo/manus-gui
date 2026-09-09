@@ -84,6 +84,12 @@ _CLOSED_ERRORS = (
     "Browser has been closed",
 )
 
+# 店小秘列表接口的限流提示词。全量扫描（SCAN_LIMIT=None）要连翻几十页、页间连发 fetch，
+# 中段开始接口会返回 code!=0 的「系统繁忙,请稍后重试」这类限流提示（2026-09-08 实测：
+# 取消单次扫描条数上限后，数据搬家池 1796 条翻 36 页就触发）。这是业务层返回的 msg，
+# 不是 evaluate 的瞬时错误，eval_json 的瞬时重试兜不住，得单独判「繁忙」再退避。
+_BUSY_HINTS = ("系统繁忙", "稍后重试", "稍后再试", "繁忙", "请稍候")
+
 
 class TargetClosedError(RuntimeError):
     """页面/浏览器已关闭（页签被关、Chrome 退出或页面崩溃）——不可重试，须重建会话。"""
@@ -105,6 +111,40 @@ PAGE_LOCK = asyncio.Lock()
 
 # evaluate/eval_json 的「没传参」哨兵：None 是合法的 JS 参数（null），不能拿它判断
 _NO_ARG = object()
+
+
+async def eval_list_page(session, code: str, arg: Any = _NO_ARG,
+                         busy_retries: int = 3, busy_backoff: float = 2.0) -> dict:
+    """页面内 fetch 取一页列表 JSON，对店小秘「系统繁忙」限流做退避重试。
+
+    【为什么单独一个函数，而不是三个扫描模块各写一遍】session.eval_json 的重试只覆盖
+    evaluate 的瞬时错误（上下文销毁、导航中），兜不住接口返回的**业务**限流——那种情况
+    下 evaluate 本身成功，是接口 body 里 code!=0、msg=「系统繁忙,请稍后重试」。全量扫描
+    翻页撞上它若直接抛，整轮扫描失败、上次清单还保留，用户看到的就是「扫描失败：系统繁忙」。
+    这里把「判繁忙 → 退避 sleep → 重取」收成一处，banjia/crawlbox/collectbox 共用。
+
+    非限流的业务错误（ok=false 但 msg 不含繁忙词）不重试、原样返回，交由调用方按原逻辑
+    raise 出带具体信息的错误；重试耗尽仍繁忙也原样返回最后一个结果，同样由调用方 raise——
+    这样调用方只需把 eval_json 换成 eval_list_page，判断逻辑一字不改。
+
+    设计成接受 session 参数的模块级函数而不是 BrowserSession 方法：三个扫描模块的测试用
+    假 session 只需实现 eval_json 即可，不必再补一个新方法。
+    """
+    d: dict = {}
+    for attempt in range(1, busy_retries + 1):
+        d = await session.eval_json(code, arg=arg)
+        if d.get("ok") is not False:
+            return d
+        hint = str(d.get("msg") or d.get("status") or "")
+        if not any(w in hint for w in _BUSY_HINTS):
+            return d
+        if attempt >= busy_retries:
+            return d
+        logger.warning(
+            f"列表接口限流，第 {attempt}/{busy_retries} 次退避 "
+            f"{busy_backoff * attempt:.1f}s：{hint}")
+        await asyncio.sleep(busy_backoff * attempt)
+    return d
 
 
 # ---- 页面 toast 哨兵 --------------------------------------------------------

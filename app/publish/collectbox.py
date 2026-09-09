@@ -75,7 +75,7 @@ from typing import Optional
 from app.config import config
 from app.logger import logger
 from app.publish.browser import (DIANXIAOMI_HOST, PAGE_LOCK, BrowserSession,
-                                  ensure_cdp_alive)
+                                  ensure_cdp_alive, eval_list_page)
 # 只 import base（纯字符串判断），不 import sources 包本身——那会经 get_adapter 的
 # 延迟导入链拉起 Playwright，而本模块判平台只是个正则
 from app.publish.sources.base import platform_name, platform_of, source_id
@@ -103,6 +103,9 @@ INTERVAL_MAX = 1440
 # 历史上一度限 200 以避免把上千行塞进前端表格卡住浏览器；现已改为全量扫描。
 SCAN_LIMIT = None
 PAGE_SIZE = 50
+# 翻页间隔（秒）：全量扫描连翻几十页，页间留间隔避免撞店小秘「系统繁忙」限流
+# （见 browser.eval_list_page 的退避重试，那边兜偶发，这边压频率）。
+PAGE_GAP = 0.5
 
 # 编辑进度探测的并发批大小。实测 60 个并发 0.2 秒（4ms/个），瓶颈完全不在这里；
 # 取 40 是给平台留余量——这是别人的生产接口，没必要为省 0.1 秒去压它。
@@ -476,8 +479,8 @@ async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMI
             page_no = 1
             while limit is None or len(rows) < limit:
                 page_size = PAGE_SIZE if limit is None else min(PAGE_SIZE, limit - len(rows))
-                d = await session.eval_json(
-                    _JS_LIST, arg=[state, page_no, page_size])
+                d = await eval_list_page(
+                    session, _JS_LIST, arg=[state, page_no, page_size])
                 if not d.get("ok"):
                     raise RuntimeError(
                         f"列表接口失败：{d.get('status') or d.get('msg') or d}")
@@ -487,6 +490,7 @@ async def scan_once(state: str = DEFAULT_STATE, limit: Optional[int] = SCAN_LIMI
                 if page_no >= total_page or not d.get("rows"):
                     break
                 page_no += 1
+                await asyncio.sleep(PAGE_GAP)
 
             # 计数与店铺名：都是 best-effort 的补充信息，坏了不影响清单本身
             counts = {}
