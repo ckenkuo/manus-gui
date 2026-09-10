@@ -166,7 +166,7 @@ def test_含量区间取下界():
 
 def test_含量单值形态():
     r = parse_main_composition({"主面料成分": "棉", "主面料成分含量": "55（%）"})
-    assert r == {"fiber": "棉", "percent": 55, "raw": "55（%）"}
+    assert r == {"fiber": "棉", "percent": 55, "raw": "55（%）", "fiberText": "棉"}
 
 
 def test_含量缺失时按单一成分100():

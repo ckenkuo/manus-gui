@@ -28,6 +28,7 @@ import json
 import re
 import time
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import Page, async_playwright
 
@@ -492,13 +493,29 @@ class BrowserSession:
         """
         try:
             ctx = self._browser.contexts[0]
+            def matches_page(page_url):
+                parsed = urlsplit(page_url or "")
+                if re.search(r"login|signin|captcha|verification|punish", parsed.path, re.I):
+                    return False
+                if must_include.startswith("-g-"):
+                    product_id = must_include[3:]
+                    return (parsed.hostname in ("temu.com", "www.temu.com")
+                            and bool(re.search(r"(?:/|-)g-" + re.escape(product_id) + r"\.html$", parsed.path)))
+                return must_include in (page_url or "")
             cands = [p for p in ctx.pages
-                     if must_include in (p.url or "") and not p.is_closed()]
+                     if not p.is_closed() and matches_page(p.url)]
         except Exception as e:
             return {"ok": False, "err": f"枚举页签失败：{e}"}
         if not cands:
             return {"ok": False, "err": f"没有已打开的页签匹配 {must_include!r}"}
         page = cands[0]
+        if page is self._page and self._cdp is not None:
+            return {"ok": True, "url": page.url}
+        if self._cdp is not None:
+            try:
+                await self._cdp.detach()
+            except Exception as error:
+                logger.debug(f"旧页签 CDP 会话已不可用，继续切换：{error}")
         self._page = page
         self._watch_page(page)
         try:

@@ -54,6 +54,18 @@ def norm_spec(spec: str) -> str:
     return f"{parts[0]}>{'/'.join(parts[1:])}"
 
 
+def parse_composition(attrs: dict) -> dict:
+    """1688 源成分解析：读「主面料成分/面料名称」+「主面料成分含量」，交共享框架。
+
+    【为什么只做一层转发】1688 的成分键名解析就是 extract.parse_main_composition
+    （共享框架 _compose_from 的默认键名形态），本适配器不必重写取键逻辑；单独挂
+    parse_composition 是为了让 extract_product 能按 getattr(adapter, "parse_composition")
+    统一分发，四个平台同一个调用点、不用写 if platform。
+    """
+    from app.publish import extract as E
+    return E.parse_main_composition(attrs or {})
+
+
 async def fetch(session: BrowserSession, url: str,
                 on_manual=None, timeout: float = 40.0) -> SourceProduct:
     """打开 1688 详情页并抽出 SourceProduct。只读。
@@ -95,10 +107,19 @@ async def fetch(session: BrowserSession, url: str,
             # 【2026-09-03 增强错误诊断】如果 _JS_EXTRACT 返回了诊断信息，先打印出来
             if "diagnostic" in data:
                 logger.error(f"页面数据结构诊断：{data['diagnostic']}")
+                diagnostic = data['diagnostic']
+                page_url = str(diagnostic.get('url') or '')
+                if 'login' in page_url.lower():
+                    reason = "1688 当前停在登录页，请登录后保持目标商品页打开再重试"
+                elif not diagnostic.get('hasContext'):
+                    reason = "1688 页面未注入商品数据（window.context 缺失），请检查是否仍在目标详情页或加载被拦"
+                elif not diagnostic.get('hasResult'):
+                    reason = "1688 商品数据未就绪（window.context.result 缺失）"
+                else:
+                    reason = "1688 页面数据结构异常：window.context.result.data 缺失"
                 raise RuntimeError(
-                    f"页面数据结构异常：window.context.result 存在但 data 字段不存在。\n"
+                    f"{reason}。\n"
                     f"诊断信息：{data['diagnostic']}\n"
-                    f"这可能是 1688 改版或反爬机制导致的数据结构变化。"
                 )
 
             # 旧版诊断（兼容没有 diagnostic 字段的情况）

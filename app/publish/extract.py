@@ -75,22 +75,25 @@ _JS_EXTRACT = """(() => {
   // 【2026-09-03 增加诊断与多路径兼容】原先只检查 window.context.result.data，
   // 但实测发现 result 存在但 data 不存在。增加诊断信息帮助排查，并尝试其他可能路径。
   const ctx = window.context || {};
-  const result = ctx.result || {};
+  const result = ctx.result;
 
   // 诊断信息：如果 data 不存在，记录 result 的结构
-  if (!result.data) {
+  if (!result || !result.data) {
     const diag = {
       found: false,
       diagnostic: {
         hasContext: typeof window.context !== 'undefined',
-        hasResult: typeof result !== 'undefined' && result !== null,
-        resultKeys: Object.keys(result),
+        hasResult: !!result,
+        resultKeys: Object.keys(result || {}),
         resultType: typeof result,
         // 尝试其他常见路径
-        hasContent: typeof result.content !== 'undefined',
-        hasModel: typeof result.model !== 'undefined',
+        hasContent: !!result && typeof result.content !== 'undefined',
+        hasModel: !!result && typeof result.model !== 'undefined',
         // 打印 result 的前 500 字符样本
-        resultSample: JSON.stringify(result).substring(0, 500)
+        resultSample: JSON.stringify(result || null).substring(0, 500),
+        url: location.href,
+        title: document.title,
+        readyState: document.readyState
       }
     };
     return JSON.stringify(diag);
@@ -346,47 +349,61 @@ _COMP_NON_FIBER = (
 COMP_DEFAULT_FIBER = "聚酯纤维"
 
 
-def parse_main_composition(attrs: dict) -> dict:
-    """把源属性里的主面料成分与含量提炼成结构化字段，供阶段④做确定性覆盖。
+def _compose_from(fiber_text: str, raw_text: str) -> dict:
+    """成分解析的共享框架：输入「纤维原文」与「含量原文」，做占位词识别 + 四分支。
 
     为什么要单独提炼：卖家填的「主面料成分含量」是源页面上的确定事实，但整个
     attributes 原先只是 json.dumps 塞进属性审核的 prompt，成分百分比实际由 LLM
     单次判断决定——pipeline.check_attrs 注释里记的「55/45 变成 90/10」漂移正是
     这么来的。提炼出来后，写入前可以直接用源值覆盖模型填的数字，不再靠模型复读。
 
+    【为什么把框架从 parse_main_composition 里拆出来】占位词识别、百分比抠取、四分支
+    这套逻辑对四个来源平台通用，平台差异只在「从哪个属性键取这两个原文、原文要不要先
+    清洗」（拼多多的「其它/涤纶（聚酯纤维）」要剥前缀）。故框架只吃两个已处理干净的入参，
+    各适配器的 parse_composition 负责取键 + 清洗 + 调本函数。
+
     【2026-08-25 改：缺失时不再返回 {}，而是给确定性默认值】用户结论——源页面一般
-    只写一个含量（如聚酯纤维 90%），剩下的份额靠推断；**源什么都没写时一律按
-    聚酯纤维 100% 处理**，不要退回让模型自己编一组比例。
-    【2026-09-04 增：占位词识别】「主面料成分」填的是「其它」「牛仔布」这类非纤维值
-    时，不产出假 fiber（fiber 置空 + assumed 标记），保留含量事实交阶段④ LLM 推断。
-    故四种情形：
+    只写一个含量（如聚酯纤维 90%），剩下的份额靠推断；源什么都没写时一律按
+    聚酯纤维 100% 处理，不要退回让模型自己编一组比例。
+    【2026-09-04 增：占位词识别】纤维原文是「其它」「牛仔布」这类非纤维值时，不产出
+    假 fiber（fiber 置空 + assumed 标记），保留含量事实交阶段④ LLM 推断。四种情形：
       0. 占位词/织物名   → fiber 空 + assumed，交 LLM 依据面料名称/品类推断（含量保留）
       1. 纤维 + 合法含量  → 按源值（percent < 100 时剩余份额由阶段④补差纤维）
       2. 有纤维、含量缺失或非法 → 该纤维 100%（源信息里有的就用，只是没给比例）
       3. 连纤维都没有      → 聚酯纤维 100%（assumed=True，最常见的跨境服装面料）
     情形 0/2/3 打 assumed 标记，供提示词与日志区分「源事实」和「默认值」。
+
+    返回 dict 比 parse_main_composition 多一个 fiberText 字段：成分词原文，供
+    pipeline._resolve_main_fiber 在 fiber 被占位词清空时拿原文做 LLM 归约——旧的
+    raw 字段记的是【含量原文】，归约要的是【成分词原文】，两者不是一回事。
     """
-    attrs = attrs or {}
-    fiber = (attrs.get("主面料成分") or attrs.get("面料名称") or "").strip()
-    raw = (attrs.get("主面料成分含量") or "").strip()
+    fiber = (fiber_text or "").strip()
+    raw = (raw_text or "").strip()
     m = _PCT_RE.search(raw) if raw else None
     pct = int(float(m.group())) if m else 0
-    # 【占位词/织物名 → 不产出假 fiber】卖家在「主面料成分」里常填「其它」「牛仔布」这类
-    # 非纤维值：占位词（其它）没有信息量，织物名（牛仔布）是组织结构不是纤维成分，
-    # 两者都映射不到 Temu 的纤维选项。硬存成 fiber 会让阶段④确定性覆盖失效、并把假纤维
-    # 喂给 LLM 误导它（2026-09-04 商品 1013502117778 实测：主面料成分=其它，一路掉到
-    # 保存被平台拒「百分比之和需等于100」）。这里 fiber 置空、保留含量事实，交阶段④ LLM
-    # 依据面料名称/品类/图片推断，并打 assumed 留痕。
+    # 【占位词/织物名 → 不产出假 fiber】卖家常填「其它」「牛仔布」这类非纤维值：
+    # 占位词（其它）没有信息量，织物名（牛仔布）是组织结构不是纤维成分，两者都映射不到
+    # Temu 的纤维选项。硬存成 fiber 会让阶段④确定性覆盖失效、并把假纤维喂给 LLM 误导它
+    # （2026-09-04 商品 1013502117778 实测：主面料成分=其它，一路掉到保存被平台拒
+    # 「百分比之和需等于100」）。这里 fiber 置空、保留含量事实，交阶段④ LLM 推断。
     if fiber and any(w in fiber for w in _COMP_NON_FIBER):
         return {"fiber": "", "percent": pct if 0 < pct <= 100 else 0, "raw": raw,
+                "fiberText": fiber,
                 "assumed": f"源主面料成分是「{fiber}」（非纤维成分），纤维交 LLM 推断"}
     if fiber and 0 < pct <= 100:
-        return {"fiber": fiber, "percent": pct, "raw": raw}
+        return {"fiber": fiber, "percent": pct, "raw": raw, "fiberText": fiber}
     if fiber:
-        return {"fiber": fiber, "percent": 100, "raw": raw,
+        return {"fiber": fiber, "percent": 100, "raw": raw, "fiberText": fiber,
                 "assumed": "源未给含量，按单一成分 100% 处理"}
-    return {"fiber": COMP_DEFAULT_FIBER, "percent": 100, "raw": raw,
+    return {"fiber": COMP_DEFAULT_FIBER, "percent": 100, "raw": raw, "fiberText": fiber,
             "assumed": "源未给主面料成分，按默认纤维 100% 处理"}
+
+
+def parse_main_composition(attrs: dict) -> dict:
+    """兼容原有 1688 成分解析入口；其他来源使用自己的发布流程。"""
+    from app.publish.workflows.alibaba1688 import parse_composition
+
+    return parse_composition(attrs)
 
 
 def pivot_skus(sku_map: list) -> tuple[dict, list, list]:
@@ -841,6 +858,10 @@ async def extract_product(
         if own_session:
             await session.close()
 
+    from app.publish.workflows import get_workflow
+
+    workflow = get_workflow(platform)
+    fields = workflow.prepare_product(prod)
     if not prod.title:
         raise RuntimeError(f"{platform_name(platform)}提取到的标题为空（页面改版？）")
 
@@ -876,8 +897,8 @@ async def extract_product(
     # 结构化提炼并落盘（这段与来源平台无关：适配器已把差异吃掉）
     material_check = check_material_image(downloaded["main"])
     attrs = dict(prod.attributes or {})
-    main_comp = parse_main_composition(attrs)
-    pivot, colors, sizes = pivot_skus(prod.skuMap or [])
+    main_comp = fields["mainComposition"]
+    pivot, colors, sizes = fields["skus"], fields["colors"], fields["sizes"]
 
     raw = {"offerId": product_id, "productId": product_id, "url": url,
            **prod.as_raw(), "descImages": desc_imgs}
@@ -942,6 +963,7 @@ async def extract_product(
                    "url": url,
                    "canonicalUrl": normalize_url(url, prod.platform or platform),
                    "offerId": product_id, "productId": product_id},
+        "workflow_id": workflow.workflow_id,
         "title": prod.title,
         "attributes": attrs,
         # 主面料成分/含量：阶段④成分行按它做确定性覆盖，解析不出时按默认纤维兜
@@ -1035,7 +1057,8 @@ async def extract_product(
 # 摘要的 visionError，不静默。
 
 _VISION_SYSTEM = (
-    "你是跨境电商选品与合规审核助手，正在看一个 1688 服装商品的主图和详情长图。"
+    "你是跨境电商选品与合规审核助手，正在看一个货源商品（可能是服装，也可能是"
+    "毯子/宠物用品/玩具/家居等非服装）的主图和详情长图。"
     "你的输出会直接驱动后续的属性填写、标题生成和素材图挑选，"
     "所以【只描述你在图里真正看到的东西】：图里没有的信息一律留空，绝对不要推测或编造。"
     "只输出 JSON，不要加 ``` 围栏、不要任何解释文字。"
@@ -1067,8 +1090,12 @@ desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名�
    尺码键用图里的写法但【不要带「码」字】（如 "120" 或 "120cm"，不要 "120码"）。
    图里没有身高体重参考表就返回 {{}}。
 
-3. sizeMeasurements —— 尺码的【平铺实测尺寸】表（衣长/胸围/袖长/裤长等，单位 cm）：
+3. sizeMeasurements —— 尺码的【成品实测尺寸】表（服装是衣长/胸围/袖长/裤长等；
+   非服装如毯子/宠物窝/玩具则是直径/长/宽/高/重量等，单位 cm）：
    {{"<尺码>": {{"<参数名>": <数值>}}}}。同样不带「码」字，值只填数字不带单位。
+   参数名照抄图里写法（「朵数/件数」这类非长度列也照抄，下游自己挑）。
+   非服装的尺码名可能本身就写着尺寸（如毯子尺码「直径60cm」既是尺码也是直径值），
+   尺码键照图里的写法即可。
    全围类参数按图里写法照抄参数名，不要自己换算半围/全围。
    图里没有实测尺寸表就返回 {{}}——【不许按经验估算】，估算有后续阶段专门做。
    注意：图里表格常有「供应商尺寸」「跳码规则」「允差」这类【非尺码列】，

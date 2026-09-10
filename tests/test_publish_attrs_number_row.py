@@ -19,6 +19,8 @@ dump_attrs 时还不存在，主轮清单里必然没有它们；原实现只把
     成分             select[棉] → input[80] → select[聚酯纤维] → input[20]
 故 kind 判据只能是「控件序里第一个控件是不是输入框」。
 """
+
+from publish_patching import patch_publish
 import pytest
 
 from app.publish import cache, pipeline
@@ -98,8 +100,8 @@ def _stub_dom(monkeypatch):
     async def _sleep(*a, **kw):
         return None
     monkeypatch.setattr(pipeline.asyncio, "sleep", _sleep)
-    monkeypatch.setattr(pipeline, "_expand_attr_section", lambda *a, **kw: _async({}))
-    monkeypatch.setattr(pipeline, "_park_ghost_dropdowns",
+    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
+    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
                         lambda *a, **kw: _async({"parked": 0}))
 
 
@@ -116,7 +118,7 @@ async def test_数值行不点开下拉读选项(_stub_dom, monkeypatch):
                 "scrollHeight": 0, "scrolledToEnd": True}
         return (["梭织", "针织"], meta) if with_meta else ["梭织", "针织"]
 
-    monkeypatch.setattr(pipeline, "_read_active_options", _read)
+    patch_publish(monkeypatch, "pipeline", "_read_active_options", _read)
     s = _FakeSession([_num_row(), _sel_row("织造方式")])
 
     d = await pipeline.dump_attrs(s, cat_path=PATH)
@@ -156,9 +158,9 @@ async def test_联动新增必填行会被补填(_stub_dom, monkeypatch):
         return ([{"label": c["label"], "value": c["value"], "result": "ok"}
                  for c in changes], [], [])
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
-    monkeypatch.setattr(pipeline, "_apply_attr_changes", _apply)
-    monkeypatch.setattr(pipeline, "_read_active_options",
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
+    patch_publish(monkeypatch, "pipeline", "_read_active_options",
                         lambda *a, **kw: _async(
                             (["聚酯纤维(涤纶）", "棉"], {"complete": True})))
 
@@ -182,7 +184,7 @@ async def test_主轮已有的行不算联动新增(_stub_dom, monkeypatch):
         called.append(1)
         return {}
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
     r = await pipeline._fill_linkage_rows(
         s, {"里衬成分"}, {"title": "x"}, None, PATH)
     assert r == {"applied": [], "newRequired": [], "compFailed": []}
@@ -203,7 +205,7 @@ async def test_有预填值的联动行也会被审但不改(_stub_dom, monkeypa
         called.append(1)
         return {}  # LLM 判断预填值「棉」合适，无 change
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
     r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
     assert called == [1]                     # 扫到并审过，不因预填值跳过
     assert r["applied"] == []                # 无 change，不写入
@@ -218,8 +220,8 @@ async def test_补填问LLM失败不抛(_stub_dom, monkeypatch):
     async def _boom(*a, **kw):
         raise RuntimeError("LLM 挂了")
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _boom)
-    monkeypatch.setattr(pipeline, "_read_active_options",
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _boom)
+    patch_publish(monkeypatch, "pipeline", "_read_active_options",
                         lambda *a, **kw: _async((["棉"], {"complete": True})))
 
     r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
@@ -231,11 +233,11 @@ async def test_补填问LLM失败不抛(_stub_dom, monkeypatch):
 async def test_补填走同一套校验闸(_stub_dom, monkeypatch):
     """编造的选项在补填轮也要被拒——闸门与主轮共用，不能另写一套。"""
     s = _FakeSession([_sel_row("里衬成分")])
-    monkeypatch.setattr(pipeline, "_ask_attr_review",
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review",
                         lambda *a, **kw: _async(
                             {"changes": [{"label": "里衬成分", "value": "编造纤维"}],
                              "notes": []}))
-    monkeypatch.setattr(pipeline, "_read_active_options",
+    patch_publish(monkeypatch, "pipeline", "_read_active_options",
                         lambda *a, **kw: _async((["棉", "亚麻"], {"complete": True})))
     called = []
 
@@ -243,7 +245,7 @@ async def test_补填走同一套校验闸(_stub_dom, monkeypatch):
         called.append(1)
         return ([], [], [])
 
-    monkeypatch.setattr(pipeline, "_apply_attr_changes", _apply)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
     r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
     assert called == [], "编造的值不该走到写入"
     assert r["applied"] == []
@@ -294,7 +296,7 @@ async def test_写入数值行不再抛属性错误(_stub_dom, monkeypatch):
         # 走真实数值分支（未归一时它返回字符串，下面记录 readback 时就会炸）
         return await _orig(_NumSession(), label, value, kind=kind)
 
-    monkeypatch.setattr(pipeline, "set_attr", _set)
+    patch_publish(monkeypatch, "pipeline", "set_attr", _set)
     changes = [{"label": "里料克重（g/m²)", "value": "80", "kind": "number"}]
     row_map = {"里料克重（g/m²)": _num_row()}
     applied, refreshed, comp_failed = await pipeline._apply_attr_changes(
@@ -341,7 +343,7 @@ class _MultiRoundSession:
 @pytest.fixture
 def _stub_round(monkeypatch):
     """把读选项与 LLM 替成确定性应答，只留轮次控制流。"""
-    monkeypatch.setattr(pipeline, "_read_active_options",
+    patch_publish(monkeypatch, "pipeline", "_read_active_options",
                         lambda *a, **kw: _async((["棉", "聚酯纤维"],
                                                  {"complete": True})))
 
@@ -356,7 +358,7 @@ def _stub_round(monkeypatch):
                 changes.append({"label": r["label"], "value": "棉", "num": 100})
         return {"changes": changes, "notes": []}
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
 
 
 @pytest.mark.asyncio
@@ -369,7 +371,7 @@ async def test_第二层联动行也会被补填(_stub_dom, _stub_round, monkeyp
     async def _apply(session, changes, row_map, info, cat_path, **kw):
         return ([{"label": c["label"], "result": "ok"} for c in changes], [], [])
 
-    monkeypatch.setattr(pipeline, "_apply_attr_changes", _apply)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
     r = await pipeline._fill_linkage_rows(
         s, {"里料纹理"}, {"title": "x"}, None, PATH)
     filled = [a["label"] for a in r["applied"]]
@@ -391,8 +393,8 @@ async def test_不再冒新行就停止不白转(_stub_dom, _stub_round, monkeyp
         return {"changes": [{"label": r["label"], "value": "棉", "num": 100}
                             for r in rows], "notes": []}
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
-    monkeypatch.setattr(pipeline, "_apply_attr_changes",
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes",
                         lambda session, changes, *a, **kw: _async(
                             ([{"label": c["label"], "result": "ok"}
                               for c in changes], [], [])))
@@ -411,7 +413,7 @@ async def test_一轮全失败就停止追加轮次(_stub_dom, _stub_round, monk
         rounds.append(1)
         return ([{"label": c["label"], "result": "error"} for c in changes], [], [])
 
-    monkeypatch.setattr(pipeline, "_apply_attr_changes", _apply)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
     r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
     assert len(rounds) == 1, "一项都没写成功还继续转轮次"
     assert r["newRequired"] == ["里衬成分", "里衬成分含量"]   # 仍要报出来交人工
@@ -430,7 +432,7 @@ async def test_轮次有上限不会无界循环(_stub_dom, _stub_round, monkeyp
         rounds.append(1)
         return ([{"label": c["label"], "result": "ok"} for c in changes], [], [])
 
-    monkeypatch.setattr(pipeline, "_apply_attr_changes", _apply)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
     r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
     assert len(rounds) == pipeline._LINKAGE_MAX_ROUNDS
     assert len(r["newRequired"]) == pipeline._LINKAGE_MAX_ROUNDS
@@ -451,8 +453,8 @@ async def test_已见过的行不重复补(_stub_dom, _stub_round, monkeypatch):
         return {"changes": [{"label": r["label"], "value": "棉", "num": 100}
                             for r in rows if r["kind"] != "number"], "notes": []}
 
-    monkeypatch.setattr(pipeline, "_ask_attr_review", _ask)
-    monkeypatch.setattr(pipeline, "_apply_attr_changes",
+    patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
+    patch_publish(monkeypatch, "pipeline", "_apply_attr_changes",
                         lambda session, changes, *a, **kw: _async(
                             ([{"label": c["label"], "result": "ok"}
                               for c in changes], [], [])))

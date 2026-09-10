@@ -6,6 +6,8 @@
 读到尺寸），也进不了 unknown（unknown 要求有 img 但 naturalWidth=0），于是被
 当成合规行放过，错误一路延后到 ⑭ 才以「保存可能未生效」这种含糊结论暴露。
 """
+
+from publish_patching import patch_publish
 import pytest
 
 from app.publish import service
@@ -22,7 +24,7 @@ async def _run(rows, monkeypatch, *, has_trigger=True):
         return {"supported": has_trigger, "rows": rows,
                 "previewIdx": 0, "colorIdx": 1}
 
-    monkeypatch.setattr(service, "sku_preview_state", fake_state)
+    patch_publish(monkeypatch, "service", "sku_preview_state", fake_state)
     events = []
 
     async def emit(ev):
@@ -60,11 +62,10 @@ async def test_全部合规仍判skipped(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_尺寸未知不判空也不判失败(monkeypatch):
-    """图没加载完（有 img、naturalWidth=0）是证据不足，与空图位相反：
-    不能判 fail，只提示人工确认。"""
+async def test_尺寸持续未知应等待后阻止保存(monkeypatch):
+    """图片加载失败不能报告全部合规。"""
     rows = [{"i": 0, "color": "白色", "url": "http://x/1.jpg",
              "w": 0, "h": 0, "empty": False, "bad": False}]
     res, events = await _run(rows, monkeypatch)
-    assert res["status"] == "skipped"
+    assert res["status"] == "fail"
     assert any("读不到尺寸" in (e.get("message") or "") for e in events)

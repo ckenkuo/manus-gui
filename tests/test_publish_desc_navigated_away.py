@@ -10,6 +10,8 @@
 故这里锁两条不变量：错误信息带上当前 URL 并给出 navigatedAway 标志，
 且该标志一出现就中断整段替换循环。
 """
+
+from publish_patching import patch_publish
 import asyncio
 
 import pytest
@@ -78,7 +80,7 @@ def test_resolve_desc_pos返回三元且透传fatal(monkeypatch):
         return {"status": "error", "err": "页签已不在编辑页（当前 .../draft）",
                 "navigatedAway": True}
 
-    monkeypatch.setattr(S, "desc_map", _map_navigated)
+    patch_publish(monkeypatch, "service", "desc_map", _map_navigated)
     pos, err, fatal = asyncio.run(S._resolve_desc_pos(None, "http://x/a.jpg"))
     assert (pos, fatal) == (0, True)
     assert "不在编辑页" in err
@@ -86,7 +88,7 @@ def test_resolve_desc_pos返回三元且透传fatal(monkeypatch):
     async def _map_missing(session, info_path=""):
         return {"status": "ok", "modules": [{"pos": 1, "url": "http://x/b.jpg"}]}
 
-    monkeypatch.setattr(S, "desc_map", _map_missing)
+    patch_publish(monkeypatch, "service", "desc_map", _map_missing)
     pos, err, fatal = asyncio.run(S._resolve_desc_pos(None, "http://x/a.jpg"))
     # 源图找不到是【单张】的问题（可能已被删或已替换），后续几张仍该继续试
     assert (pos, fatal) == (0, False)
@@ -138,14 +140,14 @@ def test_fatal时中断整段而不是逐张重试(monkeypatch, tmp_path):
             f.write(b"x")
         return p, p
 
-    monkeypatch.setattr(S, "desc_map", _map)
+    patch_publish(monkeypatch, "service", "desc_map", _map)
     monkeypatch.setattr(S.vision, "plan_desc", _plan_desc)
-    monkeypatch.setattr(S, "_resolve_desc_pos", _resolve)
-    monkeypatch.setattr(S, "_desc_cache_paths", _paths)
-    monkeypatch.setattr(S, "desc_replace", _replace)
-    monkeypatch.setattr(S, "desc_save", _save)
-    monkeypatch.setattr(S, "ensure_desc_closed", _closed)
-    monkeypatch.setattr(S, "_load_info", lambda p: {})
+    patch_publish(monkeypatch, "service", "_resolve_desc_pos", _resolve)
+    patch_publish(monkeypatch, "service", "_desc_cache_paths", _paths)
+    patch_publish(monkeypatch, "service", "desc_replace", _replace)
+    patch_publish(monkeypatch, "service", "desc_save", _save)
+    patch_publish(monkeypatch, "service", "ensure_desc_closed", _closed)
+    patch_publish(monkeypatch, "service", "_load_info", lambda p: {})
 
     ctx = {"info_path": "", "workdir": str(tmp_path)}
     asyncio.run(S._st_desc(ctx, None, _emit))

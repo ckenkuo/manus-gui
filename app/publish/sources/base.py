@@ -278,7 +278,7 @@ WAIT_HUMAN_REMIND = 30.0     # 日志重复提醒的间隔（别每 3s 刷一行
 
 
 async def wait_human(session, probe_js: str, ready_key: str, message: str,
-                     on_manual=None, timeout: float = None) -> bool:
+                     on_manual=None, timeout: float = None, before_probe=None) -> bool:
     """提示人工处理（登录/验证/开页面），然后原地轮询等到数据就绪。
 
     probe_js    判据 JS，须返回带 blocked 与 ready_key 两个字段的 JSON
@@ -313,12 +313,14 @@ async def wait_human(session, probe_js: str, ready_key: str, message: str,
     while loop.time() < deadline:
         await asyncio.sleep(WAIT_HUMAN_INTERVAL)
         try:
+            if before_probe is not None:
+                await before_probe()
             probe = await session.eval_json(probe_js)
         except RuntimeError as e:
             # 人在操作时页面可能正在导航，执行上下文销毁是常态，继续等
             logger.debug(f"人工等待轮询失败，继续等：{e}")
             continue
-        if probe.get(ready_key):
+        if probe.get(ready_key) and not probe.get("blocked"):
             logger.info("页面数据已就绪（人工处理完成），继续提取")
             return True
         now = loop.time()

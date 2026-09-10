@@ -24,6 +24,8 @@
 全程离线：不连 CDP、不碰真站，浏览器调用一律 monkeypatch。
 app.py 与 app 包同名，普通 import 会被包遮蔽，故按文件路径加载（同 test_publish_web）。
 """
+
+from publish_patching import patch_publish
 import importlib.util
 import sys
 from pathlib import Path
@@ -42,7 +44,7 @@ def prefs(tmp_path, monkeypatch):
     from app.publish import service
 
     p = tmp_path / "publish_prefs.json"
-    monkeypatch.setattr(service, "PREFS_PATH", str(p))
+    patch_publish(monkeypatch, "service", "PREFS_PATH", str(p))
     return p
 
 

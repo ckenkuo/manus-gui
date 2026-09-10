@@ -3,6 +3,8 @@
 只测几何处理：这部分是发布流程的刚性依赖（尺寸不合规会被 Temu 静默弹回），
 且完全确定性、可离线验证。AI 编辑部分要真实 API key + 网络，不在单测范围。
 """
+
+from publish_patching import patch_publish
 import os
 import re
 
@@ -340,7 +342,7 @@ async def test_skc新图超上限在入口拦下(monkeypatch, tmp_path):
         called["state"] += 1
         return {"count": 4, "urls": [], "sizes": [], "tooSmall": []}
 
-    monkeypatch.setattr(pipeline, "_skc_row_state", fake_state)
+    patch_publish(monkeypatch, "pipeline", "_skc_row_state", fake_state)
     r = await pipeline.skc_replace_row(None, "咖啡色", str(tmp_path))
     assert r["status"] == "error" and r["stage"] == "precheck", r
     assert called["state"] == 0, "入口拦下时不该去读页面状态"
@@ -373,10 +375,10 @@ async def test_skc新图不足下限不在入口拦(monkeypatch, tmp_path):
         # 2026-08-26 起按批挂图（一次弹窗勾多张），注入点从 _pick_from_space 换到这里
         return {"stage": "ok", "picked": list(fids), "counted": len(fids)}
 
-    monkeypatch.setattr(pipeline, "_skc_row_state", fake_state)
-    monkeypatch.setattr(pipeline, "upload_image", fake_upload)
-    monkeypatch.setattr(pipeline, "_skc_open_space", fake_open)
-    monkeypatch.setattr(pipeline, "_pick_many_from_space", fake_pick_many)
+    patch_publish(monkeypatch, "pipeline", "_skc_row_state", fake_state)
+    patch_publish(monkeypatch, "pipeline", "upload_image", fake_upload)
+    patch_publish(monkeypatch, "pipeline", "_skc_open_space", fake_open)
+    patch_publish(monkeypatch, "pipeline", "_pick_many_from_space", fake_pick_many)
     r = await pipeline.skc_replace_row(None, "米色马甲", str(tmp_path))
     # 走到了 verify-row（假 state 恒返回空 srcs），关键是【没有】被 precheck 拦
     assert r.get("stage") != "precheck", r

@@ -10,6 +10,8 @@
 这里用假 session 记录每一步操作，重演出行内图数的完整轨迹，对轨迹断言不变式——
 比只断言最终结果强得多：预删那版的最终结果也是对的，坏在中间态。
 """
+
+from publish_patching import patch_publish
 import os
 
 import pytest
@@ -107,9 +109,9 @@ def stub_steps(monkeypatch):
         """删图后的 0.4s 等待是真站 DOM 重排需要的，离线穷举 88 个组合会累积到分钟级。"""
         return None
 
-    monkeypatch.setattr(pl, "upload_image", fake_upload)
-    monkeypatch.setattr(pl, "_skc_open_space", fake_open_space)
-    monkeypatch.setattr(pl, "_pick_many_from_space", fake_pick_many)
+    patch_publish(monkeypatch, "pipeline", "upload_image", fake_upload)
+    patch_publish(monkeypatch, "pipeline", "_skc_open_space", fake_open_space)
+    patch_publish(monkeypatch, "pipeline", "_pick_many_from_space", fake_pick_many)
     monkeypatch.setattr(pl.asyncio, "sleep", no_sleep)
 
 
@@ -243,7 +245,7 @@ async def test_failure_midway_never_drops_below_start(tmp_path, stub_steps, monk
             return {"err": "空间弹窗打不开（模拟）"}
         return {"opened": True}
 
-    monkeypatch.setattr(pl, "_skc_open_space", flaky_open)
+    patch_publish(monkeypatch, "pipeline", "_skc_open_space", flaky_open)
     row = FakeRow(6)
     r = await pl.skc_replace_row(FakeSession(row), "图色", _imgs(tmp_path, 6))
     assert r["status"] == "error" and r["stage"] == "open-space", r

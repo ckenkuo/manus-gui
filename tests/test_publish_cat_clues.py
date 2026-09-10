@@ -6,6 +6,8 @@
   - 线索确实进了两条路径（遍历 + 缓存快路径）的提示词，且无线索时提示词退化成原样；
   - fix_sizes 在两侧档位相反时把报错指向「类目选错」而不是「尺码别名没覆盖」。
 """
+
+from publish_patching import patch_publish
 import json
 
 import pytest
@@ -157,7 +159,7 @@ async def test_st_auto_cat把info传给auto_cat(monkeypatch, tmp_path):
         got.update(kw, title=title)
         return {"status": "ok", "path": "A > B", "pathList": ["A", "B"],
                 "source": "walk"}
-    monkeypatch.setattr(service, "auto_cat", _fake)
+    patch_publish(monkeypatch, "service", "auto_cat", _fake)
     r = await service._st_auto_cat({"rowid": "r1", "info_path": str(ip)}, None, None)
     assert r["status"] == "ok"
     assert got["info"]["attributes"]["适合年龄段"].startswith("婴幼童")
@@ -172,7 +174,7 @@ async def test_读info失败不拖垮类目阶段(monkeypatch):
     async def _fake(session, rowid, title, **kw):
         got.update(kw, title=title)
         return {"status": "ok", "path": "A", "pathList": ["A"], "source": "walk"}
-    monkeypatch.setattr(service, "auto_cat", _fake)
+    patch_publish(monkeypatch, "service", "auto_cat", _fake)
     r = await service._st_auto_cat(
         {"rowid": "r1", "info_path": "不存在的路径.json", "title": "标题"}, None, None)
     assert r["status"] == "ok" and got["info"] is None

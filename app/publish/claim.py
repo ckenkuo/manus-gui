@@ -57,7 +57,7 @@ from typing import Optional
 
 from app.logger import logger
 from app.publish.browser import CRAWL_URL, BrowserSession, fill_js
-from app.publish.pipeline import find_rowid
+from app.publish.navigation import find_rowid
 
 # 认领弹窗与结果弹窗的识别文本：店小秘不给弹窗加稳定 class/id，只能靠标题文本认。
 # 两个弹窗会先后出现在同一个 .ant-modal-root 下，认错了就会在结果弹窗里找店铺列表。

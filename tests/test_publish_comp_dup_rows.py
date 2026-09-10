@@ -12,6 +12,8 @@ attrValueId，`if (n.includes(p)) return C(\`${t._label}不能重复选择\`)`�
 「棉」），再按 2 行写入（聚酯纤维 60% + 棉 40%），回读得到
 ['聚酯纤维(涤纶）', '棉', '棉'] —— 同字段两行同纤维，保存即被平台拦下。
 """
+
+from publish_patching import patch_publish
 import pytest
 
 from app.publish.pipeline import _apply_attr_changes, _trim_comp_rows
@@ -90,7 +92,7 @@ async def test_写完成分后按最大row裁剪(monkeypatch):
         return {"status": "ok", "label": label, "value": value,
                 "readback": {"label": label, "current": value}}
 
-    monkeypatch.setattr(pipeline, "set_attr", _fake_set_attr)
+    patch_publish(monkeypatch, "pipeline", "set_attr", _fake_set_attr)
     s = _ApplySession(rows=3)
     changes = [
         {"label": "成分", "value": "聚酯纤维(涤纶）", "num": 60, "row": 1},
@@ -113,7 +115,7 @@ async def test_非成分字段不裁(monkeypatch):
         return {"status": "ok", "label": label, "value": value,
                 "readback": {"label": label, "current": value}}
 
-    monkeypatch.setattr(pipeline, "set_attr", _fake_set_attr)
+    patch_publish(monkeypatch, "pipeline", "set_attr", _fake_set_attr)
     s = _ApplySession(rows=3)
     changes = [{"label": "织造方式", "value": "梭织", "num": None, "row": None}]
     row_map = {"织造方式": {"label": "织造方式", "kind": "select"}}
@@ -131,7 +133,7 @@ async def test_数值行不当成成分裁(monkeypatch):
         return {"status": "ok", "label": label, "value": value,
                 "readback": {"label": label, "current": value}}
 
-    monkeypatch.setattr(pipeline, "set_attr", _fake_set_attr)
+    patch_publish(monkeypatch, "pipeline", "set_attr", _fake_set_attr)
     s = _ApplySession(rows=3)
     changes = [{"label": "里料克重（g/m²)", "value": "120", "kind": "number",
                 "num": 120, "row": 1}]
@@ -153,8 +155,8 @@ async def test_裁剪异常不影响写入(monkeypatch):
     async def _boom(session, label, keep):
         raise RuntimeError("页面没了")
 
-    monkeypatch.setattr(pipeline, "set_attr", _fake_set_attr)
-    monkeypatch.setattr(pipeline, "_trim_comp_rows", _boom)
+    patch_publish(monkeypatch, "pipeline", "set_attr", _fake_set_attr)
+    patch_publish(monkeypatch, "pipeline", "_trim_comp_rows", _boom)
     s = _ApplySession(rows=3)
     changes = [{"label": "成分", "value": "棉", "num": 100, "row": 1}]
     row_map = {"成分": {"label": "成分", "kind": "select", "hasPercent": True}}

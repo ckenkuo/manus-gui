@@ -39,7 +39,10 @@ _JS_EXTRACT = r"""(() => {
   const st = ((window.rawData || {}).store || {});
   const g = st.goods || {};
   const gid = String(st.goodsId || g.goodsId || '');
-  if (!gid) return JSON.stringify({found: false});
+  const title = String(g.goodsName || g.goods_name || g.title || '').trim();
+  if (!gid || !title) return JSON.stringify({found: false, goodsId: gid,
+    diagnostic: {hasGoodsId: !!gid, goodsKeys: Object.keys(g),
+      reason: !gid ? 'missing-goods-id' : 'missing-title', url: location.href}});
   const num = v => (v == null || v === '' ? null : Number(v));
   // 详情长图：productDetail 可能是对象也可能是 JSON 串（实测是对象，但 SSR
   // 注入的同名字段在别的页面形态下见过字符串，故两种都收）
@@ -55,7 +58,7 @@ _JS_EXTRACT = r"""(() => {
   return JSON.stringify({
     found: true,
     goodsId: gid,
-    title: g.goodsName || '',
+    title: title,
     props: (st.goodsProperty || []).map(p => ({
       key: p.key || '', values: (p.values || []).map(String)})),
     skus: (st.sku || []).map(s => ({
@@ -89,7 +92,10 @@ _JS_BLOCKED = r"""(() => {
   const urlHit = /verification|captcha|\/login/i.test(href);
   const t = (document.body ? (document.body.innerText || '') : '').slice(0, 2000);
   const words = ['Verify', 'verification', 'unusual traffic', '安全验证', 'Press and hold'];
-  const hasData = !!(((window.rawData || {}).store || {}).goodsId);
+  const store = (window.rawData || {}).store || {};
+  const goods = store.goods || {};
+  const hasData = !!((store.goodsId || goods.goodsId) &&
+    String(goods.goodsName || goods.goods_name || goods.title || '').trim());
   const wordHit = (!hasData && words.find(w => t.includes(w))) || '';
   return JSON.stringify({blocked: !!(urlHit || wordHit), hasData: hasData,
                          detail: String(wordHit || (urlHit ? href : '')),
@@ -201,30 +207,37 @@ async def fetch(session: BrowserSession, url: str,
             detail = str(probe.get("detail") or "未知")
             is_login = "login" in detail.lower()
             if is_login:
-                hint = ("请在该 Chrome 窗口里手动打开这个商品页（从站内点进去最稳，"
-                        "必要时先登录 Temu 账号），保持页签开着再重跑本商品")
+                hint = ("请在该 Chrome 窗口里登录并打开目标商品页（可从站内进入或新开页签），"
+                        "保持页签开着，检测到完整商品数据后自动继续")
             else:
-                hint = "请切到该 Chrome 窗口手动完成校验（通常是长按按钮或刷新），过关后重跑"
+                hint = "请切到该 Chrome 窗口手动完成校验并打开目标商品页，过关后自动继续"
             # 【拦截原因用人话，不贴 URL】原先直接把 login.html?from=... 的长串塞进
             # 提示里，截断后是「https://www.temu.com/login.html?from=https%3A%2F%2F」
             # 这种半截 URL，占满一行还什么都没说明。
             why = "被跳转到登录页" if is_login else f"命中校验（{detail[:40]}）"
-            message = f"Temu 取数被拦（{why}）：{hint}"
+            message = f"Temu 取数被拦（{why}）：{hint}；目标商品 {gid}"
             # 【等人处理，不直接失败】理由同拼多多适配器：人就在机器前，登录或把商品页
             # 点开只要几秒；报错则要重跑整个商品。
+            async def recover_page():
+                if gid:
+                    await session.adopt_open_page(f"-g-{gid}")
+
             if await wait_human(session, _JS_BLOCKED, "hasData", message,
-                                on_manual=on_manual):
+                                on_manual=on_manual, before_probe=recover_page):
                 data = await session.wait_for(_JS_EXTRACT, lambda d: d.get("found"),
                                               timeout=timeout)
             if not data.get("found"):
                 raise RuntimeError(f"{message}（等待超时或仍未就绪）")
         else:
             raise RuntimeError(
-                "Temu 页面数据未就绪（window.rawData.store.goodsId 缺失）。"
+                "Temu 商品数据未完整加载（缺少商品 ID 或标题）。"
+                + f"诊断：{data.get('diagnostic') or {}}。"
                 + ("" if adopted else
                    "本次是新导航打开的——Temu 常把重新导航跳到登录页，"
                    "请在该 Chrome 窗口里把商品页打开着再跑（见适配器 fetch 的说明）"))
 
+    if gid and str(data.get("goodsId") or "") != gid:
+        raise RuntimeError(f"Temu 页面商品不匹配：目标 {gid}，实际 {data.get('goodsId')}，请打开目标商品页")
     logger.info(f"Temu 页面数据就绪：{(data.get('title') or '')[:60]}")
 
     attrs: dict = {}

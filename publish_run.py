@@ -82,7 +82,9 @@ async def main() -> int:
     ap = argparse.ArgumentParser(description="店小秘发布管线批量编排")
     src = ap.add_mutually_exclusive_group(required=False)
     src.add_argument("--tasks", help="任务清单 JSON 文件（批量）")
-    src.add_argument("--url", help="单个 1688 链接（全流程）")
+    src.add_argument("--url", help="单个来源商品链接（自动选择对应发布管线）")
+    ap.add_argument("--source", choices=("1688", "pdd", "temu", "amazon"),
+                    help="限定来源发布管线；与链接或商品数据不一致时拒绝运行")
     src.add_argument("--rowid", help="单个草稿 rowid（跳过采集认领，需配 --info）")
     ap.add_argument("--title", default="", help="商品标题（--url/--rowid 模式可选）")
     ap.add_argument("--info", default="", help="product-info.json 路径（--rowid 模式必填）")
@@ -137,6 +139,15 @@ async def main() -> int:
         tasks = [{"rowid": args.rowid, "info_path": args.info, "title": args.title}]
     else:
         ap.error("必须给 --tasks / --url / --rowid 之一")
+
+    if args.source:
+        from app.publish.workflows import get_workflow
+
+        try:
+            workflow = get_workflow(args.source)
+            tasks = [workflow.validate_task(task) for task in tasks]
+        except (ValueError, OSError) as error:
+            ap.error(str(error))
 
     # 并发数落的是同一份 prefs（Web 页与 CLI 共用），故这里是「设置」而不是「本次覆盖」。
     # 刻意不做成临时值：用户在链路差的环境里调小它，下次跑批照样该小，

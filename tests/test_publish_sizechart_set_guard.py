@@ -9,6 +9,8 @@
      「有 3 件、只进了 2 件」。
   3. note 要点出每张表用了源图哪个部件（partUsed），那是复核数值分没分开的第一眼。
 """
+
+from publish_patching import patch_publish
 import asyncio
 
 from app.publish import service as S
@@ -29,8 +31,8 @@ def _run(monkeypatch, judge, r0, r1, ctx_extra=None, calls=None):
     async def fake_prewarm(ctx, key):
         return judge
 
-    monkeypatch.setattr(S, "add_sizechart", fake_add)
-    monkeypatch.setattr(S, "_await_prewarm", fake_prewarm)
+    patch_publish(monkeypatch, "service", "add_sizechart", fake_add)
+    patch_publish(monkeypatch, "service", "_await_prewarm", fake_prewarm)
     ctx = {"info_path": "x"}
     if ctx_extra:
         ctx.update(ctx_extra)

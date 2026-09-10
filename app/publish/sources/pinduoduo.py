@@ -141,6 +141,20 @@ def _price_of(sku: dict) -> float:
     return None
 
 
+def _clean_pdd_fiber(raw: str) -> str:
+    """兼容入口，拼多多数据规则归独立发布管线所有。"""
+    from app.publish.workflows.pinduoduo import clean_fiber
+
+    return clean_fiber(raw)
+
+
+def parse_composition(attrs: dict) -> dict:
+    """兼容入口，转交拼多多发布管线解析成分。"""
+    from app.publish.workflows.pinduoduo import parse_composition as parse
+
+    return parse(attrs)
+
+
 async def fetch(session: BrowserSession, url: str,
                 on_manual=None, timeout: float = 40.0) -> SourceProduct:
     """打开拼多多详情页并抽出 SourceProduct。只读：不点任何按钮。

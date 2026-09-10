@@ -16,6 +16,8 @@ r"""阶段⑦b SKU 预览图（变种信息表第一列）——2026-08-30 玩�
 
 全程离线：假会话 + 纯函数，不连 CDP、不发 LLM 请求、不碰真实图床。
 """
+
+from publish_patching import patch_publish
 import json
 
 import pytest
@@ -79,13 +81,13 @@ async def test_有trigger判supported():
 
 
 @pytest.mark.asyncio
-async def test_有行但无trigger判不支持():
-    """该类目这一列不可换图 → 调用方应 skipped（同 skc_image_support 的取向）。"""
+async def test_有行但无trigger仍检查预览图():
+    """空格可能只有点击入口，没有悬停触发器。"""
     s = _StateSession({"rows": [_row(0, "均码", 800, 800)],
                        "heads": ["预览图( 批量)", "颜色"],
                        "previewIdx": 0, "colorIdx": 1, "hasTrigger": False})
     st = await P.sku_preview_state(s)
-    assert st["supported"] is False
+    assert st["supported"] is True
 
 
 @pytest.mark.asyncio
@@ -142,8 +144,8 @@ def test_状态脚本带行级换图入口():
 
 
 @pytest.mark.asyncio
-async def test_坏行全无换图入口判ok不fail(monkeypatch, tmp_path):
-    """坏行全无 trigger 时是继承图（共享主图），不判 fail，只记 manual_check 交人工。"""
+async def test_坏行全无换图入口判fail(monkeypatch, tmp_path):
+    """不合规图片无入口仍必须拦截。"""
     async def fake_state(session):
         return {"supported": True, "rows": [
             {"i": 0, "color": "洛克黄", "url": "https://x.jpg", "w": 600, "h": 600,
@@ -156,9 +158,9 @@ async def test_坏行全无换图入口判ok不fail(monkeypatch, tmp_path):
         events.append(ev)
 
     # service 模块 import 的是自己的名字，mock 要打在 S 上而不是 P 上
-    monkeypatch.setattr(S, "sku_preview_state", fake_state)
+    patch_publish(monkeypatch, "service", "sku_preview_state", fake_state)
     r = await S._st_sku_preview({"workdir": str(tmp_path)}, None, emit)
-    assert r["status"] == "ok"
+    assert r["status"] == "fail"
     assert any(e.get("type") == "manual_check" and e.get("stage") == "sku_preview"
                for e in events)
 
@@ -271,7 +273,7 @@ def _stub_upload(monkeypatch):
         return {"status": "ok",
                 "fileId": "/wxalbum/2525332/20260830/newfid.jpg"}
 
-    monkeypatch.setattr(P, "upload_image", _fake)
+    patch_publish(monkeypatch, "pipeline", "upload_image", _fake)
     return _fake
 
 
@@ -321,7 +323,7 @@ async def test_上传失败不碰页面(monkeypatch):
     async def _fail(session, path, full_cid=None):
         return {"status": "error", "err": "COS PUT 被拦"}
 
-    monkeypatch.setattr(P, "upload_image", _fail)
+    patch_publish(monkeypatch, "pipeline", "upload_image", _fail)
     s = _ReplaceSession()
     r = await P.sku_preview_replace_row(s, 0, "x.jpg", 0)
     assert r["status"] == "error" and r["stage"] == "upload"

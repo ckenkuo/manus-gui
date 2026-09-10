@@ -163,6 +163,8 @@ def test_显式从阶段一重跑要真的重提(tmp_path, monkeypatch):
 
     async def fake_extract(url, session=None, enrich=True, on_manual=None):
         called["url"] = url
+        (tmp_path / "new.json").write_text(
+            json.dumps({"source": {"platform": "1688", "url": url}}), encoding="utf-8")
         return {"status": "ok", "infoPath": str(tmp_path / "new.json"),
                 "outdir": str(tmp_path), "title": "新抓的", "attrCount": 3,
                 "mainImgs": 11, "descImgs": 9}
@@ -183,6 +185,8 @@ def test_显式从阶段一重跑要真的重提(tmp_path, monkeypatch):
 def test_普通续跑仍沿用旧产物(tmp_path, monkeypatch):
     """没点名 ① 时必须保持原行为：续跑不该白重抓一遍源站（几十张图要重下）。"""
     from app.publish import service as S
+    (tmp_path / "old.json").write_text(
+        json.dumps({"source": {"platform": "1688"}}), encoding="utf-8")
 
     async def boom(*a, **kw):
         raise AssertionError("普通续跑不该调 extract_product")
@@ -202,6 +206,8 @@ def test_普通续跑仍沿用旧产物(tmp_path, monkeypatch):
 def test_rowid模式点名阶段一也无从重提(tmp_path, monkeypatch):
     """rowid 模式（无 url）没有源页面可抓，点名 ① 仍要跳过而不是拿 None 去导航。"""
     from app.publish import service as S
+    (tmp_path / "old.json").write_text(
+        json.dumps({"source": {"platform": "1688"}}), encoding="utf-8")
 
     async def boom(*a, **kw):
         raise AssertionError("无 url 时不该调 extract_product")

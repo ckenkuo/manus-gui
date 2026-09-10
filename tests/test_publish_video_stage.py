@@ -9,6 +9,8 @@
 被平台打回」。这类「本该降级却中断」的回归在真站上极难发现（要恰好碰上下载失败），
 故用单测把每条失败路径都钉住。
 """
+
+from publish_patching import patch_publish
 import os
 
 import pytest
@@ -39,7 +41,7 @@ def _patch(monkeypatch, *, cur=None, dl=None, norm=None, setv=None):
     async def _read(session, rowid):
         return cur if cur is not None else {"status": "ok", "videoUrl": ""}
 
-    monkeypatch.setattr(service, "read_video_url", _read)
+    patch_publish(monkeypatch, "service", "read_video_url", _read)
     monkeypatch.setattr(
         service.videolib, "download_video",
         lambda url, out, **kw: (dl if dl is not None
@@ -57,7 +59,7 @@ def _patch(monkeypatch, *, cur=None, dl=None, norm=None, setv=None):
     async def _set(session, path, full_cid=None):
         return setv if setv is not None else {"status": "ok", "url": "https://x/a.mp4"}
 
-    monkeypatch.setattr(service, "set_video", _set)
+    patch_publish(monkeypatch, "service", "set_video", _set)
 
 
 # ---- skipped 的三种情形 -----------------------------------------------------
@@ -96,7 +98,7 @@ async def test_视频已合规时跳过且不上传(monkeypatch, _ctx):
            cur={"status": "ok", "videoUrl": "https://cdn/a.mp4"},
            norm={"status": "ok", "action": "skip", "output": "a.mp4",
                  "meta": {"w": 1080, "h": 1080, "ratio": 1.0}, "ratioName": "1:1"})
-    monkeypatch.setattr(service, "set_video", _set)
+    patch_publish(monkeypatch, "service", "set_video", _set)
     events, emit = _emit_collector()
     r = await service._st_video(_ctx, _FakeSession(), emit)
     assert r["status"] == "skipped"

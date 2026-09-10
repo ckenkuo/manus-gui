@@ -6,6 +6,8 @@ vision.plan_desc_text 的测试随该函数一起删除，这里只覆盖删除�
 
 desc_text_delete_all 走浏览器，mock 掉 session 只验证枚举、顺序与失败隔离。
 """
+
+from publish_patching import patch_publish
 import re
 
 import pytest
@@ -57,7 +59,7 @@ def _stub_text_map(monkeypatch):
     async def fake_map(session):
         return {"status": "ok", "count": len(texts), "texts": texts}
 
-    monkeypatch.setattr("app.publish.pipeline.desc_text_map", fake_map)
+    patch_publish(monkeypatch, "pipeline", "desc_text_map", fake_map)
     return texts
 
 
@@ -108,7 +110,7 @@ async def test_map_error_propagates(monkeypatch):
     async def fake_map(session):
         return {"status": "error", "err": "编辑器不在"}
 
-    monkeypatch.setattr("app.publish.pipeline.desc_text_map", fake_map)
+    patch_publish(monkeypatch, "pipeline", "desc_text_map", fake_map)
     session = FakeSession()
     r = await desc_text_delete_all(session)
     assert r["status"] == "error" and "编辑器不在" in str(r)

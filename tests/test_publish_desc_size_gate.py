@@ -7,6 +7,8 @@
   2. ⑧ 的 `missing`（源尺码在页面无对应框）被 service 层整个丢掉，note 只剩
      「源尺码 5 个 | SKU 表 4 行」，少了谁全靠人对数字。
 """
+
+from publish_patching import patch_publish
 import asyncio
 import json
 import os
@@ -174,7 +176,7 @@ async def test_service层把缺失尺码报成manual_check(tmp_path, monkeypatch
     async def _fake(session, info_path, **kw):
         return {"status": "ok", "wantedSizes": ["6-9m", "9-12m"],
                 "rowCount": 4, "missing": ["6-9m"]}
-    monkeypatch.setattr(service, "fix_sizes", _fake)
+    patch_publish(monkeypatch, "service", "fix_sizes", _fake)
 
     r = await service._st_fix_sizes({"info_path": "x.json"}, None, _emit)
     assert r["status"] == "ok"
@@ -195,7 +197,7 @@ async def test_无缺失时不发manual_check(tmp_path, monkeypatch):
 
     async def _fake(session, info_path, **kw):
         return {"status": "ok", "wantedSizes": ["6-9m"], "rowCount": 5}
-    monkeypatch.setattr(service, "fix_sizes", _fake)
+    patch_publish(monkeypatch, "service", "fix_sizes", _fake)
 
     r = await service._st_fix_sizes({"info_path": "x.json"}, None, _emit)
     assert r["status"] == "ok" and r["note"] == "源尺码 1 个 | SKU 表 5 行"

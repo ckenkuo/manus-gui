@@ -11,6 +11,8 @@
 这里钉三件事：菜单晚出来要等到、第一次点击被吃掉要补点一次、瞄点没落在链接上
 要先收浮层再重读坐标。不覆盖真实页面（要 Chrome 和登录态）。
 """
+
+from publish_patching import patch_publish
 import pytest
 
 from app.publish import pipeline
@@ -76,7 +78,7 @@ def _patched(monkeypatch):
 
     async def _upload(session, path, full_cid=None, **kw):
         return {"status": "ok", "fileId": "abc/deadbeef"}
-    monkeypatch.setattr(pipeline, "upload_image", _upload)
+    patch_publish(monkeypatch, "pipeline", "upload_image", _upload)
 
 
 async def _click_counter(session, x, y):
@@ -86,7 +88,7 @@ async def _click_counter(session, x, y):
 @pytest.mark.asyncio
 async def test_菜单晚一拍出来要等到而不是直接判失败(monkeypatch, _patched):
     """硬等 1.8s 不够就判失败，是这条 bug 的直接成因。"""
-    monkeypatch.setattr(pipeline, "_cdp_click_xy", _click_counter)
+    patch_publish(monkeypatch, "pipeline", "_cdp_click_xy", _click_counter)
     # 第一次点击就会开菜单，但要轮询几轮才可见
     s = _FakeSession(menu_ready_after_clicks=1)
     r = await pipeline.desc_replace(s, 1, "x.jpg", expect_url="https://cdn/a.jpg")
@@ -101,7 +103,7 @@ async def test_第一次点击被吃掉时补点一次(monkeypatch, _patched):
     模块图点击也算一次，故这里让菜单要到第 3 次点击才出现：
     模块图(1) + 更换图片首点(2) 都不出，补点(3) 才出。
     """
-    monkeypatch.setattr(pipeline, "_cdp_click_xy", _click_counter)
+    patch_publish(monkeypatch, "pipeline", "_cdp_click_xy", _click_counter)
     s = _FakeSession(menu_ready_after_clicks=3)
     r = await pipeline.desc_replace(s, 1, "x.jpg", expect_url="https://cdn/a.jpg")
     assert not (r["status"] == "error" and r.get("stage") == "menu"), \
@@ -112,7 +114,7 @@ async def test_第一次点击被吃掉时补点一次(monkeypatch, _patched):
 @pytest.mark.asyncio
 async def test_始终不展开时报错带上瞄点诊断(monkeypatch, _patched):
     """真的打不开也要报清楚：坐标、是否命中链接、命中了谁，否则只能靠猜。"""
-    monkeypatch.setattr(pipeline, "_cdp_click_xy", _click_counter)
+    patch_publish(monkeypatch, "pipeline", "_cdp_click_xy", _click_counter)
     s = _FakeSession(menu_ready_after_clicks=99)
     r = await pipeline.desc_replace(s, 1, "x.jpg", expect_url="https://cdn/a.jpg")
     assert r["status"] == "error" and r["stage"] == "menu"
@@ -128,7 +130,7 @@ async def test_始终不展开时报错带上瞄点诊断(monkeypatch, _patched)
 @pytest.mark.asyncio
 async def test_瞄点被浮层盖住时先收浮层再重读坐标(monkeypatch, _patched):
     """残留图片菜单是 fixed，正好停在右侧面板这条带上——同 SKC 行按钮那类遮挡。"""
-    monkeypatch.setattr(pipeline, "_cdp_click_xy", _click_counter)
+    patch_publish(monkeypatch, "pipeline", "_cdp_click_xy", _click_counter)
     s = _FakeSession(menu_ready_after_clicks=2, on_link=False)
     r = await pipeline.desc_replace(s, 1, "x.jpg", expect_url="https://cdn/a.jpg")
     assert s.parked >= 1, "瞄点没命中链接时必须先收残留浮层"
@@ -154,7 +156,7 @@ async def test_点击前先收掉上一张残留的描述菜单(monkeypatch, _pa
         if (x, y) == (6, 300):
             session.blank_clicks += 1
 
-    monkeypatch.setattr(pipeline, "_cdp_click_xy", _track)
+    patch_publish(monkeypatch, "pipeline", "_cdp_click_xy", _track)
     s = _FakeSession(menu_ready_after_clicks=2, stale_menu_open=True)
     r = await pipeline.desc_replace(s, 1, "x.jpg", expect_url="https://cdn/a.jpg")
 

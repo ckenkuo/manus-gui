@@ -23,6 +23,8 @@
 
 全程离线：假会话按 JS 片段特征分派，不连 CDP、不发 LLM 请求。
 """
+
+from publish_patching import patch_publish
 import asyncio
 import json
 import os
@@ -101,7 +103,7 @@ def test_有尺码组时照旧走原逻辑(tmp_path):
     assert "全部不存在" in r["reason"]
 
 
-def test_阶段八包装把skipped透传():
+def test_阶段八包装把skipped透传(monkeypatch):
     """service 侧不能把 skipped 二次判成 fail（原实现「不等于 ok」就 fail）。"""
     events = []
 
@@ -111,12 +113,8 @@ def test_阶段八包装把skipped透传():
     async def fake_fix_sizes(session, info_path):
         return {"status": "skipped", "reason": "本类目没有尺码属性行（非服装类目）"}
 
-    orig = S.fix_sizes
-    try:
-        S.fix_sizes = fake_fix_sizes
-        r = asyncio.run(S._st_fix_sizes({"info_path": "x"}, None, emit))
-    finally:
-        S.fix_sizes = orig
+    patch_publish(monkeypatch, "service", "fix_sizes", fake_fix_sizes)
+    r = asyncio.run(S._st_fix_sizes({"info_path": "x"}, None, emit))
     assert r["status"] == "skipped"
     # 要在进度里留一条说明，否则用户只看到⑧ 没做事、不知道为什么
     assert any("尺码" in (e.get("message") or "") for e in events)
@@ -141,8 +139,8 @@ def test_无尺码表栏时阶段九跳过(monkeypatch):
     async def fake_prewarm(ctx, key):
         return {"skuCat": "1", "packing": []}
 
-    monkeypatch.setattr(S, "add_sizechart", fake_add)
-    monkeypatch.setattr(S, "_await_prewarm", fake_prewarm)
+    patch_publish(monkeypatch, "service", "add_sizechart", fake_add)
+    patch_publish(monkeypatch, "service", "_await_prewarm", fake_prewarm)
     r = asyncio.run(S._st_sizechart({"info_path": "x"}, None, emit))
     assert r["status"] == "skipped"
     assert "无尺码表栏" in r["note"]
@@ -159,8 +157,8 @@ def test_尺码表其它失败仍算失败(monkeypatch):
     async def fake_prewarm(ctx, key):
         return {"skuCat": "1", "packing": []}
 
-    monkeypatch.setattr(S, "add_sizechart", fake_add)
-    monkeypatch.setattr(S, "_await_prewarm", fake_prewarm)
+    patch_publish(monkeypatch, "service", "add_sizechart", fake_add)
+    patch_publish(monkeypatch, "service", "_await_prewarm", fake_prewarm)
     r = asyncio.run(S._st_sizechart({"info_path": "x"}, None, emit))
     assert r["status"] == "fail"
 
@@ -335,9 +333,9 @@ def test_阶段七不支持时跳过且不发视觉请求(monkeypatch):
     async def fake_support(session):
         return {"supported": False, "checkboxes": 6}
 
-    monkeypatch.setattr(S, "skc_image_support", fake_support)
+    patch_publish(monkeypatch, "service", "skc_image_support", fake_support)
     monkeypatch.setattr(S.vision, "plan_skc", boom)
-    monkeypatch.setattr(S, "_load_info", lambda p: {"colors": ["a", "b"]})
+    patch_publish(monkeypatch, "service", "_load_info", lambda p: {"colors": ["a", "b"]})
     r = asyncio.run(S._st_skc({"info_path": "x", "workdir": "y"}, None, emit))
     assert r["status"] == "skipped"
     assert "颜色图位" in r["note"]

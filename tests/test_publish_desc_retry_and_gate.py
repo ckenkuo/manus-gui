@@ -18,6 +18,8 @@ tests/test_publish_desc_link_occluded.py）。后果是两层：
   3. 尺寸破线时本阶段必须 fail，不能带着不合规的图走到发布
 不覆盖真实页面（要 Chrome 和登录态）。
 """
+
+from publish_patching import patch_publish
 import asyncio
 import os
 
@@ -79,14 +81,14 @@ def _env(tmp_path, monkeypatch, calls: dict, replace_results: list,
             f.write(b"x")
         return p, p
 
-    monkeypatch.setattr(S, "desc_map", _map)
+    patch_publish(monkeypatch, "service", "desc_map", _map)
     monkeypatch.setattr(S.vision, "plan_desc", _plan_desc)
-    monkeypatch.setattr(S, "_resolve_desc_pos", _resolve)
-    monkeypatch.setattr(S, "_desc_cache_paths", _paths)
-    monkeypatch.setattr(S, "desc_replace", _replace)
-    monkeypatch.setattr(S, "desc_save", _save)
-    monkeypatch.setattr(S, "ensure_desc_closed", _closed)
-    monkeypatch.setattr(S, "_load_info", lambda p: {})
+    patch_publish(monkeypatch, "service", "_resolve_desc_pos", _resolve)
+    patch_publish(monkeypatch, "service", "_desc_cache_paths", _paths)
+    patch_publish(monkeypatch, "service", "desc_replace", _replace)
+    patch_publish(monkeypatch, "service", "desc_save", _save)
+    patch_publish(monkeypatch, "service", "ensure_desc_closed", _closed)
+    patch_publish(monkeypatch, "service", "_load_info", lambda p: {})
     return {"info_path": "", "workdir": str(tmp_path)}
 
 
@@ -225,7 +227,7 @@ def test_页签被导航走时不重试(tmp_path, monkeypatch):
     async def _resolve_fatal(session, url):
         calls["resolve"] = calls.get("resolve", 0) + 1
         return 0, "页签已不在编辑页（当前 .../draft）", True
-    monkeypatch.setattr(S, "_resolve_desc_pos", _resolve_fatal)
+    patch_publish(monkeypatch, "service", "_resolve_desc_pos", _resolve_fatal)
 
     _run(ctx, msgs)
 

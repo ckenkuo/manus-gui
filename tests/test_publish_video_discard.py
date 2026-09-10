@@ -11,6 +11,8 @@
 故这里逐条覆盖，不测 DOM 几何（那部分靠真站探查，见
 workspace/_probe_video_delete_click.py 的取证记录）。
 """
+
+from publish_patching import patch_publish
 import pytest
 
 from app.publish import service
@@ -61,9 +63,9 @@ def _patch_discard(monkeypatch, ret):
         calls["set"] += 1
         return {"status": "ok"}
 
-    monkeypatch.setattr(service, "delete_video", _del)
-    monkeypatch.setattr(service, "read_video_url", _read)
-    monkeypatch.setattr(service, "set_video", _set)
+    patch_publish(monkeypatch, "service", "delete_video", _del)
+    patch_publish(monkeypatch, "service", "read_video_url", _read)
+    patch_publish(monkeypatch, "service", "set_video", _set)
     monkeypatch.setattr(service.videolib, "download_video", _dl)
     monkeypatch.setattr(service.videolib, "normalize_video", _norm)
     return calls
@@ -139,7 +141,7 @@ def test_publish_one与run_batch都收keep_video():
 
 def test_publish_one把keep_video塞进ctx():
     import inspect
-    src = inspect.source = inspect.getsource(service.publish_one)
+    src = inspect.getsource(service._run_product)
     assert '"keep_video": keep_video' in src
 
 
@@ -152,7 +154,7 @@ def test_keep_video不进状态文件():
     """与 use_cache/price/do_publish 同理：「这批要不要视频」属于本次运行的决定，
     续跑不该继承上次的取向。"""
     import inspect
-    src = inspect.getsource(service.publish_one)
+    src = inspect.getsource(service._run_product)
     # 状态回写的白名单元组里不该出现 keep_video
     assert 'state["keep_video"]' not in src
     assert "keep_video" not in src.split('for k in (')[-1].split(')')[0]

@@ -304,7 +304,7 @@ def test_1688空维段不产出空颜色或空尺码():
 
 def test_1688抽取脚本使用有效的context回退表达式():
     """window.context 缺失时也要返回 found=false，而不是脚本语法错误。"""
-    assert "window.context||{})" in E._JS_EXTRACT
+    assert "const ctx = window.context || {};" in E._JS_EXTRACT
     assert "window.context||)" not in E._JS_EXTRACT
 
 
@@ -358,6 +358,43 @@ def test_干净URL不被动到(mod):
     url = "https://img.kwcdn.com/product/fancy/00c80dc9-0dbd-4364-b302-0ab9571f285f.jpg"
     assert mod.strip_img_params(url) == url
     assert mod.strip_img_params("") == ""
+
+
+# ---- 成分解析策略（来源平台键名差异）----------------------------------------
+
+def test_拼多多成分解析剥占位前缀与括号别名():
+    """拼多多「面料/材质」值形如「其它/涤纶（聚酯纤维）」：不清洗会命中 _COMP_NON_FIBER
+    的「其它」、把真正的纤维「涤纶」也一起清掉。故先剥前缀与括号别名再进框架。"""
+    r = pinduoduo.parse_composition(
+        {"面料/材质": "其它/涤纶（聚酯纤维）", "成分含量": "70%（含）-80%（不含）"})
+    assert r["fiber"] == "涤纶" and r["percent"] == 70
+    assert r["fiberText"] == "涤纶"
+
+
+def test_拼多多成分解析无占位前缀():
+    r = pinduoduo.parse_composition({"面料/材质": "棉", "成分含量": "90%"})
+    assert r["fiber"] == "棉" and r["percent"] == 90
+
+
+def test_拼多多成分解析整段都是占位词时交LLM():
+    """「面料/材质」只有「其它」这类占位词时，fiber 置空、保留含量事实交阶段④推断，
+    而不是清洗成空串被当成「源没写」走默认聚酯纤维 100%。"""
+    r = pinduoduo.parse_composition({"面料/材质": "其它", "成分含量": "70%"})
+    assert r["fiber"] == "" and r["percent"] == 70
+    assert r["fiberText"] == "其它" and r.get("assumed")
+
+
+def test_拼多多成分解析缺失走默认兜底():
+    r = pinduoduo.parse_composition({})
+    assert r["fiber"] == "聚酯纤维" and r["percent"] == 100 and r.get("assumed")
+
+
+def test_1688成分解析走默认键名():
+    """1688 的 parse_composition 是 extract.parse_main_composition 的转发，键名仍用
+    「主面料成分」「主面料成分含量」，行为不因拆策略而变。"""
+    r = alibaba1688.parse_composition(
+        {"主面料成分": "棉", "主面料成分含量": "90%（含）-95%（不含）（%）"})
+    assert r["fiber"] == "棉" and r["percent"] == 90
 
 
 # ---- 亚马逊重量解析 ---------------------------------------------------------

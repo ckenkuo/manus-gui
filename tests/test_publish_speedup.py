@@ -7,6 +7,8 @@
   test_publish_service.py 里那条更早的测试）；
 - 预热命中时不再重复调 LLM，预热失败/未跑时各阶段照原路现场算（行为与改造前一致）。
 """
+
+from publish_patching import patch_publish
 import asyncio
 import inspect
 import json
@@ -20,7 +22,7 @@ from app.publish import service
 @pytest.fixture(autouse=True)
 def _isolate_prefs(tmp_path, monkeypatch):
     """prefs 重定向到临时目录，不污染真实 workspace/publish_prefs.json。"""
-    monkeypatch.setattr(service, "PREFS_PATH", str(tmp_path / "publish_prefs.json"))
+    patch_publish(monkeypatch, "service", "PREFS_PATH", str(tmp_path / "publish_prefs.json"))
 
 
 # ---- 生图并发可配置 ----------------------------------------------------------
@@ -235,8 +237,8 @@ async def test_预热命中时标题阶段不再调LLM(tmp_path, monkeypatch):
     async def never(*a, **kw):
         raise AssertionError("预热已命中，不该再调 generate_titles")
 
-    monkeypatch.setattr(service, "set_titles", fake_set_titles)
-    monkeypatch.setattr(service, "generate_titles", never)
+    patch_publish(monkeypatch, "service", "set_titles", fake_set_titles)
+    patch_publish(monkeypatch, "service", "generate_titles", never)
 
     ctx = {"info_path": _info_file(tmp_path),
            "prewarm": {"titles": {"status": "ok",
@@ -260,7 +262,7 @@ async def test_预热未跑时标题阶段照原路现场生成(tmp_path, monkey
         seen["generated"] = generated
         return {"status": "ok", "generated": {"enTitle": "现场生成"}}
 
-    monkeypatch.setattr(service, "set_titles", fake_set_titles)
+    patch_publish(monkeypatch, "service", "set_titles", fake_set_titles)
     ctx = {"info_path": _info_file(tmp_path)}          # 没有 prewarm
 
     async def _emit(ev):
@@ -280,7 +282,7 @@ async def test_预热结果只用一次(tmp_path, monkeypatch):
         calls.append(generated)
         return {"status": "ok", "generated": {"enTitle": "x"}}
 
-    monkeypatch.setattr(service, "set_titles", fake_set_titles)
+    patch_publish(monkeypatch, "service", "set_titles", fake_set_titles)
     ctx = {"info_path": _info_file(tmp_path),
            "prewarm": {"titles": {"status": "ok", "generated": {"enTitle": "预热"}}}}
 
@@ -301,7 +303,7 @@ async def test_预热生成失败时不当成命中(tmp_path, monkeypatch):
         seen["generated"] = generated
         return {"status": "ok", "generated": {"enTitle": "x"}}
 
-    monkeypatch.setattr(service, "set_titles", fake_set_titles)
+    patch_publish(monkeypatch, "service", "set_titles", fake_set_titles)
     ctx = {"info_path": _info_file(tmp_path),
            "prewarm": {"titles": {"status": "error",
                                   "reason": "title-generation-failed"}}}
@@ -319,7 +321,7 @@ async def test_清理预热命中时不重复清理(tmp_path, monkeypatch):
     async def never(ctx, emit):
         raise AssertionError("预热已清过，不该再清一遍")
 
-    monkeypatch.setattr(service, "_clean_main_images", never)
+    patch_publish(monkeypatch, "service", "_clean_main_images", never)
     ctx = {"info_path": _info_file(tmp_path),
            "prewarm": {"clean_images": {"status": "ok", "note": "清理 2/2 张"}}}
 
@@ -339,7 +341,7 @@ async def test_清理未预热时照原路现场清(tmp_path, monkeypatch):
         seen["ran"] = True
         return {"status": "ok", "note": "清理 1/1 张"}
 
-    monkeypatch.setattr(service, "_clean_main_images", fake_clean)
+    patch_publish(monkeypatch, "service", "_clean_main_images", fake_clean)
     ctx = {"info_path": _info_file(tmp_path)}
 
     async def _emit(ev):
@@ -498,7 +500,7 @@ def _client(_webapp):
 
 def test_settings接口返回当前并发与上限(_client, monkeypatch, tmp_path):
     client, webapp = _client
-    monkeypatch.setattr(webapp.publish_service, "PREFS_PATH",
+    patch_publish(monkeypatch, "service", "PREFS_PATH",
                         str(tmp_path / "p.json"))
     d = client.get("/publish/settings").json()
     assert d["imageConcurrency"] == 30
@@ -508,7 +510,7 @@ def test_settings接口返回当前并发与上限(_client, monkeypatch, tmp_pat
 
 def test_settings接口可保存并读回(_client, monkeypatch, tmp_path):
     client, webapp = _client
-    monkeypatch.setattr(webapp.publish_service, "PREFS_PATH",
+    patch_publish(monkeypatch, "service", "PREFS_PATH",
                         str(tmp_path / "p.json"))
     r = client.post("/publish/settings", json={"imageConcurrency": 16})
     assert r.status_code == 200 and r.json()["imageConcurrency"] == 16
@@ -518,7 +520,7 @@ def test_settings接口可保存并读回(_client, monkeypatch, tmp_path):
 def test_settings接口拒越界值(_client, monkeypatch, tmp_path):
     """越界是配置错误不是服务端故障，必须 400 而不是 500。"""
     client, webapp = _client
-    monkeypatch.setattr(webapp.publish_service, "PREFS_PATH",
+    patch_publish(monkeypatch, "service", "PREFS_PATH",
                         str(tmp_path / "p.json"))
     for bad in (0, -1, service.IMAGE_CONCURRENCY_MAX + 1):
         r = client.post("/publish/settings", json={"imageConcurrency": bad})
@@ -662,5 +664,3 @@ def test_滚动停稳判据是位置不再变():
     js = pl._JS_SCROLL_SETTLED
     assert "getBoundingClientRect().top" in js
     assert "same >= 2" in js, "要连续两次相同才算停稳，单次可能撞上匀速平台期"
-
-

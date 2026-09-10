@@ -124,10 +124,12 @@ def test_measurements_detects_half_girth():
     assert any("半围" in b for b in bad)
 
 
-def test_measurements_ignores_missing():
-    """缺值不算问题（缺值由 lacking 那条路径管）。"""
+def test_measurements_reports_missing_for_retry():
+    """缺失参数应触发模型重试。"""
     est = {"90cm": {"衣长": 40}}
-    assert _check_measurements(est, SIZES, ["衣长"]) == []
+    problems = _check_measurements(est, SIZES, ["衣长"])
+    assert len(problems) == 2
+    assert all("缺少有效正数参数" in problem for problem in problems)
 
 
 # ---- 人群档位判断 ---------------------------------------------------------

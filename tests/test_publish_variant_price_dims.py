@@ -8,6 +8,8 @@
 回归价值在「服装类真的没调 LLM」——这类接线一旦失效就是静默的（模型照样返回一组
 数、流程照样绿），只能靠断言 ask_json 没被调用来证明。参照 dimsCm 那个死键的教训。
 """
+
+from publish_patching import patch_publish
 import json
 
 import pytest
@@ -124,7 +126,7 @@ async def test_apparel_dims_skip_llm(tmp_path, monkeypatch):
         called.append(kw.get("what"))
         raise AssertionError("服装类不该调用 LLM 估算包装尺寸")
 
-    monkeypatch.setattr(pipeline, "ask_json", _boom, raising=False)
+    patch_publish(monkeypatch, "pipeline", "ask_json", _boom, raising=False)
     import app.publish.llm as pub_llm
     monkeypatch.setattr(pub_llm, "ask_json", _boom)
 
@@ -281,7 +283,7 @@ async def test_service_传递price与cat_path(monkeypatch):
         return {"status": "ok", "price": "99", "dims": ["30", "25", "3"],
                 "weight": "420", "msrp": "14.14", "rowCount": 3}
 
-    monkeypatch.setattr(service, "set_variant", _fake_set_variant)
+    patch_publish(monkeypatch, "service", "set_variant", _fake_set_variant)
 
     async def _emit(ev):
         return None
@@ -309,7 +311,7 @@ async def test_service_不自带默认价(monkeypatch):
         return {"status": "ok", "price": DECLARE_PRICE_DEFAULT,
                 "dims": ["30", "25", "3"], "weight": "420", "rowCount": 3}
 
-    monkeypatch.setattr(service, "set_variant", _fake_set_variant)
+    patch_publish(monkeypatch, "service", "set_variant", _fake_set_variant)
 
     async def _emit(ev):
         return None

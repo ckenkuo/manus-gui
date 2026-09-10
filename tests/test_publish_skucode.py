@@ -10,6 +10,8 @@
 这里钉住的是不依赖浏览器的那几层语义：token 清洗、非 ASCII 判定、词表去重与
 并发翻译、逐行拼装与重名加序号、以及回读校验的失败出口。
 """
+
+from publish_patching import patch_publish
 import json
 
 import pytest
@@ -80,7 +82,7 @@ async def test_中文颜色翻译后逐行拼装(monkeypatch):
         {"i": 1, "color": "粉红色", "size": "90", "cur": ""},
         {"i": 2, "color": "藏青色", "size": "80", "cur": ""},
     ]
-    monkeypatch.setattr(pipeline, "_translate_term",
+    patch_publish(monkeypatch, "pipeline", "_translate_term",
                         _fake_translate({"粉红色": "Pink", "藏青色": "Navy"}))
     s = _FakeSession(rows)
     r = await pipeline.fix_sku_codes(s)
@@ -106,7 +108,7 @@ async def test_按词去重只翻一次(monkeypatch):
         calls.append(term)
         return term, {"粉红色": "Pink", "藏青色": "Navy"}[term]
 
-    monkeypatch.setattr(pipeline, "_translate_term", _t)
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _t)
     r = await pipeline.fix_sku_codes(_FakeSession(rows))
     assert r["status"] == "ok"
     assert sorted(calls) == ["粉红色", "藏青色"]      # 尺码是数字，不进翻译
@@ -120,7 +122,7 @@ async def test_已是英文的词不调翻译(monkeypatch):
     async def _boom(term, kind, sem):
         raise AssertionError(f"不该翻译已是 ASCII 的词：{term}")
 
-    monkeypatch.setattr(pipeline, "_translate_term", _boom)
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _boom)
     r = await pipeline.fix_sku_codes(_FakeSession(rows))
     assert r["status"] == "ok"
     assert r["codes"] == ["Black-XL"]
@@ -135,7 +137,7 @@ async def test_不同中文译成同一英文时加序号(monkeypatch):
         {"i": 1, "color": "粉红色", "size": "80", "cur": ""},
         {"i": 2, "color": "粉色", "size": "90", "cur": ""},
     ]
-    monkeypatch.setattr(pipeline, "_translate_term",
+    patch_publish(monkeypatch, "pipeline", "_translate_term",
                         _fake_translate({"粉色": "Pink", "粉红色": "Pink"}))
     r = await pipeline.fix_sku_codes(_FakeSession(rows))
     assert r["status"] == "ok"
@@ -151,7 +153,7 @@ async def test_翻译结果剥完为空则失败不写入(monkeypatch):
     async def _t(term, kind, sem):
         return term, pipeline.sku_token("粉红")     # 模型没翻，剥完为空
 
-    monkeypatch.setattr(pipeline, "_translate_term", _t)
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _t)
     s = _FakeSession(rows)
     r = await pipeline.fix_sku_codes(s)
     assert r["status"] == "error"
@@ -167,7 +169,7 @@ async def test_模型混着中文吐回时剥净可用(monkeypatch):
     async def _t(term, kind, sem):
         return term, pipeline.sku_token("粉Pink")
 
-    monkeypatch.setattr(pipeline, "_translate_term", _t)
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _t)
     r = await pipeline.fix_sku_codes(_FakeSession(rows))
     assert r["status"] == "ok"
     assert r["codes"] == ["Pink-80"]
@@ -176,7 +178,7 @@ async def test_模型混着中文吐回时剥净可用(monkeypatch):
 @pytest.mark.asyncio
 async def test_回读发现非ascii残留报validation_error(monkeypatch):
     rows = [{"i": 0, "color": "粉红色", "size": "80", "cur": ""}]
-    monkeypatch.setattr(pipeline, "_translate_term", _fake_translate({"粉红色": "Pink"}))
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _fake_translate({"粉红色": "Pink"}))
     s = _FakeSession(rows, fill_result={
         "filled": 1, "mismatch": [],
         "bad": [{"i": 0, "v": "粉红色-80", "why": "non-ascii"}], "sample": []})
@@ -188,7 +190,7 @@ async def test_回读发现非ascii残留报validation_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_行序被重排时那行跳过并报出(monkeypatch):
     rows = [{"i": 0, "color": "粉红色", "size": "80", "cur": ""}]
-    monkeypatch.setattr(pipeline, "_translate_term", _fake_translate({"粉红色": "Pink"}))
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _fake_translate({"粉红色": "Pink"}))
     s = _FakeSession(rows, fill_result={
         "filled": 0, "mismatch": [{"i": 0, "why": "row-moved", "now": "藏青色/90"}],
         "bad": [], "sample": []})

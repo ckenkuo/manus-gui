@@ -5,6 +5,8 @@
 单阶段失败不拖垮批次、事件序列契约、vision 决策的解析与兜底。
 真实页面交互已由各阶段自己的真站验证覆盖，这里全部换成假阶段函数。
 """
+
+from publish_patching import patch_publish
 import json
 import os
 import asyncio
@@ -21,8 +23,8 @@ _JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01" + b"A" * 40
 @pytest.fixture(autouse=True)
 def _isolate_state(tmp_path, monkeypatch):
     """状态文件和 prefs 重定向到临时目录，不污染真实 workspace/。"""
-    monkeypatch.setattr(service, "STATE_DIR", str(tmp_path / "publish-state"))
-    monkeypatch.setattr(service, "PREFS_PATH", str(tmp_path / "publish_prefs.json"))
+    patch_publish(monkeypatch, "service", "STATE_DIR", str(tmp_path / "publish-state"))
+    patch_publish(monkeypatch, "service", "PREFS_PATH", str(tmp_path / "publish_prefs.json"))
 
 
 def _fake_stages(monkeypatch, calls: list, fail_at: str = "", raise_at: str = ""):
@@ -35,13 +37,21 @@ def _fake_stages(monkeypatch, calls: list, fail_at: str = "", raise_at: str = ""
             if _sid == fail_at:
                 return {"status": "fail", "note": "模拟失败"}
             return {"status": "ok", "note": f"{_sid} done"}
-        monkeypatch.setitem(service._STAGE_FUNCS, sid, fake)
+        patch_publish(monkeypatch, "service", service._STAGE_FUNCS[sid].__name__, fake)
+    real_load = service._load_info
+
+    def load_info(path):
+        if path == "x.json":
+            return {"source": {"platform": "1688"}}
+        return real_load(path)
+
+    patch_publish(monkeypatch, "service", "_load_info", load_info)
     # 续跑补开编辑页（publish_one 在 claim/auto_cat 都跳过时调用）也换成假的，
     # 记录为 "open_edit" 便于断言调用时机
     async def fake_open_edit(session, rowid):
         calls.append("open_edit")
         return {"rowid": rowid}
-    monkeypatch.setattr(service, "open_edit", fake_open_edit)
+    patch_publish(monkeypatch, "service", "open_edit", fake_open_edit)
 
     # 续跑实况探测默认「表单成果都还在」：这些用例测的是状态文件的跳过规则本身，
     # 不该被实况判定干扰。测实况判定的用例自己覆盖 live_state（见 _fake_live）。
@@ -53,7 +63,7 @@ def _fake_stages(monkeypatch, calls: list, fail_at: str = "", raise_at: str = ""
                 # ⑦b 预览图达标（这份桩的语义是「成果都还在」）
                 "previewCount": 8, "previewBad": 0,
                 "catText": "女士运动卫裤", "catUnset": False, "catDeleted": False}
-    monkeypatch.setattr(service, "live_state", fake_live)
+    patch_publish(monkeypatch, "service", "live_state", fake_live)
 
 
 def _fake_live(monkeypatch, **over):
@@ -77,7 +87,7 @@ def _fake_live(monkeypatch, **over):
 
     async def fake(session):
         return live
-    monkeypatch.setattr(service, "live_state", fake)
+    patch_publish(monkeypatch, "service", "live_state", fake)
 
 
 def _collect(events: list):
@@ -605,7 +615,7 @@ async def test_run_batch_缺站点aborted():
 async def test_run_batch_单商品失败不拖垮批次(tmp_path, monkeypatch):
     async def _alive(*a, **k):
         return True
-    monkeypatch.setattr(service, "ensure_cdp_alive", _alive)
+    patch_publish(monkeypatch, "service", "ensure_cdp_alive", _alive)
 
     class _FakeSession:
         async def open(self):
@@ -616,8 +626,8 @@ async def test_run_batch_单商品失败不拖垮批次(tmp_path, monkeypatch):
             return True
         # run_batch 失败路径会读它判断要不要保留编辑页签；此处恒 False 即不触发
         edit_page_open = False
-    monkeypatch.setattr(service, "BrowserSession", _FakeSession)
-    monkeypatch.setattr(service, "reset_token_counters", lambda: None)
+    patch_publish(monkeypatch, "service", "BrowserSession", _FakeSession)
+    patch_publish(monkeypatch, "service", "reset_token_counters", lambda: None)
 
     async def _fake_one(session, task, store, site, on_progress=None,
                         index=0, total=1, from_stage="", use_cache=True,
@@ -627,7 +637,7 @@ async def test_run_batch_单商品失败不拖垮批次(tmp_path, monkeypatch):
                     "note": "", "elapsed_s": 1.0}
         return {"status": "fail", "rowid": None, "failed_stage": "attrs",
                 "note": "模拟失败", "elapsed_s": 0.5}
-    monkeypatch.setattr(service, "publish_one", _fake_one)
+    patch_publish(monkeypatch, "service", "publish_one", _fake_one)
 
     events = []
     tasks = [{"url": "https://detail.1688.com/offer/123456.html"},
@@ -768,7 +778,7 @@ async def test_实况读取失败则保守重跑全部表单阶段(tmp_path, mon
 
     async def boom(session):
         raise RuntimeError("页面炸了")
-    monkeypatch.setattr(service, "live_state", boom)
+    patch_publish(monkeypatch, "service", "live_state", boom)
     state = service.load_state("rowid-105")
     for sid, _ in service.STAGES:
         if sid != "save":
@@ -828,12 +838,12 @@ def _desc_env(tmp_path, monkeypatch, calls: dict):
             f.write(b"edited")
         return {"status": "ok", "output": out}
 
-    monkeypatch.setattr(service, "desc_map", fake_map)
+    patch_publish(monkeypatch, "service", "desc_map", fake_map)
     monkeypatch.setattr(service.vision, "plan_desc", fake_plan)
-    monkeypatch.setattr(service, "desc_replace", fake_replace)
-    monkeypatch.setattr(service, "desc_save", fake_save)
+    patch_publish(monkeypatch, "service", "desc_replace", fake_replace)
+    patch_publish(monkeypatch, "service", "desc_save", fake_save)
     # 描述编辑器是全屏 modal，收尾必须确认关掉（否则后续阶段全被遮住点不中）
-    monkeypatch.setattr(service, "ensure_desc_closed", fake_ensure_closed)
+    patch_publish(monkeypatch, "service", "ensure_desc_closed", fake_ensure_closed)
     monkeypatch.setattr(service.vision, "check_cleaned", fake_qc)
     monkeypatch.setattr(service.extract, "_download_image", fake_download)
     monkeypatch.setattr(service.images, "edit_image", fake_edit)
@@ -885,7 +895,7 @@ async def test_删图后替换按源URL重定位序号(tmp_path, monkeypatch):
     async def fake_plan(mods, info):
         return {"delete": [], "replace": [{"pos": 6, "url": "https://cdn/a.jpg"}]}
 
-    monkeypatch.setattr(service, "desc_map", fake_map)
+    patch_publish(monkeypatch, "service", "desc_map", fake_map)
     monkeypatch.setattr(service.vision, "plan_desc", fake_plan)
 
     r = await service._st_desc(ctx, None, _collect_async(events))
@@ -906,7 +916,7 @@ async def test_源图已不在描述区时跳过且不烧生图(tmp_path, monkey
     async def fake_plan(mods, info):
         return {"delete": [], "replace": [{"pos": 1, "url": "https://cdn/a.jpg"}]}
 
-    monkeypatch.setattr(service, "desc_map", fake_map)
+    patch_publish(monkeypatch, "service", "desc_map", fake_map)
     monkeypatch.setattr(service.vision, "plan_desc", fake_plan)
 
     r = await service._st_desc(ctx, None, _collect_async(events))
@@ -1089,10 +1099,10 @@ def _fake_skc_env(monkeypatch, tmp_path, row_states, replace_results=None):
         calls["replaced"].append((kw, n))
         return (replace_results or {}).get(kw, {"status": "ok"})
 
-    monkeypatch.setattr(service, "_skc_row_state", fake_state)
+    patch_publish(monkeypatch, "service", "_skc_row_state", fake_state)
     monkeypatch.setattr(service.extract, "_download_image", fake_download)
     monkeypatch.setattr(service.images, "fit_34", fake_fit34)
-    monkeypatch.setattr(service, "skc_replace_row", fake_replace)
+    patch_publish(monkeypatch, "service", "skc_replace_row", fake_replace)
     return calls
 
 
@@ -1297,7 +1307,7 @@ async def test_publish阶段_默认不发布(monkeypatch):
         called.append(confirm)
         return {"status": "ok"}
 
-    monkeypatch.setattr(service, "publish_now", fake_publish_now)
+    patch_publish(monkeypatch, "service", "publish_now", fake_publish_now)
     ctx = {"rowid": "1", "state": {"stages": {"save": {"status": "ok"}}}}
     r = await service._st_publish(ctx, None, _noop_emit)
     assert r["status"] == "skipped"
@@ -1312,7 +1322,7 @@ async def test_publish阶段_save未成功不发布(monkeypatch):
         called.append(confirm)
         return {"status": "ok"}
 
-    monkeypatch.setattr(service, "publish_now", fake_publish_now)
+    patch_publish(monkeypatch, "service", "publish_now", fake_publish_now)
     ctx = {"rowid": "1", "do_publish": True,
            "state": {"stages": {"save": {"status": "fail"}}}}
     r = await service._st_publish(ctx, None, _noop_emit)
@@ -1328,7 +1338,7 @@ async def test_publish阶段_开关加save成功才真发(monkeypatch):
         called.append((rowid, confirm))
         return {"status": "ok", "messages": ["发布成功"]}
 
-    monkeypatch.setattr(service, "publish_now", fake_publish_now)
+    patch_publish(monkeypatch, "service", "publish_now", fake_publish_now)
     ctx = {"rowid": "42", "do_publish": True,
            "state": {"stages": {"save": {"status": "ok"}}}}
     r = await service._st_publish(ctx, None, _noop_emit)
@@ -1344,7 +1354,7 @@ async def test_publish阶段_判据不足记fail并转人工(monkeypatch):
     async def fake_publish_now(session, rowid, confirm=False):
         return {"status": "unknown", "messages": []}
 
-    monkeypatch.setattr(service, "publish_now", fake_publish_now)
+    patch_publish(monkeypatch, "service", "publish_now", fake_publish_now)
 
     async def emit(ev):
         events.append(ev)

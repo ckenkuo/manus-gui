@@ -11,6 +11,8 @@
 
 修复：keep 且不在店小秘图床上的图，下载原图后原样重挂（画面一个像素都不动）。
 """
+
+from publish_patching import patch_publish
 import os
 
 import pytest
@@ -51,9 +53,9 @@ def stub(monkeypatch, tmp_path):
         state["replaced"].append({"pos": pos, "url": expect_url, "path": path})
         return {"status": "ok"}
 
-    monkeypatch.setattr(service, "_resolve_desc_pos", _resolve)
+    patch_publish(monkeypatch, "service", "_resolve_desc_pos", _resolve)
     monkeypatch.setattr(service.extract, "_download_image", _download)
-    monkeypatch.setattr(service, "desc_replace", _replace)
+    patch_publish(monkeypatch, "service", "desc_replace", _replace)
     state["workdir"] = str(tmp_path)
     return state
 

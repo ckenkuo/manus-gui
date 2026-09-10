@@ -25,6 +25,8 @@
   4. 坐标始终不可用时走派发事件兜底，且仍能把图换上
 不覆盖真实页面（要 Chrome 和登录态）。
 """
+
+from publish_patching import patch_publish
 import json
 import os
 import shutil
@@ -243,7 +245,7 @@ def _patched(monkeypatch):
 
     async def _upload(session, path, full_cid=None, **kw):
         return {"status": "ok", "fileId": "abc/deadbeef"}
-    monkeypatch.setattr(pipeline, "upload_image", _upload)
+    patch_publish(monkeypatch, "pipeline", "upload_image", _upload)
 
     async def _click(session, x, y):
         session.clicks.append((x, y))
@@ -251,7 +253,7 @@ def _patched(monkeypatch):
         # 坐标没命中就去点，等于点在顶栏上，菜单永远不会展开
         if (x, y) == (1731, 61) and session.aim_ok:
             session.menu_open = True
-    monkeypatch.setattr(pipeline, "_cdp_click_xy", _click)
+    patch_publish(monkeypatch, "pipeline", "_cdp_click_xy", _click)
 
 
 @pytest.mark.asyncio
