@@ -367,6 +367,9 @@ api_version = ""
 
 # DeepSeek 官方视觉模型（api-docs.deepseek.com/zh-cn/guides/vision）。
 # 走官方 chat/completions 协议，content 是 text + image_url 两段，与项目既有拼装一致。
+# 【2026-09-10 改名】官方模型 ID 已统一为 deepseek-flash（视觉文档 guides/vision 的
+# 示例同样用它）：旧名 deepseek-v4-flash-vision-exp 对应的模型已下线，旧名仍可调用但
+# 由最新 Flash 承接。实测本 ID 文本与 base64 图都通。
 # base64 与远程 http URL 都收（2026-08-22 实测，两种都返回 200），但发布管线
 # 一律走 base64（image_ref 已统一下载
 # 转码）：远程 URL 是让服务端自己出网取图，成不成看它的出网环境，不可控。
@@ -376,7 +379,7 @@ api_version = ""
 # 可用，故留一倍余量。按量计费只算实际产出的 token，调高额度本身不涨钱。
 [llm.publish-deepseek]
 api_type = "openai"
-model = "deepseek-v4-flash-vision-exp"
+model = "deepseek-flash"
 base_url = "https://api.deepseek.com"
 api_key = ""                                                   # 你的 DeepSeek API key
 max_tokens = 32000
@@ -386,28 +389,6 @@ api_version = ""
 # ---- 店小秘 Temu 半托管发布管线（app/publish/）--------------------------------
 # 从 1688 链接到店小秘草稿保存的 12 阶段发布流程。浏览器操作走 [browser].cdp_url
 # 接管已登录的真实 Chrome，与采集/订单/活动三条管线同一个前提。
-
-# 同一个 deepseek-v4-flash-vision-exp，走 Packy（cf.api.fan）网关而不是官方端点。
-# 【为什么两条都留】官方段与本段模型名相同、能力相同，差别只在计费与出网链路：
-# 官方按量计费、要单独充值；Packy 走已有订阅额度。2026-08-25 grok-4.6 整段被
-# Packy 网关限流打死（每发都 503 packy_api_error「达到可承受的 QPS/TPM 高峰」，
-# 文本与视觉 0 成功），而同一网关同一 key 下的本段全绿——故这是 grok 档挂掉时
-# 不必换供应商就能顶上的那一档。
-# 2026-08-25 实测（本 key + cf.api.fan）：
-#   chat/completions 文本 1.19s 通；responses 协议 1.03s 也通（取 chat，与官方段
-#     协议一致，image_url 拼装可直接复用，不必像 grok 那样开 openai-response）；
-#   base64 图像理解 8.28s 通（商品图答「白色、浅蓝色」，与图相符）；
-#   temperature = 0.0 被接受（不像 Kimi 只收 1）。
-# 【max_tokens 沿用 32000】同一个推理模型，截断返空的坑与官方段完全一样——
-# 给 16000 会偶发 finish_reason="length"、content 返空，靠重试白等两分钟。
-[llm.publish-packy-deepseek]
-api_type = "openai"
-model = "deepseek-v4-flash-vision-exp"
-base_url = "https://cf.api.fan/v1"
-api_key = ""                                                   # 你的 packycode API key
-max_tokens = 32000
-temperature = 0.0
-api_version = ""
 
 [publish]
 # 图片 AI 编辑（去中文/去水印/描述图英化）用的 Packy gpt-image-2 密钥。
@@ -467,3 +448,15 @@ database = ""
 table = "pipeline_errors"
 # 可选：同一台机器跑多实例/多账号时用于区分（留空则只用 hostname 区分机器）
 instance = ""
+
+# ---- 失败现场快照 + 失败页截图（2026-09-11 新增）-----------------------------
+# 单个商品失败时，除主表那行文本外，再把「执行现场 + 失败页截图」写进 <table>_snapshots
+# 明细表（表名由上面的 table 派生，不用另配，免得两处各写一个表名、改名时漏一处）。
+# 现场含：断点文件瘦身版（各阶段结论 + Manus 兜底的工具调用历史）、ctx 参数、
+# 本次计划跑/跳过的阶段、失败页 URL 与页面报错文案、当前页 toast。
+# 【隐私与带宽】截图是真实页面，可能含商品与店铺信息，且单张几百 KB；
+# 公网直连且在意这两点时把 screenshot 关掉（其余现场照常上报）。
+snapshot = true            # 关掉＝只写主表那行文本
+screenshot = true          # 失败页 PNG 开关
+screenshot_max_kb = 2048   # 单张 PNG 上限，超了不传（只记字节数）
+snapshot_max_kb = 256      # 现场 JSON 上限，超了按 history→state→page 顺序降级

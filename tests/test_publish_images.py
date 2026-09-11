@@ -67,7 +67,7 @@ def test_fit34_补白边不裁切内容(tmp_path):
 
 
 def test_square_素材图裁方并放大(tmp_path):
-    """素材图要 1:1 且 ≥800×800；默认 target=1785 同时满足服装类 ≥1340×1785。"""
+    """素材图要 1:1 且 ≥800×800；默认 target=1786 同时满足服装类那条最小尺寸。"""
     src = _make(str(tmp_path / "rect.jpg"), 750, 1000)
     r = square_image(src, str(tmp_path / "rect-sq.jpg"))
     ow, oh = image_size(r["output"])
@@ -77,7 +77,12 @@ def test_square_素材图裁方并放大(tmp_path):
 
 
 def test_square_已达标不缩小(tmp_path):
-    """已经比 target 大的正方形不该被缩小到 target（缩小可能掉回红线以下）。"""
+    """已经比 target 大的正方形不该被缩小到 target。
+
+    两个理由：target 只是平台下限、不是画质目标，缩小纯属降采样磨画质（素材图是
+    轮播首图）；且压到下限附近还会贴线——平台那条口径是【严格大于】（见
+    check_cloth_size 的 strict）。取向同 _fit_min_size：只放大不缩小。
+    """
     src = _make(str(tmp_path / "big.jpg"), 2400, 2400)
     r = square_image(src, str(tmp_path / "big-sq.jpg"))
     ow, oh = image_size(r["output"])
@@ -160,13 +165,28 @@ def test_闸门拦真站那两种描述图尺寸(tmp_path):
         assert f"{CLOTH_MIN_W - w}px" in r["reason"]
 
 
-def test_闸门放行达标图(tmp_path):
+def test_闸门拦贴线图_服装口径(tmp_path):
+    """服装类（strict）恰好等于下限也要拦：平台把「=1340px」也判不合格。
+
+    2026-09-05 实测（1071736188944）：宽恰好 1340 的图一路穿过上传闸门，到发布才被
+    平台以「服装类图片尺寸不能小于1340px*1785px」拒掉，且回执不说是哪张图。故服装
+    那条与 _fit_min_size 统一按「严格大于」把关。
+    """
     from app.publish.images import check_cloth_size
 
-    # 恰好等于下限要放行（>= 而不是 >）
-    for w, h in [(1340, 1785), (1340, 2010), (2000, 3000)]:
+    for w, h in [(1340, 1785), (1340, 2010), (1700, 1785)]:
+        p = _make(str(tmp_path / f"t{w}x{h}.jpg"), w, h)
+        r = check_cloth_size(p, strict=True)
+        assert not r["ok"], f"{w}x{h} 贴线应被拦下"
+
+
+def test_闸门放行达标图_服装口径(tmp_path):
+    from app.publish.images import check_cloth_size
+
+    # 必须【严格大于】下限才放行（见上一条的口径）
+    for w, h in [(1341, 1786), (1341, 3000), (2000, 3000)]:
         p = _make(str(tmp_path / f"o{w}x{h}.jpg"), w, h)
-        r = check_cloth_size(p)
+        r = check_cloth_size(p, strict=True)
         assert r["ok"], f"{w}x{h} 应放行：{r['reason']}"
 
 
@@ -265,8 +285,10 @@ def test_desc_save_js_带尺寸下限占位符():
     # 2026-08-28 起还要注入比例上下限：描述图的规则是「比例 0.5~2 且两边 >= 480」
     assert "__RMIN__" in _JS_DESC_SAVE and "__RMAX__" in _JS_DESC_SAVE
     assert "naturalWidth" in _JS_DESC_SAVE
-    # 未加载完（0）不能当成不达标，否则会误报一堆
-    assert "if (!w || !h) return;" in _JS_DESC_SAVE
+    # 读不到真实宽高不能当成不达标，否则会误报一堆。判据是 < 2 而不是「非 0」：
+    # 2026-09-04 实测（836739130561）源图 404 后编辑页渲染成 1x1 占位，
+    # naturalWidth=1 照样被当成「两边 < 480」而整单未落库。
+    assert "if (w < 2 || h < 2) return;" in _JS_DESC_SAVE
 
 
 # ---- 描述编辑器必须让出屏幕 --------------------------------------------------

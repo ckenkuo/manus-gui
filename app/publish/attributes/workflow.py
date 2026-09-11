@@ -2,12 +2,12 @@
 
 import asyncio
 from app.logger import logger
-from app.publish import cache
 from app.publish.attributes import (
     composition as attributes_composition,
     dropdowns as attributes_dropdowns,
     form as attributes_form,
     review as attributes_review,
+    server_options as attributes_server_options,
     validation as attributes_validation,
 )
 from app.publish.browser import BrowserSession
@@ -49,42 +49,32 @@ async def _scan_linkage_rows(session: BrowserSession, seen: set) -> list:
             and a.get("required") and a.get("visible") is not False]
 
 
-async def _read_linkage_options(session: BrowserSession, new_rows: list, cat_path,
-                                use_cache: bool, site: str) -> None:
+async def _read_linkage_options(session: BrowserSession, new_rows: list,
+                                rowid: str, cat_id: str = "") -> None:
     """给联动行就地补上 options（原地改 new_rows），规矩与主轮 dump_attrs 一致。
 
-    缓存优先、未命中现场读并回灌；数值行不读选项——它行内的 select 是只读单位，
-    点开读到的是单位清单（见 dump_attrs 里的 number-row 分支）。
+    联动新增的必填行仍是【同一类目】的属性，所以与主轮共用同一份服务端清单
+    （见 attributes/server_options）；数值行不读选项——它行内的 select 是只读单位。
     """
-    cached = (cache.load_attr_options(cat_path[-1], cat_path, site)
-              if use_cache and cat_path else {})
+    server_opts = await attributes_server_options.fetch_attr_options(
+        session, rowid, cat_id)
     for a in new_rows:
         a["options"] = []
         if a.get("kind") == "number":
             a["optionsEmptyReason"] = "number-row"
             continue
-        hit = cached.get(a["label"])
-        if hit:
-            a["options"] = hit
-            a["optionsFrom"] = "cache"
-            continue
-        opts, meta = await attributes_dropdowns._read_active_options(session, a["label"], with_meta=True)
-        logger.info(f"读选项（联动行）：{a['label']} -> {len(opts)} 个"
-                    + ("" if meta["complete"] else "（未滚到底，不进缓存）"))
+        opts = server_opts.get(a["label"]) or []
         if opts:
             a["options"] = opts
-            a["optionsFrom"] = "live"
-            a["optionsComplete"] = meta["complete"]
+            a["optionsFrom"] = "server"
         else:
-            a["optionsEmptyReason"] = "open-failed"
-        await asyncio.sleep(0.3)
-    if use_cache and cat_path:
-        cache.save_attr_options(cat_path[-1], cat_path, new_rows, site)
+            a["optionsEmptyReason"] = "server-missing"
+            logger.warning(f"联动行「{a['label']}」在服务端清单里没有对应项，读不到选项")
 
 
 async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dict,
-                              main_comp: Optional[dict], cat_path,
-                              use_cache: bool, site: str) -> tuple:
+                              main_comp: Optional[dict], rowid: str = "",
+                              cat_id: str = "") -> tuple:
     """补填一轮：读选项 → 问 LLM → 校验 → 写入，返回 (applied, compFailed)。
 
     与主轮共用 _validate_attr_changes 与 _apply_attr_changes：闸门（非必填留空、
@@ -93,7 +83,7 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
 
     【best-effort】读不到行、LLM 不给值、写入失败一律只记录不抛，交末尾复扫报人工。
     """
-    await _read_linkage_options(session, new_rows, cat_path, use_cache, site)
+    await _read_linkage_options(session, new_rows, rowid, cat_id)
     # 问 LLM：喂法与主轮完全一致（同一套提示词、同样带 kind/numHint），只是行少。
     # 【提示词不能换】规则 5（成分合计 100）、规则 8（数值行只给纯数字）对里衬成分和
     # 里料克重恰好都适用，换一套简版提示词等于把这两条闸的前提抽掉。
@@ -120,16 +110,15 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
     if not valid:
         return [], []
     applied, _refreshed, comp_failed = await attributes_review._apply_attr_changes(
-        session, valid, {a["label"]: a for a in new_rows}, info, cat_path,
-        use_cache=use_cache, site=site)
+        session, valid, {a["label"]: a for a in new_rows}, info)
     ok_n = sum(1 for a in applied if a.get("result") == "ok")
     logger.info(f"本轮补填完成：{ok_n}/{len(applied)} 项写入成功")
     return applied, comp_failed
 
 
 async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dict,
-                             main_comp: Optional[dict], cat_path,
-                             use_cache: bool = True, site: str = "") -> dict:
+                             main_comp: Optional[dict], rowid: str = "",
+                             cat_id: str = "") -> dict:
     """补填「联动新增的必填行」，循环追到不再冒新行为止。
 
     为什么必须单独一轮而不能并进主轮：这些行是【改了别的行才出现的】——阶段④开头
@@ -162,7 +151,7 @@ async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dic
         logger.info(f"联动新增必填行 {len(labels)} 条（第 {rnd}/{_LINKAGE_MAX_ROUNDS} 轮），"
                     f"开始补填：{'、'.join(labels)}")
         applied, comp_failed = await _fill_linkage_round(
-            session, new_rows, info, main_comp, cat_path, use_cache, site)
+            session, new_rows, info, main_comp, rowid)
         all_applied.extend(applied)
         all_comp_failed.extend(comp_failed)
         if not any(a.get("result") == "ok" for a in applied):
@@ -177,19 +166,113 @@ async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dic
             "compFailed": all_comp_failed}
 
 
+async def _try_default_attrs(session: BrowserSession, info: dict,
+                             main_comp: Optional[dict]) -> Optional[dict]:
+    """默认属性快路径：草稿预填的属性值若全都与商品相符，整个阶段④都不用跑。
+
+    【为什么值得单开一条】编辑页草稿本来就带着属性值（认领时店小秘按源商品映射的），
+    它们对的时候，读选项（33 项要 3-5 分钟，见 dump_attrs）、完整审核、逐项写入、
+    联动补填轮全是白跑。这里一个下拉都不点：读一次表单现状 + 一次轻量判断。
+
+    落回原有流程的五种情形：读不到行、有空必填行（默认不完整，必须读 options 才能填）、
+    判断调用失败、判出有明显矛盾的行、判断期间表单又长出了新行（见末尾复扫那段）。
+    落回时【什么都没改过】——本函数只读不写，原流程从零开始跑，不留任何需要清理的状态。
+
+    返回值与 check_attrs 的成功返回【同构】，多一个 source="default"；applied/proposed
+    一律为空（本路径不写任何东西）。
+    """
+    # 这条路径只读现状、一个下拉都不碰，选项来源改服务端后更是不涉及选项
+    # （见 dump_attrs 的 skip_options 早退分支）。
+    dump = await attributes_form.dump_attrs(session, skip_options=True)
+    attrs = [a for a in (dump.get("attrs") or []) if a.get("visible") is not False]
+    if not attrs:
+        return None
+    # 未填的判据与主流程一致：current 以 "(" 开头即占位符（"(请选择)" 等）
+    def _filled(a) -> bool:
+        cur = str(a.get("current") or "").strip()
+        return bool(cur) and not cur.startswith("(")
+
+    missing = [a["label"] for a in attrs if a.get("required") and not _filled(a)]
+    if missing:
+        logger.info(f"默认属性缺 {len(missing)} 项必填"
+                    f"（{'、'.join(missing[:6])}{'…' if len(missing) > 6 else ''}），"
+                    "走逐项审核")
+        return None
+    # 只判「已有值」的行：非必填且空着的行按策略一律留空（见 _ATTR_PROMPT 规则 4），
+    # 本就不该填，不能因为它们没值就把整条快路径判死——那会让判据反过来惩罚正确行为
+    # （表单上大半非必填行本来就该是空的）。
+    rows = [{"label": a["label"], "current": a.get("current"),
+             "required": bool(a.get("required")), "kind": a.get("kind") or "select",
+             "numValues": a.get("numValues")}
+            for a in attrs if _filled(a)]
+    if not rows:
+        return None
+    try:
+        verdict = await attributes_review._ask_default_attr_review(rows, info, main_comp)
+    except Exception as e:
+        # 与两条类目快路径同一取向：加速手段自己的 LLM 调用失败不该拖垮整个阶段
+        logger.warning(f"默认属性判断失败，落回逐项审核：{e}")
+        return None
+    if not verdict.get("ok"):
+        bad = "、".join(str(i.get("label")) for i in (verdict.get("issues") or [])[:6])
+        logger.info(f"默认属性不适用（{verdict.get('reason')}）"
+                    + (f"，涉及：{bad}" if bad else "") + "，走逐项审核")
+        return None
+    logger.info(f"沿用草稿默认属性：{len(rows)} 行经 LLM 判定均相符，"
+                "跳过读选项、逐项写入与联动补填")
+    # 末尾必填复扫照跑：它是交给调用方的「还差什么」清单，判据必须与主流程一致。
+    # 本路径没有写入，故不会有联动新增行；一个下拉都没点过，也不会有幽灵浮层要清。
+    rows3 = await session.eval_json(attributes_form._JS_LIST_ATTR_ROWS)
+    attrs3 = [a for a in rows3.get("attrs", []) if a["label"] != "产品属性"]
+    # 【复扫还要当一次「表单有没有长出新行」的哨兵】开头那次 dump 已经改成等行集稳定
+    # （见 _rows_settled），但稳定只是「静默了一轮」，不保证拿到的是终态：类目刚改完时
+    # 动态属性行按接口返回逐批挂上，两批之间完全可能静默超过一轮。判定要通过一次 LLM
+    # （实测 21s），这段时间足够剩下的行全部到齐——拿它当第二道闸，只要冒出一行开头
+    # 没见过的，就说明刚才判的不是完整表单，快路径的前提不成立，落回完整流程重判。
+    # 白花一次 LLM 换「绝不漏判必填行」，这个代价是值的：漏判的下场是下游十几个阶段
+    # 白跑、到 save 才炸（2026-09-11 商品 1044382261282 的「面料类型」即此）。
+    # 【两边必须同口径：都用「除分组标题外的全部行」】上面 attrs 滤掉了 visible=False
+    # 的行，若这里拿它当已知集，表单本来就有隐藏行（「材质」依赖「是否纺织品」这类
+    # 开关字段，未选时不显示）时 grown 恒非空，快路径每次都被判「长出了新行」而落回，
+    # 等于把这条优化整个废掉。隐藏行变可见不构成漏判：本路径不填任何值，而末尾复扫
+    # （unfilled）扫的是全部行，真变成必填且空照样报得出来。
+    known = {a["label"] for a in (dump.get("attrs") or [])}
+    grown = [a["label"] for a in attrs3 if a["label"] not in known]
+    if grown:
+        logger.info(f"默认属性判定期间表单又出现 {len(grown)} 行"
+                    f"（{'、'.join(grown[:6])}{'…' if len(grown) > 6 else ''}），"
+                    "快路径前提不成立，走逐项审核")
+        return None
+    unfilled = [a["label"] for a in attrs3
+                if a.get("required") and a.get("visible") is not False
+                and str(a.get("current") or "").startswith("(")]
+    return {"status": "ok", "source": "default", "attrCount": len(rows),
+            "proposed": [], "rejected": [], "keepCurrent": [],
+            "notes": [], "cacheRead": 0, "activeRead": 0,
+            "mainComposition": main_comp or None,
+            "applied": [], "cacheRefreshed": [], "compFailed": [],
+            "linkageFilled": [], "linkageNewRequired": [],
+            "unfilledRequired": unfilled, "parkedGhosts": 0}
+
+
 async def check_attrs(session: BrowserSession, info_path: str,
                       apply: bool = False, required_only: bool = True,
-                      cat_path=None, use_cache: bool = True,
-                      site: str = "") -> dict:
+                      use_cache: bool = True, rowid: str = "",
+                      cat_id: str = "") -> dict:
     """阶段④：LLM 比对源商品信息与表单属性，产出修改清单（apply=True 时执行）。
 
     不导航——须紧跟 auto_cat 在同一页执行（类目决定属性行）。
     apply=False 是 dry-run：只出清单不动表单，供人工过目。这是本阶段的推荐用法，
     因为属性填错会一路带到发布，而 dry-run 几乎零成本。
 
-    cat_path + use_cache 透传给 dump_attrs 用作 options 缓存的键（见那边的说明）。
-    命中缓存的行若写入失败，走 _refresh_row_and_retry 只重读该行——缓存过期的表现
-    就是「点不中」，而 set_attr 本来就会回读校验发现它。
+    apply=True 且 use_cache=True 时先试默认属性快路径（_try_default_attrs）：草稿里
+    预填的属性值全都与商品相符就整个阶段短路——一个下拉都不点。不适用/判不正确则
+    落回下面这条完整流程，一行逻辑都不跳。
+
+    选项来自服务端接口（见 attributes/server_options），rowid 是要传给它的草稿 id，
+    cat_id 是页面上当前生效的叶子类目 id（阶段③ 选定后经 ctx 传下来）——类目是运行中
+    改的、还没保存，接口只能按已保存的类目回答，不传就会查出上一版类目的属性清单。
+    写入失败的行走 _retry_row 原值再试一次，不重读选项（选项当次现取、不存在过期）。
 
     成分比例防漂移（原脚本踩的坑）：LLM 两次调用结果会漂移（55/45 变成 90/10）。
     2026-08-21 起改成【源值确定性覆盖】：主面料成分字段的纤维与百分比按
@@ -203,8 +286,23 @@ async def check_attrs(session: BrowserSession, info_path: str,
 
     with open(info_path, encoding="utf-8") as f:
         info = _json.load(f)
+    # 【2026-09-02】整合所有来源的成分信息（详情文字 > 详情图 > 源属性 > 默认值）。
+    # 只依赖 info，故提到 dump_attrs 之前——下面的默认属性快路径要用它做判断依据。
+    main_comp = attributes_composition._merge_composition_sources(info)
+
+    # 默认属性快路径：草稿预填值全都相符时整个阶段④直接返回（见 _try_default_attrs）。
+    # 【只在 apply=True 时走】dry-run 的用途就是出完整清单供人工过目，不该省这一步。
+    # 【受 use_cache 控制】与类目那边同口径：勾掉「使用缓存」是要全量重判，草稿预填值
+    # 也是「既有值」，不该被信任。
+    # 这里传的是【未归约】的 main_comp：归约主纤维要读表单 options（见下方 _resolve_
+    # main_fiber），排在快路径之后；对判断而言它只是背景信息，归不归约不影响判据。
+    if apply and use_cache:
+        hit = await _try_default_attrs(session, info, main_comp)
+        if hit:
+            return hit
+
     dump = await attributes_form.dump_attrs(session, required_only=required_only,
-                            cat_path=cat_path, use_cache=use_cache, site=site)
+                                            rowid=rowid, cat_id=cat_id)
     attrs = dump["attrs"]
     if not attrs:
         # 属性行空着喂给 LLM 只会逼它瞎编（2026-08-21 实测 grok 收到空表单后
@@ -220,8 +318,6 @@ async def check_attrs(session: BrowserSession, info_path: str,
              "numValues": a.get("numValues"), "options": a.get("options", [])}
             for a in attrs]
 
-    # 【2026-09-02 改】整合所有来源的成分信息（详情文字 > 详情图 > 源属性 > 默认值）
-    main_comp = attributes_composition._merge_composition_sources(info)
     # 【2026-09-08 新增】源主面料成分是「棉混纺」这类合成词/占位词、融合后仍解析不出
     # 确定主纤维（fiber 空）且非按款式区分时，单开一次聚焦 LLM 推理归约主纤维
     # （不硬编码词表）；归约出选项写法后回填，走 _rebuild_main_comp 的确定性比例覆盖。
@@ -257,8 +353,8 @@ async def check_attrs(session: BrowserSession, info_path: str,
     result = {"status": "ok", "attrCount": len(rows), "proposed": valid,
               "rejected": rejected, "keepCurrent": keep_current,
               "notes": decision.get("notes", []),
-              "cacheRead": dump.get("cacheRead") or 0,
-              "activeRead": dump.get("activeRead") or 0,
+              "serverAttrs": dump.get("serverAttrs") or 0,
+              "optionsMissed": dump.get("optionsMissed") or [],
               "mainComposition": main_comp or None}
     if not apply:
         result["applied"] = None
@@ -266,7 +362,7 @@ async def check_attrs(session: BrowserSession, info_path: str,
 
     row_map = {a["label"]: a for a in attrs}   # 查 optionsFrom / current / required
     applied, cache_refreshed, comp_failed = await attributes_review._apply_attr_changes(
-        session, valid, row_map, info, cat_path, use_cache=use_cache, site=site)
+        session, valid, row_map, info)
     result["applied"] = applied
     result["cacheRefreshed"] = cache_refreshed
     result["compFailed"] = comp_failed
@@ -290,7 +386,7 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 会在联动显示后进入补填轮正常补上。
     fill = await _fill_linkage_rows(
         session, {a["label"] for a in attrs if a.get("visible") is not False},
-        info, main_comp, cat_path, use_cache=use_cache, site=site)
+        info, main_comp, rowid, cat_id)
     result["linkageFilled"] = fill.get("applied") or []
     result["linkageNewRequired"] = fill.get("newRequired") or []
     if fill.get("compFailed"):

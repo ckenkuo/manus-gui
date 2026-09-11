@@ -2,8 +2,9 @@
 
 import asyncio
 from app.logger import logger
-from app.publish import cache, common
+from app.publish import common
 from app.publish.attributes import dropdowns as attributes_dropdowns
+from app.publish.attributes import server_options as attributes_server_options
 from app.publish.browser import BrowserSession, J
 from typing import Optional
 
@@ -62,7 +63,40 @@ _JS_LIST_ATTR_ROWS = r"""(() => {
     // 反过来「按 input 存在就算数值行」也不行——成分行同样有百分比 input。
     // 区分点在【顺序】：数值行的输入框在单位下拉之前，成分行的下拉在百分比之前。
     // （旁证：单位下拉内部的搜索框带 readonly，是纯展示的固定单位，不必也不该改。）
+    // 必填判定三处都要看：动态属性行是 span.attr-label.required（主力），
+    // 固定字段是 label.ant-form-item-required，末项是 antd 的通用兜底。
+    // 【提到 seq 之前】复选框分支也要用它，两处各写一遍必然漂移。
+    const required = (attrSpan && attrSpan.classList.contains('required'))
+      || labelEl.classList.contains('ant-form-item-required')
+      || !!it.querySelector('.ant-form-item-required');
     const ctrl = it.querySelector('.ant-form-item-control') || it;
+    // 【第三类控件：搜索框 + 复选框组】2026-09-11 真站取证（rowid 184807703145936681
+    // 的「颜色」）：这类多选属性行没有 .ant-select，行内是 116 个 label.ant-checkbox-wrapper
+    // （各内嵌 input[type=checkbox]，value 是属性 vid：376=白色、377=红色、472=灰色…），
+    // 外加一个 placeholder=搜索 的文本输入框。
+    // 【为什么必须单独判】那个搜索框躲得过下面 seq 对 hidden/radio/checkbox 的排除，
+    // 于是成为 seq[0] → firstIsInput → 整行被判成 kind="number"。后果是三连错：
+    // dump_attrs 走 number-row 分支【从不读它的选项】，喂给 LLM 的就是个「数值行、
+    // placeholder=搜索」的空行（模型只能提 0 项，末尾必填复扫报「颜色仍留空」，商品
+    // 白跑十几个阶段到⑭保存才炸——2026-09-11 商品 1052052060281 实测）；写入时
+    // set_attr 的下拉分支对该行必然 no-select；回读的 current 又恒为「(请输入)」。
+    // 【判据为什么要求「无 .ant-select」】两者都有的复合行没实测过，不猜——保持原
+    // 两分法的结果，宁可维持现状也不臆造分支。
+    const cbWrappers = Array.from(ctrl.querySelectorAll('label.ant-checkbox-wrapper'));
+    if (cbWrappers.length > 0 && !ctrl.querySelector('.ant-select')) {
+      it.setAttribute('data-attr-label', label);
+      const cbText = (w) => (w.textContent || '').trim();
+      const checked = cbWrappers
+        .filter(w => (w.className || '').includes('ant-checkbox-wrapper-checked'))
+        .map(cbText).filter(Boolean);
+      out.push({label: label,
+        // 【current 是顿号连接的已勾选项】多选行没有单一当前值。空时给 "(请选择)"，
+        // 与下拉行同形——下游判空（cur.startswith('(')）和必填复扫才不必分叉。
+        current: checked.length ? checked.join('、') : '(请选择)',
+        kind: 'checkbox', hasPercent: false, numHint: null, numValues: [],
+        required: required, visible: it.offsetHeight > 0});
+      return;
+    }
     // 控件序：select 与「可填 input」按 DOM 顺序排一列。select 内部的搜索框
     // （.ant-select-selection-search-input）会一并匹配到，按 class 剔除。
     const seq = Array.from(ctrl.querySelectorAll('.ant-select, input')).filter(el => {
@@ -108,11 +142,6 @@ _JS_LIST_ATTR_ROWS = r"""(() => {
       unit: unitFromSel || (unitEl ? (unitEl.textContent || '').trim() : ''),
       value: (fillable[0] && fillable[0].value) || '',
     };
-    // 必填判定三处都要看：动态属性行是 span.attr-label.required（主力），
-    // 固定字段是 label.ant-form-item-required，末项是 antd 的通用兜底。
-    const required = (attrSpan && attrSpan.classList.contains('required'))
-      || labelEl.classList.contains('ant-form-item-required')
-      || !!it.querySelector('.ant-form-item-required');
     out.push({label: label,
       // 【数值行的 current 只能读输入框，绝不能读 selection-item】克重行那个
       // selection-item 是【单位】'g/㎡'，读它等于把空行报成已填（原缺陷的核心）。
@@ -133,9 +162,37 @@ _JS_LIST_ATTR_ROWS = r"""(() => {
 })()"""
 
 
+def _rows_settled():
+    """给 wait_for 用的「属性行集已渲染完」判据：连续两次读到相同的 label 序列。
+
+    【为什么不能只判「有行」】2026-09-11 真机取证（商品 1044382261282，类目
+    「派对桌布」）：类目是【运行中】改的，Temu 的动态属性行（形状/材质类型/成分/
+    面料类型/…）要等选完类目后前端异步拉回来才渲染。原判据「found 且有 attrs」
+    在第一批行（当时是草稿自带的固定字段那批）就放行，于是拿到一份缺行的表单：
+    阶段④ 的默认属性快路径据此判「没有空必填」，短路掉整个阶段——21 秒后 LLM 判完
+    再复扫，行早渲染出来了，才发现「面料类型」还空着，白跑一趟还判了失败。
+    行集分批到达是这一带的常态，判据必须是「不再变」而不是「非空」。
+
+    间隔仍用 wait_for 的 1.5s：静默一轮再确认，给分帧渲染留出余量。
+    """
+    prev: list = []
+
+    def predicate(data) -> bool:
+        if not (data.get("found") and data.get("attrs")):
+            return False
+        labels = [a.get("label") for a in data["attrs"]]
+        if prev and labels == prev[0]:
+            return True
+        prev.clear()
+        prev.append(labels)
+        return False
+
+    return predicate
+
+
 async def dump_attrs(session: BrowserSession, skip_options: bool = False,
-                     required_only: bool = True,
-                     cat_path=None, use_cache: bool = True, site: str = "") -> dict:
+                     required_only: bool = True, rowid: str = "",
+                     cat_id: str = "") -> dict:
     """阶段④(只读)：导出产品属性当前值 + 每项下拉的真实选项。
 
     不导航——必须紧跟 auto_cat 在同一页执行：类目决定了有哪些属性行，换页就得重选。
@@ -154,15 +211,20 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
     短行名被长键包含就命中，误开口子的面还会继续扩大。现在的规则回到单一口径：
     非必填一律留空，源商品写了也不填。
 
-    skip_options=True 时一个下拉都不点，只读当前值——最快，但没有 options 就不能喂给
+    skip_options=True 时不取选项，只读当前值——最快，但没有 options 就不能喂给
     LLM 做修改建议，只能看现状。
 
-    cat_path（类目路径列表）+ use_cache 命中时，options 从缓存注入、跳过该行的「点开
-    下拉 + 滚虚拟列表」，那正是本阶段 92.9s 的主体。cat_path 给不出来（续跑、
-    publish_inspect 单跑）时为 None → 当未命中 → 全量现场读，行为与加缓存前完全一致。
-    注意【缓存只补 options，永不造行】：行集、current、required、visible 一律从活页面
-    读——required 是 _validate_attr_changes 第 1 道闸的依据，用缓存里的旧值等于拿旧
-    策略判新表单。
+    options 一律取自服务端（见 attributes/server_options）：一次请求拿全该类目所有属性的
+    可选值。要求的 rowid 是当前页打开的那个草稿，店铺 id 由它现取。
+    cat_id 是【页面上当前生效】的叶子类目 id（阶段③ 选定后经 ctx 传下来）。必须由调用方
+    给：类目是运行中改的、还没保存，服务端只能按已保存的类目回答，本次会话就是拿它查出
+    了上一版类目的属性清单（20 个电子类属性），页面上要填的动态属性一个都没有。
+    拿不到时传空串，此时退回「按草稿已保存的类目查」——那只在类目没被改过时才正确。
+    选项来源改服务端后，原先的 cat_path / use_cache / site 三个参数（属性选项缓存的
+    键与开关）已随之删除。
+    【行集、current、required、visible 仍一律从活页面读】——required 与 kind 是表单的
+    真实状态（平台按表单校验，且 DOM 判据已实测与服务端一致），options 才是那份可以
+    从接口整份取回的、与页面活得久不久无关的数据。
 
     隐藏行（依赖字段未触发、行仍 display:none）跳过并标 optionsEmptyReason=row-hidden，
     不强行点开——那种行点不开是正常的，不是故障。
@@ -186,11 +248,10 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
     # 属性行是懒渲染：open_edit 只等到 skuDataInfo 出现，跟在后面立刻读经常
     # 读到 0 行（2026-08-21 实测：续跑补开编辑页后 2.5s 就判空失败）。
     # 故这里轮询等到行出来再判，超时返回的最后一次结果交给下方空行分支。
-    # 【展开与轮询都不能因命中缓存而跳过】命中省掉的只是逐行读选项，行本身仍要渲染出来。
+    # 【判据是「行集稳定」而不是「非空」】分批渲染（尤其阶段③ 刚改完类目）时，
+    # 只判非空会拿到缺行的表单，见 _rows_settled 的取证。
     rows = await session.wait_for(
-        _JS_LIST_ATTR_ROWS,
-        lambda d: d.get("found") and bool(d.get("attrs")),
-        timeout=20, interval=1.5)
+        _JS_LIST_ATTR_ROWS, _rows_settled(), timeout=20, interval=1.5)
     if not rows.get("found"):
         raise RuntimeError("productBasicInfo 未找到（当前页不是编辑页？）")
     attrs = [a for a in rows.get("attrs", []) if a["label"] != "产品属性"]  # 分组标题行
@@ -200,15 +261,16 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
         return {"status": "ok", "count": len(attrs), "attrs": attrs,
                 "optionsRead": False}
     n_required = sum(1 for a in attrs if a.get("required"))
-    # 同类目的 options 清单不随商品变，能从缓存拿就不必逐行点开下拉
-    cached = (cache.load_attr_options(cat_path[-1], cat_path, site)
-              if use_cache and cat_path else {})
+    # 【选项一次问服务端，不再逐行开下拉】见 attributes/server_options 的模块说明：
+    # 逐行点开下拉读选项既慢（那是本阶段耗时的主体），又会在面板塌缩时读到一份
+    # 「真前缀、假完整」的清单并把它写进同类目缓存。接口给的是同一份权威数据的全集，
+    # 也不随页面活得久不久而退化——实测全新页签上两者逐项一致，退化的只是 DOM 那条路。
+    server_opts = await attributes_server_options.fetch_attr_options(
+        session, rowid, cat_id)
     logger.info(f"属性行 {len(attrs)} 条（必填 {n_required}），"
-                + (f"缓存 {len(cached)} 行可用，" if cached else "")
-                + "逐个读必填项下拉选项…")
-    active_read = 0
+                f"服务端给出 {len(server_opts)} 个属性的选项")
     skipped_optional = 0
-    cache_read = 0
+    missed: list = []
     for a in attrs:
         a["options"] = []
         if a.get("visible") is False:
@@ -218,49 +280,27 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
             a["optionsEmptyReason"] = "optional-skipped"
             skipped_optional += 1
             continue
-        # 【数值行不读选项】它行内那个 select 是【只读的单位】（克重行是 'g/㎡'），
-        # 点开读到的是单位清单、不是可选值。读了有三重害处：白花一次开合下拉、
-        # 一份 ['g/㎡'] 落进缓存（缓存文件里的「面料克重1（g/m²) → ['g/㎡']」就是
-        # 这么来的），以及让 _validate_attr_changes 里「数值行 options 恒为空」这个
-        # 前提失效——那道量级闸靠 kind 分流，前提失效不至于出错，但缓存脏了会一直脏。
+        # 【数值行没有可选值】它行内那个 select 是【只读的单位】（克重行是 'g/㎡'），
+        # 服务端的 values 对它同样不适用；标 number-row 让 _validate_attr_changes 的
+        # 「数值行 options 恒为空」前提继续成立（那道量级闸靠 kind 分流）。
         if a.get("kind") == "number":
             a["optionsEmptyReason"] = "number-row"
             continue
-        # 【这个 guard 必须在上面两个 skip 之后，顺序不能调】_validate_attr_changes 的
-        # 第 2 个分支靠「非必填 + 未填 + options 空」判定「按策略留空」；提前注入会给
-        # 那些行填上 options，把这条既定策略打穿（填得多错得多）。
-        hit = cached.get(a["label"])
-        if hit:
-            a["options"] = hit
-            a["optionsFrom"] = "cache"   # 写入失败后要不要重读该行，就看这个标记
-            cache_read += 1
-            continue
-        opts, meta = await attributes_dropdowns._read_active_options(session, a["label"], with_meta=True)
-        logger.info(f"读选项：{a['label']} -> {len(opts)} 个"
-                    + ("" if meta["complete"] else "（未滚到底，不进缓存）"))
+        opts = server_opts.get(a["label"]) or []
         if opts:
             a["options"] = opts
-            a["optionsFrom"] = "live"
-            # 只有确认读全的清单才允许落盘：截断的清单进了缓存，之后每个同类目商品
-            # 都会拿一份缺项的 options 去做校验与纤维匹配，且没人会发现
-            a["optionsComplete"] = meta["complete"]
-            active_read += 1
+            a["optionsFrom"] = "server"
         else:
-            a["optionsEmptyReason"] = "open-failed"
-        # 行间隔：0.3s → 0.12s。这里等的是「上一行的下拉收起、不干扰下一行定位」，
-        # 而 _read_active_options 收尾已经关下拉 + 清幽灵；真没清干净时下一行的
-        # _open_attr_dropdown 本就有幂等打开与二次重试兜着。逐行读只在缓存未命中时
-        # 发生（实测每类目 16-18 必填行），这一项省约 3s。
-        await asyncio.sleep(0.12)
-    parked = await attributes_dropdowns._park_ghost_dropdowns(session)
-    # 现场读到的行写回缓存（按 label 并集合并，见 cache.save_attr_options）
-    if use_cache and cat_path and active_read:
-        cache.save_attr_options(cat_path[-1], cat_path, attrs, site)
+            # 服务端没有这个属性名（或整份清单没取到）：如实标出来，由调用方在 note 里
+            # 报给人看。不静默、也不去开下拉补——读不到就是读不到。
+            a["optionsEmptyReason"] = "server-missing"
+            missed.append(a["label"])
+    if missed:
+        logger.warning(f"以下属性行在服务端清单里没有对应项，读不到选项：{missed}")
     return {"status": "ok", "count": len(attrs), "attrs": attrs,
             "optionsRead": True, "requiredOnly": required_only,
-            "activeRead": active_read, "cacheRead": cache_read,
-            "skippedOptional": skipped_optional,
-            "parkedGhosts": parked.get("parked", 0)}
+            "serverAttrs": len(server_opts), "optionsMissed": missed,
+            "skippedOptional": skipped_optional}
 
 
 async def _readback_attr(session: BrowserSession, label: str, row_no: int = 1) -> Optional[dict]:
@@ -471,7 +511,7 @@ async def set_attr(session: BrowserSession, label: str, value: str,
                             .replace("__VALUEQ__", J(str(value))))
         # 【readback 必须与下拉分支同形状】上面那段 JS 回读的是 input.value（字符串），
         # 而下拉分支给的是 _readback_attr 的字典，调用方（_apply_attr_changes、
-        # _refresh_row_and_retry）一律按 r["readback"]["current"] 取值。原样透出字符串
+        # _retry_row）一律按 r["readback"]["current"] 取值。原样透出字符串
         # 会把阶段④整个炸掉：2026-08-25 联动补填写「里料克重（g/m²)」实测
         # AttributeError: 'str' object has no attribute 'get'，商品未落库。
         # 包成 current 不是硬凑：_JS_LIST_ATTR_ROWS 对 kind=number 的 current 读的
@@ -569,6 +609,114 @@ async def set_attr(session: BrowserSession, label: str, value: str,
     else:
         result["parkedGhosts"] = 0
     return result
+
+
+def _js_checkbox_state(label: str) -> str:
+    """读复选框组属性行的全部选项与已勾选项。
+
+    定位方式与 _JS_LIST_ATTR_ROWS 同一套（#productBasicInfo 下的 label 文本匹配，
+    含内层 span.attr-label 的 fallback）——两处判据必须一致，否则枚举说这行是
+    checkbox、写入却找不到它。
+    """
+    return r"""(() => {
+      const sec = document.getElementById('productBasicInfo');
+      const it = sec && Array.from(sec.querySelectorAll('.ant-form-item')).find(el => {
+        const l = el.querySelector('.ant-form-item-label label');
+        if (!l) return false;
+        const sp = l.querySelector('.attr-label');
+        const name = sp ? (sp.textContent||'').trim()
+                        : (l.getAttribute('title')||l.textContent||'').trim();
+        return name === __LABEL__;
+      });
+      if (!it) return JSON.stringify({found: false, reason: 'row-not-found'});
+      const ws = Array.from(it.querySelectorAll('label.ant-checkbox-wrapper'));
+      const txt = (w) => (w.textContent || '').trim();
+      return JSON.stringify({found: true,
+        all: ws.map(txt).filter(Boolean),
+        checked: ws.filter(w => (w.className||'').includes('ant-checkbox-wrapper-checked'))
+                    .map(txt).filter(Boolean)});
+    })()""".replace("__LABEL__", J(label))
+
+
+def _js_toggle_checkbox(label: str, value: str) -> str:
+    """点一下该行里文本等于 value 的那个复选框（合成 MouseEvent 三连）。
+
+    【为什么用合成事件而不是真实鼠标点击】2026-09-11 在编辑页实测（rowid
+    184807703145936681 的「颜色」）：mousedown/mouseup/click 三连对这种
+    ant-checkbox 生效且可逆（再点一次取消），与 _click_dropdown_option 同一套手法。
+    browser.py 记的「编辑页上真实鼠标点击被吞」与 bulkattr 记的「JS label.click()
+    对 ant-checkbox 无效」都不与本条冲突：前者针对的是列表页场景，后者针对的是原生
+    .click() 方法——两条结论在这里都已在真页面复验过，故按实测结果办。
+    """
+    return r"""(() => {
+      const sec = document.getElementById('productBasicInfo');
+      const it = sec && Array.from(sec.querySelectorAll('.ant-form-item')).find(el => {
+        const l = el.querySelector('.ant-form-item-label label');
+        if (!l) return false;
+        const sp = l.querySelector('.attr-label');
+        const name = sp ? (sp.textContent||'').trim()
+                        : (l.getAttribute('title')||l.textContent||'').trim();
+        return name === __LABEL__;
+      });
+      if (!it) return JSON.stringify({switched: false, reason: 'row-not-found'});
+      const w = Array.from(it.querySelectorAll('label.ant-checkbox-wrapper'))
+          .find(x => (x.textContent||'').trim() === __VALUEQ__);
+      if (!w) return JSON.stringify({switched: false, reason: 'option-not-found'});
+      const inp = w.querySelector('input.ant-checkbox-input') || w;
+      ['mousedown','mouseup','click'].forEach(t => inp.dispatchEvent(
+          new MouseEvent(t, {bubbles: true, cancelable: true, view: window})));
+      return JSON.stringify({switched: true});
+    })()""".replace("__LABEL__", J(label)).replace("__VALUEQ__", J(value))
+
+
+async def set_attr_checkbox(session: BrowserSession, label: str, values: list) -> dict:
+    """把复选框组属性行重设为 values 指定的选项集合（勾选目标、取消其余），回读校验。
+
+    不导航（须在编辑页且类目已选）。values 是【该行的完整目标集合】，不是增量：
+    这类行没有「当前值」的概念，而管线支持续跑重入——增量语义会让每跑一次多勾几项、
+    越积越错，重设才幂等。同一 label 的多条 change 由调用方归并成一个集合再调这里。
+
+    【拒绝空集合】values 为空等于把整行清空，而必填项空着平台直接卡保存。故宁可
+    报 error 让上层判 fail，也不做这种不可逆动作——与 preview.py「绝不把行搞成
+    空的」同一取向。
+
+    readback 形状与 set_attr 对齐（{"label","current"}）：_readback_current 与
+    调用方一律按 r["readback"]["current"] 取诊断值，形状不一致会让阶段④整个抛异常
+    （2026-08-25 数值行那次就是这么炸的）。
+    """
+    state = await session.eval_json(_js_checkbox_state(label))
+    if not state.get("found"):
+        return {"status": "error", "label": label, "value": values, "kind": "checkbox",
+                "reason": state.get("reason") or "row-not-found", "readback": None}
+    if not values:
+        return {"status": "error", "label": label, "value": values, "kind": "checkbox",
+                "reason": "目标集合为空，拒绝清空整行", "readback": None}
+    allv = state.get("all") or []
+    unknown = [v for v in values if v not in allv]
+    if unknown:
+        return {"status": "error", "label": label, "value": values, "kind": "checkbox",
+                "reason": f"选项不在该行：{'、'.join(unknown)}", "readback": None}
+
+    want, have = set(values), set(state.get("checked") or [])
+    # 按 DOM 顺序逐个切换：要勾的先来、要取消的后来。set 去重保证同一个值最多点一次
+    # （LLM 重复给值时不会点两下把刚勾上的又取消掉）。
+    todo = ([v for v in allv if v in want and v not in have]
+            + [v for v in allv if v not in want and v in have])
+    for name in todo:
+        r = await session.eval_json(_js_toggle_checkbox(label, name))
+        if not r.get("switched"):
+            logger.warning(f"{label} 复选框「{name}」切换失败：{r.get('reason')}")
+        await asyncio.sleep(0.15)
+
+    final = await common._poll_until(
+        lambda: session.eval_json(_js_checkbox_state(label)),
+        lambda d: bool(d) and d.get("found") and set(d.get("checked") or []) == want,
+        timeout=4.0, interval=0.5)
+    got = set((final or {}).get("checked") or [])
+    return {"status": "ok" if got == want else "error",
+            "label": label, "value": values, "kind": "checkbox",
+            "readback": {"label": label,
+                         "current": "、".join([v for v in allv if v in got]) or None}}
 
 
 async def _set_select_by_label(session: BrowserSession, label: str, value: str,

@@ -43,12 +43,13 @@ class FakeProc:
         self.stderr = stderr
 
 
-def _img(path: str, w: int = CLOTH_MIN_W, h: int = CLOTH_MIN_H) -> str:
+def _img(path: str, w: int = CLOTH_MIN_W + 1, h: int = CLOTH_MIN_H + 1) -> str:
     """造一张【尺寸达标】的测试图。
 
-    默认给 1340×1785：upload_image 的 precheck 会拦下不达标的图（服装类硬红线，
-    见 images.check_cloth_size），拿占位小图会连第一步取签名都走不到。本文件测的是
-    直传三步协议，闸门本身由 test_publish_upload_sizegate.py 覆盖。
+    默认给 1341×1786（比服装下限大 1px）：upload_image 的 precheck 按【严格大于】判
+    （平台把 =1340×1785 也拦下，见 images.check_cloth_size 的 strict 参数），拿贴线图
+    或占位小图会连第一步取签名都走不到。本文件测的是直传三步协议，闸门本身由
+    test_publish_upload_sizegate.py 覆盖。
     """
     Image.new("RGB", (w, h), (10, 20, 30)).save(path)
     return path

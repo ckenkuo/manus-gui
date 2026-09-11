@@ -32,6 +32,7 @@ asyncio.to_thread 下沉线程，不堵事件循环。
 import asyncio
 import functools
 import inspect
+import json
 import re
 import socket
 import traceback as _traceback
@@ -71,6 +72,35 @@ _INSERT = """INSERT INTO `{table}`
     (machine, instance, pipeline, stage, item, level, message, traceback)
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"""
 
+# 明细表：主表那行文本之外的「失败现场」。为什么另起一张表而不是给主表加列——
+# 主表 DDL 是 CREATE TABLE IF NOT EXISTS，加列的 ALTER 在已部署机器上根本不会执行，
+# 而带新列的 INSERT 会整行失败，等于为一个关联列把四条管线现有的上报全打死。
+# 关联字段放这里，主表一列不动。
+# shot_png 用 MEDIUMBLOB（16MB）：PNG 截图几百 KB 到 1MB，BLOB(64KB) 会截断，
+# LONGBLOB 是浪费。shot_bytes 单列出来，几 KB 就基本是空白页/黑帧，一眼能认出来。
+_SNAP_DDL = """CREATE TABLE IF NOT EXISTS `{table}` (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    error_id BIGINT UNSIGNED NOT NULL,
+    machine VARCHAR(64) NOT NULL,
+    instance VARCHAR(64) NOT NULL DEFAULT '',
+    pipeline VARCHAR(32) NOT NULL,
+    item VARCHAR(128) NOT NULL DEFAULT '',
+    stage VARCHAR(64) NOT NULL DEFAULT '',
+    exit_tag VARCHAR(8) NOT NULL DEFAULT '',
+    snapshot MEDIUMTEXT,
+    shot_png MEDIUMBLOB,
+    shot_bytes INT UNSIGNED NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (id),
+    KEY idx_error (error_id),
+    KEY idx_item (item),
+    KEY idx_time (created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+
+_SNAP_INSERT = """INSERT INTO `{table}`
+    (error_id, machine, instance, pipeline, item, stage, exit_tag, snapshot, shot_png, shot_bytes)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+
 
 def load_config() -> dict:
     """读 config.toml 的 [error_report] 段，返回连接/开关参数；读不到返回禁用态。
@@ -83,6 +113,11 @@ def load_config() -> dict:
     result = {
         "enabled": False, "host": "", "port": 3306, "user": "", "password": "",
         "database": "", "table": DEFAULT_TABLE, "instance": "",
+        # 失败现场明细表名由主表名派生、不单独配：两处各写一个表名，改名时必漏一处。
+        # 主表名已过 _TABLE_RE 白名单，加后缀拼进 DDL 同样安全。
+        "detail_table": f"{DEFAULT_TABLE}_snapshots",
+        "snapshot": True, "screenshot": True,
+        "screenshot_max_kb": 2048, "snapshot_max_kb": 256,
     }
     try:
         import tomllib
@@ -103,6 +138,11 @@ def load_config() -> dict:
             result["instance"] = str(section.get("instance") or "").strip()
             table = str(section.get("table") or DEFAULT_TABLE).strip()
             result["table"] = table if _TABLE_RE.match(table) else DEFAULT_TABLE
+            result["detail_table"] = f"{result['table']}_snapshots"
+            result["snapshot"] = bool(section.get("snapshot", True))
+            result["screenshot"] = bool(section.get("screenshot", True))
+            result["screenshot_max_kb"] = int(section.get("screenshot_max_kb") or 2048)
+            result["snapshot_max_kb"] = int(section.get("snapshot_max_kb") or 256)
             result["enabled"] = (
                 bool(section.get("enabled", False))
                 and bool(result["host"]) and bool(result["database"])
@@ -175,6 +215,98 @@ async def report(pipeline: str, level: str = "error", stage: str = "",
         await asyncio.to_thread(_write, cfg, entry)
     except Exception as e:
         logger.warning(f"错误上报失败（忽略）：{e}")
+
+
+def _write_snapshot(cfg: dict, entry: dict, snapshot: Optional[dict],
+                    shot: Optional[bytes]) -> int:
+    """同步写主表 + 明细表（在线程里跑），返回主表 id；未写成返回 0。
+
+    与 _write 的三处差别，都是为「明细可能很大」服务的：
+    - 多两个超时：几百 KB 的 BLOB 经慢速公网 INSERT，只设 connect_timeout 会一直挂到
+      TCP 超时，而这条路径是在批次循环里被 await 的，挂住就是拖住整批商品。
+    - 分两次 commit：主表先落地，明细写失败也保住原来那行（与 _write 的语义一致）。
+      顺序不能反——error_id 要等主表 INSERT 拿到 lastrowid（同一连接内 commit 前后都有效）。
+    - 截图按 bytes 参数化写入，pymysql 会转成 _binary'...'。不转 base64：多 33% 体积，
+      读的时候还得再解一遍。
+    best-effort：任何一步失败只 logger.warning，返回 0。
+    """
+    try:
+        import pymysql
+    except ImportError:
+        logger.warning("未安装 pymysql，错误上报跳过（pip install pymysql）")
+        return 0
+
+    conn = None
+    try:
+        conn = pymysql.connect(
+            host=cfg["host"], port=cfg["port"], user=cfg["user"],
+            password=cfg["password"], database=cfg["database"],
+            charset="utf8mb4", connect_timeout=5,
+            read_timeout=15, write_timeout=15,
+        )
+        with conn.cursor() as cur:
+            cur.execute(_DDL.format(table=cfg["table"]))
+            cur.execute(
+                _INSERT.format(table=cfg["table"]),
+                (
+                    MACHINE, cfg["instance"], entry["pipeline"], entry["stage"],
+                    entry["item"], entry["level"], entry["message"], entry["traceback"],
+                ),
+            )
+            error_id = cur.lastrowid
+        conn.commit()
+
+        with conn.cursor() as cur:
+            cur.execute(_SNAP_DDL.format(table=cfg["detail_table"]))
+            cur.execute(
+                _SNAP_INSERT.format(table=cfg["detail_table"]),
+                (
+                    error_id, MACHINE, cfg["instance"], entry["pipeline"], entry["item"],
+                    entry["stage"], entry.get("exit_tag", ""),
+                    json.dumps(snapshot, ensure_ascii=False, default=str) if snapshot else None,
+                    shot, len(shot) if shot else 0,
+                ),
+            )
+        conn.commit()
+        return int(error_id)
+    except Exception as e:
+        logger.warning(f"失败现场上报写库失败（忽略）：{e}")
+        return 0
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+async def report_snapshot(pipeline: str, level: str = "error", stage: str = "",
+                          item: str = "", message: str = "", traceback: str = "",
+                          snapshot: Optional[dict] = None, shot: Optional[bytes] = None,
+                          exit_tag: str = "") -> int:
+    """异步上报一条错误 + 失败现场；返回主表 id，未启用或失败返回 0。best-effort，绝不抛。
+
+    调用方（发布侧）拿返回的 id 判断「主表那行已经写过没有」，据此决定要不要补写，
+    这是既不重复上报、又不因快照链路失败而丢主表记录的依据。
+    snapshot 为 None 表示没采到现场，此时明细行的 snapshot 列为 NULL，主表照写。
+    """
+    cfg = load_config()
+    if not cfg["enabled"]:
+        return 0
+    entry = {
+        "pipeline": str(pipeline or "")[:32],
+        "level": str(level or "error")[:16],
+        "stage": str(stage or "")[:64],
+        "item": str(item or "")[:128],
+        "message": str(message or "")[:_MESSAGE_MAX],
+        "traceback": str(traceback or "")[:_TRACEBACK_MAX],
+        "exit_tag": str(exit_tag or "")[:8],
+    }
+    try:
+        return await asyncio.to_thread(_write_snapshot, cfg, entry, snapshot, shot)
+    except Exception as e:
+        logger.warning(f"失败现场上报失败（忽略）：{e}")
+        return 0
 
 
 def _is_failure(event: dict) -> bool:

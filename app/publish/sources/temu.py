@@ -33,7 +33,8 @@ import re
 
 from app.logger import logger
 from app.publish.browser import BrowserSession
-from app.publish.sources.base import SourceProduct, source_id, wait_human
+from app.publish.sources.base import (SourceProduct, source_id, wait_for_open_tab,
+                                      wait_human)
 
 _JS_EXTRACT = r"""(() => {
   const st = ((window.rawData || {}).store || {});
@@ -41,6 +42,11 @@ _JS_EXTRACT = r"""(() => {
   const gid = String(st.goodsId || g.goodsId || '');
   const title = String(g.goodsName || g.goods_name || g.title || '').trim();
   if (!gid || !title) return JSON.stringify({found: false, goodsId: gid,
+    // 商品本身不可售时（售罄/下架）页面只回骨架：goods 里有 status 与 soldOutContent，
+    // 却没有 goodsName。这两个字段带出来，供 Python 侧把「商品废了」和「被反爬拦了」
+    // 分开报——两者处置相反，混在一起报会把人引错方向（见 fetch 的说明）。
+    status: String(g.status || ''), statusExplain: String(g.statusExplain || ''),
+    soldOut: !!g.soldOutContent,
     diagnostic: {hasGoodsId: !!gid, goodsKeys: Object.keys(g),
       reason: !gid ? 'missing-goods-id' : 'missing-title', url: location.href}});
   const num = v => (v == null || v === '' ? null : Number(v));
@@ -58,6 +64,13 @@ _JS_EXTRACT = r"""(() => {
   return JSON.stringify({
     found: true,
     goodsId: gid,
+    // 【found=true 也可能是不可售商品】status=7「不可购买」时 goodsName 的字面值就是
+    // 「不可购买」四个字，title 非空于是 found=true——不带出这两个字段的话，Python
+    // 侧会把它当正常商品收下，产出标题叫「不可购买」、SKU 全空的数据一路往下走，
+    // 直到保存才被平台拒。（status=5 售罄的 goodsName 为空、走上面的 found=false
+    // 分支，那条路已经有同一道闸。）
+    status: String(g.status || ''), statusExplain: String(g.statusExplain || ''),
+    soldOut: !!g.soldOutContent,
     title: title,
     props: (st.goodsProperty || []).map(p => ({
       key: p.key || '', values: (p.values || []).map(String)})),
@@ -175,26 +188,40 @@ async def fetch(session: BrowserSession, url: str,
                 on_manual=None, timeout: float = 40.0) -> SourceProduct:
     """抽 Temu 买家侧详情页的 SourceProduct。只读。
 
-    【取数策略：先复用已打开的页签，再退回导航】2026-08-27 实测 Temu 会把对商品页的
-    重新导航 302 到 login.html?login_scene=2（哪怕同一个 URL、同一个浏览器、页签里
-    正开着完整数据）。用户从站内点进去的那个页签带着导航不可复现的会话上下文，
-    故优先直接读它；页签不在时才 navigate，此时可能撞登录墙、由下面的判据报出来。
-    这是 Temu 独有的处置，另三家都能直接导航（见各自适配器）。
+    【取数策略：只复用人工开好的页签，绝不导航】2026-09-10 真站实测（探测脚本见
+    workspace/_probe_temu_*.py）：Temu 现在对自动导航一律跳 bgn_verification 安全
+    验证页，导航这个动作本身就足以把验证激出来，之后 wait_human 只会白等 600 秒。
+    反过来，人工从站内点开的页签里数据完整（12 个实测全部可读），且只读取数不触发
+    任何风控。故缺页签时不再退回导航，改为提示人工打开该商品页并原地等
+    （wait_for_open_tab）——人开好即继续，不必重跑整个商品。
+
+    与 2026-08-27 那版（先 adopt、失败退回 navigate）只差这一处：当时拦的是 302 到
+    login.html，navigate 尚有一线可能；现在导航必被拦，退回导航已无意义。
     """
     gid = source_id(url, "temu")
-    adopted = False
-    if gid:
-        # 按商品 ID 找页签而不是整个 URL 相等：用户打开的链接带一长串 _oak_* 参数，
-        # 与任务里填的那条几乎不会字节相同，但 -g-<id> 这段是稳定的。
-        r = await session.adopt_open_page(f"-g-{gid}")
-        adopted = bool(r.get("ok"))
-    if not adopted:
-        logger.info(f"打开 Temu 详情页提取：{url}")
-        r = await session.navigate(url)
-        if not r.get("ok"):
-            raise RuntimeError(f"导航失败: {r}")
+    if not gid:
+        raise RuntimeError(f"Temu 链接里抽不出商品 ID：{url}")
+    # 按商品 ID 找页签而不是整个 URL 相等：用户打开的链接带区域段（/us-zh-Hans/）与
+    # 一长串 _oak_* 参数，跟任务里填的那条几乎不会字节相同，但 -g-<id> 这段是稳定的。
+    if not (await session.adopt_open_page(f"-g-{gid}")).get("ok"):
+        message = ("Temu 商品页签未打开：请在调试 Chrome 里从站内点开该商品页"
+                   "（需先人工登录、过人机验证）并保持开着，开好后流程自动继续。"
+                   f"商品 URL：{url}")
+        if not await wait_for_open_tab(session, f"-g-{gid}", message,
+                                       on_manual=on_manual):
+            raise RuntimeError(f"{message}（等待超时）")
 
     data = await session.wait_for(_JS_EXTRACT, lambda d: d.get("found"), timeout=timeout)
+    # 【商品不可售要最先判，且 found 为真时也要判】两类不可售的形态不同：
+    #   status=5 售罄     → goodsName 为空，found=false
+    #   status=7 不可购买 → goodsName 就是「不可购买」四个字，found=**true**
+    # 后者若不在这里挡掉，会产出标题叫「不可购买」、SKU 全空的商品数据继续往下走，
+    # 直到保存才被平台拒——而那时已经白跑十几个阶段。两者都不是反爬，喊人来处理也没用，
+    # 批量跑时该直接跳过该商品。2026-09-10 实测采集箱 12 条旧链接全是这两种。
+    if data.get("soldOut") or str(data.get("statusExplain") or "") == "NO_QUANTITY":
+        raise RuntimeError(
+            f"Temu 源商品已售罄或不可购买（status={data.get('status') or '?'}），"
+            f"取不到商品数据：{url}。该商品在 Temu 上已下架，换一条在售商品重试。")
     if not data.get("found"):
         probe = {}
         try:
@@ -232,9 +259,7 @@ async def fetch(session: BrowserSession, url: str,
             raise RuntimeError(
                 "Temu 商品数据未完整加载（缺少商品 ID 或标题）。"
                 + f"诊断：{data.get('diagnostic') or {}}。"
-                + ("" if adopted else
-                   "本次是新导航打开的——Temu 常把重新导航跳到登录页，"
-                   "请在该 Chrome 窗口里把商品页打开着再跑（见适配器 fetch 的说明）"))
+                + "页签里没有商品数据，请确认该商品页在浏览器里正常显示后重试。")
 
     if gid and str(data.get("goodsId") or "") != gid:
         raise RuntimeError(f"Temu 页面商品不匹配：目标 {gid}，实际 {data.get('goodsId')}，请打开目标商品页")

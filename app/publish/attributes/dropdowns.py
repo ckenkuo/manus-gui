@@ -23,20 +23,80 @@ async def _expand_attr_section(session: BrowserSession) -> dict:
     })()""")
 
 
+# 幽灵浮层停靠用的类名与样式表 id（机制与取证见 _park_ghost_dropdowns）
+_PARK_CLASS = "dxm-ghost-parked"
+_PARK_STYLE_ID = "dxm-ghost-park-style"
+
+
+def _js_unpark() -> str:
+    """拼进别的 JS 里的一行：拿到 panel 后顺手摘掉停靠类。
+
+    为什么每处「要用这个浮层」的 JS 都要自己摘一次、而不是只在打开下拉时统一摘：
+    park 是【对浮层整体】做的，而打开态与浮层铺开是两件事——浮层复用同一节点，
+    上一次留下没摘干净就会一直塌着（取证见 _park_ghost_dropdowns）。让每个真正
+    动浮层的地方自带这一行，就不依赖「打开那一步一定跑过、且跑在浮层挂载之后」。
+    """
+    return (f"if (target.classList.contains('{_PARK_CLASS}')) "
+            f"target.classList.remove('{_PARK_CLASS}');")
+
+
 async def _park_ghost_dropdowns(session: BrowserSession) -> dict:
-    """把视觉残留的幽灵浮层恢复成停靠态（清 left/top、宽高归零）。见坑1。"""
-    return await session.eval_json(r"""(() => {
+    """把视觉残留的幽灵浮层恢复成停靠态（加停靠类：宽高归零、不可见、不可点）。见坑1。
+
+    【为什么改成加类，不再写内联 style】2026-09-11 真机取证（商品 1044382261282 的
+    「面料类型」）：原实现直接改内联样式，而 React 不知道这次改动——antd 重新打开该
+    下拉时复用同一个浮层节点，rc-align 是命令式的会把 left/top 写回去，但 width 走
+    React 的 style diff，React 手里那份值没变就不重写 DOM，park 写的 0px 于是永久
+    残留。浮层塌成 8px 宽（antd dropdown 的 padding 4×2），虚拟列表滚不动
+    （scrollHeight == clientHeight，日志里 256/256），只渲染首屏 10 项，而目标
+    「色丁布」是第 21 项——点选与滚动都只能报 option-not-rendered，兜底 agent 从这
+    一步起全程无解，最后按「未能通过原阶段校验」判商品失败。日志里的铁证是
+    ddStyle 那两个值：`min-width: 0px; width: 0px`，全项目只有这段代码会那么写。
+    用类就绕开了 React 管的属性：要恢复只需把类摘掉（_unpark_own_panel / _js_unpark）。
+
+    归零宽度就够让它既看不见也点不到（外加 visibility/pointer-events 两道），
+    故不再像原来那样顺手清 left/top——那同样是 React 不认的内联改动。
+    """
+    js = r"""(() => {
+      const ID = '__STYLEID__';
+      if (!document.getElementById(ID)) {
+        const s = document.createElement('style');
+        s.id = ID;
+        s.textContent = '.ant-select-dropdown.__CLS__{'
+          + 'width:0 !important;min-width:0 !important;'
+          + 'visibility:hidden !important;pointer-events:none !important;}';
+        document.head.appendChild(s);
+      }
       let parked = 0;
       Array.from(document.querySelectorAll('.ant-select-dropdown')).forEach(d => {
+        if (d.classList.contains('__CLS__')) return;   // 已停靠的不重复计
         const r = d.getBoundingClientRect();
         if (r.top > -1000 && r.width > 50) {
-          d.style.left = ''; d.style.top = '';
-          d.style.width = '0px'; d.style.minWidth = '0px';
+          d.classList.add('__CLS__');
           parked++;
         }
       });
       return JSON.stringify({parked: parked});
-    })()""")
+    })()""".replace("__STYLEID__", _PARK_STYLE_ID).replace("__CLS__", _PARK_CLASS)
+    return await session.eval_json(js)
+
+
+async def _unpark_own_panel(session: BrowserSession, label: str,
+                            sel_idx: int = 0) -> dict:
+    """摘掉【目标行自己的】浮层的停靠类，让它恢复成能读能点的正常浮层。
+
+    只动这一行，不碰别的残留浮层：坑1 那套保护（防误点别的字段）靠的是「选项查找
+    一律限定在本行浮层内」，本行浮层恢复可见不会削弱它。
+    """
+    js = r"""(() => {
+      const target = __PANEL__;
+      if (!target || !target.classList.contains('__CLS__'))
+        return JSON.stringify({unparked: false});
+      __UNPARK__
+      return JSON.stringify({unparked: true});
+    })()""".replace("__PANEL__", _js_own_panel(label, sel_idx)) \
+        .replace("__CLS__", _PARK_CLASS).replace("__UNPARK__", _js_unpark())
+    return await session.eval_json(js)
 
 
 async def _press_escape(session: BrowserSession) -> None:
@@ -48,29 +108,20 @@ async def _press_escape(session: BrowserSession) -> None:
 
 
 def _js_dropdown_options_rendered(label: str) -> str:
-    """探「该行最近的可见浮层里已渲染出几个选项」。
+    """探「该行自己的浮层里已渲染出几个选项」。
 
     给「开下拉之后等什么」用：_open_attr_dropdown 的收敛条件是浮层可见，而浮层可见
     ≠ 里面的 rc-virtual-list 已挂上 .ant-select-item-option（虚拟列表要一帧才渲染）。
     原先靠固定 sleep(0.6) 兜这段，现在等这个真实信号（上限仍 0.6s）。
-    「取距本行最近的可见浮层」与坑1/坑2 那套幽灵浮层过滤同一判据
-    （top > -1000 && width > 50），不另立标准。
+    浮层按 _js_own_panel 的 aria 关联取——原先按「距本行最近」猜，会数到幽灵浮层里
+    上一行的选项条数，于是本行还没渲染就被判成「已就绪」。
     """
     return r"""(() => {
-      const row = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
-          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
-        || Array.from(document.querySelectorAll('.ant-form-item'))
-          .find(el => { const l = el.querySelector('.ant-form-item-label label');
-            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
-      const rowY = row ? row.getBoundingClientRect().top : 0;
-      const drops = Array.from(document.querySelectorAll('.ant-select-dropdown'))
-        .map(d => ({d, r: d.getBoundingClientRect()}))
-        .filter(x => x.r.top > -1000 && x.r.width > 50);
-      if (!drops.length) return JSON.stringify({n: 0});
-      drops.sort((a, b) => Math.abs(a.r.top - rowY) - Math.abs(b.r.top - rowY));
+      const target = __PANEL__;
+      if (!target) return JSON.stringify({n: 0});
       return JSON.stringify({
-        n: drops[0].d.querySelectorAll('.ant-select-item-option').length});
-    })()""".replace("__LABEL__", J(label))
+        n: target.querySelectorAll('.ant-select-item-option').length});
+    })()""".replace("__PANEL__", _js_own_panel(label))
 
 
 async def _visible_dropdown_near(session: BrowserSession, label: str,
@@ -140,6 +191,12 @@ async def _open_attr_dropdown(session: BrowserSession, label: str,
     一个浮层，下游的浮层定位就不会再选错。
     """
     if await _is_dropdown_open(session, label, sel_idx):
+        # 【已打开也要摘一次停靠类】Vue 的打开态与浮层的铺开状态是两回事：上一次读完
+        # 选项后 park 过、而打开态没关（合成事件路径下很常见），这里就会一边报
+        # already=true、一边把塌缩的浮层交出去。2026-09-11 商品 1044382261282 的
+        # 「面料类型」正是如此：兜底 agent 的 dxm_attribute_open 报 already=true，
+        # 紧接着的 dxm_attribute_click 却一律 option-not-rendered。
+        await _unpark_own_panel(session, label, sel_idx)
         return {"opened": True, "already": True}
     # 没打开：先清残留浮层（park 停靠 + Escape 关 Vue 内部态），再点开。
     await _park_ghost_dropdowns(session)
@@ -170,8 +227,45 @@ async def _open_attr_dropdown(session: BrowserSession, label: str,
             lambda: _is_dropdown_open(session, label, sel_idx),
             lambda d: d, timeout=0.5)
         if seen:
+            # 打开态一出现就摘停靠类：浮层要再等一帧才挂载，这里取不到就什么都不做
+            # （读/点那两处 JS 各自还会再摘一次，见 _js_unpark）。
+            await _unpark_own_panel(session, label, sel_idx)
             return {"opened": True, "attempts": attempt}
     return {"opened": False, "reason": "open-verify-failed"}
+
+
+def _js_own_panel(label: str, sel_idx: int = 0) -> str:
+    """生成「取本行第 sel_idx 个 select 自己的下拉浮层」的 JS 表达式（取不到为 null）。
+
+    拼进别的 JS 里当表达式用，例如 `const panel = __PANEL__;`。
+
+    【为什么必须按 aria 关联取，不能再按「距本行最近」猜】2026-09-11 真机取证
+    （rowid 184807703145936681，「主体材质」与「适用年龄段」相邻两行）：读到前一行时
+    留下的浮层会变成幽灵，`_press_escape` + `_park_ghost_dropdowns` 都清不掉它——
+    下一次打开邻行时 antd 又把它重新定位回可见位置（实测 top=617 / width=240，
+    内容仍是材质清单），而邻行自己的浮层反被 park 成 0 宽（top=-327）。于是「距本行
+    最近」选中了幽灵：读选项读回【上一行】的清单（「适用年龄段」读成亚麻/蚕丝/莱卡，
+    并被按该行 label 落盘进同类目缓存），点选项也会点到
+    别的字段上——2026-09-04 修过的「XX成分不能重复选择」是同一根源的另一面。
+    antd 本就把浮层与所属 select 用 aria-controls/aria-owns 绑好了（实测该页 37 个
+    select 全带该属性，`_list` 元素向上 2 跳即 .ant-select-dropdown），按它取不必猜。
+    浮层是懒挂载的，故这条只在「先打开下拉再取」时成立——三处调用方都是这么用的。
+    """
+    return r"""(() => {
+      const it = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
+          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
+        || Array.from(document.querySelectorAll('.ant-form-item'))
+          .find(el => { const l = el.querySelector('.ant-form-item-label label');
+            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
+      if (!it) return null;
+      const sel = Array.from(it.querySelectorAll('.ant-select'))[__IDX__];
+      const inp = sel && sel.querySelector('input');
+      const cid = inp && (inp.getAttribute('aria-controls') || inp.getAttribute('aria-owns'));
+      let el = cid ? document.getElementById(cid) : null;
+      for (let k = 0; el && k < 6 && !el.classList.contains('ant-select-dropdown'); k++)
+        el = el.parentElement;
+      return (el && el.classList.contains('ant-select-dropdown')) ? el : null;
+    })()""".replace("__LABEL__", J(label)).replace("__IDX__", str(sel_idx))
 
 
 async def _read_active_options(session: BrowserSession, label: str,
@@ -204,19 +298,28 @@ async def _read_active_options(session: BrowserSession, label: str,
     await asyncio.sleep(0.5)
     js = r"""(async () => {
       const sleep = ms => new Promise(res => setTimeout(res, ms));
-      const row = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
-          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
-        || Array.from(document.querySelectorAll('.ant-form-item'))
-          .find(el => { const l = el.querySelector('.ant-form-item-label label');
-            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
-      const rowY = row ? row.getBoundingClientRect().top : null;
-      const drops = Array.from(document.querySelectorAll('.ant-select-dropdown'))
-        .map(d => ({d, r: d.getBoundingClientRect()}))
-        .filter(x => x.r.top > -1000 && x.r.width > 50);
-      if (!drops.length) return JSON.stringify({open: false, options: []});
-      if (drops.length > 1 && rowY !== null)
-        drops.sort((a, b) => Math.abs(a.r.top - rowY) - Math.abs(b.r.top - rowY));
-      const target = drops[0].d;
+      const target = __PANEL__;
+      if (!target) return JSON.stringify({open: false, options: [], reason: 'no-panel'});
+      // 【先摘停靠类再判】本行浮层可能正被上一次 park 压着（见 _park_ghost_dropdowns）：
+      // 不摘就一直塌着，读出来只有首屏那十来个，白白把本行判成读不到。
+      __UNPARK__
+      // 【面板没铺开就一个字都不读】2026-09-11 真机取证（rowid 184807703145936681 的
+      // 「适用年龄段」）：该面板会进入一种塌缩态——getBoundingClientRect().width 为 0、
+      // scrollHeight 等于 clientHeight（滚动容器根本滚不动），此时只能渲染出首屏那
+      // 十来个选项，而 rolling 循环一步就判「到底」。坏在【它照样报 scrolledToEnd /
+      // complete 为真】：那份【真前缀、假完整】的清单会一路写进同类目属性缓存
+      // 的同类目缓存，之后每个同类目商品都拿缺项的 options 去校验与喂 LLM，没有任何
+      // 环节会发现（与 optionsComplete 那道闸要防的是同一类错，只是那条闸的前提
+      // 「滚到底 ⇒ 读全了」在这个状态下不成立）。
+      // 面板铺开是好状态的可靠判据（实测完整列表那次 width=240，与读到的条数 24 严格
+      // 对应）。【下界取 50 而不是「> 0」】塌缩态实测有两种宽度：没被 antd 定位过的
+      // 恒为 0，被定位过的盒子还剩 padding 4×2 = 8px（2026-09-11 商品 1044382261282
+      // 的面料类型就是 8），只判「> 0」会把它当正常面板放过去。50 与
+      // _visible_dropdown_near 认「可见浮层」的口径一致，不会误伤正常浮层。
+      // 宁可如实报读不到（上层据此标 open-failed、不进缓存、LLM 也不会拿着缺项清单
+      // 去猜），也不返回一份半截清单。
+      if (target.getBoundingClientRect().width < 50)
+        return JSON.stringify({open: false, options: [], reason: 'panel-collapsed'});
       const holder = target.querySelector('.rc-virtual-list-holder');
       const seen = [];
       const collect = () => Array.from(target.querySelectorAll('.ant-select-item-option-content'))
@@ -246,14 +349,14 @@ async def _read_active_options(session: BrowserSession, label: str,
       await sleep(250);
       collect();
       return JSON.stringify({open: true, options: seen, virtual: true,
-                             visibleDrops: drops.length,
                              scrollHeight: holder.scrollHeight,
                              clientHeight: holder.clientHeight,
                              // 滚到底了才算读全（没滚到底说明 40 次循环用完还没走完，
                              // 那份清单是截断的，不能进缓存）
                              scrolledToEnd: holder.scrollTop + holder.clientHeight
                                             >= holder.scrollHeight - 2});
-    })()""".replace("__LABEL__", J(label))
+    })()""".replace("__PANEL__", _js_own_panel(label)) \
+        .replace("__UNPARK__", _js_unpark())
     res = await session.eval_json(js)
     await _press_escape(session)
     await asyncio.sleep(0.2)
@@ -266,6 +369,10 @@ async def _read_active_options(session: BrowserSession, label: str,
     return opts, {"virtual": bool(res.get("virtual")),
                   "scrollHeight": res.get("scrollHeight"),
                   "scrolledToEnd": bool(res.get("scrolledToEnd")),
+                  # 没读到的原因（no-panel / panel-collapsed）透给调用方写日志：这两种
+                  # 都表现为「0 个」，不区分的话现场只剩一句「读选项：X -> 0 个」，
+                  # 排查时看不出是没开出来还是面板塌了。
+                  "reason": res.get("reason"),
                   "complete": complete}
 
 
@@ -280,22 +387,10 @@ async def _click_dropdown_option(session: BrowserSession, label: str,
     找不到目标选项时返回 option-not-rendered，交 _scroll_click_option 滚动去找。
     """
     js = r"""(() => {
-      const row = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
-          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
-        || Array.from(document.querySelectorAll('.ant-form-item'))
-          .find(el => { const l = el.querySelector('.ant-form-item-label label');
-            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
-      if (!row) return JSON.stringify({clicked: false, reason: 'row-not-found'});
-      row.scrollIntoView({block: 'center'});
-      const rowY = row.getBoundingClientRect().top;
-      const drops = Array.from(document.querySelectorAll('.ant-select-dropdown'))
-        .map(d => ({d, r: d.getBoundingClientRect()}))
-        .filter(x => x.r.top > -1000 && x.r.width > 50);
-      if (!drops.length) return JSON.stringify({clicked: false, reason: 'no-visible-dropdown'});
-      drops.sort((a, b) => Math.abs(a.r.top - rowY) - Math.abs(b.r.top - rowY));
-      if (Math.abs(drops[0].r.top - rowY) > 600)
-        return JSON.stringify({clicked: false, reason: 'dropdown-too-far'});
-      const opt = Array.from(drops[0].d.querySelectorAll('.ant-select-item-option'))
+      const target = __PANEL__;
+      if (!target) return JSON.stringify({clicked: false, reason: 'no-visible-dropdown'});
+      __UNPARK__
+      const opt = Array.from(target.querySelectorAll('.ant-select-item-option'))
         .find(o => {
           const c = o.querySelector('.ant-select-item-option-content');
           return ((c || o).textContent || '').trim() === __VALUE__;
@@ -304,7 +399,8 @@ async def _click_dropdown_option(session: BrowserSession, label: str,
         value: __VALUE__});
       opt.click();
       return JSON.stringify({clicked: true, value: __VALUE__});
-    })()""".replace("__LABEL__", J(label)).replace("__VALUE__", J(value))
+    })()""".replace("__PANEL__", _js_own_panel(label)).replace("__VALUE__", J(value)) \
+        .replace("__UNPARK__", _js_unpark())
     return await session.eval_json(js)
 
 
@@ -317,20 +413,9 @@ async def _scroll_click_option(session: BrowserSession, label: str,
     """
     js = r"""(async () => {
       const sleep = ms => new Promise(res => setTimeout(res, ms));
-      const row = Array.from(document.querySelectorAll('.ant-form-item[data-attr-label]'))
-          .find(el => el.getAttribute('data-attr-label') === __LABEL__)
-        || Array.from(document.querySelectorAll('.ant-form-item'))
-          .find(el => { const l = el.querySelector('.ant-form-item-label label');
-            return l && (l.getAttribute('title')||l.textContent||'').trim() === __LABEL__; });
-      if (row) row.scrollIntoView({block: 'center'});
-      const rowY = row ? row.getBoundingClientRect().top : null;
-      const drops = Array.from(document.querySelectorAll('.ant-select-dropdown'))
-        .map(d => ({d, r: d.getBoundingClientRect()}))
-        .filter(x => x.r.top > -1000 && x.r.width > 50);
-      if (!drops.length) return JSON.stringify({clicked: false, reason: 'no-visible-dropdown'});
-      if (drops.length > 1 && rowY !== null)
-        drops.sort((a, b) => Math.abs(a.r.top - rowY) - Math.abs(b.r.top - rowY));
-      const target = drops[0].d;
+      const target = __PANEL__;
+      if (!target) return JSON.stringify({clicked: false, reason: 'no-visible-dropdown'});
+      __UNPARK__
       const hitNow = () => Array.from(target.querySelectorAll('.ant-select-item-option'))
         .find(o => {
           const c = o.querySelector('.ant-select-item-option-content');
@@ -354,5 +439,6 @@ async def _scroll_click_option(session: BrowserSession, label: str,
       const last = hitNow();
       if (last) { last.click(); return JSON.stringify({clicked: true, value: __VALUE__, atEnd: true}); }
       return JSON.stringify({clicked: false, reason: 'option-not-rendered', value: __VALUE__});
-    })()""".replace("__LABEL__", J(label)).replace("__VALUE__", J(value))
+    })()""".replace("__PANEL__", _js_own_panel(label)).replace("__VALUE__", J(value)) \
+        .replace("__UNPARK__", _js_unpark())
     return await session.eval_json(js)

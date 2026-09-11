@@ -125,28 +125,8 @@ def test_deepseek_选项已登记():
     meta = llm.LLM_CHOICES["deepseek"]
     assert meta["config_name"] == "publish-deepseek"
     section = (app_config.llm or {}).get("publish-deepseek")
-    assert section.model == "deepseek-v4-flash-vision-exp"
+    assert section.model == "deepseek-flash"
     assert "api.deepseek.com" in section.base_url
-
-
-def test_packy_deepseek_选项已登记():
-    """Packy 版 deepseek 段：与官方段同模型、不同网关，两者都要在册。
-
-    钉住三件事：段名对得上、模型名与官方段一致（同一个模型，故白名单天然覆盖）、
-    base_url 指的是 Packy 网关而不是官方端点——写错了会拿 Packy 的 key 打官方域名，
-    表现为 401 而非「模型不存在」，排查方向容易带偏。
-    """
-    from app.config import config as app_config
-
-    meta = llm.LLM_CHOICES["packy-deepseek"]
-    assert meta["config_name"] == "publish-packy-deepseek"
-    section = (app_config.llm or {}).get("publish-packy-deepseek")
-    assert section is not None, "config 里没有 [llm.publish-packy-deepseek] 段"
-    assert section.model == "deepseek-v4-flash-vision-exp"
-    assert "cf.api.fan" in section.base_url
-    # 与 grok 段的区别：deepseek 走标准 chat/completions，不能配成 openai-response
-    # （2026-08-25 实测两个协议都通，取 chat 以复用既有 image_url 拼装）
-    assert section.api_type == "openai"
 
 
 def test_get_llm_按选择映射config_name(_isolate_llm_prefs, monkeypatch):
@@ -212,7 +192,7 @@ def test_stage_视觉阶段拒非多模态(_isolate_llm_prefs, monkeypatch):
 
     monkeypatch.setattr(
         core, "MULTIMODAL_MODELS",
-        [m for m in core.MULTIMODAL_MODELS if m != "deepseek-v4-flash-vision-exp"])
+        [m for m in core.MULTIMODAL_MODELS if m != "deepseek-flash"])
     assert llm._choice_multimodal("deepseek") is False
     with pytest.raises(ValueError, match="不是多模态"):
         llm.set_stage_choice("desc", "deepseek")        # 视觉阶段：拒

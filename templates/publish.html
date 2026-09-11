@@ -869,19 +869,6 @@
                   <ul id="cachePaths" class="list-unstyled mb-0 font-monospace" style="font-size: 0.78rem"></ul>
                 </div>
               </div>
-              <div class="table-responsive">
-                <table class="table table-sm table-hover align-middle mb-0">
-                  <thead>
-                    <tr class="text-muted">
-                      <th>叶子类目</th>
-                      <th class="text-end">已缓存行</th>
-                      <th>更新时间</th>
-                      <th></th>
-                    </tr>
-                  </thead>
-                  <tbody id="cacheAttrs"></tbody>
-                </table>
-              </div>
             </div>
           </div>
         </div>
@@ -1145,10 +1132,8 @@
           const r = await fetch("/publish/cache");
           const d = await r.json();
           const nPath = d.paths || 0;
-          const nCat = d.attrCategories || 0;
-          $("cacheSummary").textContent =
-            `类目路径 ${nPath} 条 · 属性类目 ${nCat} 个（${d.attrRows || 0} 行）`;
-          const empty = nPath === 0 && nCat === 0;
+          $("cacheSummary").textContent = `类目路径 ${nPath} 条`;
+          const empty = nPath === 0;
           $("cacheEmpty").classList.toggle("d-none", !empty);
           $("cacheBody").classList.toggle("d-none", empty);
           if (empty) return;
@@ -1162,39 +1147,19 @@
                 `</li>`
             )
             .join("");
-          $("cacheAttrs").innerHTML = (d.attrFiles || [])
-            .map(
-              (f) =>
-                `<tr><td class="text-truncate" title="${esc((f.catPath || []).join(" > "))}">` +
-                esc(f.leaf || f.slug) +
-                (f.site ? ` <span class="text-muted">(${esc(f.site)})</span>` : "") +
-                `</td><td class="text-end">${f.rowCount || 0}</td>` +
-                `<td class="text-muted">${esc(f.updated_at || "")}</td>` +
-                `<td class="text-end"><button class="btn btn-link btn-sm p-0 text-danger" ` +
-                `data-slug="${esc(f.slug)}">清除</button></td></tr>`
-            )
-            .join("");
-          $("cacheAttrs")
-            .querySelectorAll("button[data-slug]")
-            .forEach((b) =>
-              b.addEventListener("click", () => clearCache(b.dataset.slug))
-            );
         } catch (e) {
           $("cacheSummary").textContent = "读取失败";
         }
       }
 
-      async function clearCache(slug) {
-        const what = slug ? `属性缓存「${slug}」` : "全部缓存（含类目路径清单）";
-        if (!confirm(`确定清除${what}？清完下一次跑会回落到全量遍历，只是慢，不会出错。`))
+      async function clearCache() {
+        if (!confirm("确定清除类目路径缓存？清完下一次跑会回落到全量遍历，只是慢，不会出错。"))
           return;
         try {
-          const url = "/publish/cache" + (slug ? `?slug=${encodeURIComponent(slug)}` : "");
-          const r = await fetch(url, { method: "DELETE" });
+          const r = await fetch("/publish/cache", { method: "DELETE" });
           const d = await r.json();
           if (!r.ok) throw new Error(d.detail || r.status);
-          const n = (d.removed && d.removed.attrFiles ? d.removed.attrFiles.length : 0);
-          showToast("缓存已清除", `属性类目 ${n} 个`, "success");
+          showToast("缓存已清除", "类目路径清单", "success");
         } catch (e) {
           showToast("清除失败", String(e), "danger");
         }
@@ -1202,7 +1167,7 @@
       }
 
       $("btnCacheRefresh").addEventListener("click", loadCache);
-      $("btnCacheClear").addEventListener("click", () => clearCache(""));
+      $("btnCacheClear").addEventListener("click", () => clearCache());
       loadCache();
 
       // 折叠状态持久化：面板是「跑批前偶尔看一眼」的维护区，攒久了会顶掉下方进度视野，

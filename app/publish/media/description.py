@@ -265,7 +265,7 @@ async def desc_text_apply(session: BrowserSession, plan: list) -> dict:
             "kept": kept, "failed": failed}
 
 
-async def desc_save(session: BrowserSession) -> dict:
+async def desc_save(session: BrowserSession, allow_empty: bool = False) -> dict:
     """阶段⑪ 保存描述编辑器的改动。
 
     注意这只保存【描述编辑器】，整个商品还要再走一次阶段⑫ save 才落库。
@@ -273,6 +273,11 @@ async def desc_save(session: BrowserSession) -> dict:
     返回 status="validation-error" 而不是 error 的情形：保存后编辑页描述区仍有非
     店小秘图床的外链图。那说明这些图没被平台转存，发布时可能被拦——但也可能是本商品
     本来就没替换过描述图（外链是采集时的原始状态），故不当硬错误、交调用方判断。
+
+    allow_empty：描述区【本来就没有图】时放行。源商品没有详情长图、描述区只剩文字
+    模块时，下面「读回必须有图」这道校验必然失败，而那种情况下「没有图片」是预期
+    状态而非错误（2026-09-10 实测 Temu 女装衬衫，源详情图 0 张，整个 ⑬ 判 fail）。
+    调用方须先确认描述区确实没有图片模块才传 True。
     """
     st = await _desc_ensure_open(session)
     if st.get("err"):
@@ -290,6 +295,10 @@ async def desc_save(session: BrowserSession) -> dict:
         r["killedStuck"] = killed.get("removed")
         return {"status": "error", "stage": "close", "detail": r}
     if not r.get("descImgs"):
+        if allow_empty:
+            return {"status": "ok", "descImgs": 0,
+                    "dxmHosted": r.get("dxmHosted") or 0,
+                    "note": "描述区无图片（源无详情图），文字模块已处理"}
         return {"status": "error", "stage": "readback",
                 "err": "保存后编辑页描述区没有图片", "detail": r}
     all_hosted = r["descImgs"] == r["dxmHosted"]

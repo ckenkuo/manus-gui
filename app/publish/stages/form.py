@@ -15,8 +15,26 @@ from app.publish.titles import set_titles
 async def _st_claim(ctx: dict, session: BrowserSession, emit) -> dict:
     note = ""
     if not ctx.get("rowid"):
-        r = await collect_and_claim(session, ctx["url"], ctx["title"],
-                                    ctx["store"], ctx["site"])
+        # 【Temu 源跳过「链接采集」，只做认领】店小秘服务端的链接采集不支持 Temu：
+        # 2026-09-10 实测对 temu.com 链接返回「已执行1条，成功:0，跳过:0，失败:1」，
+        # 采集记录压根不产生，随后认领必然报「采集列表未找到商品」——那句提示还会
+        # 诱人反复重跑，而重跑永远不会成。Temu 商品要用店小秘的浏览器插件在官网上采
+        # （用户既有做法，采完先进采集箱），那一趟人工本来就要打开商品页，与 ① 复用
+        # 页签取数共用同一批页签。故这里只认领、不重复提交那个注定失败的链接。
+        skip_crawl = ctx.get("source_platform") == "temu"
+        try:
+            r = await collect_and_claim(session, ctx["url"], ctx["title"],
+                                        ctx["store"], ctx["site"],
+                                        skip_crawl=skip_crawl)
+        except RuntimeError as e:
+            # 认领的前提是商品已在采集箱里。缺了就给一条能照着做的提示，而不是让
+            # 「采集可能还没完成，稍后重跑」把人引向无限重试。
+            if skip_crawl and "采集列表未找到商品" in str(e):
+                raise RuntimeError(
+                    "采集箱里没有这条 Temu 商品，无法认领——请先用店小秘浏览器插件在 "
+                    f"Temu 官网采集它（采完会先进采集箱），再重跑本商品。原始信息：{e}"
+                ) from e
+            raise
         if not r.get("rowid"):
             return {"status": "fail", "note": "认领后未取到 rowid（采集列表同步延迟？可续跑）"}
         ctx["rowid"] = r["rowid"]
@@ -50,9 +68,14 @@ async def _st_auto_cat(ctx: dict, session: BrowserSession, emit) -> dict:
     # 阶段④的属性缓存要按类目路径取，这里把它落进 ctx（并经回写元组进状态文件，
     # 续跑 from attrs 时才拿得到）
     ctx["cat_path"] = r.get("pathList") or []
-    # note 里记明走的是缓存还是遍历：缓存快路径选错了下游没有任何校验能发现，
+    # 叶子 catId 同样落进 ctx：阶段④ 拿它查该类目的属性选项。类目是【运行中改的、
+    # 没保存】，服务端只认草稿里已保存的那版——2026-09-11 实测按旧类目查出的是电子
+    # 类属性，页面上要填的动态属性一个都没有。走默认类目快路径时它是空串（类目没变，
+    # 按草稿查就是对的），拿不到就当空处理，绝不臆造一个 id。
+    ctx["cat_id"] = str(r.get("leafCatId") or "")
+    # note 里记明走的是默认类目/缓存还是遍历：两条快路径选错了下游没有任何校验能发现，
     # 事后核对全靠这一条（见 _try_cached_category 的风险注释）
-    src = "缓存" if r.get("source") == "cache" else "遍历"
+    src = {"cache": "缓存", "default": "默认类目"}.get(r.get("source"), "遍历")
     return {"status": "ok", "note": f"[{src}] {r.get('path') or ''}"}
 
 
@@ -60,16 +83,22 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
     if not ctx.get("info_path"):
         return {"status": "fail", "note": "缺 product-info.json（rowid 模式必须带 info_path）"}
     r = await check_attrs(session, ctx["info_path"], apply=True,
-                          cat_path=ctx.get("cat_path"),
                           use_cache=ctx.get("use_cache", True),
-                          site=ctx.get("site") or "")
+                          rowid=str(ctx.get("rowid") or ""),
+                          cat_id=str(ctx.get("cat_id") or ""))
     if r.get("status") != "ok":
         return {"status": "fail", "note": (r.get("reason") or str(r))[:200]}
     applied = r.get("applied") or []
     ok_n = sum(1 for a in applied if a.get("result") == "ok")
-    note = f"改 {ok_n}/{len(applied)} 项，LLM 拒 {len(r.get('rejected') or [])} 项"
-    if r.get("cacheRead"):
-        note += f"，缓存选项 {r['cacheRead']} 行"
+    if r.get("source") == "default":
+        # 这条路径一行都没动、一个下拉都没点：note 里写明，免得看日志的人以为漏跑了
+        note = f"默认属性 {r.get('attrCount') or 0} 行经 LLM 判定均相符，未做改动"
+    else:
+        note = f"改 {ok_n}/{len(applied)} 项，LLM 拒 {len(r.get('rejected') or [])} 项"
+    if r.get("optionsMissed"):
+        # 【必须报出来】这些行在服务端属性清单里没有对应项，选项是空的——不报的话
+        # 现场只剩一句「改 0/0 项」，看不出是模型没给值还是这行压根没选项可给。
+        note += f"，{len(r['optionsMissed'])} 行无选项（{ '、'.join(r['optionsMissed'][:4]) }）"
     if r.get("cacheRefreshed"):
         note += f"，过期重读 {len(r['cacheRefreshed'])} 行"
     if r.get("linkageFilled"):
@@ -88,7 +117,20 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
         miss = r["unfilledRequired"]
         await emit({"type": "manual_check", "stage": "attrs",
                     "message": f"必填属性仍留空需人工补：{'、'.join(miss)}"})
-        note += f"，仍空 {len(miss)} 项必填"
+        # 【如实判 fail，不再静默放过】原先这里只发提示就 return ok，结果是④放过、
+        # 后面⑨⑩⑪⑫⑬⑬b 十几个阶段白跑，到⑭ save 才报「产品信息校验未过」，那时
+        # 现场早离开属性页（2026-09-11 商品 1052052060281 的「颜色」即此；与⑦b预览图
+        # 2026-09-01 两单是同一个静默放过模式，见 preview.py 的复盘）。判 fail 后交给
+        # Manus ReAct 兜底：agent 用 dxm_attribute_open/options/click 补选，再复跑
+        # dxm_stage_attrs —— 复跑走的还是本函数，故「必填是否还空」是主流程与兜底
+        # 共用的唯一判据，补不上就一路 fail 到商品终止，不会带着空属性往下跑。
+        # 【清单放 note 开头】service 与状态文件都会把 note 截到 200 字符（service.py
+        # 的 note[:200]），改写统计被截掉无所谓，「还差哪几行」被截掉 agent 就没方向了。
+        # unfilledRequired 另以结构化字段透出：recover_stage 把整个 failure 字典塞进
+        # 给 agent 的 request，故那条路不受 200 字符限制。
+        return {"status": "fail",
+                "note": f"必填仍空：{'、'.join(miss)}；{note}"[:200],
+                "unfilledRequired": miss}
     return {"status": "ok", "note": note}
 
 

@@ -1,18 +1,19 @@
 # -*- coding: utf-8 -*-
-"""类目/属性缓存在 pipeline 与 service 里的接线单测（假 session，不碰 CDP、不碰 LLM）。
+"""类目缓存与属性选项来源在 pipeline / service 里的接线单测（假 session，不碰 CDP、不碰 LLM）。
 
-这里测的是「缓存怎么影响流程」，而不是缓存文件本身的读写（那部分在
+这里测的是「数据来源怎么影响流程」，而不是缓存文件本身的读写（那部分在
 test_publish_cache.py）。重点钉住几条容易在后续改动中被无声打穿的不变式：
-  - 缓存注入的 guard 必须排在两个 skip 之后，否则「非必填留空」策略会被绕过；
-  - 缓存永不造行、永不覆盖活页面读到的 required；
-  - 写入失败后的单行重读只对缓存来的行触发，成分行一律不碰；
-  - use_cache=False / cat_path=None 时行为与加缓存前完全一致（零回归）。
+  - 非必填未填 / 隐藏行不给选项，且这两条 guard 排在填选项之前；
+  - 行集只由活 DOM 决定，服务端清单是超集也不许凭空造行；
+  - required 取活页面的值，不取任何远端/缓存版本；
+  - 服务端没有的属性行如实标出来，不静默也不回退去开下拉；
+  - 写入失败只做「原值再试一次」，不换值、不碰数值行。
 """
 
 from publish_patching import patch_publish
 import pytest
 
-from app.publish import cache, pipeline, service
+from app.publish import cache, category, category_api, pipeline, service
 
 
 PATH = ["服装、鞋靴和珠宝饰品", "女童时尚", "女童服装",
@@ -60,21 +61,10 @@ class _FakeSession:
         return {}
 
 
-def _fake_read(options, calls=None, complete=True):
-    """假 _read_active_options，兼容 with_meta 的两种返回形状。
-
-    真函数在 with_meta=True 时返回 (options, meta)、否则返回裸列表；替身必须照这个
-    契约来，否则测的就不是真实调用路径了。
-    """
-    async def _f(session, label, with_meta=False):
-        if calls is not None:
-            calls.append(label)
-        if with_meta:
-            return list(options), {"virtual": True, "scrollHeight": 1704,
-                                   "scrolledToEnd": complete,
-                                   "complete": bool(options) and complete}
-        return list(options)
-    return _f
+def _async(v):
+    async def _f():
+        return v
+    return _f()
 
 
 def _row(label, required=True, current="(请选择)", visible=True):
@@ -90,221 +80,111 @@ def _no_sleep(monkeypatch):
     monkeypatch.setattr(pipeline.asyncio, "sleep", _s)
 
 
-# ---- dump_attrs 的缓存注入 ---------------------------------------------------
+# ---- dump_attrs 的选项来源（服务端）-----------------------------------------
+#
+# 2026-09-11 起选项不再从缓存/下拉里来，而是 attributes/server_options 一次问服务端
+# 拿全（原因见该模块说明：DOM 那条路会读到「真前缀、假完整」的截断清单还自称完整）。
+# 这里钉住几条仍然成立的不变式——它们都是 _validate_attr_changes 那些闸的前提。
 
-@pytest.mark.asyncio
-async def test_命中缓存的行不再点开下拉(_no_sleep, monkeypatch):
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["梭织", "针织"]}])
-    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
-    read_calls = []
+def _stub_server_opts(monkeypatch, mapping):
+    """把选项来源换成服务端桩：mapping 是 {属性名: [值…]}。
 
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["现场读的"], read_calls))
+    cat_id 必须收下：它是阶段④ 查选项用的叶子类目 id（类目是运行中改的、没保存，
+    服务端只认草稿已保存的那版，见 attributes/server_options），调用方按位置传。
+    """
+    async def _fetch(session, rowid="", cat_id=""):
+        return {k: list(v) for k, v in mapping.items()}
+    patch_publish(monkeypatch, "pipeline", "fetch_attr_options", _fetch)
+
+
+def _stub_dump(monkeypatch, rows, mapping):
+    s = _FakeSession(rows={"found": True, "attrs": rows})
+    _stub_server_opts(monkeypatch, mapping)
     patch_publish(monkeypatch, "pipeline", "_expand_attr_section",
-                        lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
-    assert read_calls == []                      # 一次下拉都没点开
-    assert d["attrs"][0]["options"] == ["梭织", "针织"]
-    assert d["attrs"][0]["optionsFrom"] == "cache"
-    assert d["cacheRead"] == 1 and d["activeRead"] == 0
-
-
-def _async(v):
-    async def _f():
-        return v
-    return _f()
+                  lambda *a, **kw: _async({}))
+    return s
 
 
 @pytest.mark.asyncio
-async def test_缓存没有的必填行仍现场读(_no_sleep, monkeypatch):
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["梭织", "针织"]}])
-    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式"), _row("季节")]})
-    read_calls = []
-
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["春/秋", "夏"], read_calls))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
-    assert read_calls == ["季节"]                # 只有缓存缺的那行被现场读
-    by = {a["label"]: a for a in d["attrs"]}
-    assert by["织造方式"]["optionsFrom"] == "cache"
-    assert by["季节"]["optionsFrom"] == "live"
-
-
-@pytest.mark.asyncio
-async def test_非必填且源未给值的行即使缓存有也保持留空(_no_sleep, monkeypatch):
-    """guard 必须排在 optional-skipped 之后：_validate_attr_changes 靠「非必填 +
-    未填 + options 空」判定「按策略留空」，提前注入会把这条策略打穿。"""
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "品牌名", "required": False, "options": ["A", "B"]}])
-    s = _FakeSession(rows={"found": True,
-                           "attrs": [_row("品牌名", required=False)]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options", _fake_read([]))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
+async def test_非必填未填的行不给选项(_no_sleep, monkeypatch):
+    """optional-skipped 必须排在填选项之前：_validate_attr_changes 靠「非必填 +
+    未填 + options 空」判定「按策略留空」，给它们填上选项会把这条策略打穿。"""
+    s = _stub_dump(monkeypatch,
+                   [_row("品牌名", required=False)],
+                   {"品牌名": ["A", "B"]})
+    d = await pipeline.dump_attrs(s)
     a = d["attrs"][0]
     assert a["options"] == [] and a["optionsEmptyReason"] == "optional-skipped"
     assert "optionsFrom" not in a
 
 
 @pytest.mark.asyncio
-async def test_隐藏行即使缓存有也不注入(_no_sleep, monkeypatch):
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "里衬成分", "required": True, "options": ["棉"]}])
-    s = _FakeSession(rows={"found": True,
-                           "attrs": [_row("里衬成分", visible=False)]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options", _fake_read([]))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
+async def test_隐藏行不给选项(_no_sleep, monkeypatch):
+    s = _stub_dump(monkeypatch,
+                   [_row("里衬成分", visible=False)],
+                   {"里衬成分": ["棉"]})
+    d = await pipeline.dump_attrs(s)
     assert d["attrs"][0]["optionsEmptyReason"] == "row-hidden"
     assert d["attrs"][0]["options"] == []
 
 
 @pytest.mark.asyncio
-async def test_缓存不造行(_no_sleep, monkeypatch):
-    """缓存里有、活页面没有的 label 不能出现在输出里——行集只由活 DOM 决定。"""
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["梭织"]},
-        {"label": "早已下架的属性", "required": True, "options": ["X"]}])
-    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options", _fake_read([]))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
+async def test_服务端有而表单没有的属性不造行(_no_sleep, monkeypatch):
+    """行集只由活 DOM 决定：服务端清单是表单的超集（水枪 10 vs 表单 6 行），
+    多出来的属性不能凭空出现在输出里。"""
+    s = _stub_dump(monkeypatch,
+                   [_row("织造方式")],
+                   {"织造方式": ["梭织"], "早已下架的属性": ["X"]})
+    d = await pipeline.dump_attrs(s)
     assert [a["label"] for a in d["attrs"]] == ["织造方式"]
 
 
 @pytest.mark.asyncio
-async def test_required用活页面的值不用缓存的(_no_sleep, monkeypatch):
-    """required 是 _validate_attr_changes 第 1 道闸的依据，用缓存里的旧值等于拿旧
-    策略判新表单（平台会调整必填与否，实测同类目从 18 必填变成 16）。"""
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "腰带", "required": False, "options": ["有", "无"]}])
-    s = _FakeSession(rows={"found": True,
-                           "attrs": [_row("腰带", required=True)]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options", _fake_read([]))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    # 活页面说必填，所以这行不会被 optional-skipped，能走到注入
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
+async def test_required用活页面的值(_no_sleep, monkeypatch):
+    """required 是 _validate_attr_changes 第 1 道闸的依据，必须取活页面的值
+    （平台会调整必填与否，实测同类目从 18 必填变成 16）。"""
+    s = _stub_dump(monkeypatch,
+                   [_row("腰带", required=True)],
+                   {"腰带": ["有", "无"]})
+    d = await pipeline.dump_attrs(s)
     assert d["attrs"][0]["required"] is True
-    assert d["attrs"][0]["optionsFrom"] == "cache"
+    assert d["attrs"][0]["optionsFrom"] == "server"
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kwargs", [{"use_cache": False, "cat_path": PATH},
-                                    {"cat_path": None}])
-async def test_禁用缓存或无类目路径时零回归(_no_sleep, monkeypatch, kwargs):
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["缓存的"]}])
-    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["现场读的"]))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, **kwargs)
-    assert d["attrs"][0]["options"] == ["现场读的"]
-    assert d["cacheRead"] == 0 and d["activeRead"] == 1
+async def test_服务端没有的属性标出来(_no_sleep, monkeypatch):
+    """服务端清单里没有这一行时如实标 server-missing 并进 optionsMissed，
+    供 note 报给人看——不静默、也不回退去开下拉。"""
+    s = _stub_dump(monkeypatch,
+                   [_row("织造方式"), _row("季节")],
+                   {"季节": ["春/秋", "夏"]})
+    d = await pipeline.dump_attrs(s)
+    by = {a["label"]: a for a in d["attrs"]}
+    assert by["织造方式"]["optionsEmptyReason"] == "server-missing"
+    assert by["织造方式"]["options"] == []
+    assert by["季节"]["options"] == ["春/秋", "夏"]
+    assert d["optionsMissed"] == ["织造方式"]
+    assert d["serverAttrs"] == 1
 
 
 @pytest.mark.asyncio
-async def test_skip_options不注入缓存(_no_sleep, monkeypatch):
-    """那条路径语义是「一个下拉都不点、只看现状」，注入会让它返回 optionsRead=False
-    却带着 options，把返回契约打乱。"""
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["梭织"]}])
+async def test_skip_options时不取选项(_no_sleep, monkeypatch):
+    """那条路径语义是「只看现状」，带着 options 返回会把它的契约打乱。"""
     s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
+    called = []
 
-    d = await pipeline.dump_attrs(s, skip_options=True, cat_path=PATH)
+    async def _fetch(session, rowid="", cat_id=""):
+        called.append(1)
+        return {"织造方式": ["梭织"]}
+
+    patch_publish(monkeypatch, "pipeline", "fetch_attr_options", _fetch)
+    patch_publish(monkeypatch, "pipeline", "_expand_attr_section",
+                  lambda *a, **kw: _async({}))
+
+    d = await pipeline.dump_attrs(s, skip_options=True)
     assert d["optionsRead"] is False
     assert "options" not in d["attrs"][0]
-
-
-@pytest.mark.asyncio
-async def test_现场读到的行写回缓存(_no_sleep, monkeypatch):
-    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["梭织", "针织"]))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    await pipeline.dump_attrs(s, cat_path=PATH)
-    assert cache.load_attr_options("女童针织套头衫", PATH) == {
-        "织造方式": ["梭织", "针织"]}
-
-
-@pytest.mark.asyncio
-async def test_未滚到底的选项不写缓存(_no_sleep, monkeypatch):
-    """静默截断是这一带最难发现的一类错（67 项成分只读到首屏 10 条）。
-    缓存了截断清单，之后每个同类目商品都拿缺项 options 做校验与纤维匹配。"""
-    s = _FakeSession(rows={"found": True, "attrs": [_row("上装成分")]})
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["棉", "腈纶"], complete=False))
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
-    # 本次仍然用它（现场读的就是当下能拿到的最好结果），但不许进缓存
-    assert d["attrs"][0]["options"] == ["棉", "腈纶"]
-    assert d["attrs"][0]["optionsComplete"] is False
-    assert cache.load_attr_options("女童针织套头衫", PATH) == {}
-
-
-@pytest.mark.asyncio
-async def test_截断的重读结果不回灌缓存(_no_sleep, monkeypatch):
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["旧选项"]}])
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["截断的"], complete=False))
-    patch_publish(monkeypatch, "pipeline", "set_attr",
-                        lambda *a, **kw: _async({"status": "ok"}))
-    monkeypatch.setattr("app.publish.llm.ask_json",
-                        lambda *a, **kw: _async({"value": "截断的", "reason": "r"}))
-
-    await pipeline._refresh_row_and_retry(
-        _FakeSession(), {"label": "织造方式", "value": "已下架"},
-        {"current": "(请选择)"}, PATH)
-    # 过期数据不该被换成缺项数据
-    assert cache.load_attr_options("女童针织套头衫", PATH)["织造方式"] == ["旧选项"]
-
-
-@pytest.mark.asyncio
-async def test_全命中时不重复写缓存(_no_sleep, monkeypatch):
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["梭织"]}])
-    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
-    patch_publish(monkeypatch, "pipeline", "_expand_attr_section", lambda *a, **kw: _async({}))
-    patch_publish(monkeypatch, "pipeline", "_park_ghost_dropdowns",
-                        lambda *a, **kw: _async({"parked": 0}))
-    written = []
-    monkeypatch.setattr(cache, "save_attr_options",
-                        lambda *a, **kw: written.append(a))
-
-    await pipeline.dump_attrs(s, cat_path=PATH)
-    assert written == []          # activeRead == 0，没有新东西可写
+    assert called == [], "skip_options 连服务端都不该问"
 
 
 # ---- 类目缓存快路径 ----------------------------------------------------------
@@ -430,18 +310,15 @@ def test_提示词按第一级分组且序号全局连续():
     assert "曾用于: t1" in txt
 
 
-# ---- 单行回落重读 -----------------------------------------------------------
+# ---- 单行写入失败后的原值重试 -----------------------------------------------
+#
+# 原先这三条测的是「重读下拉选项 → 回灌缓存 → 值没了就问 LLM 重选」。选项改服务端
+# 之后那条路整个不成立了（选项当次现取、不存在过期），只剩「原值再试一次」。
 
 @pytest.mark.asyncio
-async def test_目标值仍在新选项里则原值重试不问LLM(_no_sleep, monkeypatch):
-    """不白花一次 LLM 调用：set_attr 内部已自愈过一次，这里隔了一次真实下拉开合。"""
-    cache.save_attr_options("女童针织套头衫", PATH, [
-        {"label": "织造方式", "required": True, "options": ["旧选项"]}])
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["梭织", "针织"]))
-    asked = []
-    monkeypatch.setattr("app.publish.llm.ask_json",
-                        lambda *a, **kw: asked.append(1))
+async def test_写入失败原值再试一次(_no_sleep, monkeypatch):
+    """不白花 LLM：set_attr 内部已自愈过一次，这次隔了若干项写入与开合下拉，
+    页面状态已刷新，能救回偶发的点击落空。"""
     sets = []
 
     async def _set(session, label, value, num=None, row=1):
@@ -449,41 +326,19 @@ async def test_目标值仍在新选项里则原值重试不问LLM(_no_sleep, mo
         return {"status": "ok", "readback": {"current": value}}
     patch_publish(monkeypatch, "pipeline", "set_attr", _set)
 
-    fix = await pipeline._refresh_row_and_retry(
-        _FakeSession(), {"label": "织造方式", "value": "针织"},
-        {"current": "(请选择)", "required": True}, PATH)
-    assert fix["status"] == "ok" and fix["askedLLM"] is False
-    assert asked == [] and sets == [("织造方式", "针织")]
-    # 不管救不救得回来，过期缓存都得换掉
-    assert cache.load_attr_options("女童针织套头衫", PATH)["织造方式"] == ["梭织", "针织"]
+    fix = await pipeline._retry_row(_FakeSession(), {"label": "织造方式", "value": "针织"})
+    assert fix["status"] == "ok"
+    assert sets == [("织造方式", "针织")], "必须拿原值重试，不能换值"
 
 
 @pytest.mark.asyncio
-async def test_目标值没了才问LLM并再过options闸(_no_sleep, monkeypatch):
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        _fake_read(["梭织", "针织"]))
+async def test_重试失败如实报错(_no_sleep, monkeypatch):
+    async def _set(*a, **kw):
+        return {"status": "error", "reason": "option-not-rendered"}
+    patch_publish(monkeypatch, "pipeline", "set_attr", _set)
 
-    async def _ask(prompt, what="判断", **kw):
-        return {"value": "手工编织", "reason": "编的"}   # 模型照样会编造
-    monkeypatch.setattr("app.publish.llm.ask_json", _ask)
-    sets = []
-    patch_publish(monkeypatch, "pipeline", "set_attr",
-                        lambda *a, **kw: sets.append(a) or _async({"status": "ok"}))
-
-    fix = await pipeline._refresh_row_and_retry(
-        _FakeSession(), {"label": "织造方式", "value": "已下架选项"},
-        {"current": "(请选择)", "required": True}, PATH)
-    assert fix["status"] == "error" and fix["askedLLM"] is True
-    assert sets == []                     # 不在 options 内就不去点
-
-
-@pytest.mark.asyncio
-async def test_重读为空直接放弃(_no_sleep, monkeypatch):
-    patch_publish(monkeypatch, "pipeline", "_read_active_options", _fake_read([]))
-    fix = await pipeline._refresh_row_and_retry(
-        _FakeSession(), {"label": "织造方式", "value": "针织"},
-        {"current": "(请选择)"}, PATH)
-    assert fix["status"] == "error" and fix["askedLLM"] is False
+    fix = await pipeline._retry_row(_FakeSession(), {"label": "织造方式", "value": "针织"})
+    assert fix["status"] == "error"
 
 
 # ---- service 层接线 ---------------------------------------------------------
@@ -520,7 +375,8 @@ async def test_遍历路径的note标遍历(monkeypatch):
 async def test_成分写入失败发manual_check(monkeypatch):
     async def _fake_check(session, info_path, **kw):
         return {"status": "ok", "applied": [{"result": "error"}],
-                "rejected": [], "compFailed": ["上装成分"], "cacheRead": 3}
+                "rejected": [], "compFailed": ["上装成分"],
+                "serverAttrs": 7, "optionsMissed": ["腰带"]}
     patch_publish(monkeypatch, "service", "check_attrs", _fake_check)
     events = []
 
@@ -530,7 +386,9 @@ async def test_成分写入失败发manual_check(monkeypatch):
     assert r["status"] == "ok"
     assert any(e["type"] == "manual_check" and "上装成分" in e["message"]
                for e in events)
-    assert "缓存选项 3 行" in r["note"]
+    # 服务端没给的属性行必须在 note 里报出来，否则现场只剩一句「改 0/0 项」，
+    # 看不出是模型没给值还是这行压根没选项可给
+    assert "1 行无选项（腰带）" in r["note"]
 
 
 @pytest.mark.asyncio
@@ -548,3 +406,98 @@ def test_旧状态文件没有cat_path也能读(monkeypatch, tmp_path):
     patch_publish(monkeypatch, "service", "STATE_DIR", str(tmp_path / "s"))
     service.save_state({"key": "k2", "stages": {}, "status": "ok"})
     assert service.load_state("k2").get("cat_path") is None
+
+
+# ---- 叶子类目 id 的接线（阶段③ → 阶段④）--------------------------------------
+#
+# 阶段④ 查属性选项要带【页面上当前生效】的叶子类目 id。类目是阶段③ 运行中改的、
+# 还没保存，服务端只认草稿里已保存的那版——2026-09-11 实测按旧类目查出的是上一版
+# 类目的属性清单（电子类的那 20 个），页面上真正要填的动态属性一个都不在里面，
+# 阶段④ 于是判「面料类型」这类必填填不上、交兜底也没救回来。这几个用例钉住这条 id
+# 从阶段③ 一路传到接口的那几段接线，别在后续重构里被无声掐断。
+
+@pytest.mark.asyncio
+async def test_dump_attrs把类目id转给服务端(_no_sleep, monkeypatch):
+    seen = {}
+
+    async def _fetch(session, rowid="", cat_id=""):
+        seen["cat_id"] = cat_id
+        return {}
+
+    patch_publish(monkeypatch, "pipeline", "fetch_attr_options", _fetch)
+    patch_publish(monkeypatch, "pipeline", "_expand_attr_section",
+                  lambda *a, **kw: _async({}))
+    s = _FakeSession(rows={"found": True, "attrs": [_row("织造方式")]})
+    await pipeline.dump_attrs(s, cat_id="11717")
+    assert seen["cat_id"] == "11717"
+
+
+@pytest.mark.asyncio
+async def test_叶子catId落进ctx并传给阶段4(monkeypatch):
+    async def _fake_auto_cat(session, rowid, title, **kw):
+        return {"status": "ok", "path": "A > B", "pathList": ["A", "B"],
+                "source": "walk", "leafCatId": "11717"}
+    patch_publish(monkeypatch, "service", "auto_cat", _fake_auto_cat)
+
+    ctx = {"rowid": "1", "title": "标题"}
+    await service._st_auto_cat(ctx, None, None)
+    assert ctx["cat_id"] == "11717"
+
+    seen = {}
+
+    async def _fake_check(session, info_path, **kw):
+        seen.update(kw)
+        return {"status": "ok", "applied": []}
+    patch_publish(monkeypatch, "service", "check_attrs", _fake_check)
+
+    async def _emit(ev):
+        return None
+
+    r = await service._st_attrs({"info_path": "x.json", "cat_id": "11717"}, None, _emit)
+    assert r["status"] == "ok" and seen["cat_id"] == "11717"
+
+
+def test_cat_id随状态文件往返(monkeypatch, tmp_path):
+    """续跑 from attrs 时阶段③被跳过，cat_id 必须能从状态文件回填，否则阶段④
+    退回按草稿已保存的类目查选项——那正是本次要修掉的错。"""
+    patch_publish(monkeypatch, "service", "STATE_DIR", str(tmp_path / "s"))
+    service.save_state({"key": "k3", "stages": {}, "status": "running", "cat_id": "11717"})
+    assert service.load_state("k3")["cat_id"] == "11717"
+
+
+@pytest.mark.asyncio
+async def test_老缓存条目按路径反查补catId(monkeypatch):
+    """catIds 是 2026-09-11 起才随路径记的，此前攒下的几十条缓存都没有这个键。
+    不补的话，「改了类目又命中缓存」的商品会继续按草稿已保存的旧类目查选项。"""
+    levels = {"": [{"catId": "9711", "catName": "家居、厨房用品"}],
+              "9711": [{"catId": "11649", "catName": "活动和派对用品"}],
+              "11649": [{"catId": "11717", "catName": "派对装饰"}]}
+
+    async def _shop(session, rowid):
+        return "8746250"
+
+    async def _children(session, shop_id, parent_id=""):
+        return levels.get(parent_id, [])
+
+    monkeypatch.setattr(category_api, "fetch_shop_id", _shop)
+    monkeypatch.setattr(category_api, "fetch_children", _children)
+
+    got = await category._lookup_cat_ids(_FakeSession(), "1", ["家居、厨房用品", "活动和派对用品", "派对装饰"])
+    assert got == ["9711", "11649", "11717"]
+
+
+@pytest.mark.asyncio
+async def test_反查时中间级对不上就放弃(monkeypatch):
+    """类目树变了（路径里有一级已下架）就必须整条作废：缺一级的 id 串会让阶段④
+    拿它去查一个别的类目的属性清单，而查出来的东西「看起来正常」。"""
+    async def _shop(session, rowid):
+        return "8746250"
+
+    async def _children(session, shop_id, parent_id=""):
+        return {"": [{"catId": "9711", "catName": "家居、厨房用品"}]}.get(parent_id, [])
+
+    monkeypatch.setattr(category_api, "fetch_shop_id", _shop)
+    monkeypatch.setattr(category_api, "fetch_children", _children)
+
+    got = await category._lookup_cat_ids(_FakeSession(), "1", ["家居、厨房用品", "已下架的中间级"])
+    assert got == []

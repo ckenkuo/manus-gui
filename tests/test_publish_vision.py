@@ -425,6 +425,7 @@ async def test_enrich_vision_落盘并统计(tmp_path, monkeypatch):
     # test_publish_sizechart_parts.py）
     assert r["filled"] == {"imageUnderstanding": 2, "sizeChart": 1,
                            "sizeMeasurements": 1, "sizeMeasurementsByPart": 0,
+                           "composition": 0,
                            "complianceNotes": 3, "cleanFiles": 1}
     with open(info_path, encoding="utf-8") as f:
         saved = json.load(f)

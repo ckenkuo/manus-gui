@@ -64,6 +64,16 @@ def _validate_attr_changes(changes: list, attrs: list,
             else:
                 # 统一成纯数字串写入：LLM 常带上单位（"120g/m²"），输入框只收数字
                 valid.append({**c, "value": m.group(), "kind": "number"})
+        elif row.get("kind") == "checkbox":
+            # 【复选框组：选项来自行内 DOM，一趟校验一条值】这类行是多选（如「颜色」
+            # 116 个复选框），LLM 给几个值就出几条同 label 的 change，每条都按
+            # 「在该行 options 内」这一条闸过——语义与下拉行完全相同，故不另立判据。
+            # kind 必须显式标透：_apply_attr_changes 靠它把同一 label 的多条归并成
+            # 一个目标集合一次性重设，漏标会让它们各自走下拉分支、必然 no-select。
+            if c.get("value") in opt_map.get(label, []):
+                valid.append({**c, "kind": "checkbox"})
+            else:
+                rejected.append({**c, "rejectReason": "value 不在 options 内，已拒绝"})
         elif c.get("value") in opt_map.get(label, []):
             valid.append(c)
         else:

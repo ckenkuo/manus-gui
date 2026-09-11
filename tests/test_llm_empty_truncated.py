@@ -90,7 +90,7 @@ def test_谓词_带图那条也要排除抬额度后仍返空():
 
 # ---- ask 的就地抬额度重发 -------------------------------------------------------
 
-def _ask_stub(responses, max_tokens=1000, model="deepseek-v4-flash-vision-exp"):
+def _ask_stub(responses, max_tokens=1000, model="deepseek-flash"):
     """造一个只跑 ask 非流式分支的 LLM，client 换成按序返回预设响应的假货。
 
     走 object.__new__ 绕开单例登记与真实网络客户端构造（同 test_llm_response_api

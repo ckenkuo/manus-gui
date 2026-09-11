@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+from app.logger import logger
 from app.publish import video as videolib
 from app.publish.browser import BrowserSession
 from app.publish.media.video import delete_video, read_video_url, set_video
@@ -75,10 +76,18 @@ async def _st_video(ctx: dict, session: BrowserSession, emit) -> dict:
 
     meta = norm.get("meta") or {}
     if norm.get("action") == "skip":
-        # 源视频本来就合规：什么都不用改，连上传都省掉
-        return {"status": "skipped",
-                "note": f"视频已合规（{meta.get('w')}×{meta.get('h')} "
-                        f"{norm.get('ratioName')}），未改动"}
+        # 【源地址不在店小秘图床时，比例虽合规也要转存一次】"已合规就什么都不做、连上传
+        # 都省掉"这条优化是为 1688 定的：它的视频在淘宝 CDN 上，店小秘拉得动。但 Temu 源
+        # 的视频在 goods-vod.kwcdn.com，**店小秘拉它会被限流**——2026-09-10 实测发布时
+        # 报「上传视频接口报错:上传视频信息失败 connect timed out」，店小秘自己的提示也是
+        # 「建议视频保存在本地，然后选择从本地上传」。也就是说：比例不是问题，**地址本身
+        # 才是**。故这里仍走一次直传图床 + 回填（用的是刚下载到本地的那个文件），
+        # 把地址换到店小秘域名下。已在店小秘图床的（1688 那类本就没问题）照旧跳过。
+        if "dianxiaomi.com" in src_url:
+            return {"status": "skipped",
+                    "note": f"视频已合规（{meta.get('w')}×{meta.get('h')} "
+                            f"{norm.get('ratioName')}），未改动"}
+        logger.info(f"视频已合规但源地址不在店小秘图床（{src_url[:70]}），仍转存一次")
 
     # 3) 直传 + 用「网络上传」把地址填回表单
     r = await set_video(session, norm["output"])

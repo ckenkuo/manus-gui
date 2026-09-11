@@ -146,6 +146,93 @@ async def test_不同中文译成同一英文时加序号(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_尺码列全部行同值时丢掉尺码(monkeypatch):
+    """2026-09-11 真站取证（rowid 184807703145882711，墙贴 30 行）：1688 源的
+    「尺码」维度里卖家写的是销售说明「拍多件默认10米1件发，有要求5米找客服备注
+    【可封装/贴标/代发等】」，30 行一模一样，译文 80 字符却逐行挂上，两条货号到
+    122 字符被 Temu「SKC External Code cannot exceed 120 characters」拦下。
+    同值维度区分不了任何 SKU，必须丢。"""
+    size = "拍多件默认10米1件发，有要求5米找客服备注"
+    rows = [
+        {"i": 0, "color": "白砖纹", "size": size, "cur": ""},
+        {"i": 1, "color": "动物园", "size": size, "cur": ""},
+    ]
+    patch_publish(monkeypatch, "pipeline", "_translate_term",
+                        _fake_translate({"白砖纹": "WhiteBrick", "动物园": "Zoo",
+                                         size: "MultiOrderDefault"}))
+    r = await pipeline.fix_sku_codes(_FakeSession(rows))
+    assert r["status"] == "ok"
+    assert r["codes"] == ["WhiteBrick", "Zoo"]
+    assert r["dropped"] == ["尺码"]
+
+
+@pytest.mark.asyncio
+async def test_要丢的维度不进翻译(monkeypatch):
+    """整句说明按翻译规则译不出短名（2026-09-11 实测模型返回空串），恒定维度既已
+    注定要丢，就不该白翻一趟还把阶段拉失败在 untranslated 那道闸上。"""
+    size = "拍多件默认10米1件发，有要求5米找客服备注"
+    calls = []
+
+    async def _t(term, kind, sem):
+        calls.append(term)
+        return term, {"粉红色": "Pink", "藏青色": "Navy"}[term]
+
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _t)
+    r = await pipeline.fix_sku_codes(_FakeSession([
+        {"i": 0, "color": "粉红色", "size": size, "cur": ""},
+        {"i": 1, "color": "藏青色", "size": size, "cur": ""}]))
+    assert r["status"] == "ok"
+    assert r["codes"] == ["Pink", "Navy"]
+    assert sorted(calls) == ["粉红色", "藏青色"]      # 那段说明没被送翻
+
+
+@pytest.mark.asyncio
+async def test_颜色列全部行同值时丢掉颜色(monkeypatch):
+    """单色多码：颜色恒定，留着只会让每行都背同一个色名，丢掉后货号就是尺码。"""
+    rows = [{"i": 0, "color": "粉红色", "size": "80", "cur": ""},
+            {"i": 1, "color": "粉红色", "size": "90", "cur": ""}]
+    patch_publish(monkeypatch, "pipeline", "_translate_term", _fake_translate({"粉红色": "Pink"}))
+    r = await pipeline.fix_sku_codes(_FakeSession(rows))
+    assert r["codes"] == ["80", "90"]
+    assert r["dropped"] == ["颜色"]
+
+
+@pytest.mark.asyncio
+async def test_两维各有多值时都保留(monkeypatch):
+    """正常的「颜色-尺码」商品不能被上面的取舍规则误伤。"""
+    rows = [{"i": 0, "color": "粉红色", "size": "80", "cur": ""},
+            {"i": 1, "color": "粉红色", "size": "90", "cur": ""},
+            {"i": 2, "color": "藏青色", "size": "80", "cur": ""}]
+    patch_publish(monkeypatch, "pipeline", "_translate_term",
+                        _fake_translate({"粉红色": "Pink", "藏青色": "Navy"}))
+    r = await pipeline.fix_sku_codes(_FakeSession(rows))
+    assert r["codes"] == ["Pink-80", "Pink-90", "Navy-80"]
+    assert r["dropped"] == []
+
+
+@pytest.mark.asyncio
+async def test_货号超长按上限截断():
+    """颜色名本身就是长描述时（水枪那种「超大号62CM手自一体【科技白】储水量700ml」），
+    丢完恒定维度仍会越界——按平台硬限截尾，货号难看也好过整条商品发不出去。"""
+    long_color = "ExtraLarge62CMLightWeightWaterProof" * 10    # 370 字符，已 ASCII 不进翻译
+    r = await pipeline.fix_sku_codes(_FakeSession(
+        [{"i": 0, "color": long_color, "size": "", "cur": ""}]))
+    assert r["status"] == "ok"
+    assert len(r["codes"][0]) <= pipeline.SKU_CODE_MAX
+
+
+@pytest.mark.asyncio
+async def test_截断后撞名加序号仍不越界():
+    """两个长名截断后只剩同一段前缀，靠序号错开——序号位必须预留在上限之内。"""
+    same = "X" * 118
+    r = await pipeline.fix_sku_codes(_FakeSession([
+        {"i": 0, "color": same + "AAA", "size": "", "cur": ""},
+        {"i": 1, "color": same + "BBB", "size": "", "cur": ""}]))
+    assert len(set(r["codes"])) == 2
+    assert all(len(c) <= pipeline.SKU_CODE_MAX for c in r["codes"])
+
+
+@pytest.mark.asyncio
 async def test_翻译结果剥完为空则失败不写入(monkeypatch):
     """不兜底转拼音、不留中文：填错货号会一路带到发布，直接失败交上层重试。"""
     rows = [{"i": 0, "color": "粉红色", "size": "80", "cur": ""}]

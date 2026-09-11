@@ -75,11 +75,27 @@ async def test_skip_size_check_可显式跳过(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_达标图放行进入取签名(tmp_path, monkeypatch):
-    """恰好等于下限的图不该被误伤（判据是 >= 而非 >）。"""
+async def test_贴线图被拦_服装口径(tmp_path, monkeypatch):
+    """服装那条平台口径是「严格大于」：1340×1785 会被发布拦下，故闸门也不放行。
+
+    2026-09-05 实测（1071736188944）宽恰好 1340 的图穿过闸门、到发布才被平台以
+    「服装类图片尺寸不能小于1340px*1785px」拒掉。原先这里断言「恰好等于下限放行」，
+    与平台实测相反，已改（描述图的 >= 480 是另一套规则，走显式传下限那条路）。
+    """
     monkeypatch.setattr(upload, "resolve_full_cid", lambda: "test-cid-")
     s = _SpySession()
-    ok_img = _img(tmp_path / "ok.jpg", 1340, 1785)
+    p = _img(tmp_path / "edge.jpg", 1340, 1785)
+    r = await upload.upload_image(s, p)
+    assert r["status"] == "error" and r["stage"] == "size-check"
+    assert s.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_达标图放行进入取签名(tmp_path, monkeypatch):
+    """严格大于下限才放行。"""
+    monkeypatch.setattr(upload, "resolve_full_cid", lambda: "test-cid-")
+    s = _SpySession()
+    ok_img = _img(tmp_path / "ok.jpg", 1341, 1786)
     with pytest.raises(AssertionError, match="不该走到取签名"):
         await upload.upload_image(s, ok_img)
     assert s.calls == 1

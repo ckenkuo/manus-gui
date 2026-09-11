@@ -206,11 +206,16 @@ async def test_只缺像素的图走放大不烧生图(tmp_path, monkeypatch):
     # images.check_desc_size），假 compress 的签名要跟上，否则 TypeError → ok=False
     monkeypatch.setattr(service.images, "compress",
                         lambda p, quality=88, min_w=None, min_h=None: p)
+    # 比例合规化同样桩掉：本用例验的是「走放大、不烧生图」，不验几何处理本身（那是
+    # images 单测的事），而桩下载出来的产物不是真图片，真调 fit_desc_ratio 会因
+    # 「cannot identify image file」抛错。
+    monkeypatch.setattr(service.images, "fit_desc_ratio",
+                        lambda p, out_path=None: {"status": "ok", "output": out_path or p})
     monkeypatch.setattr(service.images, "image_size", lambda p: (1340, 1785))
     got = await service._prepare_desc_image(
         str(tmp_path), {"pos": 1, "url": "https://cdn/a.jpg",
                         "needsUpscale": True, "reason": "尺寸不够"})
-    assert got["ok"] and got["how"] == "upscaled"
+    assert got["ok"] and got["how"] == "upscaled", str(got)
     assert "edit" not in calls and "qc" not in calls, "放大路径不该生图、也不必质检"
 
 

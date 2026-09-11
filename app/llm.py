@@ -150,7 +150,10 @@ MULTIMODAL_MODELS = [
     # 协议，content 用 text + image_url 两段，与本文件既有拼装完全一致，故无需另写分支。
     # 2026-08-22 实测：base64 与远程 URL 都收（少数几家两种都行的），temperature 0.0 可用。
     # 发布管线仍统一走 base64（image_ref 转码），不依赖服务端出网取图。
-    "deepseek-v4-flash-vision-exp",
+    # 2026-09-10：官方模型 ID 统一为 deepseek-flash，旧名 deepseek-v4-flash-vision-exp
+    # 对应模型已下线。注意第三方网关（如 Packy cf.api.fan）上的 deepseek-v4-flash /
+    # v4-pro 实测都返回 400「Model do not support image input」，不能拿来顶这一档。
+    "deepseek-flash",
 ]
 
 

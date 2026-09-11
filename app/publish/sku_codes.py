@@ -27,6 +27,15 @@ from app.publish.browser import BrowserSession, J
 
 SKU_CODE_CONCURRENCY = 4    # 词表翻译并发数（每次输入极小，主要是压往返延迟）
 
+# 平台硬校验：Temu 的 SKC/SKU External Code 不能超过 120 字符。
+# 2026-09-11 真站取证（rowid 184807703145882711，墙贴 30 行）：该商品 1688 源的
+# 【尺码】维度里，卖家写的是一段销售说明「拍多件默认10米1件发，有要求5米找客服
+# 备注【可封装/贴标/代发等】」，逐行翻译后 80 字符，30 行全都挂上这条尾巴——
+# 第 16、22 行到 122 字符，发布被 Temu「Product SKC External Code cannot exceed
+# 120 characters」拦下。故货号除翻译外还要过两道闸：丢恒定维度（见 fix_sku_codes
+# 第 2 步）与按此上限截断（第 3 步）。
+SKU_CODE_MAX = 120
+
 
 # 货号只保留 ASCII 字母数字：内部连字符/空格/标点一律去掉，让整个货号里唯一的 `-`
 # 就是「颜色-尺码」那个分隔符，回读校验也好判。
@@ -75,8 +84,18 @@ _JS_READ_SKU_CODES = r"""(() => {
   // 表头文案带「(批量)」这类后缀，故颜色用「以颜色开头」而不是全等（实测第 9 列
   // 也叫「颜色」——那是 SKU分类区的列，取第一个即可）。
   const heads = Array.from(sku.querySelectorAll('thead th')).map(th => txt(th));
-  const colorIdx = heads.findIndex(h => /^颜色/.test(h));
-  const sizeIdx = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
+  let colorIdx = heads.findIndex(h => /^颜色/.test(h));
+  let sizeIdx = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
+  // 【没有颜色列时，唯一那维可能就是装在「尺码」列里的】2026-09-11 真机取证
+  // （rowid 184807703146387073，类目派对桌布）：表头是
+  //   ["预览图(批量)", "尺码", "SKU货号", "EAN…", …]  ← 压根没有「颜色」列
+  // 而 9 行的「尺码」值就是颜色名（亮光雨丝桌裙-粉色/红色/金色…），即平台这个类目
+  // 把唯一的变种维挂在了尺码位上。原判据硬性要求 /^颜色/，匹配不到直接 no-color-column
+  // 判失败——整个 ⑩a 卡死、交 Manus 兜底也无解（页面上确实没有颜色列可读）。
+  // 此时把这一列当颜色维用、尺码维按不存在处理：既有的「维度取舍」与「两个维度都空
+  // 才算读不到」两道逻辑照常生效，货号退化成纯单维，正是这类目该有的形状。
+  // 真·双维（颜色+尺码）与真·无维度（两个表头都没有）都不受影响。
+  if (colorIdx < 0 && sizeIdx >= 0) { colorIdx = sizeIdx; sizeIdx = -1; }
   if (colorIdx < 0) return JSON.stringify({err: 'no-color-column', heads: heads});
   const rows = [];
   Array.from(tb.querySelectorAll('tr')).forEach((tr, i) => {
@@ -108,8 +127,11 @@ _JS_FILL_SKU_CODES = r"""(async () => {
   // 列下标与 _JS_READ_SKU_CODES 用同一套表头判据：逐行核对必须比对同样两列，
   // 否则无尺码类目下会因为「读的是颜色、核的是预览图」而全行 row-moved（见那边注释）。
   const heads = Array.from(sku.querySelectorAll('thead th')).map(th => txt(th));
-  const colorIdx = heads.findIndex(h => /^颜色/.test(h));
-  const sizeIdx = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
+  let colorIdx = heads.findIndex(h => /^颜色/.test(h));
+  let sizeIdx = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
+  // 判据与 _JS_READ_SKU_CODES 完全一致（含「唯一维装在尺码列」那条），别只改一边：
+  // 读与写取的列不同，逐行核对会整表 row-moved，货号一个都填不进去。
+  if (colorIdx < 0 && sizeIdx >= 0) { colorIdx = sizeIdx; sizeIdx = -1; }
   if (colorIdx < 0) return JSON.stringify({err: 'no-color-column', heads: heads});
   const cellAt = (tds, idx) => (idx >= 0 ? txt(tds[idx]) : '');
   const filled = [], mismatch = [];
@@ -150,17 +172,37 @@ async def _translate_term(term: str, kind: str, sem: asyncio.Semaphore) -> tuple
 
     kind 只用来给模型交代这词是颜色还是尺码——同一个「灰」字，颜色该译 Gray、
     尺码语境下可能是别的说法，说清类别能少一轮返工。
+
+    【源词常是长描述，得给模型立规矩】2026-09-11 取证（rowid 184807703145882711）：
+    同一批 30 个颜色，原先只说「翻成英文名」，模型就自由发挥——`Zoo` 干净利落、
+    `HotAirBalloonL5MW70Cm` 带上尺寸、`CultureBrickHoneyPotBearLength5MWidth70CM`
+    连尺寸全拼，货号长度从 3 到 41 字符乱跳，同一批货号看着像两拨人做的。故提示词
+    改成给判据 + 给长名示例：认款必需的词（颜色/图案/款式/型号）留，说明性的（售后
+    文案、数量、卖点、纯尺寸）丢。原提示词还写死了「服装」，对墙贴/水枪这类非服装
+    类目是误导，一并去掉。
+
+    注意口径只能靠规则和示例锚定：本阶段按词并发调用，模型看不到同批其他词，
+    「跟同批保持一致」这种话对它没有约束力。
     """
     from app.publish.llm import ask_json
 
     prompt = (
-        f"你是跨境电商 Listing 专家。请把下面这个服装{kind}的中文名，"
-        "翻译成跨境电商货号里常用的英文名。\n"
+        f"你是跨境电商 Listing 专家。请把下面这个商品{kind}的中文名，"
+        "翻译成跨境电商货号里用的英文短名。\n"
         f"中文{kind}：{term}\n"
-        "要求：\n"
-        "1. 只给英文名本身，不要解释、不要中文；\n"
-        "2. 用电商通行译法，例如 粉红色→Pink、藏青色→Navy、卡其色→Khaki、均码→OneSize；\n"
-        "3. 只允许英文字母和数字，不要空格、连字符和任何标点（多个单词直接首字母大写连写）。\n"
+        "要求（只做加减法：该留的一个不落，该丢的一个不留，同一批词才不会有长有短）：\n"
+        "1. 保留：颜色、图案、款式、型号、版本、尺寸档位（如「大号40CM」）、"
+        "产品类型（如「水枪电池」）；颜色/图案即使在【】（）里也要保留；\n"
+        "2. 丢掉：售后与优惠话术（如「拍多件默认…」）、数量、材质与功能卖点"
+        "（如「储水量700ml」「可外接水瓶」「手自一体」）、括号里的附加尺寸规格"
+        "（如「长5米*宽70厘米」）；\n"
+        "3. 译文尽量不超过 30 个字符；\n"
+        "4. 用电商通行译法：粉红色→Pink、藏青色→Navy、均码→OneSize；\n"
+        "5. 只允许英文字母和数字，不要空格、连字符和任何标点（多个单词首字母大写连写）。\n"
+        "示例：\n"
+        "  粉红色 → Pink\n"
+        "  白砖纹【长5米*宽70厘米】 → WhiteBrick\n"
+        "  大号40CM版【灰色】水枪电池 → L40GrayWaterGunBattery\n"
         '只输出严格JSON：{"en":"英文名"}'
     )
     async with sem:
@@ -175,6 +217,16 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     上方的真站取证）。这里按行的颜色/尺码列重新拼：中文词去重后并发交 LLM 翻译，
     英文/数字词（80、XL 这类）直接用，不浪费一次调用。
 
+    维度取舍：某维度在全部行里取值恒定，就区分不了任何 SKU——那是卖家把说明文案
+    写在了属性位上（真站取证见 SKU_CODE_MAX）。拼进货号不增加任何区分能力，却把
+    每行都撑长，故丢掉。两个维度各有多值时是正常的「颜色-尺码」，照旧都留。
+    这一步排在翻译之前：要丢的多半是整句说明，按翻译规则译不出短名（模型返回空串），
+    白翻一趟不说，还会撞在下面 untranslated 那道闸上把整个阶段判失败。
+
+    长度上限：丢完恒定维度仍可能越界（颜色名本身就是长描述，如水枪的
+    「超大号62CM手自一体【科技白】储水量700ml（可外接水瓶）」），按 SKU_CODE_MAX
+    截尾——货号难看是小，整条商品被平台拒了发不出去是大。
+
     重名保护：不同中文颜色可能译成同一个英文（「粉色」「粉红色」都译 Pink），
     那样两行货号会撞。撞了就在尾部加序号（`Pink-80-2`）保证逐行唯一——货号是 SKU
     的唯一标识，重复了平台侧对不上账。
@@ -184,7 +236,11 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     """
     read = await session.eval_json(_JS_READ_SKU_CODES)
     if read.get("err"):
-        return {"status": "error", "reason": f"读货号列失败：{read['err']}"}
+        # 【失败必须带上真实表头】单看 no-color-column 只知道「没有颜色列」，而表头长
+        # 什么样决定了它是「这个类目的变种结构本就不同」还是「页面没渲染完」——
+        # 2026-09-11 商品 1044382261282 排查时就卡在日志里只有 err、没有现场。
+        return {"status": "error",
+                "reason": f"读货号列失败：{read['err']}（表头 {read.get('heads')}）"}
     rows = read.get("rows") or []
     if not rows:
         return {"status": "error", "reason": "变种表无 variationSku 输入框（尺码未勾选？）"}
@@ -194,11 +250,24 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
         logger.info(f"变种表无尺码列（本类目无尺码维），货号按纯颜色拼；"
                     f"表头：{read.get('heads')}")
 
-    # 1) 词表：颜色与尺码各自去重，只把含非 ASCII 的词送去翻译
+    # 1) 词表：颜色与尺码各自去重
     colors = sorted({r["color"] for r in rows if r.get("color")})
     sizes = sorted({r["size"] for r in rows if r.get("size")})
-    todo = [(c, "颜色") for c in colors if has_cjk(c)] + \
-           [(s, "尺码") for s in sizes if has_cjk(s)]
+
+    # 2) 维度取舍：某维度全部行同值 = 它区分不了任何 SKU（见 docstring 的「维度取舍」）。
+    # 两个维度都恒定的情况不存在——那意味着只有一行变种，判不出「恒定」也就无从丢起。
+    # 【必须在翻译之前判】要丢的多半是整句说明（「拍多件默认10米1件发…」），按翻译规则
+    # 译不出短名、模型会返回空串，白花一次调用还让整个阶段失败在 untranslated 那道闸上。
+    drop_color = bool(colors and sizes) and len(colors) == 1 and len(sizes) > 1
+    drop_size = bool(colors and sizes) and len(sizes) == 1 and len(colors) > 1
+    dropped = [k for k, d in (("颜色", drop_color), ("尺码", drop_size)) if d]
+    if dropped:
+        logger.info(f"货号丢掉恒定维度 {'、'.join(dropped)}"
+                    f"（该列全部行同值，区分不了 SKU，拼进去只会撑长货号）")
+
+    # 3) 只把【保留维度】里含非 ASCII 的词送去翻译
+    todo = [(c, "颜色") for c in colors if has_cjk(c) and not drop_color] + \
+           [(s, "尺码") for s in sizes if has_cjk(s) and not drop_size]
 
     mapping = {w: sku_token(w) for w in colors + sizes if not has_cjk(w)}
     if todo:
@@ -214,16 +283,25 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
         return {"status": "error",
                 "reason": f"这些词未能译成合法货号 token：{untranslated}"}
 
-    # 2) 逐行拼装 + 重名加序号
+    # 4) 逐行拼装 + 截断 + 重名加序号
+    # 截断要给重名序号留位（最长的序号是 "-" + 行数位数），否则加完序号又越界。
+    cap = SKU_CODE_MAX - (len(str(len(rows))) + 1)
     plan, used = [], {}
     for r in rows:
-        parts = [mapping.get(r["color"], ""), mapping.get(r["size"], "")]
+        parts = []
+        if not drop_color:
+            parts.append(mapping.get(r["color"], ""))
+        if not drop_size:
+            parts.append(mapping.get(r["size"], ""))
         base = "-".join(p for p in parts if p)
         if not base:
             # 颜色列也空：这才是真读不到（无尺码类目下 size 空是正常的，见上方日志）
             return {"status": "error",
                     "reason": f"第 {r['i'] + 1} 行颜色/尺码列都读不到，无法拼货号"
                               f"（表头 {read.get('heads')}，颜色列 {read.get('colorIdx')}）"}
+        if len(base) > cap:
+            # 硬切在单词中间也比被平台拒了强；切完的尾部可能是那个分隔符，去掉更干净
+            base = base[:cap].rstrip("-")
         used[base] = used.get(base, 0) + 1
         code = base if used[base] == 1 else f"{base}-{used[base]}"
         plan.append({"i": r["i"], "color": r["color"], "size": r["size"], "code": code})
@@ -236,6 +314,7 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     return {"status": "ok" if ok else "validation-error",
             "rowCount": len(rows),
             "translated": {w: mapping[w] for w, _ in todo},
+            "dropped": dropped,
             "codes": [p["code"] for p in plan],
             "filled": res.get("filled"),
             "mismatch": res.get("mismatch"),

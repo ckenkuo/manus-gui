@@ -87,7 +87,13 @@ async def test_商品没有视频时跳过(monkeypatch, _ctx):
 
 @pytest.mark.asyncio
 async def test_视频已合规时跳过且不上传(monkeypatch, _ctx):
-    """重编码必然掉画质，对本来就合规的视频做一遍是倒扣分；连上传都该省掉。"""
+    """重编码必然掉画质，对本来就合规的视频做一遍是倒扣分；连上传都该省掉。
+
+    【2026-09-10 起，跳过还多一个前提：源地址已在店小秘图床】Temu 源的视频挂在
+    goods-vod.kwcdn.com，店小秘拉它会 connect timed out（发布时才炸，回执只说
+    「上传视频接口报错」）——那时比例不是问题、地址才是，故仍要转存一次。
+    本用例覆盖的是「地址已在图床」这一支，即原来那条为 1688 定的路径。
+    """
     called = {"set_video": False}
 
     async def _set(session, path, full_cid=None):
@@ -95,7 +101,8 @@ async def test_视频已合规时跳过且不上传(monkeypatch, _ctx):
         return {"status": "ok"}
 
     _patch(monkeypatch,
-           cur={"status": "ok", "videoUrl": "https://cdn/a.mp4"},
+           cur={"status": "ok",
+                "videoUrl": "https://wxalbum-10001658-file.dianxiaomi.com/a.mp4"},
            norm={"status": "ok", "action": "skip", "output": "a.mp4",
                  "meta": {"w": 1080, "h": 1080, "ratio": 1.0}, "ratioName": "1:1"})
     patch_publish(monkeypatch, "service", "set_video", _set)

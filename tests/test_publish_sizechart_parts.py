@@ -35,28 +35,40 @@ def test_部件名归类到尺码分类关键词():
     assert f("帽子") is None
 
 
-def test_按分类配对而不是按序号():
+@pytest.mark.asyncio
+async def test_按分类配对而不是按序号():
     """源图部件序（连衣裙在前）与包装清单件序（上衣在前）相反，是真站的实际情形。"""
     parts = [
         {"part": "连衣裙", "measurements": {"6-9M": {"前衣长": 42, "腰围": 54}}},
         {"part": "上衣", "measurements": {"6-9M": {"肩宽": 21, "胸围": 52}}},
     ]
     # 第 0 张表分类是「上装」：即使上衣排在源图第二个，也要取上衣那份
-    meas, part = pipeline._pick_part_measurements(parts, "上装", 0)
+    meas, part = await pipeline._pick_part_measurements(parts, "上装", 0)
     assert part == "上衣" and meas["6-9M"]["肩宽"] == 21
     # 第 1 张表分类是「连衣裙」：取连衣裙那份
-    meas2, part2 = pipeline._pick_part_measurements(parts, "连衣裙", 1)
+    meas2, part2 = await pipeline._pick_part_measurements(parts, "连衣裙", 1)
     assert part2 == "连衣裙" and meas2["6-9M"]["腰围"] == 54
 
 
-def test_分类配不上时按序号退回且不同表拿不同份():
-    """配不上也不能让两张表同源——同源就是这个 bug 本身。"""
+@pytest.mark.asyncio
+async def test_分类配不上时按序号退回且不同表拿不同份(monkeypatch):
+    """配不上也不能让两张表同源——同源就是这个 bug 本身。
+
+    词表配不上时实现会先升模型配对（见 _match_part_by_llm），本用例验的是「模型也
+    判不出」那一支，故把那次调用桩成判不出。不桩的话这条离线的单测会真打一次 LLM。
+    """
+    from app.publish.sizechart import parts as sizechart_parts
+
+    async def _no_match(category, part_list):
+        return None
+
+    monkeypatch.setattr(sizechart_parts, "_match_part_by_llm", _no_match)
     parts = [
         {"part": "A件", "measurements": {"80": {"衣长": 40}}},
         {"part": "B件", "measurements": {"80": {"裙长": 50}}},
     ]
-    m0, p0 = pipeline._pick_part_measurements(parts, "马甲", 0)
-    m1, p1 = pipeline._pick_part_measurements(parts, "马甲", 1)
+    m0, p0 = await pipeline._pick_part_measurements(parts, "马甲", 0)
+    m1, p1 = await pipeline._pick_part_measurements(parts, "马甲", 1)
     assert (p0, p1) == ("A件", "B件")
     assert m0 != m1
 

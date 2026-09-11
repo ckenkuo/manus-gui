@@ -1011,22 +1011,22 @@ async def publish_settings_save(imageConcurrency: int = Body(..., embed=True)):
 
 @app.get("/publish/cache")
 async def publish_cache_list():
-    """类目/属性缓存现状（统计 + 明细），供发布页缓存面板渲染。
+    """类目路径缓存现状，供发布页缓存面板渲染。
 
-    命中缓存时阶段③约 15s、未命中要 110s，阶段④同理，所以「现在缓存里有什么」
-    是跑批前值得看一眼的信息。
+    命中缓存时阶段③约 15s、未命中要 110s，所以「现在缓存里有什么」是跑批前值得看
+    一眼的信息。（属性选项缓存 2026-09-11 已删：选项改由服务端接口现取。）
     """
     return publish_cache.cache_stats()
 
 
 @app.delete("/publish/cache")
-async def publish_cache_clear(slug: str = ""):
-    """清缓存：带 slug 只删那一个类目的属性缓存，不带则连类目路径清单一起清空。
+async def publish_cache_clear():
+    """清空类目路径缓存。
 
-    清完下一次跑就回落到全量遍历/全量读选项（慢，但不会错），故这里不做二次确认，
-    交前端按钮自己问。
+    清完下一次跑就回落到全量遍历（慢，但不会错），故这里不做二次确认，交前端按钮
+    自己问。
     """
-    return {"status": "success", "removed": publish_cache.clear(slug)}
+    return {"status": "success", "removed": publish_cache.clear()}
 
 
 class PublishJob:

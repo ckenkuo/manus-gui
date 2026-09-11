@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+import traceback
 from app.error_report import report
 from app.logger import logger
 from app.publish import (
@@ -15,6 +16,7 @@ from app.publish import (
     extract,
     images,
     preferences,
+    snapshot,
     state as publish_state,
     video as videolib,
     vision,
@@ -157,6 +159,7 @@ from app.publish.state import (
     save_state as save_state,
 )
 from app.publish.stock import set_stock
+from app.publish.recovery import recover_stage
 from app.publish.titles import generate_titles, set_titles
 from app.publish.variant_colors import accessory_colors_from_rows, drop_accessory_colors
 from app.publish.variants import set_variant
@@ -256,9 +259,13 @@ def _alert_hook(on_progress: ProgressCB, store: str, site: str,
                         store=store, site=site, rowid=event.get("rowid"),
                         index=event.get("index") or 0, total=event.get("total") or total,
                         elapsed_s=event.get("elapsed_s") or 0.0)
-                    await report("publish", stage=stage_name,
-                                 item=str(event.get("offer") or ""),
-                                 message=str(event.get("note") or ""))
+                    # 失败现场已由 snapshot.report_failure 写过主表那行（它拿得到会话与
+                    # 断点文件，而本钩子只看得见事件字典），这里只在没有快照 id 时补写：
+                    # 既不重复（一个失败留两行），也不因快照链路整个失败而丢掉原来那条。
+                    if not event.get("snapshot_id"):
+                        await report("publish", stage=stage_name,
+                                     item=str(event.get("offer") or ""),
+                                     message=str(event.get("note") or ""))
             elif t == "batch_done" and int(event.get("fail") or 0) > 0:
                 await alert.alert_batch_done(
                     ok=int(event.get("ok") or 0), fail=int(event.get("fail") or 0),
@@ -351,8 +358,17 @@ async def publish_one(
         note = f"来源校验失败：{error}"
         await _emit(on_progress, {"type": "manual_check", "index": index,
                                  "stage": "extract", "message": note})
+        # 现场一并上报：这里连 ctx 都还没建（来源压根没认出来），能给的只有 task 与断点
+        # 文件。_task_key 重算不会抛——run_batch 调用本函数前已成功算过一次，否则走的是
+        # 它自己的 except（出口 F），根本到不了这里。
+        snapshot_id = await snapshot.report_failure(
+            session=session, exit_tag="A", key=publish_state._task_key(task), task=task,
+            stage="extract", stage_label=dict(STAGES).get("extract", ""),
+            note=note, traceback=traceback.format_exc(),
+            store=store, site=site, index=index, total=total)
         return {"status": "fail", "rowid": task.get("rowid"),
-                "failed_stage": "extract", "note": note, "elapsed_s": 0.0}
+                "failed_stage": "extract", "note": note,
+                "snapshot_id": snapshot_id, "elapsed_s": 0.0}
     return await workflow.rules.publish_one(
         session, validated_task, store,
         site=site, on_progress=on_progress, index=index, total=total,
@@ -404,8 +420,16 @@ async def _run_product(
         note = f"来源校验失败：{error}"
         await _emit(on_progress, {"type": "manual_check", "index": index,
                                  "offer": key, "stage": "extract", "message": note})
+        # 此处 ctx 还没建（在上面几行之后才建），但 key 已算出、断点文件里也有
+        # workdir/info_path，够还原「这台机器拿了个什么链接、上次跑到哪」。
+        snapshot_id = await snapshot.report_failure(
+            session=session, exit_tag="B", key=key, task=task,
+            stage="extract", stage_label=dict(STAGES).get("extract", ""),
+            note=note, traceback=traceback.format_exc(),
+            store=store, site=site, index=index, total=total)
         return {"status": "fail", "rowid": task.get("rowid"),
-                "failed_stage": "extract", "note": note, "elapsed_s": 0.0}
+                "failed_stage": "extract", "note": note,
+                "snapshot_id": snapshot_id, "elapsed_s": 0.0}
     if not workdir and info_path:
         workdir = os.path.dirname(os.path.abspath(info_path))
     ctx = {
@@ -419,8 +443,12 @@ async def _run_product(
         "workdir": workdir,
         "store": store,
         "site": site,
-        # 类目路径：阶段③写入，阶段④拿它当属性缓存的键；续跑时从状态文件回填
+        # 类目路径：阶段③写入；续跑时从状态文件回填
         "cat_path": state.get("cat_path"),
+        # 叶子类目 id：阶段③写入，阶段④拿它查该类目的属性选项（类目是运行中改的、
+        # 没保存，服务端只认草稿已保存的那版，见 attributes/server_options）。
+        # 续跑 from attrs 时阶段③被跳过，故同样要从状态文件回填。
+        "cat_id": state.get("cat_id"),
         # {颜色: [fileId…]}：阶段⑦换图成功时写入，续跑时判某行是否已是这一批图。
         # 【为什么必须持久化】表单阶段的成果一重载就丢，页面上的图却还在——没有这份
         # 清单就无从确认页面上那几张是不是本轮的，只能无条件重换（6 张约一分钟白工）。
@@ -498,9 +526,21 @@ async def _run_product(
             await open_edit(session, ctx["rowid"])
             opened_edit = True
         except Exception as e:
+            failed = run_ids[0] if run_ids else ""
+            note = f"打开编辑页失败：{e}"[:200]
+            # ctx 已建、会话刚用过，是现场最全的几个出口之一。注意此处按原逻辑不写
+            # state 的 fail、也不发 stage_done（不改既有行为），所以快照里 state.status
+            # 仍是 running——这是如实记录，真相由 exit_tag/note/stage 三个字段承载。
+            snapshot_id = await snapshot.report_failure(
+                session=session, exit_tag="C", key=key, task=task,
+                stage=failed, stage_label=dict(STAGES).get(failed, ""),
+                note=note, traceback=traceback.format_exc(), ctx=ctx,
+                run_ids=run_ids, stale_form=stale_form, from_stage=from_stage,
+                elapsed_s=round(time.monotonic() - t0, 1),
+                store=store, site=site, index=index, total=total)
             return {"status": "fail", "rowid": ctx.get("rowid"),
-                    "failed_stage": run_ids[0] if run_ids else "",
-                    "note": f"打开编辑页失败：{e}"[:200],
+                    "failed_stage": failed, "note": note,
+                    "snapshot_id": snapshot_id,
                     "elapsed_s": round(time.monotonic() - t0, 1)}
 
     # 【续跑的关键一步：状态文件说「跑过」不等于「存住了」】save 从未成功过时，
@@ -553,15 +593,23 @@ async def _run_product(
                 note = r.get("note") or ""
             except Exception as e:
                 status, note = "fail", f"异常：{e}"
+                r = {"status": status, "note": note}
                 logger.exception(f"[{key}] 阶段 {sid} 异常")
+            if status == "fail":
+                r = await recover_stage(ctx, session, sid, r, handlers, emit)
+                status = r.get("status") if r.get("status") in stages_results._DONE else "fail"
+                note = r.get("note") or note
             elapsed = round(time.monotonic() - st0, 1)
             state["stages"][sid] = {"status": status, "elapsed_s": elapsed,
                                     "note": note[:200]}
-            # ctx 里后续的产出（rowid/info_path/workdir/title/cat_path）回写状态，续跑全靠它们。
-            # cat_path 是阶段③走通的类目路径，属性缓存要用它当键——续跑 from attrs 时
-            # 阶段③被跳过，不持久化就取不到（旧状态文件没这个键 → None → 全量读，不回归）。
-            for k in ("rowid", "info_path", "workdir", "title", "cat_path", "skc_done",
-                      "source_platform", "workflow_id"):
+            if r.get("recovery"):
+                state["stages"][sid]["recovery"] = r["recovery"]
+            # ctx 里后续的产出（rowid/info_path/workdir/title/cat_path/cat_id）回写状态，
+            # 续跑全靠它们。cat_id 是阶段③选定的叶子类目 id，阶段④ 要用它查属性选项
+            # ——续跑 from attrs 时阶段③被跳过，不持久化就取不到（旧状态文件没这个键
+            # → None → 退回按草稿已保存的类目查，不回归到更差的行为）。
+            for k in ("rowid", "info_path", "workdir", "title", "cat_path", "cat_id",
+                      "skc_done", "source_platform", "workflow_id"):
                 if ctx.get(k):
                     state[k] = ctx[k]
             state["status"] = "running"
@@ -573,8 +621,20 @@ async def _run_product(
                 state["status"] = "fail"
                 state["failed_stage"] = sid
                 publish_state.save_state(state)
+                # 【必须在 save_state 之后采】快照里的 state 是从断点文件重读的，先落盘
+                # 才对得上。主出口也是现场最全的一处：ctx/run_ids/stale_form 在手边，
+                # 兜底 Manus 的工具历史也已随上面写进 state（stage 的 recovery 键）。
+                # 不传 traceback：阶段失败大多是「正常返回 fail」而非抛异常，异常那条
+                # （上面 except 转成 note="异常：…"）到这一步已经出了 except 块，
+                # 此时再 format_exc() 只会得到一句 NoneType: None。
+                snapshot_id = await snapshot.report_failure(
+                    session=session, exit_tag="D", key=key, task=task,
+                    stage=sid, stage_label=dict(STAGES).get(sid, ""),
+                    note=note, ctx=ctx, run_ids=run_ids, stale_form=stale_form,
+                    from_stage=from_stage, elapsed_s=round(time.monotonic() - t0, 1),
+                    store=store, site=site, index=index, total=total)
                 return {"status": "fail", "rowid": ctx.get("rowid"), "failed_stage": sid,
-                        "note": note[:200],
+                        "note": note[:200], "snapshot_id": snapshot_id,
                         "elapsed_s": round(time.monotonic() - t0, 1)}
 
             # ① 刚跑完就起预热，让它与 ② 认领、③ 类目并行（那两步实测 50~350s，
@@ -697,16 +757,16 @@ async def run_batch(
         "type": "log", "level": "info",
         "message": ("本次保留产品视频：按比例合规化后回填" if keep_video
                     else "本次丢弃产品视频：编辑页直接删除，不做比例审核")})
-    # 报一下缓存现状：类目/属性缓存命中与否直接决定阶段③④的耗时，跑之前就让人看见
+    # 报一下缓存现状：类目路径缓存命中与否直接决定阶段③ 的耗时，跑之前就让人看见。
+    # （属性选项缓存 2026-09-11 已删：选项改由服务端接口现取，阶段④ 不再受它影响。）
     if use_cache:
         st = cache.cache_stats()
         await _emit(on_progress, {
             "type": "log", "level": "info",
-            "message": f"缓存：已知类目路径 {st['paths']} 条，"
-                       f"已缓存属性类目 {st['attrCategories']} 个（{st['attrRows']} 行）"})
+            "message": f"缓存：已知类目路径 {st['paths']} 条"})
     else:
         await _emit(on_progress, {"type": "log", "level": "info",
-                                  "message": "已禁用缓存，类目与属性走全量读取"})
+                                  "message": "已禁用缓存，类目走全量遍历"})
     ok = fail = 0
     t0 = time.monotonic()
     sink_id = _install_log_bridge(on_progress)
@@ -742,9 +802,16 @@ async def run_batch(
                 key = f"task-{i}"
                 await _emit(on_progress, {"type": "product_start", "index": i,
                                           "total": total, "offer": key, "title": ""})
+                # 现场最少的一类：链接本身就认不出来，连断点文件都没有。但 task 与当前页
+                # 截图在，足以回答「哪台机器拿了个什么链接」。
+                snapshot_id = await snapshot.report_failure(
+                    session=session, exit_tag="F", key=key, task=task, note=str(e),
+                    traceback=traceback.format_exc(),
+                    store=store, site=site, index=i, total=total)
                 await _emit(on_progress, {"type": "product_done", "index": i, "total": total,
                                           "offer": key, "rowid": None, "status": "fail",
-                                          "elapsed_s": 0.0, "note": str(e), "failed_stage": ""})
+                                          "elapsed_s": 0.0, "note": str(e), "failed_stage": "",
+                                          "snapshot_id": snapshot_id})
                 fail += 1
                 continue
             await _emit(on_progress, {"type": "product_start", "index": i, "total": total,
@@ -757,8 +824,16 @@ async def run_batch(
                                       warehouse=warehouse)
             except Exception as e:
                 logger.exception(f"[{key}] 商品级异常")
+                # traceback 必须在 except 块内取好再传：report_failure 里有 await，
+                # await 之后 thread-local 的异常栈不再可靠。
+                # 这一类的 ctx 已随 _run_product 的栈帧销毁，是最需要现场却最难拿的一处，
+                # 断点文件（571 行那批回写键）与截图是仅有的可用信息。
+                snapshot_id = await snapshot.report_failure(
+                    session=session, exit_tag="E", key=key, task=task,
+                    note=str(e), traceback=traceback.format_exc(),
+                    store=store, site=site, index=i, total=total)
                 r = {"status": "fail", "rowid": task.get("rowid"), "failed_stage": "",
-                     "note": f"异常：{e}"}
+                     "note": f"异常：{e}", "snapshot_id": snapshot_id}
             if r["status"] == "ok":
                 ok += 1
             else:
@@ -782,7 +857,10 @@ async def run_batch(
                                       "status": r["status"],
                                       "elapsed_s": r.get("elapsed_s", 0.0),
                                       "note": r.get("note") or "",
-                                      "failed_stage": r.get("failed_stage") or ""})
+                                      "failed_stage": r.get("failed_stage") or "",
+                                      # 快照 id 透给告警钩子，让它知道主表那行已经写过
+                                      # （见 _alert_hook 里那段补写守卫）。
+                                      "snapshot_id": r.get("snapshot_id")})
     finally:
         logger.remove(sink_id)
         await session.close()

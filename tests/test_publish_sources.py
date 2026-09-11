@@ -632,7 +632,7 @@ async def test_拼多多fetch产出结构():
 async def test_多值属性折成逗号串():
     """阶段④ 把整个 attributes dumps 进提示词；统一成字符串能让 1688 那边写好的
     具名键读取（attrs["套装类型"] 之类）在新平台上也不会拿到 list 而炸。"""
-    s = _FakeSession(_TEMU_SAMPLE)
+    s = _FakeSession(_TEMU_SAMPLE, has_open_tab=True)
     p = await temu.fetch(s, "https://www.temu.com/jp-zh-Hans/x-g-606214515739511.html")
     assert p.attributes["节假日"] == "圣诞节,万圣节,复活节"
 
@@ -649,10 +649,25 @@ async def test_temu优先复用已打开页签():
 
 
 @pytest.mark.asyncio
-async def test_temu没开着页签才导航():
+async def test_temu没开着页签时提示人工等超时才失败():
+    """页签没开成时不退回导航，而是提示人工去开、原地轮询等（wait_for_open_tab）。
+
+    2026-09-10 真站实测：Temu 对自动导航一律跳 bgn_verification 安全验证页，导航
+    这个动作本身就足以把验证激出来，之后 wait_human 只会白等 600 秒。故这里只轮询
+    页签、等不到才失败——把「人去开页签」那段时间等回来，比整个商品失败重跑划算。
+    （等待时长由 autouse 的「人工等待缩到毫秒级」压到毫秒，用例本身不会挂 10 分钟。）
+    """
     s = _FakeSession(_TEMU_SAMPLE, has_open_tab=False)
-    await temu.fetch(s, "https://www.temu.com/jp-zh-Hans/x-g-606214515739511.html")
-    assert [a[0] for a in s.actions] == ["adopt", "navigate"]
+    prompts = []
+
+    with pytest.raises(RuntimeError) as err:
+        await temu.fetch(s, "https://www.temu.com/jp-zh-Hans/x-g-606214515739511.html",
+                         on_manual=prompts.append)
+    # 提示要点名该开哪一条——否则批量跑时人不知道去开哪个页签
+    assert prompts and "x-g-606214515739511.html" in prompts[0]
+    assert "等待超时" in str(err.value)
+    # 全程只轮询 adopt、绝不 navigate（导航会把验证激出来）
+    assert s.actions and all(a[0] == "adopt" for a in s.actions)
 
 
 @pytest.mark.asyncio

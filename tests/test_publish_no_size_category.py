@@ -254,12 +254,24 @@ def test_无尺码列时货号退化成纯颜色():
 
 
 def test_有尺码列时仍按两维拼():
-    """服装类目表头带尺码列，货号照旧「颜色-尺码」。"""
+    """服装类目表头带尺码列、且颜色确实有多色时，货号照旧「颜色-尺码」。"""
+    heads = ["预览图( 批量)", "颜色", "尺码", "SKU货号 ( 一键生成 )"]
+    s = _CodeSession(heads, [["", "Gray", "100", ""], ["", "Orange", "110", ""]])
+    r = asyncio.run(P.fix_sku_codes(s))
+    assert r["status"] == "ok"
+    assert [p["code"] for p in s.plan] == ["Gray-100", "Orange-110"]
+
+
+def test_颜色恒定时丢掉该维度():
+    """颜色列全部行同值 = 区分不了任何 SKU，拼进货号只把每行撑长。
+
+    见 fix_sku_codes 的「维度取舍」：这类恒定值多半是卖家把整句说明写在了属性位上。
+    """
     heads = ["预览图( 批量)", "颜色", "尺码", "SKU货号 ( 一键生成 )"]
     s = _CodeSession(heads, [["", "Gray", "100", ""], ["", "Gray", "110", ""]])
     r = asyncio.run(P.fix_sku_codes(s))
     assert r["status"] == "ok"
-    assert [p["code"] for p in s.plan] == ["Gray-100", "Gray-110"]
+    assert [p["code"] for p in s.plan] == ["100", "110"]
 
 
 # ---- 5) ⑦ SKC：本类目没有颜色图位时跳过 ---------------------------------------

@@ -48,6 +48,34 @@ def _desc_cache_paths(workdir: str, url: str) -> tuple:
     return os.path.join(base, f"{h}.jpg"), os.path.join(base, f"{h}-en.jpg")
 
 
+def _desc_geometry_fix(workdir: str, url: str, src: str) -> str:
+    """把描述图几何修正到合规（两边 >= 480、比例 0.5~2），返回产物路径。
+
+    只治「画面干净、几何不达标」的图：先按描述图下限放大（compress），再补白边修
+    比例（fit_desc_ratio）。全程纯 PIL、无 AI——与 needsUpscale 同一取向：生图既贵
+    又可能把一张本来干净的原图改坏。
+
+    产物落 <url哈希>-fit.jpg（与英化产物同目录、同一套 URL 哈希键），存在且复核通过
+    就复用。已合规的图原样返回 src，不做任何 IO——绝大多数 keep 图走的就是这一支。
+    """
+    sz = images.image_size(src)
+    # 读不到尺寸按「无法判断」处理（同 check_desc_size 的取向）：宁可原样转存，
+    # 也不要把未知判成不合规、白做一遍几何处理
+    if not sz or images.check_desc_size(*sz).get("ok") is not False:
+        return src
+    local, _en = _desc_cache_paths(workdir, url)
+    dst = os.path.splitext(local)[0] + "-fit.jpg"
+    if os.path.exists(dst) and os.path.getsize(dst) > 0:
+        dsz = images.image_size(dst)
+        if dsz and images.check_desc_size(*dsz).get("ok") is not False:
+            return dst
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    shutil.copy(src, dst)
+    out = images.compress(dst, quality=88,
+                          min_w=images.DESC_MIN_W, min_h=images.DESC_MIN_H)
+    return images.fit_desc_ratio(out, out)["output"]
+
+
 async def _rehost_desc_keeps(ctx: dict, session: BrowserSession, mods: list,
                              keep_pos: list, emit) -> dict:
     """把判 keep 的描述图【原图转存到店小秘图床】，返回 {"done", "failed", "skipped"}。
@@ -105,6 +133,17 @@ async def _rehost_desc_keeps(ctx: dict, session: BrowserSession, mods: list,
         if not path:
             failed.append({"url": mod["url"], "why": err})
             continue
+        # 【转存前复核尺寸与比例】判 keep 的依据是 desc_map 当场读到的尺寸，而图没
+        # 加载完时读不到（naturalWidth=0 就不标 tooSmall，见 desc_map），那种图会被
+        # 判 keep 原样转存；等 desc_save 回读时图已加载、尺寸现形，⑬ 便以「1 张描述图
+        # 不符合要求」整单失败——2026-09-10 pdd-917366346213 / pdd-983579420547 两单
+        # 报的 750×330、1201×481 就是这一类：两边都够 480，只有比例超。
+        # 故这里无条件复核一次：不合规的走纯几何修正（画面不动），合规的原样转
+        # （绝大多数图走这一支，只是一次读文件头）。
+        fixed = await asyncio.to_thread(_desc_geometry_fix, ctx["workdir"], mod["url"], path)
+        if fixed != path:
+            logger.info(f"描述图keep转存前做了几何修正（画面未动）："
+                        f"{images.image_size(path)} -> {images.image_size(fixed)}")
         cur_pos, perr, fatal = await _resolve_desc_pos(session, mod["url"])
         if perr:
             # 页签被导航走对后续每一张都成立，立刻收工（同 _replace_round 的取向）
@@ -115,7 +154,7 @@ async def _rehost_desc_keeps(ctx: dict, session: BrowserSession, mods: list,
                 break
             failed.append({"url": mod["url"], "why": perr})
             continue
-        rr = await desc_replace(session, cur_pos, path, expect_url=mod["url"])
+        rr = await desc_replace(session, cur_pos, fixed, expect_url=mod["url"])
         if rr.get("status") == "ok":
             done += 1
         else:
@@ -183,10 +222,15 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 生图，正是 images.check_desc_size 那段注释要避免的；只有确实读到了
         # 且低于下限才作废。
         sz = images.image_size(en_path)
-        if sz and (sz[0] < images.DESC_MIN_W or sz[1] < images.DESC_MIN_H):
+        # 【比例也要一起复查】产物不合规有两类：像素不够（低于 480）与比例超限
+        # （超长通栏图，见 images.fit_desc_ratio）。原先只查前者，比例超限的旧产物
+        # 会被当合规缓存复用，替换上去照样被 desc_save 判 tooSmall。
+        chk = (images.check_desc_size(*sz) if sz
+               else {"ok": None, "reasons": ["宽高读取失败"]})
+        if chk.get("ok") is False:
             logger.warning(
-                f"描述图落盘产物尺寸不达标（{sz[0]}x{sz[1]}，要求两边 >= "
-                f"{images.DESC_MIN_W}），当缓存未命中重做：{os.path.basename(en_path)}")
+                f"描述图落盘产物不合规（{sz[0]}x{sz[1]}：{'、'.join(chk['reasons'])}），"
+                f"当缓存未命中重做：{os.path.basename(en_path)}")
         else:
             return {"ok": True, "path": en_path, "how": "cached"}
 
@@ -209,6 +253,11 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
             out = await asyncio.to_thread(
                 images.compress, en_path, quality=88,
                 min_w=images.DESC_MIN_W, min_h=images.DESC_MIN_H)
+            # 【compress 治不了比例】它只把两边拉到 >= 480，宽高比原样保留：超比例
+            # 的长条图（750×330、1201×481）到这里仍是 2.27/2.50，替换上去被 desc_save
+            # 判 tooSmall、⑬ 整单失败。故再补一道比例合规化，产物写回 en_path——那是
+            # 缓存键，不写回的话重跑时上面那道复核会判它不合规、白重做一遍。
+            out = (await asyncio.to_thread(images.fit_desc_ratio, out, en_path))["output"]
         except Exception as e:
             # 【单张图下载失败时返回失败而不抛异常】2026-09-02：原先 upscale 分支的
             # _download_image 调用没有被 try-except 包裹，一张 404 就让整个商品失败。

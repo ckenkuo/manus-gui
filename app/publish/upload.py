@@ -170,6 +170,8 @@ async def upload_image(session: BrowserSession, file_path: str,
 
     min_w/min_h 按用途覆盖那道闸的下限（不传＝服装的 1340×1785）：描述图的平台
     要求只有「两边 >= 480、比例 0.5~2」，套服装下限会把达标的图拒掉。
+    不传下限时按【严格大于】判（服装那条平台连等于也拦），传了下限则放行等于下限
+    （描述图明文是「>= 480」），理由见 check_cloth_size 的 strict 参数。
     """
     if not os.path.exists(file_path):
         return {"status": "error", "stage": "precheck", "err": f"文件不存在: {file_path}"}
@@ -181,10 +183,11 @@ async def upload_image(session: BrowserSession, file_path: str,
         # 原始外链，⑬ 最终以「1 张不符合要求」整单失败——被拒的图其实是达标的。
         # 闸门本身要留（它挡住了小图静默弹回，见下方 docstring），只是下限要
         # 跟着用途走：素材/SKC 图不传参照旧默认，描述图传 DESC_MIN_W/H。
-        chk = check_cloth_size(
-            file_path,
-            **{k: v for k, v in (("min_w", min_w), ("min_h", min_h))
-               if v is not None})
+        # 【口径按用途分】没传下限＝走服装默认那条（素材图/SKC 图）：平台把它当
+        # 「不能小于 1340×1785」判、连等于也拦，故用 strict=True；传了下限＝调用方
+        # 按自己的明文规则来（描述图「两边 >= 480」），放行等于下限。见 check_cloth_size。
+        kw = {k: v for k, v in (("min_w", min_w), ("min_h", min_h)) if v is not None}
+        chk = check_cloth_size(file_path, strict=not kw, **kw)
         if not chk["ok"]:
             logger.error(f"图片尺寸不达标，拒绝上传：{os.path.basename(file_path)} {chk['reason']}")
             return {"status": "error", "stage": "size-check",

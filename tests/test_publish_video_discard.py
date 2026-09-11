@@ -57,7 +57,10 @@ def _patch_discard(monkeypatch, ret):
 
     def _norm(path, **kw):
         calls["normalize"] += 1
-        return {"status": "ok", "action": "skip", "meta": {}, "ratioName": "1:1"}
+        # output 必须给：真实实现的 skip 分支也会带上它（stages/video 拿它当直传的源文件）。
+        # 少了它，走到「源地址不在店小秘图床 → 仍需转存」那条路时会 KeyError。
+        return {"status": "ok", "action": "skip", "output": path,
+                "meta": {}, "ratioName": "1:1"}
 
     async def _set(session, path, full_cid=None):
         calls["set"] += 1

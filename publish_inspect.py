@@ -11,8 +11,8 @@
   python publish_inspect.py enrich-desc-text <info.json>   从详情纯文字抽尺码表
                                                            （不连浏览器、不看图）
   python publish_inspect.py pick-rowid "标题" "店铺" [--site 站点]  认领后按站点筛 rowid
-  python publish_inspect.py cache-list                      类目/属性缓存现状（不连浏览器）
-  python publish_inspect.py cache-clear [--slug <slug>]     清缓存（不给 slug 则全清）
+  python publish_inspect.py cache-list                      类目路径缓存现状（不连浏览器）
+  python publish_inspect.py cache-clear                     清类目路径缓存（只删本地文件）
 
 写入命令（会真实修改草稿，但不会点发布）：
   python publish_inspect.py crawl "<1688链接>"                        链接采集（建采集记录）
@@ -47,9 +47,9 @@
     （2026-08-20 实测）。这一点反过来也是安全阀——验证时不保存就不会动到真实草稿。
   - 阶段⑪ 的 desc-save 只保存【描述编辑器】，整个商品仍要再走一次 save 才落库。
 
-耗时提示：dump-attrs / check-attrs 要逐个点开下拉读选项（虚拟列表需滚动收集），
-默认只读必填项（约 18 项）仍需数分钟；加 --skip-options 可跳过（但没有 options
-就不能做 LLM 审核）。
+耗时提示：dump-attrs / check-attrs 的可选值来自服务端接口（一次请求拿全该类目），
+不再逐行点开下拉；大头只剩 LLM 那次审核。--skip-options 仍可跳过取选项，
+但没有 options 就不能做 LLM 审核。
 
 前提：调试 Chrome（--remote-debugging-port=9222）里已登录店小秘。
 本 CLI 不提供发布入口——「发布」按钮永不自动点击。
@@ -100,32 +100,24 @@ async def main() -> int:
     p.add_argument("--site", default="", help="经营站点（缓存键的一部分）")
     p.add_argument("--info-json", default="",
                    help="product-info.json 路径，给类目判断补年龄段/尺码线索")
-    p = sub.add_parser("dump-attrs", help="导出产品属性当前值+下拉选项（只读）")
+    p = sub.add_parser("dump-attrs", help="导出产品属性当前值+可选值（只读）")
     p.add_argument("rowid")
     p.add_argument("--skip-options", action="store_true",
-                   help="只读当前值不点开下拉（快，但没有 options）")
+                   help="只取当前值不要可选值（选项来自服务端接口，默认一并取回）")
     p.add_argument("--all-options", action="store_true",
-                   help="读全部项的选项（默认只读必填项，省一半时间）")
-    p.add_argument("--cat-path", default="",
-                   help='类目路径（如 "A > B > C"），给了才能用属性选项缓存')
-    p.add_argument("--no-cache", action="store_true", help="不用属性选项缓存")
-    p.add_argument("--site", default="", help="经营站点（缓存键的一部分）")
+                   help="连非必填项的选项也标出来（默认非必填按策略留空、不打选项）")
     p = sub.add_parser("check-attrs", help="LLM 比对属性并产出修改清单")
     p.add_argument("rowid")
     p.add_argument("info_json", help="product-info.json 路径")
     p.add_argument("--apply", action="store_true",
                    help="执行修改（默认 dry-run 只出清单不动表单）")
     p.add_argument("--all-options", action="store_true",
-                   help="读全部项的选项（默认只读必填项）")
-    p.add_argument("--cat-path", default="",
-                   help='类目路径（如 "A > B > C"），给了才能用属性选项缓存')
-    p.add_argument("--no-cache", action="store_true", help="不用属性选项缓存")
-    p.add_argument("--site", default="", help="经营站点（缓存键的一部分）")
+                   help="连非必填项的选项也标出来（默认非必填按策略留空、不打选项）")
+    p.add_argument("--no-cache", action="store_true",
+                   help="不信任草稿的预填值，强制走完整逐项审核")
     # 缓存管理：只读本地 JSON，两条合并成一个 handler 分支（见下方 CDP 检查之前）
     p = sub.add_parser("cache-list", help="类目/属性缓存现状（只读，不连浏览器）")
-    p = sub.add_parser("cache-clear", help="清类目/属性缓存（只删本地文件）")
-    p.add_argument("--slug", default="",
-                   help="只清这个属性缓存文件（cache-list 里的 slug）；不给则全清")
+    p = sub.add_parser("cache-clear", help="清类目路径缓存（只删本地文件）")
     p = sub.add_parser("set-titles", help="LLM 生成中英文标题并填写（写入）")
     p.add_argument("rowid")
     p.add_argument("info_json", help="product-info.json 路径")
@@ -255,13 +247,11 @@ async def main() -> int:
         if args.cmd == "cache-list":
             st = cache_stats()
             print(json.dumps(st, ensure_ascii=False, indent=2))
-            logger.info(f"已知类目路径 {st['paths']} 条，"
-                        f"已缓存属性类目 {st['attrCategories']} 个（{st['attrRows']} 行）")
+            logger.info(f"已知类目路径 {st['paths']} 条")
             return 0
-        removed = clear(args.slug)
+        removed = clear()
         print(json.dumps(removed, ensure_ascii=False, indent=2))
-        logger.info(f"已清缓存：属性类目 {len(removed['attrFiles'])} 个"
-                    + ("，含类目路径清单" if removed["categories"] else ""))
+        logger.info("已清类目路径缓存" if removed["categories"] else "类目路径缓存本来就是空的")
         return 0
 
     if not await ensure_cdp_alive():
@@ -292,37 +282,34 @@ async def main() -> int:
                                use_cache=not args.no_cache, site=args.site,
                                info=cat_info)
             print(json.dumps(r, ensure_ascii=False, indent=2))
-            logger.info(f"类目已选定（{r['levels']} 级，走{'缓存' if r.get('source') == 'cache' else '遍历'}）"
-                        f"：{r['path']}")
+            src = {"cache": "缓存", "default": "默认类目"}.get(r.get("source"), "遍历")
+            logger.info(f"类目已选定（{r['levels']} 级，走{src}）：{r['path']}")
         elif args.cmd == "dump-attrs":
             await open_edit(session, args.rowid)
             await asyncio.sleep(2)
             # --cat-path 不给就当未命中走全量读（不去反推当前类目：那要么从 300 字
             # 文本里抠路径太脆，要么得重开类目弹窗——在带着未保存修改的表单上开弹窗
             # 不值得为一个探查命令引入）
-            cat_path = [x.strip() for x in args.cat_path.split(">") if x.strip()]
-            r = await dump_attrs(session, skip_options=args.skip_options,
-                                 required_only=not args.all_options,
-                                 cat_path=cat_path or None,
-                                 use_cache=not args.no_cache, site=args.site)
+            r = await dump_attrs(session, skip_options=args.skip_options, rowid=args.rowid,
+                                 required_only=not args.all_options)
             print(json.dumps(r, ensure_ascii=False, indent=2))
             req = sum(1 for a in r["attrs"] if a.get("required"))
             unfilled = sum(1 for a in r["attrs"]
                            if a.get("required") and (a.get("current") or "").startswith("("))
             logger.info(
                 f"属性 {r['count']} 项（必填 {req}，必填未填 {unfilled}）"
-                + (f"，现场读 {r.get('activeRead')} 项"
-                   + (f"、缓存 {r['cacheRead']} 项" if r.get("cacheRead") else "")
+                + (f"，服务端给 {r.get('serverAttrs')} 个属性的选项"
+                   + (f"、{len(r['optionsMissed'])} 行无选项"
+                      f"（{'、'.join(r['optionsMissed'][:4])}）"
+                      if r.get("optionsMissed") else "")
                    if r.get("optionsRead") else "")
             )
         elif args.cmd == "check-attrs":
             await open_edit(session, args.rowid)
             await asyncio.sleep(2)
-            cat_path = [x.strip() for x in args.cat_path.split(">") if x.strip()]
             r = await check_attrs(session, args.info_json, apply=args.apply,
                                   required_only=not args.all_options,
-                                  cat_path=cat_path or None,
-                                  use_cache=not args.no_cache, site=args.site)
+                                  use_cache=not args.no_cache, rowid=args.rowid)
             print(json.dumps(r, ensure_ascii=False, indent=2))
             logger.info(
                 f"属性 {r['attrCount']} 项 | 建议改 {len(r['proposed'])} 项 | "

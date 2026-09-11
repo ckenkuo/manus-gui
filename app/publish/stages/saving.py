@@ -23,11 +23,19 @@ async def _st_save(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "fail", "note": f"保存前预览图校验未过：{rows}，请重跑⑦b SKU预览图"}
     r = await save(session, ctx["rowid"])
     if r.get("status") != "ok":
+        # 【别把已经抓到的证据丢掉】save 的 validation-error 有两条来路：走 explain-error
+        # 的回 redSections/fieldErrors/errors（没有 reason 键），走校验后 toast 与更新时间
+        # 判定的才回 reason。原先只取 `red or reason`，红锚点这个名字没识别出来时，页面
+        # 上明明抓到的字段错误整批被丢弃，结论拼成「校验未过：None」——查不下去
+        # （2026-09-10 两单 984422638420、pdd-992556805954 就是这个）。
         red = "、".join(s["name"] for s in (r.get("redSections") or []))
+        why = (red
+               or "、".join(str(x) for x in (r.get("fieldErrors") or []))
+               or "；".join(str(x) for x in (r.get("errors") or []))
+               or r.get("reason"))
         await emit({"type": "manual_check", "stage": "save",
-                    "message": f"保存校验未过：{red or r.get('reason') or r.get('errors')}"
-                               f"——草稿未落库，处理后可续跑"})
-        return {"status": "fail", "note": f"校验未过：{red or r.get('reason')}"[:200]}
+                    "message": f"保存校验未过：{why}——草稿未落库，处理后可续跑"})
+        return {"status": "fail", "note": f"校验未过：{why}"[:200]}
     ut = r.get("updateTime") or {}
     return {"status": "ok",
             "note": f"已保存（未发布）更新时间 {ut.get('before')} → {ut.get('after')}"}

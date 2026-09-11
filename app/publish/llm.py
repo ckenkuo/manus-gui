@@ -22,7 +22,7 @@ gpt-4o 系视觉渠道 503 model_not_found，2026-08-19 实测）。改配 grok-
 gpt-image-2 不是一回事：那边是【图像编辑】（图生图去中文/英化），这里是【图像理解】，
 两条都要留。
 
-【max_tokens 必须给足】deepseek-v4-flash 是推理模型，先产 reasoning_content 再产
+【max_tokens 必须给足】deepseek-flash 是推理模型，先产 reasoning_content 再产
 content。额度给小了推理就占满、content 返回空字符串——表现为「调用成功但结果为空」，
 排查时极容易误以为是提示词问题。[llm.publish] 里配了 16000（grok-4.6 同理），别往下调。
 
@@ -65,11 +65,10 @@ LLM_CHOICES = {
                        "label": "Kimi K2.7 高速（Kimi Code）"},
     "deepseek": {"config_name": "publish-deepseek",
                  "label": "DeepSeek 视觉（官方）"},
-    # 同一个 deepseek-v4-flash-vision-exp，走 Packy 网关而非官方端点：模型能力一样，
-    # 差别只在计费（Packy 走已有订阅额度）与出网链路。2026-08-25 grok 档被 Packy
-    # 限流打死（每发 503）时本档全绿，故它是 grok 挂掉时的同网关替补。
-    "packy-deepseek": {"config_name": "publish-packy-deepseek",
-                       "label": "DeepSeek 视觉（Packy）"},
+    # 【2026-09-10 移除 packy-deepseek 档】该网关没有 deepseek-flash；它的 DeepSeek 线
+    # （deepseek-v4-flash / v4-pro）实测均返回 400「Model do not support image input」，
+    # 原配的 deepseek-v4-flash-vision-exp 也已 503 model_not_found——Packy 上已无可用
+    # 的 DeepSeek 视觉档，故整档删掉（config.toml 的 [llm.publish-packy-deepseek] 同步移除）。
     # Gemini 官网直连（CDP 驱动已登录 Chrome 的 gemini.google.com 页签），不经反代/
     # 官方 API，绕开反代封号风险。backend="gemini-web" 标记它不走 app.llm.LLM 的
     # HTTP 链路，而是 app/gemini_web.py 的浏览器对话（见 get_llm 的分流）。

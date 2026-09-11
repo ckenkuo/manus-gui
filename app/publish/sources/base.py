@@ -330,3 +330,50 @@ async def wait_human(session, probe_js: str, ready_key: str, message: str,
             last_remind = now
     logger.warning(f"等待人工处理超时（{int(timeout)}s）")
     return False
+
+
+async def wait_for_open_tab(session, must_include: str, message: str,
+                            on_manual=None, timeout: float = None) -> bool:
+    """提示人工打开目标页签，然后原地轮询等它出现。
+
+    【与 wait_human 的分工】那个等的是【当前页】上的数据就绪（登录/验证过关），
+    本函数等的是【另一个页签被打开】。Temu 取数只能读人工开好的页签（理由见
+    sources/temu.py 的取数策略），而批量跑时人未必预先开好每一条，故缺页签时
+    停下来提醒人开当前这一条、开好即继续——比直接判失败更贴合实际用法。
+
+    返回 True 表示页签已出现（调用方要重新 adopt 取数），超时返回 False。
+    """
+    timeout = WAIT_HUMAN_TIMEOUT if timeout is None else timeout
+    logger.warning(message)
+    if on_manual is not None:
+        try:
+            r = on_manual(message)
+            if asyncio.iscoroutine(r) or isinstance(r, asyncio.Future):
+                await r
+        except Exception as e:
+            logger.warning(f"人工提示回调异常（忽略）：{e}")
+    # 把 Chrome 窗口提到前台：人要开的页签在那里面（best-effort，理由同 wait_human）
+    try:
+        await session.page.bring_to_front()
+    except Exception as e:
+        logger.debug(f"页签提前台失败（忽略）：{e}")
+
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    last_remind = loop.time()
+    while loop.time() < deadline:
+        await asyncio.sleep(WAIT_HUMAN_INTERVAL)
+        try:
+            if (await session.adopt_open_page(must_include)).get("ok"):
+                logger.info("目标页签已打开（人工处理完成），继续提取")
+                return True
+        except Exception as e:
+            # 人在操作浏览器时枚举页签可能瞬时失败，继续等（同 wait_human 的取向）
+            logger.debug(f"页签等待轮询失败，继续等：{e}")
+        now = loop.time()
+        if now - last_remind >= WAIT_HUMAN_REMIND:
+            left = int(deadline - now)
+            logger.warning(f"仍在等待人工打开目标页签（剩余 {left}s）：{message[:80]}")
+            last_remind = now
+    logger.warning(f"等待人工打开页签超时（{int(timeout)}s）")
+    return False

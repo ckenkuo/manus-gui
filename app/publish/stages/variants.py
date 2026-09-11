@@ -231,6 +231,9 @@ async def _st_sku_code(ctx: dict, session: BrowserSession, emit) -> dict:
                     "message": f"部分行货号未通过回读校验：{str(r.get('bad') or r.get('mismatch'))[:150]}"})
     tr = r.get("translated") or {}
     note = f"{r.get('rowCount')} 行 | 首个 {(r.get('codes') or [''])[0]}"
+    # 丢恒定维度会改货号形状，写进 note 才能让人一眼看出货号为什么变短了
+    if r.get("dropped"):
+        note += f" | 丢恒定维度 {'、'.join(r['dropped'])}"
     if tr:
         note += " | 译 " + "、".join(f"{k}→{v}" for k, v in list(tr.items())[:4])
     return {"status": "ok", "note": note}

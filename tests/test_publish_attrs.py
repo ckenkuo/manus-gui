@@ -412,12 +412,16 @@ def test_下拉侧五处定位不拼CSS属性字面量():
     数值行那处已因「里料克重（g/m²)」实测炸过（阶段④异常、商品未落库）；下拉侧原先
     靠给属性值补一对引号侥幸躲过全角括号，但名字里真出现 " 同样抛错、出现 \ 则静默
     miss。属性名由平台下发，故五处一律改成枚举 [data-attr-label] 再按值比对。
+
+    【2026-09-11 收拢到一处】读/点/滚动点三处的「行定位」原先各自内联一份，改成按
+    aria 关联取本行浮层时合并成了 _js_own_panel；它们仨的源码里已不含定位语句，故
+    改查那个共享函数。判据本身（不许拼选择器、必须枚举比对）一字未改。
     """
     import inspect
     from app.publish import pipeline as P
+    from app.publish.attributes import dropdowns as D
     srcs = [inspect.getsource(f) for f in (
-        P._visible_dropdown_near, P._open_attr_dropdown, P._read_active_options,
-        P._click_dropdown_option, P._scroll_click_option)]
+        P._visible_dropdown_near, P._open_attr_dropdown, D._js_own_panel)]
     for src in srcs:
         assert "[data-attr-label=' + " not in src, "不许把标签拼进选择器"
         assert "querySelectorAll('.ant-form-item[data-attr-label]')" in src

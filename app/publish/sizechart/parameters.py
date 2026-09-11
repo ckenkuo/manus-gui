@@ -99,6 +99,159 @@ def _match_param(target: str, vals: dict) -> Optional[str]:
     return cand[0] if cand else None
 
 
+# ---- 源表「半围 / 全围」的识别与换算（腰围x2 / 20x2 / 平铺腰围）---------------
+#
+# 【为什么要认这些写法】2026-09-11 男童长裤取证：源详情图的尺码表表头写「腰围x2」
+# 「臀围x2」、格子里写「20x2」「37x2」——商家说的是「这一列是平铺单面的半围，乘 2
+# 才是绕一圈的全围」。平台参数（腰围全围/臀围全围/测量全围）要的正是全围，而管线
+# 此前既不认标记、也不做换算，于是：
+#   - 参数名「腰围x2」连 _match_param 都对不上（词表登记的是「腰围」，子串两向都不含），
+#     白扔进一次模型名称映射；映射上之后又把 20 原样填进「腰围全围」——买家拿到的
+#     腰围少一半，比缺值更糟（缺值至少会被 lacking 拦下报错）。
+#   - 同一列前后不一：源表没覆盖的 80/90 码走估算、估的是全围（36/38），源覆盖的
+#     100 码填的是半围（20），一张表里腰围从 38 掉到 20。故换算必须在【进对齐之前】
+#     做，让勾选判断、名称映射、估算锚点看到的都是同一份全围数（见 editor 的调用点）。
+#
+# 【半围的写法】命中任一即认定该列是平铺半围（值乘 2 才是平台要的全围）：
+#   乘 2 标记  腰围x2 / 臀围×2 / 腰围X2 / 腰围(x2) / 20x2（写在值里）
+#   乘 2 字样  腰围乘2 / 腰围乘以2 / 腰围2倍
+#   半围       腰围半围 / 半围腰围 / 腰围(半围)
+#   二分之一   腰围1/2 / 腰围½ / 腰围二分之一
+#   平铺/单面  平铺腰围 / 腰围(平铺) / 腰围单面 / 腰围单侧
+# 「平铺」也当半围：平铺量的是对折后的宽度，本来就是绕一圈的一半（只对围度列成立——
+# 长度列的「平铺裤长」就是裤长本身，故换算前先过 _RE_GIRTH 闸门）。
+#
+# 【全围的写法】全围 / 一圈 / 绕圈 / 周长 / 围度 / 圆周。作用有二：
+#   ① 名字里两种信号打架时（「腰围(平铺后全围)」「腰围全围x2」这种），以全围为准、
+#      绝不乘 2——「把全围当半围」会把买家尺码表放大一倍，比少一半更难被发现，
+#      故宁可漏换也不错换；
+#   ② _param_stem 的量法后缀表（全围|半围|周长|围度）剥的就是这些字样，故这里是
+#      「什么算全围写法」的出处。（measurements 的全围量级校验另按平台参数名里有没有
+#      「全围」两字判，比这里窄：平台参数实际都带全围后缀，暂没并过来。）
+#
+# 【只换围度类】名里带「围」或「口」的才换（腰围/臀围/胸围/领围/脚口/裤脚口/下摆围…）。
+# 「衣长x2」「肩宽x2」这类不换——那不是半围的意思（多半是两层料/两件），猜着乘 2
+# 会造出一个更离谱的错值；留着不动则最多是这一列走既有判据（值不可用就交估算）。
+_HALF_NAME_MARKS = (
+    ("乘2标记", re.compile(r"[xX×*]\s*2\s*倍?")),
+    ("乘2字样", re.compile(r"乘\s*(?:以)?\s*2|2\s*倍")),
+    ("半围", re.compile(r"半\s*围")),
+    ("二分之一", re.compile(r"1\s*[/／]\s*2|½|二分之一")),
+    ("平铺/单面", re.compile(r"平\s*铺|单\s*面|单\s*侧")),
+)
+_FULL_NAME_MARKS = re.compile(r"全\s*围|一\s*圈|绕\s*圈|周\s*长|围\s*度|圆\s*周")
+_RE_GIRTH = re.compile(r"[围口]")
+# 值里的写法：「20x2」是半围（乘 2 才是全围）；「20x2=40」商家自己算过了，40 就是全围
+_RE_HALF_VALUE = re.compile(r"^(\d+(?:\.\d+)?)\s*[xX×*]\s*2\s*倍?$")
+_RE_HALF_VALUE_DONE = re.compile(
+    r"^(\d+(?:\.\d+)?)\s*[xX×*]\s*2\s*[=＝]\s*(\d+(?:\.\d+)?)$")
+
+
+def _half_marks(name: str) -> list:
+    """参数名里命中的半围标记（用于日志留痕）；空列表 = 这列没写半围。"""
+    t = str(name or "")
+    return [label for label, rx in _HALF_NAME_MARKS if rx.search(t)]
+
+
+def _is_full_marked(name: str) -> bool:
+    """参数名里明确写了「全围/一圈/周长…」——那就不再当半围。"""
+    return bool(_FULL_NAME_MARKS.search(str(name or "")))
+
+
+def _strip_marks(name: str) -> str:
+    """去掉参数名里的量法标记（x2/半围/平铺/全围/一圈…），剩下干净的部位名。"""
+    t = str(name or "")
+    for rx in (*[rx for _, rx in _HALF_NAME_MARKS], _FULL_NAME_MARKS):
+        t = rx.sub("", t)
+    # 「腰围(平铺)」「腰围(全围)」去掉词后剩下空括号，一并清掉
+    t = re.sub(r"[（(\[]\s*[)）\]]", "", t)
+    return re.sub(r"\s+", "", t).strip("-_·、,，")
+
+
+def _clean_girth_name(name: str) -> str:
+    """围度列名去净标记，得到能直接对齐的部位名：腰围x2/平铺腰围/腰围(全围) → 腰围。
+
+    必须去干净：留着标记的名字连 _match_param 的字面与词表判据都过不了（词表登记的是
+    「腰围」），只能掉到模型名称映射——那正是这单腰围填错一半的入口。
+    但清完必须【还是个干净的围度词】才认，否则退回原名：
+      - 「测量全围」清完剩「测量」——不是身体部位，清成它反而对不上平台参数名
+        （platform 侧 _PARAM_STEM_KEEP 也是为它留的）；
+      - 「腰围(平铺后全围)」这类不是「部位+标记」的写法，清完会剩「腰围(后)」这种残名，
+        退回原名至少还是个能看的名字（对齐掉到模型映射那条路，值仍按全围照用）。
+    """
+    t = _strip_marks(name)
+    if t and _RE_GIRTH.search(t) and not re.search(r"[（(\[][^)）\]]+[)）\]]", t):
+        return t
+    return str(name or "").strip()
+
+
+def _split_half_value(v):
+    """源数值 → (数值, 该值自己声明的量法)。解不出数时返回 (None, None)。
+
+    量法三态：
+      None   纯数字等，值本身没表态（是半围还是全围看参数名）
+      "half" 「20x2」：20 是平铺半围，乘 2 才是全围
+      "full" 「20x2=40」：商家已经算过了，40 就是全围（此时名字里带 x2 也不再乘）
+    区间文本、带单位、空值等一律 (None, None) 交调用方原样带走——清洗不是本函数的事。
+    """
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v, None
+    t = str(v if v is not None else "").strip()
+    m = _RE_HALF_VALUE_DONE.match(t)
+    if m:
+        return float(m.group(2)), "full"
+    m = _RE_HALF_VALUE.match(t)
+    if m:
+        return float(m.group(1)), "half"
+    return None, None
+
+
+def normalize_half_marks(rows: dict) -> dict:
+    """把源实测表里的平铺半围列换算成全围，返回新表（不改调用方那份）。
+
+    换算规则（逐列判，判据顺序即优先级）：
+      1. 非围度列（衣长/袖长/肩宽/重量…）一律原样带过，名字与值都不动；
+      2. 值是「20x2=40」这种商家自己算过的写法：40 就是全围，照用、不再乘；
+      3. 值是「20x2」：乘 2；
+      4. 名字带半围标记（x2/半围/1/2/平铺/单面）且没写「全围/一圈/周长」：乘 2；
+      5. 其余（裸「腰围」、明确写「腰围全围」）原值照用——源表写全围就是全围。
+    【名字一律去净标记】不管换不换算，围度列名都清成部位名（腰围x2 / 腰围(全围) → 腰围）——
+    标记留着只会让对齐掉到模型映射那条慢路上；清完不再是围度词的（「测量全围」）退回原名。
+
+    只做换算、不做校验：换算后的值离不离谱由 measurements._check_measurements 管
+    （它有全围量级那条），这里越权判会与那条判据分家。
+    """
+    out, converted = {}, {}
+    for sz, row in (rows or {}).items():
+        if not isinstance(row, dict):
+            out[sz] = row
+            continue
+        vals = {}
+        for p, v in row.items():
+            if not _RE_GIRTH.search(str(p or "")):
+                vals[p] = v
+                continue
+            num, unit = _split_half_value(v)
+            if num is None:
+                vals[p] = v
+                continue
+            name = _clean_girth_name(p)
+            # 值先说了算（20x2=40 是商家自己乘好的，20x2 是半围）；值没表态才看名字的标记，
+            # 且名字写了「全围/一圈」就当全围——把全围当半围会把尺码表放大一倍，宁可漏换
+            marks = _half_marks(p)
+            if unit == "half" or (unit is None and marks and not _is_full_marked(p)):
+                num = float(num) * 2
+                converted[p] = (name, "值里写了 x2" if unit == "half"
+                                else "、".join(marks) + "标记")
+            # 整数就写整数：与源表其它数值形态一致（20x2 → 40 而不是 40.0）
+            vals[name] = int(num) if float(num).is_integer() else float(num)
+        out[sz] = vals
+    if converted:
+        logger.info("源尺码表平铺半围已换算成全围（×2）：" + "、".join(
+            f"{p}→{n}（{why}）" for p, (n, why) in sorted(converted.items())))
+    return out
+
+
 # 交模型做参数名映射时的提示词。词表兜不住的写法才走这里（见 _map_params_by_llm）。
 _PARAM_MAP_PROMPT = """你是服装尺码表数据对齐助手。
 

@@ -127,7 +127,9 @@ async def test_skip_when_no_size_hint(tmp_path, monkeypatch):
     r = await enrich_desc_text(_write_info(
         str(tmp_path), descText="本店48小时内发货，支持七天无理由退换，请勿漂白。"))
     assert r["status"] == "skipped" and not calls
-    assert "没有尺码相关词" in r["reason"]
+    # 文案已扩成「没有尺码或成分相关词」（成分也从详情文字抽，判据同源），
+    # 断言取公共部分，免得每次扩词都要跟着改
+    assert "没有尺码" in r["reason"]
 
 
 @pytest.mark.asyncio

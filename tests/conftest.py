@@ -13,6 +13,11 @@ cache_stats() 报缓存现状，各阶段跑通还会往里写类目路径与属
 （CDP 不通、缺店铺、商品 fail）——不隔离的话每跑一轮 -k publish 就往真实告警群
 发 6 条假告警（2026-09-01 实测，跑了三轮才发现）。这条隔离比前两条更要紧：
 前两条脏的是本机文件，这条是往真人的群里发消息。
+
+错误上报（app/error_report.py）与告警同源同理由，也掐在这里：同一批故意构造的失败
+场景会走同一个 _alert_hook，而它写的是公网 MySQL —— 跑一轮 -k publish 就往真实错误
+表里混进十几行假记录，跟真故障分不开。开发机通常 enabled=true（见 config.toml），
+所以这条不是可选项。
 """
 import pytest
 
@@ -32,6 +37,16 @@ def _isolate_publish_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _block_publish_recovery_network(monkeypatch):
+    from app.publish import recovery
+
+    def blocked(tools):
+        raise RuntimeError("离线测试禁止调用真实 Manus；恢复测试须注入假 agent")
+
+    monkeypatch.setattr(recovery, "_create_agent", blocked)
+
+
+@pytest.fixture(autouse=True)
 def _block_publish_alert(monkeypatch):
     """禁止单测把飞书告警真发出去。
 
@@ -46,3 +61,22 @@ def _block_publish_alert(monkeypatch):
         return False
 
     monkeypatch.setattr(publish_alert, "send", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _block_error_report(monkeypatch):
+    """禁止单测把失败上报真写进 MySQL（含失败现场明细表）。
+
+    掐在写库这一层、而不是让 load_config 返回禁用态：这样连 pymysql 都不会被 import、
+    也不会有出网超时，而 load_config 的取键、快照组装的截断与降级、_alert_hook 的
+    补写守卫这些逻辑仍真实执行，写错了照样能被测出来。
+
+    需要断言「报了什么的」用例自己 monkeypatch 覆盖掉这个夹具即可。
+    """
+    from app import error_report
+
+    def _blocked(*args, **kwargs):
+        return 0
+
+    monkeypatch.setattr(error_report, "_write", _blocked)
+    monkeypatch.setattr(error_report, "_write_snapshot", _blocked)

@@ -23,12 +23,22 @@ dump_attrs 时还不存在，主轮清单里必然没有它们；原实现只把
 from publish_patching import patch_publish
 import pytest
 
-from app.publish import cache, pipeline
+from app.publish import pipeline
 
 
 PATH = ["服装、鞋靴和珠宝饰品", "女童时尚", "女童服装",
         "女童连衣裙", "女童休闲连衣裙"]
 
+
+
+def _stub_server_opts(monkeypatch, mapping):
+    """把选项来源换成服务端桩：mapping 是 {属性名: [值…]}（见 attributes/server_options）。
+
+    cat_id 必须收下：它是阶段④ 查选项用的叶子类目 id，调用方会按位置传。
+    """
+    async def _fetch(session, rowid="", cat_id=""):
+        return {k: list(v) for k, v in mapping.items()}
+    patch_publish(monkeypatch, "pipeline", "fetch_attr_options", _fetch)
 
 # ---- kind 判据（控件序，不是「有无 select」）--------------------------------
 #
@@ -108,35 +118,22 @@ def _stub_dom(monkeypatch):
 # ---- dump_attrs 不给数值行读选项 --------------------------------------------
 
 @pytest.mark.asyncio
-async def test_数值行不点开下拉读选项(_stub_dom, monkeypatch):
-    """行内那个 select 是只读单位，点开读到的是单位、不是可选值，白花一次开合。"""
-    read = []
+async def test_数值行不挂选项(_stub_dom, monkeypatch):
+    """数值行没有可选值：行内那个 select 是只读单位，服务端给了也不该挂上去。
 
-    async def _read(session, label, with_meta=False):
-        read.append(label)
-        meta = {"complete": True, "virtual": False,
-                "scrollHeight": 0, "scrolledToEnd": True}
-        return (["梭织", "针织"], meta) if with_meta else ["梭织", "针织"]
-
-    patch_publish(monkeypatch, "pipeline", "_read_active_options", _read)
+    _validate_attr_changes 的「数值行 options 恒为空」这条前提靠它成立。
+    """
+    _stub_server_opts(monkeypatch, {"里料克重（g/m²)": ["g/㎡"],
+                                    "织造方式": ["梭织", "针织"]})
     s = _FakeSession([_num_row(), _sel_row("织造方式")])
 
-    d = await pipeline.dump_attrs(s, cat_path=PATH)
-    assert read == ["织造方式"], "数值行不该被点开读选项"
+    d = await pipeline.dump_attrs(s)
     num = next(a for a in d["attrs"] if a["kind"] == "number")
     assert num["options"] == []
     assert num["optionsEmptyReason"] == "number-row"
-
-
-def test_数值行的单位不进缓存():
-    """脏数据一旦落盘没有任何环节会发现，故缓存写入侧再挡一道。"""
-    cache.save_attr_options("女童休闲连衣裙", PATH, [
-        dict(_num_row(), options=["g/㎡"]),
-        dict(_sel_row("织造方式"), options=["梭织", "针织"]),
-    ])
-    got = cache.load_attr_options("女童休闲连衣裙", PATH)
-    assert "里料克重（g/m²)" not in got, "单位被当成选项存进缓存了"
-    assert got["织造方式"] == ["梭织", "针织"]
+    sel = next(a for a in d["attrs"] if a["label"] == "织造方式")
+    assert sel["options"] == ["梭织", "针织"]
+    assert sel["optionsFrom"] == "server"
 
 
 # ---- 联动补填轮 --------------------------------------------------------------
@@ -154,18 +151,17 @@ async def test_联动新增必填行会被补填(_stub_dom, monkeypatch):
             {"label": "里料克重（g/m²)", "value": "80"},
         ], "notes": []}
 
-    async def _apply(session, changes, row_map, info, cat_path, **kw):
+    async def _apply(session, changes, row_map, info, **kw):
         return ([{"label": c["label"], "value": c["value"], "result": "ok"}
                  for c in changes], [], [])
 
     patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
     patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        lambda *a, **kw: _async(
-                            (["聚酯纤维(涤纶）", "棉"], {"complete": True})))
+    _stub_server_opts(monkeypatch, {"里衬成分": ["聚酯纤维(涤纶）", "棉"],
+                                    "里料克重（g/m²)": ["80"]})
 
     r = await pipeline._fill_linkage_rows(
-        s, {"里料纹理", "织造方式"}, {"title": "连衣裙"}, None, PATH)
+        s, {"里料纹理", "织造方式"}, {"title": "连衣裙"}, None, "1")
 
     assert r["newRequired"] == ["里衬成分", "里料克重（g/m²)"]
     assert len(r["applied"]) == 2 and all(a["result"] == "ok" for a in r["applied"])
@@ -186,7 +182,7 @@ async def test_主轮已有的行不算联动新增(_stub_dom, monkeypatch):
 
     patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
     r = await pipeline._fill_linkage_rows(
-        s, {"里衬成分"}, {"title": "x"}, None, PATH)
+        s, {"里衬成分"}, {"title": "x"}, None, "1")
     assert r == {"applied": [], "newRequired": [], "compFailed": []}
     assert called == []
 
@@ -206,7 +202,7 @@ async def test_有预填值的联动行也会被审但不改(_stub_dom, monkeypa
         return {}  # LLM 判断预填值「棉」合适，无 change
 
     patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _ask)
-    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert called == [1]                     # 扫到并审过，不因预填值跳过
     assert r["applied"] == []                # 无 change，不写入
     assert r["newRequired"] == ["里衬成分"]   # 仍记录扫到的行，交末尾复扫
@@ -221,10 +217,9 @@ async def test_补填问LLM失败不抛(_stub_dom, monkeypatch):
         raise RuntimeError("LLM 挂了")
 
     patch_publish(monkeypatch, "pipeline", "_ask_attr_review", _boom)
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        lambda *a, **kw: _async((["棉"], {"complete": True})))
+    _stub_server_opts(monkeypatch, {"里衬成分": ["棉"]})
 
-    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert r["applied"] == []
     assert r["newRequired"] == ["里衬成分"]      # 仍要报出来交人工
 
@@ -237,8 +232,7 @@ async def test_补填走同一套校验闸(_stub_dom, monkeypatch):
                         lambda *a, **kw: _async(
                             {"changes": [{"label": "里衬成分", "value": "编造纤维"}],
                              "notes": []}))
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        lambda *a, **kw: _async((["棉", "亚麻"], {"complete": True})))
+    _stub_server_opts(monkeypatch, {"里衬成分": ["棉", "亚麻"]})
     called = []
 
     async def _apply(*a, **kw):
@@ -246,7 +240,7 @@ async def test_补填走同一套校验闸(_stub_dom, monkeypatch):
         return ([], [], [])
 
     patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
-    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert called == [], "编造的值不该走到写入"
     assert r["applied"] == []
 
@@ -300,7 +294,7 @@ async def test_写入数值行不再抛属性错误(_stub_dom, monkeypatch):
     changes = [{"label": "里料克重（g/m²)", "value": "80", "kind": "number"}]
     row_map = {"里料克重（g/m²)": _num_row()}
     applied, refreshed, comp_failed = await pipeline._apply_attr_changes(
-        None, changes, row_map, {"attributes": {}}, PATH)
+        None, changes, row_map, {"attributes": {}})
     assert applied[0]["result"] == "ok"
     assert applied[0]["readback"] == "80", "诊断字段要照旧填上，不是简单吞成 None"
     assert comp_failed == []
@@ -342,10 +336,18 @@ class _MultiRoundSession:
 
 @pytest.fixture
 def _stub_round(monkeypatch):
-    """把读选项与 LLM 替成确定性应答，只留轮次控制流。"""
-    patch_publish(monkeypatch, "pipeline", "_read_active_options",
-                        lambda *a, **kw: _async((["棉", "聚酯纤维"],
-                                                 {"complete": True})))
+    """把选项来源与 LLM 替成确定性应答，只留轮次控制流。"""
+    class _AnyOpts(dict):
+        """对任何属性名都返回同一份选项——联动的行名由用例动态生成，"联动行N" 之类
+        没法预先枚举；原先那个 `_read_active_options` 桩也是不分 label 一律返回同一份。"""
+
+        def get(self, key, default=None):
+            return ["棉", "聚酯纤维"]
+
+    async def _fetch(session, rowid="", cat_id=""):
+        return _AnyOpts()
+
+    patch_publish(monkeypatch, "pipeline", "fetch_attr_options", _fetch)
 
     async def _ask(rows, info, main_comp):
         # 每行都给一个 options 里的合法值，成分行凑满 100%
@@ -368,12 +370,12 @@ async def test_第二层联动行也会被补填(_stub_dom, _stub_round, monkeyp
     r2 = [_sel_row("里衬成分", current="棉"), _num_row("里衬成分含量")]
     s = _MultiRoundSession([r1, r2, r2])
 
-    async def _apply(session, changes, row_map, info, cat_path, **kw):
+    async def _apply(session, changes, row_map, info, **kw):
         return ([{"label": c["label"], "result": "ok"} for c in changes], [], [])
 
     patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
     r = await pipeline._fill_linkage_rows(
-        s, {"里料纹理"}, {"title": "x"}, None, PATH)
+        s, {"里料纹理"}, {"title": "x"}, None, "1")
     filled = [a["label"] for a in r["applied"]]
     assert "里衬成分" in filled
     assert "里衬成分含量" in filled, "第二层联动行没补上，保存时会卡必填"
@@ -398,7 +400,7 @@ async def test_不再冒新行就停止不白转(_stub_dom, _stub_round, monkeyp
                         lambda session, changes, *a, **kw: _async(
                             ([{"label": c["label"], "result": "ok"}
                               for c in changes], [], [])))
-    await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert len(asked) == 1, f"收敛后仍在问 LLM：{asked}"
 
 
@@ -414,7 +416,7 @@ async def test_一轮全失败就停止追加轮次(_stub_dom, _stub_round, monk
         return ([{"label": c["label"], "result": "error"} for c in changes], [], [])
 
     patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
-    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert len(rounds) == 1, "一项都没写成功还继续转轮次"
     assert r["newRequired"] == ["里衬成分", "里衬成分含量"]   # 仍要报出来交人工
 
@@ -433,7 +435,7 @@ async def test_轮次有上限不会无界循环(_stub_dom, _stub_round, monkeyp
         return ([{"label": c["label"], "result": "ok"} for c in changes], [], [])
 
     patch_publish(monkeypatch, "pipeline", "_apply_attr_changes", _apply)
-    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    r = await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert len(rounds) == pipeline._LINKAGE_MAX_ROUNDS
     assert len(r["newRequired"]) == pipeline._LINKAGE_MAX_ROUNDS
 
@@ -458,7 +460,7 @@ async def test_已见过的行不重复补(_stub_dom, _stub_round, monkeypatch):
                         lambda session, changes, *a, **kw: _async(
                             ([{"label": c["label"], "result": "ok"}
                               for c in changes], [], [])))
-    await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, PATH)
+    await pipeline._fill_linkage_rows(s, set(), {"title": "x"}, None, "1")
     assert asked[1] == ["里布工艺"], f"第二轮把见过的行又问了一遍：{asked[1]}"
 
 
@@ -545,20 +547,17 @@ def _j_dumps(s: str) -> str:
     return json.dumps(s)
 
 
-def test_数值行不带optionsFrom缓存标记():
-    """钉住「数值行走不进 _refresh_row_and_retry」这个前提。
+def test_数值行不进写入重试():
+    """钉住「数值行走不进 _retry_row」这个前提。
 
-    那个函数内部两处 set_attr 硬写 (None, 1) 且不传 kind，数值行进去必然按下拉流程
-    重试、白花一次 LLM。它现在进不去，靠的是 dump_attrs / 联动读选项两处都在设
-    optionsFrom 之前就对 kind == 'number' 提前 continue。这道断言防止以后挪动那两个
-    continue 时静默打开这条错路——真要放开，就得先给 set_attr 补 kind 透传。
+    _retry_row 内部的 set_attr 不传 kind，数值行进去会被按下拉流程重试（卷重这类行
+    根本没有下拉）——必然失败还白花一次开合。它现在进不去，靠的是 _apply_attr_changes
+    里按 kind 分流的那道 elif；这道断言防止以后改分流时静默打开这条错路——真要放开，
+    得先给 set_attr 补 kind 透传。
     """
     import inspect
     from app.publish import pipeline as P
-    src = inspect.getsource(P._refresh_row_and_retry)
+    src = inspect.getsource(P._retry_row)
     assert "kind=" not in src, "这个函数还没支持 kind，前提断言需要同步更新"
-    for fn in (P.dump_attrs, P._read_linkage_options):
-        s = inspect.getsource(fn)
-        i_num = s.index('a.get("kind") == "number"')
-        i_cache = s.index('a["optionsFrom"] = "cache"')
-        assert i_num < i_cache, "数值行的 continue 必须在设 optionsFrom 之前"
+    caller = inspect.getsource(P._apply_attr_changes)
+    assert 'kind != "number"' in caller, "数值行必须被挡在 _retry_row 之外"

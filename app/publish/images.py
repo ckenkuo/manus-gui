@@ -22,6 +22,7 @@ resolve_packy_key），没配就直接报错让用户去配，不留内置密钥
 image_url 的那条建议是坏渠道吐的、照做会被网关前置校验打回。
 """
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -39,8 +40,11 @@ CLOTH_MIN_H = 1785
 SKC_RATIO = 3 / 4
 # 长边安全上限（图片 API 上限，也防止放大过头体积爆炸）
 MAX_DIM = 3840
-# 素材图目标边长：1785 同时满足素材图 ≥800×800 和服装类 ≥1340×1785 两条规则
-MATERIAL_TARGET = 1785
+# 素材图目标边长：1786 同时满足素材图 ≥800×800 和服装类 ≥1340×1785 两条规则。
+# 【为什么是 1786 而不是 1785】服装类那条平台口径是【严格大于】——与下限相等也会被
+# 拦（见 check_cloth_size 的 strict 与 _fit_min_size），取 1785 恰好贴线。多这 1px
+# 对素材图的观感与体积没有影响，却能让它稳过上传闸门。
+MATERIAL_TARGET = 1786
 
 # ---- 描述长图（产品描述里的「图片模块」）的规则，与 SKC/素材图【完全不同】-------
 # 2026-08-28 用户截图取证：描述图模块弹窗自带说明——
@@ -277,8 +281,18 @@ def is_near_duplicate(path_a: str, path_b: str,
 # 闸门无从判断，猜错会把商品图裁坏。故只报「差在哪」，让调用方去调对应的几何函数。
 
 def check_cloth_size(image_path: str, min_w: int = CLOTH_MIN_W,
-                     min_h: int = CLOTH_MIN_H) -> dict:
-    """校验图片是否达到服装类最小尺寸，返回 {"ok", "size", "reason"}。
+                     min_h: int = CLOTH_MIN_H, strict: bool = False) -> dict:
+    """校验图片是否达到最小尺寸，返回 {"ok", "size", "reason"}。
+
+    【strict：服装那条平台口径是「严格大于」】平台「不能小于 1340px*1785px」的校验
+    把【等于】也拦下（2026-09-05 实测 1071736188944 发布被拒就是宽恰好 1340）。原先
+    这里一律用 `<`、放行贴线图，与 _fit_min_size 的余量逻辑一起构成同一个缺口的两半：
+    上传闸门放行、平台在发布那一刻拦下，而回执不说是哪张图。服装类那条走 strict=True。
+
+    【默认仍放行等于下限】描述图那套是弹窗里的明文规则「宽度 >= 480，高度 >= 480」
+    （2026-08-28 用户截图取证），480×480 本就是合格样本，套严格口径会把它误拒
+    （2026-08-29 那次误拒的代价：页面留下 1688 外链、⑬ 整单失败）。两套规则口径不同，
+    故由调用方按用途显式指定，见 upload_image。
 
     读不到尺寸（文件损坏/不是图片）也判不 ok：与其让它传上去在 save 时静默弹回，
     不如在这里就说清楚。
@@ -288,34 +302,36 @@ def check_cloth_size(image_path: str, min_w: int = CLOTH_MIN_W,
         return {"ok": False, "size": None,
                 "reason": f"读不出图片尺寸（文件损坏或非图片）：{image_path}"}
     w, h = size
-    if w < min_w or h < min_h:
+    bad = (w <= min_w or h <= min_h) if strict else (w < min_w or h < min_h)
+    if bad:
         return {"ok": False, "size": f"{w}x{h}",
-                "reason": (f"服装类图片不能小于 {min_w}×{min_h}，当前 {w}×{h}"
+                "reason": (f"图片尺寸不达标（要求{'严格大于' if strict else '不小于'} "
+                           f"{min_w}×{min_h}），当前 {w}×{h}"
                            f"（宽差 {max(0, min_w - w)}px、高差 {max(0, min_h - h)}px）；"
-                           "素材图走 square_image、SKC 图走 fit_34 合规化后再传")}
+                           "素材图走 square_image、SKC 图走 fit_34、描述图走 "
+                           "compress + fit_desc_ratio 合规化后再传")}
     return {"ok": True, "size": f"{w}x{h}", "reason": ""}
 
 
 def _fit_min_size(im, min_w: int = CLOTH_MIN_W, min_h: int = CLOTH_MIN_H):
-    """服装类最小尺寸兜底：宽 <min_w 或高 <min_h 时等比放大到达标（LANCZOS）。
+    """服装类最小尺寸兜底：不足时等比放大到【严格大于】min_w×min_h（LANCZOS）。
 
-    放大倍数取 max(min_w/w, min_h/h)，保证两边都 ≥ 最小值；已达标则原样返回
-    （只放大不缩小——缩小会重新掉到校验红线以下）。
+    放大倍数取 max((min_w+1)/w, (min_h+1)/h)，保证两边都严格大于最小值（平台把
+    等于下限也判不合格，见 check_cloth_size）；已达标则原样返回（只放大不缩小——
+    缩小会重新掉到校验红线以下）。
+
+    【余量必须覆盖「不需要放大」的图】原先的 +1 写在 if sc>1 的分支里，源图本身
+    贴线（1340×1785 这类）时 sc<=1、走不到那里，于是原样输出、上传闸门也放行
+    （判据是 <），一路到发布才被平台拦下（2026-09-05 实测 1071736188944）。
+    现在改成「只要没严格大于下限就等比放大一点点」，比例不因 +1 而偏移。
     """
     from PIL import Image
     w, h = im.size
-    sc = max(min_w / w, min_h / h)
-    if sc > 1:
-        nw, nh = round(w * sc), round(h * sc)
-        # 【留余量】round 可能把宽恰好落在 min_w 边界（800×1.675=1340），而平台
-        # 「不能小于 1340」的校验会把 =1340 也拦下（2026-09-05 1071736188944 发布
-        # 报「服装类图片尺寸不能小于1340px*1785px」就是它）。宽或高仍 == 下限时 +1，
-        # 保证严格大于；宽高同加 1px，3:4 比例偏差 1px 在容差内。
-        if nw <= min_w or nh <= min_h:
-            nw += 1
-            nh += 1
-        im = im.resize((nw, nh), Image.LANCZOS)
-    return im
+    if w > min_w and h > min_h:
+        return im
+    sc = max((min_w + 1) / w, (min_h + 1) / h)
+    return im.resize((max(round(w * sc), min_w + 1),
+                      max(round(h * sc), min_h + 1)), Image.LANCZOS)
 
 
 def fit_34(image_path: str, out_path: Optional[str] = None, quality: int = 85) -> dict:
@@ -357,9 +373,9 @@ def square_image(image_path: str, out_path: Optional[str] = None,
                  target: int = MATERIAL_TARGET) -> dict:
     """素材图几何修正（纯 PIL，不走 AI，不动画面内容）：
 
-    中心裁切成 1:1，再缩放到 target×target（默认 1785，同时满足素材图 ≥800×800
-    和服装类最小尺寸 ≥1340×1785 两条规则）。
-    用于 materialCheck.needsProcessing=true 的素材图处理。
+    中心裁切成 1:1；小于 target 的放大到 target×target（默认 1786，同时满足素材图
+    ≥800×800 和服装类最小尺寸两条规则），【只放大不缩小】。
+    用于 materialCheck.needsProcessing=true 的素材图处理，也用于 SKU 预览图合规化。
     """
     from PIL import Image
     if not os.path.exists(image_path):
@@ -371,10 +387,12 @@ def square_image(image_path: str, out_path: Optional[str] = None,
         side = min(w, h)
         left, top = (w - side) // 2, (h - side) // 2
         im = im.crop((left, top, left + side, top + side))
-        # 【修复】无论裁切后尺寸多大，统一缩放到 target×target
-        # 原逻辑 "if side < target" 会导致 800-1784 范围的图不被放大、直接保存小图
-        # 也会导致 >1785 的图不被缩小、浪费存储空间
-        if side != target:
+        # 【只放大不缩小】原逻辑 "if side < target" 漏了「800~1785 的小图不被放大、
+        # 直接存小图」那个 bug，当时顺手改成了无条件缩放到 target；但 > target 的方图
+        # 因此被降采样——素材图是轮播首图，降采样直接磨画质（同 pick_size 的
+        # no_downscale 那段），而缩到 target 毫无收益：它只是平台下限，不是画质目标。
+        # 故只保留「放大」这一半，取向同 _fit_min_size（只放大不缩小）。
+        if side < target:
             im = im.resize((target, target), Image.LANCZOS)
         im.save(out_path, quality=85)
     with Image.open(out_path) as im:
@@ -405,8 +423,10 @@ def compress(path: str, max_dim: int = MAX_DIM, quality: int = 80,
         w, h = im.size
         if max(w, h) > max_dim:
             sc = max_dim / max(w, h)
-            # 缩到不破下限为止：任一边会跌破就按那一边的比例封底
-            floor = max(min_w / w, min_h / h)
+            # 缩到不破下限为止：任一边会跌破就按那一边的比例封底。
+            # 封底同样按「严格大于」（+1 像素），否则缩完可能恰好落在 1340/1785 上，
+            # 被平台判不合格（口径见 check_cloth_size）
+            floor = max((min_w + 1) / w, (min_h + 1) / h)
             sc = max(sc, floor)
             if sc < 1:
                 im = im.resize((round(w * sc), round(h * sc)), Image.LANCZOS)
@@ -417,6 +437,54 @@ def compress(path: str, max_dim: int = MAX_DIM, quality: int = 80,
         im.save(out, quality=quality)
     os.unlink(path)
     return out
+
+
+def fit_desc_ratio(image_path: str, out_path: Optional[str] = None,
+                   quality: int = 88) -> dict:
+    """描述长图【比例】合规化（纯 PIL）：超比例补白边，不裁切不拉伸。
+
+    平台对描述图的规则是「比例 0.5~2、两边 >= 480」（见 check_desc_size）。尺寸那条
+    由 compress / _fit_min_size 保证，比例这条原先【没有任何函数管】——_fit_min_size
+    只放大到两边达标，比例原样保留。于是超比例的源长图（1688 详情页常见的 750×330
+    通栏、1201×481 横幅）走「不动画面」的那两条路（keep 转存、needsUpscale 纯放大）
+    之后比例仍是 2.27 / 2.50，被 desc_save 回读判 tooSmall，⑬ 整单失败——而它其实
+    只差一条白边。走生图英化的图不会出这个问题，纯属巧合：图像 API 的尺寸档位里
+    最大比例就是 1.777，出图顺手把比例拉合规了。
+
+    补白边而不是裁切：与 fit_34 同一取向，裁掉边缘会把商品图切掉一截，补白边在
+    详情页里视觉上可接受。居中补。
+
+    只处理比例：两边的最小尺寸不归这里管（补白只会让图变大，不会跌破下限；真正过小
+    的图由 compress 的 min_w/min_h 那条负责）。比例已合规时原图重存一份到 out_path。
+    """
+    from PIL import Image
+    if not os.path.exists(image_path):
+        raise FileNotFoundError(image_path)
+    out_path = out_path or os.path.splitext(image_path)[0] + "-fit.jpg"
+    # 输入输出同路径时不能直接 save（PIL 还在读同一个文件），先写临时文件再换过去
+    same = os.path.abspath(out_path) == os.path.abspath(image_path)
+    dst = out_path + ".tmp.jpg" if same else out_path
+    with Image.open(image_path) as im:
+        im = im.convert("RGB")
+        w, h = im.size
+        ratio = w / h
+        if ratio > DESC_RATIO_MAX:
+            nw, nh = w, math.ceil(w / DESC_RATIO_MAX)      # 太宽 → 补高
+        elif ratio < DESC_RATIO_MIN:
+            nw, nh = math.ceil(h * DESC_RATIO_MIN), h      # 太窄 → 补宽
+        else:
+            nw, nh = w, h
+        if (nw, nh) != (w, h):
+            canvas = Image.new("RGB", (nw, nh), (255, 255, 255))
+            canvas.paste(im, ((nw - w) // 2, (nh - h) // 2))
+            im = canvas
+        im.save(dst, quality=quality)
+    if same:
+        os.replace(dst, out_path)
+    with Image.open(out_path) as im:
+        ow, oh = im.size
+    return {"status": "ok", "input": image_path, "output": out_path,
+            "outSize": f"{ow}x{oh}", "ratio": round(ow / oh, 4)}
 
 
 def _gate_size(w: int, h: int, min_w: int = CLOTH_MIN_W,

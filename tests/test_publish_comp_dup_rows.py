@@ -99,8 +99,7 @@ async def test_写完成分后按最大row裁剪(monkeypatch):
         {"label": "成分", "value": "棉", "num": 40, "row": 2},
     ]
     row_map = {"成分": {"label": "成分", "kind": "select", "hasPercent": True}}
-    await _apply_attr_changes(s, changes, row_map, {"title": "t"}, None,
-                              use_cache=False)
+    await _apply_attr_changes(s, changes, row_map, {"title": "t"})
     assert s.trim_calls, "写完成分行后必须发一次裁剪"
     assert s.trim_calls[0]["keep"] == 2
     assert s.trim_calls[0]["after"] == 2
@@ -119,8 +118,7 @@ async def test_非成分字段不裁(monkeypatch):
     s = _ApplySession(rows=3)
     changes = [{"label": "织造方式", "value": "梭织", "num": None, "row": None}]
     row_map = {"织造方式": {"label": "织造方式", "kind": "select"}}
-    await _apply_attr_changes(s, changes, row_map, {"title": "t"}, None,
-                              use_cache=False)
+    await _apply_attr_changes(s, changes, row_map, {"title": "t"})
     assert s.trim_calls == []
 
 
@@ -138,8 +136,7 @@ async def test_数值行不当成成分裁(monkeypatch):
     changes = [{"label": "里料克重（g/m²)", "value": "120", "kind": "number",
                 "num": 120, "row": 1}]
     row_map = {"里料克重（g/m²)": {"label": "里料克重（g/m²)", "kind": "number"}}
-    await _apply_attr_changes(s, changes, row_map, {"title": "t"}, None,
-                              use_cache=False)
+    await _apply_attr_changes(s, changes, row_map, {"title": "t"})
     assert s.trim_calls == []
 
 
@@ -161,5 +158,5 @@ async def test_裁剪异常不影响写入(monkeypatch):
     changes = [{"label": "成分", "value": "棉", "num": 100, "row": 1}]
     row_map = {"成分": {"label": "成分", "kind": "select", "hasPercent": True}}
     applied, _refreshed, _comp = await _apply_attr_changes(
-        s, changes, row_map, {"title": "t"}, None, use_cache=False)
+        s, changes, row_map, {"title": "t"})
     assert applied and applied[0]["result"] == "ok"

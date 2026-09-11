@@ -135,6 +135,15 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     else:
         src_meas = info.get("sizeMeasurements") or {}
 
+    # 【源表里的平铺半围先换算成平台要的全围】源图写「腰围x2」「20x2」「腰围半围」
+    # 「平铺腰围」说的都是平铺单面的半围，平台参数（腰围全围/臀围全围/测量全围）要的是
+    # 绕一圈的全围——不换算就填错一半，而且「腰围x2」这名字连 _match_param 都过不了、
+    # 只能掉到模型映射或估算（2026-09-11 男童长裤取证，识别写法表见
+    # parameters.normalize_half_marks 上方那段）。
+    # 换算放在【取值之后、勾参数与对齐之前】：勾选判断、名称映射、估算锚点看到的都是
+    # 换算后的同一份数，不会再出现「源半围 20 + 估算全围 38」混在同一列里。
+    src_meas = sizechart_parameters.normalize_half_marks(src_meas)
+
     # 【按源数据主动勾选「尺码参数」复选框】弹窗上方那排参数是【可选】的，平台默认只勾
     # 了分类默认集（背带裤默认勾「领围」），源数据能覆盖的其它部位（裤长/胸围全围/臀围
     # 全围…）默认都没勾。原先代码只读已渲染的 thead、等于只认默认勾的那几项，源数据全
@@ -198,9 +207,22 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     if src_norm and not (set(src_norm) & size_keys):
         logger.warning(f"源尺寸表尺码 {list(src_norm)[:5]} 与弹窗尺码 {list(size_keys)[:5]} "
                        f"完全对不上，保留为模型估算参考")
+    # 【「键在不在」与「值能不能填」必须是同一个判据】need 原先只判参数键在不在，
+    # 而下面的 lacking 判的是「值是不是正有限数」，两套口径对不上就成了死结：源里某列
+    # 的值是脏的（字符串 "74-78"、区间文本、0），need 认为不缺 → 不问模型 → 来源记成
+    # source，lacking 认为缺 → 直接报「测量数据缺参数」，报出来的「模型应补 []」正是
+    # need 空集的自证。2026-09-10 两单（993873426154、994643657205）卡死在这里，重跑
+    # 必然复现、且模型永远没机会补。统一到 _valid_value 之后，脏值会进 need 交模型重估。
+    def _valid_value(v) -> bool:
+        return (isinstance(v, (int, float)) and not isinstance(v, bool)
+                and math.isfinite(v) and v > 0)
+
+    def _missing(row, p) -> bool:
+        return not _valid_value((row or {}).get(p))
+
     norm = {k: _align_params(v) for k, v in src_norm.items()}
     need = [p for p in params
-            if any(p not in (norm.get(normalize_size(s)) or {}) for s in sizes)]
+            if any(_missing(norm.get(normalize_size(s)), p) for s in sizes)]
 
     # 【词表兜不住时先问名称映射，再退估算】源参数名是商家在图上随手写的自由文本
     # （腰围(橡筋)、裤长(不含吊带)…），穷举不完；而对齐失败的代价是【整列改用凭空
@@ -237,9 +259,11 @@ async def add_sizechart(session: BrowserSession, info_path: str,
         for s in sizes:
             key = normalize_size(s)
             row = dict(norm.get(key) or {})
-            # 只填 need 里且本行确实没有的：模型值绝不覆盖源实测值
+            # 只填 need 里本行【还缺有效值】的：有效的源实测值照旧绝不被模型值覆盖。
+            # 原判据是「键不在 row 里」，而脏值恰恰是键在、值不可用——统一判据后 need
+            # 会把它们列出来，这里却仍拦着不让模型值写进去，等于白问一次模型。
             for p, v in _align_params(est.get(normalize_size(s)) or {}).items():
-                if p in need and p not in row:
+                if p in need and _missing(row, p):
                     row[p] = v
             norm[key] = row
         gen = "source+model" if src_meas else "model"
@@ -249,11 +273,9 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # _JS_FILL_SIZECHART 按【页面原始尺码文本】取 data[size]，故归一只用于匹配，
     # 最终 norm 的键必须换回页面原文，否则填表时全部取不到值
     norm = {s: norm.get(normalize_size(s), {}) for s in sizes}
-    lacking = [s for s in sizes
-               if not norm.get(s) or any(not isinstance(norm[s].get(p), (int, float))
-                                         or isinstance(norm[s].get(p), bool)
-                                         or not math.isfinite(norm[s][p]) or norm[s][p] <= 0
-                                         for p in params)]
+    # 与上面的 need 共用 _missing：判据分家过一次（need 判键、这里判值），代价是脏值
+    # 那两单永远填不出表，各自维护一套必然再次分家
+    lacking = [s for s in sizes if any(_missing(norm[s], p) for p in params)]
     if lacking:
         return {"status": "error",
                 "reason": f"测量数据缺参数（对齐后仍缺）: 尺码{lacking} × 参数{params}"

@@ -75,7 +75,11 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
         # 只有文字模块：文字已处理完，保存收尾，不进图片分支
         if not text_note:
             return {"status": "skipped", "note": "描述区无模块"}
-        sv = await desc_save(session)
+        # allow_empty：能走到这个分支就说明描述区【没有图片模块】（mods 为空），
+        # 故 desc_save 的「读回必须有图」校验在这里必然是假失败。2026-09-10 实测
+        # Temu 女装衬衫（源详情图 0 张、描述区只有文字模块）就卡在这，整个 ⑬ 判 fail。
+        # 此分支真正要验的是「文字模块处理掉了」，那由上面的 text_note 与保存结果共同担着。
+        sv = await desc_save(session, allow_empty=True)
         if sv.get("status") != "ok":
             return {"status": "fail", "note": f"desc_save 失败：{str(sv)[:150]}"}
         await ensure_desc_closed(session)
