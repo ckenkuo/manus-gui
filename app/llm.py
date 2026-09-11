@@ -22,7 +22,11 @@ from tenacity import (
 
 from app.bedrock import BedrockClient
 from app.config import LLMSettings, config
-from app.exceptions import EmptyContentTruncated, TokenLimitExceeded
+from app.exceptions import (
+    EmptyContentTruncated,
+    ModelNotMultimodalError,
+    TokenLimitExceeded,
+)
 from app.logger import logger  # Assuming a logger is set up in your app
 from app.schema import (
     ROLE_VALUES,
@@ -50,7 +54,7 @@ def _worth_retry_text(exc: BaseException) -> bool:
 
 
 def _worth_retry(exc: BaseException) -> bool:
-    """带图请求是否值得重试：400 与「抬额度后仍返空」一律不重试。
+    """带图请求是否值得重试：400、「抬额度后仍返空」与「模型不在多模态白名单」一律不重试。
 
     【为什么单独判】原先 retry_if_exception_type 里写了 Exception，等于什么都重试。
     2026-08-22 实测：Kimi 端点收到远程图片 URL 直接回 400
@@ -63,8 +67,13 @@ def _worth_retry(exc: BaseException) -> bool:
     ask_with_images 内部已就地抬过一次额度（见 _RETRY_TOKEN_SCALE），到这一步说明
     抬了也没用。带图重发还要把整批 base64 再传一遍（阶段⑬ 单次 11 张图），走满 6 次
     退避比纯文本更贵。
+
+    ModelNotMultimodalError 也是确定性失败（config 模型名与本地白名单没对齐，
+    请求根本没发出去），2026-09-11 那次整批卡死就是它被当成普通 ValueError
+    重试造成的——见 app/exceptions.py 该类的注释。
     """
-    return not isinstance(exc, (BadRequestError, EmptyContentTruncated))
+    return not isinstance(
+        exc, (BadRequestError, EmptyContentTruncated, ModelNotMultimodalError))
 
 
 # 截断返空时就地重发用的额度倍数。1.5 是够用的经验值：deepseek 档配 32000，抬到
@@ -154,6 +163,10 @@ MULTIMODAL_MODELS = [
     # 对应模型已下线。注意第三方网关（如 Packy cf.api.fan）上的 deepseek-v4-flash /
     # v4-pro 实测都返回 400「Model do not support image input」，不能拿来顶这一档。
     "deepseek-flash",
+    # 旧名仍留在白名单：官方对旧 ID 做了承接（仍可调用，由最新 Flash 承答），
+    # 各机 config.toml 没跟着改名时不至于被入闸校验拦死（2026-09-11 两台生产机
+    # 整批卡 ⑥ 就是这次改名只改了白名单、没顾旧配置；新部署仍应配 deepseek-flash）。
+    "deepseek-v4-flash-vision-exp",
 ]
 
 
@@ -603,6 +616,12 @@ class LLM:
         # 400 与「抬额度后仍返空」不重试（见 _worth_retry_text）：都是确定性失败，
         # 走满退避只是白等。其余（限流/超时/网关抖动/单次返空）照旧重试。
         retry=retry_if_exception(_worth_retry_text),
+        # 重试耗尽必须抛【原始异常】而不是 RetryError 包装：后者的 str 只有
+        # 「<Future at 0x... raised ValueError>」这种 Future 地址，真因全被吃掉
+        # （2026-09-11 发布管线整批卡死的报错就没法读）。ask_tool 不在此列——
+        # agent 链路（app/agent/toolcall.py）靠 RetryError.__cause__ 认
+        # TokenLimitExceeded，那条不动。
+        reraise=True,
     )
     async def ask(
         self,
@@ -798,6 +817,8 @@ class LLM:
         stop=stop_after_attempt(6),
         # 400 不重试（见 _worth_retry）：请求不合法，重发无意义
         retry=retry_if_exception(_worth_retry),
+        # 同 ask 的 reraise：耗尽后抛原始异常，别包成读不出真因的 RetryError。
+        reraise=True,
     )
     async def ask_with_images(
         self,
@@ -828,10 +849,13 @@ class LLM:
         """
         try:
             # 对于 ask_with_images，我们总是将 supports_images 设置为 True，因为
-            # 此方法应该只使用支持图像的模型调用
+            # 此方法应该只使用支持图像的模型调用。
+            # 【不在白名单抛专用类型，不走退避重试】模型名错配是确定性配置错误，
+            # 重试只是白等（见 ModelNotMultimodalError 的注释）。
             if self.model not in MULTIMODAL_MODELS:
-                raise ValueError(
-                    f"Model {self.model} does not support images. Use a model from {MULTIMODAL_MODELS}"
+                raise ModelNotMultimodalError(
+                    f"Model {self.model} does not support images. "
+                    f"Use a model from {MULTIMODAL_MODELS}"
                 )
 
             # 使用图像支持格式化消息

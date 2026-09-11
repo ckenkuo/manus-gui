@@ -27,7 +27,11 @@ from app.publish.attributes.workflow import check_attrs
 from app.publish.browser import BrowserSession, ensure_cdp_alive
 from app.publish.category import auto_cat
 from app.publish.claim import collect_and_claim
-from app.publish.llm import active_llm_label, reset_token_counters
+from app.publish.llm import (
+    active_llm_label,
+    reset_token_counters,
+    vision_model_problems,
+)
 from app.publish.media.description import (
     desc_delete,
     desc_map,
@@ -737,6 +741,17 @@ async def run_batch(
         return {"ok": 0, "fail": 0, "batch": batch}
     if not await ensure_cdp_alive():
         await _emit(on_progress, {"type": "aborted", "reason": "CDP 不可用（调试 Chrome 未启动）"})
+        return {"ok": 0, "fail": 0, "batch": batch}
+    # 【视觉模型预检：错配直接中止批次】看图阶段（①/⑤b/⑥/⑦/⑬）的调用一进
+    # ask_with_images 就查多模态白名单，config 的模型名与代码白名单错配时请求
+    # 根本发不出去；① 的回填又是 best-effort 静默吞，第一个硬炸点要等到 ⑥——
+    # 每个商品白跑五个阶段、再各拖一轮 Manus 兜底才记 fail（2026-09-11 白名单
+    # 改名、两台生产机配置没跟上，25 个商品排队等人工）。开跑前一次拦清。
+    vision_problems = vision_model_problems()
+    if vision_problems:
+        await _emit(on_progress, {
+            "type": "aborted",
+            "reason": "视觉模型配置不可用：" + "；".join(vision_problems)})
         return {"ok": 0, "fail": 0, "batch": batch}
     preferences.save_prefs({"store": store, "site": site})
 
