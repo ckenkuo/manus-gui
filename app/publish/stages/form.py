@@ -85,7 +85,8 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
     r = await check_attrs(session, ctx["info_path"], apply=True,
                           use_cache=ctx.get("use_cache", True),
                           rowid=str(ctx.get("rowid") or ""),
-                          cat_id=str(ctx.get("cat_id") or ""))
+                          cat_id=str(ctx.get("cat_id") or ""),
+                          site=str(ctx.get("site") or ""))
     if r.get("status") != "ok":
         return {"status": "fail", "note": (r.get("reason") or str(r))[:200]}
     applied = r.get("applied") or []
@@ -95,6 +96,15 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
         note = f"默认属性 {r.get('attrCount') or 0} 行经 LLM 判定均相符，未做改动"
     else:
         note = f"改 {ok_n}/{len(applied)} 项，LLM 拒 {len(r.get('rejected') or [])} 项"
+        if r.get("keepCurrent"):
+            # 【必须记进 note】「保持原值」= LLM 判定这行已经对了、不用改。它既不进
+            # applied 也不进 rejected，原先是全阶段唯一一处「只发生在日志里、状态文件和
+            # 数据库都看不到」的结果：note 才是写进状态文件、跨机可见的那一份，两台机器
+            # 分别跑同一商品时，另一台上只有这一行能看出模型把哪些字段判成了不用动。
+            # 对成分字段它还是个信号——主面料成分若被判「保持原值」，会连同该字段的
+            # 合计校验一起被绕过（详见 _comp_total_problems 的两条来路），此时 note 里
+            # 这个数字是现场唯一的旁证。
+            note += f"，保持原值 {len(r['keepCurrent'])} 项"
     if r.get("optionsMissed"):
         # 【必须报出来】这些行在服务端属性清单里没有对应项，选项是空的——不报的话
         # 现场只剩一句「改 0/0 项」，看不出是模型没给值还是这行压根没选项可给。
@@ -131,6 +141,20 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "fail",
                 "note": f"必填仍空：{'、'.join(miss)}；{note}"[:200],
                 "unfilledRequired": miss}
+    if r.get("badCompTotals"):
+        # 【成分合计不对，同样如实判 fail】这是本阶段第二道收尾闸，与上面那道并列。
+        # 平台对成分字段的硬校验是「百分比之和恰好 100」，合计不对保存必被拦下——不在这里
+        # 判失败，就得等⑭ 才暴露，中间十几个阶段白跑，而那时现场早离开属性页。行级判据
+        # 抓不到它：成分行的 current 是纤维名不是占位符，必填复扫扫不出来（2026-09-12
+        # 商品 908737332112 的 117% 就是这么漏过去的，判据与两条来路见
+        # attributes_form._comp_total_problems）。
+        # 清单放 note 开头：note 会被截到 200 字符，改写统计被截掉无所谓，「哪个字段差多少」
+        # 被截掉 agent 就没方向了；badCompTotals 另以结构化字段透出，不受 200 字符限制。
+        bad = "、".join(f"{p['label']} {p['total']:g}%" for p in r["badCompTotals"])
+        await emit({"type": "manual_check", "stage": "attrs",
+                    "message": f"成分百分比合计不等于 100 需人工修正：{bad}"})
+        return {"status": "fail", "note": f"成分合计不等于 100：{bad}；{note}"[:200],
+                "badCompTotals": r["badCompTotals"]}
     return {"status": "ok", "note": note}
 
 

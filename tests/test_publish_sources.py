@@ -509,6 +509,9 @@ def 人工等待缩到毫秒级(monkeypatch):
     monkeypatch.setattr(base, "WAIT_HUMAN_TIMEOUT", 0.05)
     monkeypatch.setattr(base, "WAIT_HUMAN_INTERVAL", 0.01)
     monkeypatch.setattr(base, "WAIT_HUMAN_REMIND", 0.02)
+    # Temu 取数前后的静置（人工介入后 / 导航离开前）同理：真实值 30 秒，
+    # 不压掉的话每个走 ① 的用例都要白挂半分钟。
+    monkeypatch.setattr(temu, "COOLDOWN_SECONDS", 0.0)
 
 
 class _FakeSession:
@@ -650,11 +653,12 @@ async def test_temu优先复用已打开页签():
 
 @pytest.mark.asyncio
 async def test_temu没开着页签时提示人工等超时才失败():
-    """页签没开成时不退回导航，而是提示人工去开、原地轮询等（wait_for_open_tab）。
+    """页签没开成时，管线新开一个该商品的页签，然后原地等人过验证（wait_for_open_tab）。
 
     2026-09-10 真站实测：Temu 对自动导航一律跳 bgn_verification 安全验证页，导航
-    这个动作本身就足以把验证激出来，之后 wait_human 只会白等 600 秒。故这里只轮询
-    页签、等不到才失败——把「人去开页签」那段时间等回来，比整个商品失败重跑划算。
+    这个动作本身就足以把验证激出来，之后 wait_human 只会白等 600 秒。故「读」只走
+    adopt；这里那一次 navigate 是新开页签替人打开商品页（人会看到验证页、就地过关），
+    不是去刷新已有页签。等不到才失败——比整个商品失败重跑划算。
     （等待时长由 autouse 的「人工等待缩到毫秒级」压到毫秒，用例本身不会挂 10 分钟。）
     """
     s = _FakeSession(_TEMU_SAMPLE, has_open_tab=False)
@@ -663,11 +667,15 @@ async def test_temu没开着页签时提示人工等超时才失败():
     with pytest.raises(RuntimeError) as err:
         await temu.fetch(s, "https://www.temu.com/jp-zh-Hans/x-g-606214515739511.html",
                          on_manual=prompts.append)
-    # 提示要点名该开哪一条——否则批量跑时人不知道去开哪个页签
+    # 提示要点名该开哪一条——否则批量跑时人不知道去处理哪个页签
     assert prompts and "x-g-606214515739511.html" in prompts[0]
     assert "等待超时" in str(err.value)
-    # 全程只轮询 adopt、绝不 navigate（导航会把验证激出来）
-    assert s.actions and all(a[0] == "adopt" for a in s.actions)
+    # 先按商品 ID 找页签；找不到就新开一个打开该商品页（替人省掉复制粘贴），
+    # 此后只轮询 adopt——不再有别的导航，拿导航去刷新页签会把验证激出来
+    assert s.actions[0][0] == "adopt"
+    assert s.actions[1] == ("navigate",
+                            "https://www.temu.com/jp-zh-Hans/x-g-606214515739511.html")
+    assert all(a[0] == "adopt" for a in s.actions[2:])
 
 
 @pytest.mark.asyncio

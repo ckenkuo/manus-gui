@@ -3,7 +3,7 @@
 import os
 import re
 from app.logger import logger
-from app.publish import common, images
+from app.publish import common, images, variant_dom
 from app.publish.browser import BrowserSession, DRAFT_LIST_URL, EDIT_URL, J
 from app.publish.media import preview as media_preview
 from typing import Optional
@@ -49,6 +49,12 @@ async def find_rowid(session: BrowserSession, keyword: str) -> dict:
     rowid 是草稿列表行的 <tr rowid="..."> 属性（18 位数字），后续所有阶段都靠它拼
     编辑页 URL。一个商品可能被认领到多个站点、出现多行，故返回全部匹配交调用方按
     店铺/站点筛（见 service 层的 pick_rowid）。
+
+    【text 必须够长】调用方（claim.pick_rowid）就是拿这个 text 按站点/店铺筛行的，
+    而这两列排在标题【之后】：2026-09-12 实测 Temu 英文标题单是标题就 230+ 字符，
+    原来 slice(0,120) 把站点和店铺整段切掉，于是报「草稿列表未找到店铺/站点」——
+    而同一行人在页面上看得清清楚楚。1688 标题短（中文 30 来字）所以一直没暴露。
+    500 足够容纳长标题 + 站点 + 店铺。
     """
     r = await session.navigate(DRAFT_LIST_URL)
     if not r.get("ok"):
@@ -57,7 +63,7 @@ async def find_rowid(session: BrowserSession, keyword: str) -> dict:
       const rows = Array.from(document.querySelectorAll('tr[rowid]'));
       const m = rows.filter(r => (r.textContent||'').includes(__KW__))
         .map(r => ({rowid: r.getAttribute('rowid'),
-                    text: (r.textContent||'').replace(/\s+/g,' ').slice(0,120)}));
+                    text: (r.textContent||'').replace(/\s+/g,' ').slice(0,500)}));
       return JSON.stringify({total: rows.length, matched: m});
     })()""".replace("__KW__", J(keyword))
     data = await session.wait_for(js, lambda d: d.get("total", 0) > 0, timeout=30)
@@ -285,6 +291,8 @@ _JS_LIVE_STATE = r"""(async () => {
   }
   const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
   const host = u => { try { return new URL(u, location.href).host; } catch (e) { return ''; } };
+  // 变种维列的共用判据（下方 variantByColor 用 dimIdx）：与 ⑦a/⑦b/⑩a/⑩ 同一段代码
+  __DIM_COLS__
 
   // ⑤ 标题：按 label 定位「英文标题」框——它空或含中文（非 ASCII）都说明英文标题
   // 成果已丢/未填，要重跑。不能抓基本信息区所有框：中文标题框（产品标题）本来就
@@ -349,12 +357,14 @@ _JS_LIVE_STATE = r"""(async () => {
     });
   // ⑦a 剔配件色：变种信息表按颜色统计「有源数据的行数」。续跑判定据此认配件色
   // （反选只改未保存表单，save 没成功过就会回到认领时的全勾状态）。
-  // 判据与列定位同 _JS_VARIANT_ROW_FILL，见那里的真站取证。
+  // 判据与列定位同 _JS_VARIANT_ROW_FILL（都注入 variant_dom._JS_DIM_COLS：变种维列
+  // 按「预览图之后、SKU货号之前」的结构位置认，不按颜色/尺码这两个名字猜），见那里的
+  // 真站取证。两边判据必须一致：这里认不出维度列会让续跑判定永不安排 ⑦a。
   const variantByColor = (() => {
     const t0 = (sku || document).querySelector('table');
     if (!t0) return null;
     const hs = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
-    const iC = hs.findIndex(h => /^颜色/.test(h));
+    const iC = dimIdx(hs).colorIdx;
     const iCode = hs.findIndex(h => h.includes('SKU货号'));
     const iPrice = hs.findIndex(h => h.includes('申报价格'));
     const iW = hs.findIndex(h => h.includes('重量'));
@@ -481,7 +491,8 @@ async def live_state(session: BrowserSession) -> dict:
     st = await session.eval_json(
         _JS_LIVE_STATE.replace("__MINW__", str(images.CLOTH_MIN_W))
                       .replace("__MINH__", str(images.CLOTH_MIN_H))
-                      .replace("__PREVMIN__", str(media_preview.PREVIEW_MIN_SIDE)))
+                      .replace("__PREVMIN__", str(media_preview.PREVIEW_MIN_SIDE))
+                      .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if not st.get("rendered"):
         logger.warning("编辑页 SKU 区未渲染完，实况判定按「全部需重跑」处理")
     # 类目异常单独打一行：这是整单卡死的上游根因，而页面那条 d-message 几秒就自己消失，

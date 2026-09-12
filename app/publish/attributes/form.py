@@ -3,6 +3,7 @@
 import asyncio
 from app.logger import logger
 from app.publish import common
+from app.publish.attributes import composition as attributes_composition
 from app.publish.attributes import dropdowns as attributes_dropdowns
 from app.publish.attributes import server_options as attributes_server_options
 from app.publish.browser import BrowserSession, J
@@ -160,6 +161,53 @@ _JS_LIST_ATTR_ROWS = r"""(() => {
   });
   return JSON.stringify({found: true, attrs: out});
 })()"""
+
+
+def _comp_total_problems(attrs: list) -> list:
+    """挑出百分比合计不等于 100 的成分字段，返回 [{label, total, numValues}]。
+
+    【为什么要在阶段④ 收尾单独复验一次】写入侧的 compFailed 只覆盖「我们写了、但写
+    失败」这一条来路，而成分合计不对还有另一条完全不同的：LLM 判「保持原值」时该字段
+    根本不进 changes（见 validation._validate_attr_changes 的 keep_current 分支），
+    第 3 道闸的 _rebuild_main_comp 源值确定性覆盖随之被整个绕过，页面原样留着认领带来
+    的旧行。那条路上 compFailed 恒为空，只有回读页面才看得见。
+
+    两条来路的终态是同一种残局：认领预填 3 行（聚酯纤维 90 + 氨纶 5 + 莱赛尔 22），
+    本轮按源主成分含量只想写 2 行（聚酯纤维 90 + 配料 10）。第 2 行写失败时，跳过裁行
+    的保护（见 review._apply_attr_changes）为了不裁出残缺百分比而整组不裁，于是第 3 行
+    旧值原样留在表单里，合计 117%。行级判据全绿：成分行的 current 是纤维名、不是占位符，
+    末尾的必填复扫扫不出来——2026-09-12 商品 908737332112 就这么一路带到⑭保存，被平台
+    「单个材料属性的百分比之和需等于100」拦下。
+
+    判据直接用 _JS_LIST_ATTR_ROWS 的产出，不另读 DOM：hasPercent 由行内控件序决定
+    （下拉打头才可能为真），数值行（里料克重这类输入框打头）恒为 false，不会混进来；
+    合计本身由 composition._comp_percent_total 算，与 validation._stale_main_comp 同源。
+
+    current 以 "(" 开头的跳过：一个纤维都没选的字段属于「必填留空」，那是 unfilledRequired
+    的管辖范围，在这里报「合计 0%」只是同一件事换个说法。
+
+    【必须排除「产品属性」这个分组标题行】2026-09-12 真页面实测（rowid
+    184807703146625231）：它是包裹全部属性行的外层 .ant-form-item，querySelectorAll
+    会把嵌套在内的所有百分比框一并收走——实测它的 5 个可填 input = 成分 3 + 辅料成分 1
+    + 另 1，于是 hasPercent 恒为真、numValues 是各字段百分比的大杂烩（当时读到的
+    ['73','5','22'] 与「成分」行完全同值，纯属巧合）。拿它算合计毫无意义：跨字段求和
+    碰巧等于 100 会掩盖真问题，碰巧不等于 100 则凭空判失败一个根本不存在的字段。
+    dump_attrs 与末尾复扫一直用 label != '产品属性' 滤掉它（见 check_attrs 两处），
+    本函数是新入口、attrs 由调用方直接传入，必须自己滤一次。
+    """
+    problems: list = []
+    for a in attrs:
+        if a.get("label") == "产品属性":
+            continue
+        if not a.get("hasPercent"):
+            continue
+        if str(a.get("current") or "").startswith("("):
+            continue
+        total = attributes_composition._comp_percent_total(a)
+        if abs(total - 100) > 1e-6:
+            problems.append({"label": a.get("label"), "total": total,
+                             "numValues": list(a.get("numValues") or [])})
+    return problems
 
 
 def _rows_settled():
@@ -538,12 +586,17 @@ async def set_attr(session: BrowserSession, label: str, value: str,
         # _open_attr_dropdown 的收敛条件只是「浮层可见」，而浮层可见 ≠ 里面的
         # rc-virtual-list 已挂上 item。见 _poll_until 的说明。
         await common._poll_until(
-            lambda: session.eval_json(attributes_dropdowns._js_dropdown_options_rendered(label)),
+            lambda: session.eval_json(attributes_dropdowns._js_dropdown_options_rendered(label, row_no - 1)),
             lambda d: (d or {}).get("n", 0) > 0, timeout=0.6)
-        clicked = await attributes_dropdowns._click_dropdown_option(session, label, value)
+        # 【sel_idx 必须跟着 row_no 传】上面打开的是第 row_no 行的下拉，点选也只能在
+        # 那一行自己的浮层里找。漏传会恒按第 1 行取浮层，成分第 2 行起必报
+        # option-not-rendered（2026-09-12 取证见 _click_dropdown_option 的 docstring）。
+        clicked = await attributes_dropdowns._click_dropdown_option(
+            session, label, value, sel_idx=row_no - 1)
         if not clicked.get("clicked"):
             # 目标选项可能在虚拟列表可视窗口之外，滚动去找
-            clicked = await attributes_dropdowns._scroll_click_option(session, label, value)
+            clicked = await attributes_dropdowns._scroll_click_option(
+                session, label, value, sel_idx=row_no - 1)
         if not clicked.get("clicked"):
             await attributes_dropdowns._park_ghost_dropdowns(session)  # 点开未点中也要清，别留浮层
             continue
@@ -778,13 +831,16 @@ async def _set_select_by_label(session: BrowserSession, label: str, value: str,
         await attributes_dropdowns._open_attr_dropdown(session, label, sel_idx=row_no - 1)
         # 再等浮层里的选项真渲染出来（替代原 sleep(0.6)，上限同为 0.6s）
         await common._poll_until(
-            lambda: session.eval_json(attributes_dropdowns._js_dropdown_options_rendered(label)),
+            lambda: session.eval_json(attributes_dropdowns._js_dropdown_options_rendered(label, row_no - 1)),
             lambda d: (d or {}).get("n", 0) > 0, timeout=0.6)
-        # 点选项
-        c = await attributes_dropdowns._click_dropdown_option(session, label, value)
+        # 点选项。【sel_idx 必须跟着 row_no 传】理由同 set_attr 那处：漏传会恒按第 1 行
+        # 取浮层，第 2 行起必报 option-not-rendered。
+        c = await attributes_dropdowns._click_dropdown_option(
+            session, label, value, sel_idx=row_no - 1)
         if not c.get("clicked"):
             # 目标选项可能在虚拟列表可视窗口之外：滚动该行的下拉找到后再点
-            c = await attributes_dropdowns._scroll_click_option(session, label, value)
+            c = await attributes_dropdowns._scroll_click_option(
+                session, label, value, sel_idx=row_no - 1)
         if not c.get("clicked"):
             await attributes_dropdowns._park_ghost_dropdowns(session)  # 点开未点中也清一次，避免残留浮层
             continue

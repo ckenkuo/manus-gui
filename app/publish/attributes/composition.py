@@ -25,6 +25,27 @@ def _is_main_comp_label(label: str) -> bool:
     return not any(m in label for m in _COMP_SUB_MARKS)
 
 
+def _comp_percent_total(row: dict) -> float:
+    """按属性行形状算一个成分字段的百分比合计。
+
+    输入是 _JS_LIST_ATTR_ROWS 枚举出的一行（form._JS_LIST_ATTR_ROWS）。它的 numValues
+    是该 form-item 内【全部】百分比输入框的值、不分行，故求和恰好是这个字段的合计——
+    调用方既不必另读 DOM，也不必知道有几行。
+
+    【为什么抽成公用函数】这个合计有两处判据要用，且必须同口径：form._comp_total_problems
+    用它做阶段④ 收尾的复验，validation._stale_main_comp 用它决定「保持原值」要不要放行。
+    两处各写一遍，改一处漏一处就会一边判「合计没问题」、一边判「要重建」。
+    非数字按缺失跳过（不中断累加）：合计必然对不上，如实算出来交调用方判断。
+    """
+    total = 0.0
+    for v in (row.get("numValues") or []):
+        try:
+            total += float(v)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
 def _norm_fiber(name: str) -> str:
     """纤维名归一：只留中文，去掉半/全角括号与注解差异。
 
@@ -127,6 +148,27 @@ def _match_fiber(src_fiber: str, values: list) -> Optional[str]:
     return None
 
 
+def _pick_filler(opts: list, used_keys: set) -> Optional[str]:
+    """按 _COMP_FILLERS 的优先级挑一根尚未被占用的填充纤维，返回【options 里的写法】。
+
+    【为什么不能写 `cand in opts`】候选表里是「聚酯纤维(涤纶）」「氨纶」「棉」这类裸
+    写法，而表单 options 由平台下发，写的是「氨纶（Spandex）」「莱赛尔（天丝）」——
+    精确相等一个都命中不了。原先两处调用点都是 `o in opts`，后果是这条兜底实际上
+    只在 options 恰好用裸写法时才是活的：主纤维为聚酯纤维时（候选表首项被 used 判同
+    排除）整条路必然落空，_rebuild_main_comp 只能返回 None 让整组拒绝，页面上的残缺
+    百分比没人修（2026-09-12 商品 908737332112 实测）。改用与第 1 行 target 同一套
+    _match_fiber 匹配，才认得出带括号注解的写法。
+
+    used_keys 按 _fiber_key 判同（不是字符串相等）：「聚酯纤维(涤纶）」与「涤纶」是同
+    一根纤维，只做字符串比较会挑出同一根的第二行，平台按 attrValueId 判「不能重复选择」。
+    """
+    for cand in _COMP_FILLERS:
+        hit = _match_fiber(cand, opts)
+        if hit and _fiber_key(hit) not in used_keys:
+            return hit
+    return None
+
+
 # 按源属性推断配料纤维的依据表：(属性文本匹配正则, 目标纤维关键词)。
 # 顺序即优先级，越靠前依据越硬。这是为了少走 _COMP_FILLERS 那条纯编造的路。
 _COMP_HINTS = (
@@ -216,8 +258,7 @@ def _rebuild_main_comp(label: str, items: list, opts: list, main_comp: dict) -> 
         if second:
             basis = why
     if not second:
-        second = next((o for o in _COMP_FILLERS
-                       if o in opts and _fiber_key(o) != used), None)
+        second = _pick_filler(opts, {used})
         if second:
             # 这一行是全流程唯一「凭常见配比编出来」的成分数据，留痕便于抽查
             basis = "无源依据，按最常见混纺配料填充"

@@ -88,6 +88,15 @@ _ATTR_PROMPT = """你是跨境电商商品属性审核助手。下面是 {platfo
    特别注意：「一体绒」是绒与面料一体成型，不算单独里衬，必须选「无里料/无内衬」。
    含"针织""毛衣"时织造方式应为针织类。
 7. 源商品的"风格"若在 options 中没有，保留当前值。
+7b.【按销售站点定的字段：以「发布站点」为准，不看源商品】插头规格、工作电压/额定电压、
+   电源频率、语言/语音版本、插座类型这类字段由【目标市场的电气与法规标准】决定，
+   与源商品在国内卖什么规格无关——1688/国内源商品几乎必然是中规两插 220V，照抄到
+   北美站就是错的（买家插不上、平台合规风险）。按发布站点选 options 里对应的那一项：
+   美国/加拿大/墨西哥/哥伦比亚等美洲站 → A 型或 B 型美规插头、110V/120V；
+   英国 → 英规三插 230V；欧陆（德法西意荷波等）→ 欧规 C/E/F 型、220V~230V；
+   日本 → 日规 A 型 100V；澳新 → 澳规 I 型 230V；沙特/阿联酋等中东 → 英规 G 型 230V。
+   站点未给或该站点在 options 里没有对应项时，才退回保持原值并在 notes 里记一句。
+   注意这类字段之间要自洽：插头选了美规就不要把电压留在 220V。
 8. 【数值输入行】kind="number" 的行（如里料克重、含绒量）没有 options，是纯数字输入框：
    value 只给**纯数字**，不要带单位、不要给选项文本（numHint.unit 告诉你单位，numHint.placeholder 可能有取值提示）。
    源商品没写时按该品类常识给行业通行值（如童装梭织里布 60~90 g/m²、摇粒绒 180~260 g/m²），
@@ -101,6 +110,7 @@ _ATTR_PROMPT = """你是跨境电商商品属性审核助手。下面是 {platfo
    current 里已有明显矛盾的值（如源商品只有黑白两色、表单却勾着蓝绿）要一并纠正掉。
 
 商品标题：{title}
+发布站点（目标销售市场，规则 7b 的唯一依据）：{site}
 源商品参数（{platform}）：{src_attrs}
 源主面料成分（已从源参数/详情文字/详情图解析，百分比以此为准）：{main_composition}
 图片理解摘要：{image_understanding}
@@ -129,10 +139,17 @@ _ATTR_DEFAULT_PROMPT = """你是跨境电商商品属性审核助手。下面是
 2. 主面料成分（上装成分/下装成分等）行必须与「源主面料成分」一致：纤维种类或比例对不上的，判不正确。
 3. 里料纹理/里衬类：源商品没有明确单独里衬时，预填值不是「无里料/无内衬」的判不正确（"一体绒"与面料一体成型，不算单独里衬）。
 4. 数值输入行（里料克重等）的值要落在该品类常识范围内，明显离谱的判不正确。
+4b.【按销售站点定的字段以「发布站点」为准】插头规格、工作电压/额定电压、电源频率、
+   插座类型这类由目标市场电气标准决定的字段，预填值与发布站点不符的判【不正确】——
+   预填值是认领时按源商品映射来的，国内源商品几乎必然是中规两插 220V，发到北美站
+   就是错的。对照：美洲站（美国/加拿大/墨西哥/哥伦比亚等）A/B 型美规 110V/120V；
+   英国英规三插 230V；欧陆欧规 C/E/F 型 220V~230V；日本日规 A 型 100V；
+   澳新澳规 I 型 230V；中东英规 G 型 230V。站点未给时这类字段按规则 5 处理。
 5. 源信息与图片摘要都判断不了该字段时，按「保持原值」处理，不算不正确（列表里给出的每一行都已有预填值）。
 6. 【最重要】判「正确」会让程序跳过整个属性填写阶段、直接拿这些预填值去发布；判「不正确」只是让程序多花一两分钟重新逐项审核。故只要有任何一行与商品实际明显矛盾，就必须判不正确，不要为了省事放过；反过来，也不要把"拿不准但已有值"的行算作不正确，否则这次判断就没有意义了。
 
 商品标题：{title}
+发布站点（目标销售市场，规则 4b 的唯一依据）：{site}
 源商品参数（{platform}）：{src_attrs}
 源主面料成分（已从源参数/详情文字/详情图解析）：{main_composition}
 图片理解摘要：{image_understanding}
@@ -206,8 +223,12 @@ def _split_attr_rows(rows: list) -> list:
     return [g for g in groups if g]
 
 
-async def _ask_attr_review(rows: list, info: dict, main_comp: Optional[dict]) -> dict:
+async def _ask_attr_review(rows: list, info: dict, main_comp: Optional[dict],
+                           site: str = "") -> dict:
     """问 LLM 要属性修改清单；行多时拆两组并发问，结果合并后返回。
+
+    site 是发布站点（中文站点名，如「哥伦比亚」），规则 7b 要用它——插头规格/工作电压
+    这类字段由目标市场的电气标准决定，源商品信息里推不出来。留空则该组字段退回保持原值。
 
     返回形状与单次调用一致（{"changes": [...], "notes": [...]}），故调用方不必知道
     这里拆没拆——校验（_validate_attr_changes）拿到的仍是完整清单，四道闸照旧
@@ -225,6 +246,7 @@ async def _ask_attr_review(rows: list, info: dict, main_comp: Optional[dict]) ->
         return _ATTR_PROMPT.format(
             platform=source_name(info),
             title=info.get("title"),
+            site=site or "（未给出，按规则 7b 保持原值）",
             src_attrs=_json.dumps(info.get("attributes", {}), ensure_ascii=False),
             main_composition=_json.dumps(main_comp or {}, ensure_ascii=False),
             image_understanding=_json.dumps(
@@ -252,8 +274,12 @@ async def _ask_attr_review(rows: list, info: dict, main_comp: Optional[dict]) ->
 
 
 async def _ask_default_attr_review(rows: list, info: dict,
-                                   main_comp: Optional[dict]) -> dict:
+                                   main_comp: Optional[dict], site: str = "") -> dict:
     """问 LLM「表单里这些预填值是否全都与商品相符」，返回 {"ok", "issues", "reason"}。
+
+    site（发布站点）必须与 _ask_attr_review 一起给：规则 4b 与那边的 7b 是对齐的一对。
+    只给完整审核那边、这边不给，快路径就会把「中规两插发北美站」这类预填值判成正确、
+    整个阶段④ 短路，7b 根本没机会跑。
 
     与 _ask_attr_review 的两点差别：不喂 options（省掉读选项那一大块）、不要求给替代值
     （输出短、推理少）。拆组的做法照搬——理由与阈值见 _split_attr_rows。
@@ -273,6 +299,7 @@ async def _ask_default_attr_review(rows: list, info: dict,
         return _ATTR_DEFAULT_PROMPT.format(
             platform=source_name(info),
             title=info.get("title"),
+            site=site or "（未给出，这类字段按规则 5 处理）",
             src_attrs=_json.dumps(info.get("attributes", {}), ensure_ascii=False),
             main_composition=_json.dumps(main_comp or {}, ensure_ascii=False),
             image_understanding=_json.dumps(

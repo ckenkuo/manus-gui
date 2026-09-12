@@ -2,6 +2,7 @@
 
 import asyncio
 from app.logger import logger
+from app.publish import variant_dom
 from app.publish.browser import BrowserSession, J
 from app.publish.media import space as media_space
 from app.publish.upload import upload_image
@@ -72,9 +73,13 @@ PREVIEW_MIN_SIDE = 800
 # 读变种信息表每行的预览图状态：颜色名 + 图 URL + 尺寸，并标出不合规的行。
 #
 # 【表格与列都按结构定位，不写死下标】#skuDataInfo 里有两张 table（第一张是价格/
-# 尺寸/重量，第二张是库存/SKU分类），预览图在【第一张】的第一列。颜色列同样按表头
-# 找，与 _JS_READ_SKU_CODES 一套判据——无尺码类目下表头是
-# ['预览图( 批量)', '颜色', ...]，写死下标会整体错位（那次的病根，见 fix_sku_codes）。
+# 尺寸/重量，第二张是库存/SKU分类），预览图在【第一张】的第一列。
+#
+# 【行标识列取「第一个变种维」，不是硬找「颜色」】与 ⑩a 共用 variant_dom._JS_DIM_COLS
+# （预览图之后、SKU货号之前即变种维列）。2026-09-12 取证（Temu 商品 601101104447803
+# 车贴）：该类目唯一那维叫【型号】，原判据 /^颜色/ 落空 → colorIdx=-1，于是
+# sku_preview_replace_row 的 expect_color 恒为空、行序核对整体失效（Vue 重排后会把图
+# 挂到别的 SKU 上），空位补图也拿不到「同色行」去找源图。名字随类目变、位置不变。
 #
 # bad 的判据是「非 1:1 或短边 < 800」，与 PREVIEW_MIN_SIDE 一致。naturalWidth 为 0
 # 表示图还没加载完，按【读不到】处理而不是判不合格：未知不等于不合格（同
@@ -96,7 +101,8 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
   if (!t0) return JSON.stringify({err: 'no-table'});
   const heads = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
   const iPrev = heads.findIndex(h => h.includes('预览图'));
-  const iColor = heads.findIndex(h => /^颜色/.test(h));
+  __DIM_COLS__
+  const {colorIdx: iColor} = dimIdx(heads);
   if (iPrev < 0) return JSON.stringify({err: 'no-preview-column', heads: heads});
   const MIN = __MIN__;
   const rows = [];
@@ -144,7 +150,8 @@ async def sku_preview_state(session: BrowserSession) -> dict:
     supported=None：表没渲染完（零行）时证据不足，别当「不支持」，让真失败暴露。
     """
     st = await session.eval_json(
-        _JS_SKU_PREVIEW_STATE.replace("__MIN__", J(PREVIEW_MIN_SIDE)))
+        _JS_SKU_PREVIEW_STATE.replace("__MIN__", J(PREVIEW_MIN_SIDE))
+                             .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if st.get("err"):
         return {"supported": None, **st}
     rows = st.get("rows") or []

@@ -35,13 +35,15 @@ _JS_VARIANT_ROW_FILL = r"""(() => {
   const t0 = sku.querySelector('table');
   if (!t0) return JSON.stringify({err: 'no-table'});
   const heads = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
-  // 列按表头找，不写死下标（无尺码类目表头整体左移，见 fix_sku_codes 的取证）
-  const iColor = heads.findIndex(h => /^颜色/.test(h));
-  const iSize = heads.findIndex(h => /^尺码/.test(h));
+  // 变种维列按【结构位置】找（预览图之后、SKU货号之前），不按名字穷举：车贴类目那维
+  // 叫「型号」、3C 类目见过「存储容量」，按名字认每换一个类目就得再补一次判据。
+  // 判据与 ⑩a 共用 variant_dom._JS_DIM_COLS，见那里的取证。
+  __DIM_COLS__
+  const {colorIdx: iColor, sizeIdx: iSize} = dimIdx(heads);
   const iCode = heads.findIndex(h => h.includes('SKU货号'));
   const iPrice = heads.findIndex(h => h.includes('申报价格'));
   const iWeight = heads.findIndex(h => h.includes('重量'));
-  if (iColor < 0) return JSON.stringify({err: 'no-color-column', heads: heads});
+  if (iColor < 0) return JSON.stringify({err: 'no-dim-column', heads: heads});
   const val = (tds, k) => {
     if (k < 0 || !tds[k]) return '';
     const ins = Array.from(tds[k].querySelectorAll('input, textarea'));
@@ -100,6 +102,70 @@ def _raw_sku_count(info_path: str) -> int:
         return 0
 
 
+async def wait_variant_table_stable(session: BrowserSession,
+                                    rounds: int = 20) -> int:
+    """等变种表重建稳定（行数连续两轮不变），返回最后读到的行数。
+
+    反选任何一个变种维选项都会让平台重建整张变种表，重建期间读到的行序是中间态。
+    ⑦a 剔配件色与 ⑦b「补不上图就反选该规格」都要等这一下，故抽出来共用——原先
+    ⑦a 内嵌一份，⑦b 再抄一遍就是两份会各自漂移的等待逻辑。判据与 ⑧ 一致。
+    """
+    last_n, stable, n = -1, 0, 0
+    for _ in range(rounds):
+        n = (await session.eval_json(variant_dom._JS_SKU_ROW_COUNT)).get("n", 0)
+        if n == last_n:
+            stable += 1
+            if stable >= 2:
+                break
+        else:
+            stable = 0
+        last_n = n
+        await asyncio.sleep(0.6)
+    return n
+
+
+async def uncheck_variant_option(session: BrowserSession, name: str,
+                                 why: str = "") -> dict:
+    """反选一个变种维选项（颜色/型号/尺码…任一维），返回 {"status", "reason"}。
+
+    status 取值：
+      ok        —— 点了且已变成未勾选
+      skipped   —— 本来就没勾选（无事可做，不是失败）
+      error     —— 各维度组里都找不到它，或点了仍是勾选态
+
+    【只反选，不勾选】见 _JS_UNCHECK_COLOR 上方说明。维度组按「颜色优先、其余变种维
+    兜底」找，故车贴那种唯一维叫「型号」的类目也能反选。
+    why 只进日志，用来交代这次为什么要剔（配件色 / 伪选项 / 补不上预览图）。
+    """
+    r = await session.eval_json(
+        variant_dom._JS_UNCHECK_COLOR.replace("__WANT__", J(name)))
+    tail = f"（{why}）" if why else ""
+    if not isinstance(r, dict) or not r.get("found"):
+        detail = r if isinstance(r, dict) else {}
+        logger.warning(f"规格「{name}」在变种维复选框里找不到{tail}，未反选"
+                       f"（维度组 {detail.get('groups')}，"
+                       f"已勾选项 {detail.get('checkedOptions')}）")
+        return {"status": "error",
+                "reason": f"「{name}」在变种维复选框里找不到",
+                "detail": detail}
+    if not r.get("wasChecked"):
+        logger.info(f"规格「{name}」本来就没勾选{tail}，无需反选")
+        return {"status": "skipped", "reason": f"「{name}」本来就未勾选"}
+    if r.get("err") == "last-checked-in-group":
+        # 整维只剩它一个：反选会让平台清掉整张变种表（见 _JS_UNCHECK_COLOR 的说明），
+        # 宁可留着这一个不合格规格交人工，也不能把整单的变种表搞没
+        logger.warning(f"规格「{name}」是「{r.get('group')}」维里最后一个已勾选项"
+                       f"{tail}，不反选（变种维不能为空，清空会毁掉整张变种表）")
+        return {"status": "error",
+                "reason": f"「{name}」是{r.get('group') or '该维'}里最后一个已勾选项，"
+                          f"反选会清掉整张变种表，需人工处理"}
+    if r.get("checked"):
+        logger.warning(f"规格「{name}」点了反选但仍是勾选态{tail}")
+        return {"status": "error", "reason": f"「{name}」点了反选但仍是勾选态"}
+    logger.info(f"已反选规格「{name}」（{r.get('group') or '变种维'} 组）{tail}")
+    return {"status": "ok", "group": r.get("group")}
+
+
 async def drop_accessory_colors(session: BrowserSession,
                                 max_rounds: int = 6) -> dict:
     """阶段⑦a：把配件色（变种表里只有单行有源数据的颜色）从颜色维里反选掉。
@@ -114,7 +180,8 @@ async def drop_accessory_colors(session: BrowserSession,
     【只反选，不勾选】职责是剔除，不是对齐颜色维；源里有而页面没勾的颜色一律不管
     （那是认领阶段的事）。
     """
-    st = await session.eval_json(_JS_VARIANT_ROW_FILL)
+    st = await session.eval_json(
+        _JS_VARIANT_ROW_FILL.replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if st.get("err"):
         # 与 ⑧ 同一取向：读不到变种表时不硬判失败，交由后续阶段暴露真问题
         return {"status": "skipped",
@@ -129,25 +196,16 @@ async def drop_accessory_colors(session: BrowserSession,
 
     dropped, missed = [], []
     for name in targets:
-        r = await session.eval_json(variant_dom._JS_UNCHECK_COLOR.replace("__WANT__", J(name)))
-        if not r.get("found"):
+        stat = by_color.get(name) or {}
+        why = (f"变种表 {stat.get('total')} 行里只有 {stat.get('filled')} 行有源数据"
+               f"，尺码 {stat.get('filledSizes')}，不发它的 SKC/SKU")
+        r = await uncheck_variant_option(session, name, why=f"配件色：{why}")
+        if r.get("status") == "ok":
+            dropped.append(name)
+        elif r.get("status") == "error":
             missed.append(name)
-            logger.warning(f"配件色「{name}」在颜色复选框里找不到（已勾选项："
-                           f"{r.get('checkedOptions')}），未反选")
-            continue
-        if not r.get("wasChecked"):
-            logger.info(f"配件色「{name}」本来就没勾选，无需反选")
-            continue
-        if r.get("checked"):
-            missed.append(name)
-            logger.warning(f"配件色「{name}」点了反选但仍是勾选态")
-            continue
-        dropped.append(name)
-        logger.info(
-            f"配件色「{name}」已反选：变种表 {by_color[name].get('total')} 行里只有 "
-            f"{by_color[name].get('filled')} 行有源数据"
-            f"（尺码 {by_color[name].get('filledSizes')}），不发它的 SKC/SKU")
-        # 原固定 sleep(1.2) 已去掉：下方 2589-2600 行已有变种表稳定等待（行数连续两轮不变）
+        # skipped（本来没勾）既不算剔掉也不算失败，与原先行为一致
+        # 原固定 sleep(1.2) 已去掉：下方已有变种表稳定等待（行数连续两轮不变）
 
     if not dropped:
         return {"status": "error" if missed else "skipped",
@@ -155,20 +213,11 @@ async def drop_accessory_colors(session: BrowserSession,
                 "reason": (f"配件色未能反选：{missed}" if missed
                            else "配件色本来就未勾选")}
 
-    # 反选会触发变种表重建，等它稳定（行数连续两轮不变），与 ⑧ 同一等待机制
-    last_n, stable = -1, 0
-    for _ in range(20):
-        n = (await session.eval_json(variant_dom._JS_SKU_ROW_COUNT)).get("n", 0)
-        if n == last_n:
-            stable += 1
-            if stable >= 2:
-                break
-        else:
-            stable = 0
-        last_n = n
-        await asyncio.sleep(0.6)
+    # 反选会触发变种表重建，等它稳定（与 ⑧ 同一等待机制）
+    await wait_variant_table_stable(session)
 
-    after = await session.eval_json(_JS_VARIANT_ROW_FILL)
+    after = await session.eval_json(
+        _JS_VARIANT_ROW_FILL.replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     left = set((after.get("byColor") or {}).keys())
     still = [c for c in dropped if c in left]
     if still:
@@ -417,16 +466,12 @@ async def _drop_fake_variants(session: BrowserSession,
         if not checked.get(name):
             logger.info(f"伪颜色「{name}」本来就未勾选，无需反选")
             continue
-        r = await session.eval_json(variant_dom._JS_UNCHECK_COLOR.replace("__WANT__", J(name)))
-        # eval 返回非 dict（异常/兜底桩）时当没点到，记警告放行——不拦整单
-        if not isinstance(r, dict) or not r.get("found"):
-            logger.warning(f"伪颜色「{name}」在颜色复选框里找不到，未反选")
-            continue
-        if r.get("checked"):
-            logger.warning(f"伪颜色「{name}」点了反选但仍是勾选态")
+        # 反选走共用件（颜色组优先、其余变种维兜底），失败只记警告放行——不拦整单
+        r = await uncheck_variant_option(
+            session, name, why="伪颜色：随机发货之类占位，不发它的 SKU")
+        if r.get("status") != "ok":
             continue
         dropped_colors.append(name)
-        logger.info(f"已反选伪颜色「{name}」（随机发货之类占位，不发它的 SKU）")
         await _wait_rebuild()
 
     for name in fake_sizes:

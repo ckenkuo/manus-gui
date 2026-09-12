@@ -232,8 +232,13 @@ class _CodeSession:
 
 
 def test_读货号列的JS按表头定位而不是写死下标():
-    """真站表头 tds[0] 是【预览图】，写死 tds[0] 会把颜色读成空。"""
-    js = P._JS_READ_SKU_CODES
+    """真站表头 tds[0] 是【预览图】，写死 tds[0] 会把颜色读成空。
+
+    2026-09-12 起列定位判据搬进 variant_dom._JS_DIM_COLS（按「预览图之后、SKU货号
+    之前」的结构位置认变种维列，不再按颜色/尺码这两个名字猜），故断言看的是【注入后】
+    的完整 JS，而不是模板本身。
+    """
+    js = P._JS_READ_SKU_CODES.replace("__DIM_COLS__", P._JS_DIM_COLS)
     assert "findIndex" in js and "thead th" in js
     assert "txt(tds[0]), size: txt(tds[1])" not in js
     # 填写那段的逐行核对必须用同一套下标，否则会全行 row-moved

@@ -17,6 +17,18 @@ CONTEXT_ARGUMENTS = {
     "rowid", "info_path", "store", "site", "warehouse", "cat_path", "cat_id", "use_cache",
 }
 
+# 纯观察工具：调用它们不会改动表单，故不清 verified（理由见 PublishFunctionTool.execute）。
+# 【判据是「会不会改表单字段」，逐个核对函数实现后写死在这里】不按名字前缀猜——
+# read_/list_ 这类前缀既漏（dump_attrs、inspect、live_state）又不保准。
+# attribute_options 会点开下拉，但只动浮层可见性、不写任何字段值，读完自己关闭并清幽灵，
+# 故仍算只读；category_columns/skc_row_state/sku_preview_state 同理只读 DOM。
+# 名单之外的一律按「可能改页面」处理——漏标只是多跑一次阶段复验，错标会放过真被改坏的现场。
+_READONLY_FUNCTIONS = {
+    "dump_attrs", "live_state", "inspect", "fetch_attr_options", "read_current_category",
+    "read_video_url", "list_images", "skc_image_support", "sku_preview_state", "find_rowid",
+    "desc_map", "desc_text_map", "skc_row_state", "category_columns", "attribute_options",
+}
+
 
 @dataclass
 class RecoveryContext:
@@ -59,8 +71,9 @@ class PublishFunctionTool(BaseTool):
     _callback: Any = PrivateAttr()
     _arguments: Any = PrivateAttr()
     _recovery: Any = PrivateAttr()
+    _readonly: bool = PrivateAttr(default=False)
 
-    def __init__(self, name, description, callback, arguments, recovery):
+    def __init__(self, name, description, callback, arguments, recovery, readonly=False):
         super().__init__(
             name=name,
             description=description,
@@ -69,9 +82,18 @@ class PublishFunctionTool(BaseTool):
         self._callback = callback
         self._arguments = arguments
         self._recovery = recovery
+        self._readonly = readonly
 
     async def execute(self, **kwargs) -> ToolResult:
-        self._recovery.verified = None
+        # 【只读工具不能清 verified】清空的用意是「跑完阶段拿到 ok 之后又动了页面，
+        # 那个 ok 就不再作准」，可它原先对所有工具一视同仁——连纯观察工具也算。
+        # 2026-09-12 商品 pdd-250293857545 实测：dxm_stage_attrs 已返回 ok（verified
+        # 置上），agent 遵照系统提示词「验证后不要再修改页面」只又读了一次
+        # dxm_dump_attrs 复核，就把这个 ok 抹了，recover_stage 读到 None，判「Manus
+        # 未能通过原阶段校验」——属性其实填好了、页面状态也对，纯粹的假失败。
+        # 判据只认「这个工具会不会改页面」，由注册处按函数逐个标注，不做名字前缀猜测。
+        if not self._readonly:
+            self._recovery.verified = None
         try:
             values = self._arguments.model_validate(kwargs).model_dump(exclude_unset=True)
             result = await self._callback(**values)
@@ -153,6 +175,7 @@ def build_publish_tools(recovery: RecoveryContext) -> ToolCollection:
         tools.add_tool(PublishFunctionTool(
             f"dxm_{name}", description, call_function,
             _argument_model(name, function, bound), recovery,
+            readonly=name in _READONLY_FUNCTIONS,
         ))
 
     for stage in recovery.handlers:
@@ -246,12 +269,15 @@ def build_publish_tools(recovery: RecoveryContext) -> ToolCollection:
             return ToolResult(error=f"截图失败：{captured.get('err') or 'CDP 未返回图像数据'}")
         return ToolResult(output="当前店小秘工作页截图", base64_image=image)
 
-    for name, function in (
-        ("observe", observe), ("read_info", read_info), ("evaluate", evaluate),
-        ("click", click), ("cdp_input", cdp_input), ("screenshot", screenshot),
+    # observe/read_info/screenshot 只读（读 DOM 文本、读源数据文件、截图），不清 verified；
+    # evaluate/click/cdp_input 是通用改页面手段，一律按会改处理。
+    for name, function, readonly in (
+        ("observe", observe, True), ("read_info", read_info, True),
+        ("evaluate", evaluate, False), ("click", click, False),
+        ("cdp_input", cdp_input, False), ("screenshot", screenshot, True),
     ):
         tools.add_tool(PublishFunctionTool(
             f"dxm_{name}", inspect.getdoc(function) or "读取当前页面、弹窗、提示与任务上下文",
-            function, _argument_model(name, function), recovery,
+            function, _argument_model(name, function), recovery, readonly=readonly,
         ))
     return tools

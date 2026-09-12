@@ -6,6 +6,46 @@ from app.publish.attributes import composition as attributes_composition
 from typing import Optional
 
 
+def _stale_main_comp(row: dict, main_comp: Optional[dict]) -> bool:
+    """主面料成分字段「页面现状合计 ≠ 100、且源值能确定性重建」时返回 True。
+
+    【为什么要在 keep_current 这条路上单开口子】模型判「保持原值」的依据是 current，
+    而成分字段读到的 current 只有第 1 行的纤维名——它看不到也不去算这个字段的百分比
+    合计（numValues 虽然就在喂给它的行里，但「保持原值」这条规则本身只管 current 与
+    源参数对不对得上）。于是合计 117% 的字段照样被判「保持原值」，而 keep_current 是
+    【不进 valid】的，comp 分组、合计校验、_rebuild_main_comp 的源值确定性覆盖跟着
+    全被绕过，页面原样留着认领带来的旧行，一路带到保存被平台拦「单个材料属性的百分比
+    之和需等于100」（2026-09-12 商品 908737332112）。
+
+    放行的只有「合计不对」这一类：合计本来就 100 的字段照旧保持原值、一个下拉都不点
+    ——那是这条规则的本意，也是它省时间的价值所在。合计不对的落回正常流程后进 comp
+    分组、被 _rebuild_main_comp 按源主成分含量重建成 2 行，那条路本就是确定性的。
+
+    【前提必须与重建的触发条件严格对齐】多一个 main_comp 有含量的要求：源没给含量时
+    重建压根不会发生，那条 change 会直落下面「合计 100%」的补差分支，被当成唯一一行
+    独占 100%（页面上的 90+5+22 会被写成单行 100%）——那比放着不动更糟。
+
+    【代价：配料纤维降一级依据】重建的第 2 行优先沿用「模型选的配料」，而这条路上模型
+    只给了一条「保持原值」（value 就是主纤维本身），会被 _rebuild_main_comp 的 used 判
+    同过滤掉，于是退到下一级——源属性推断（_infer_filler）或候选表（_COMP_FILLERS）。
+    即页面预填的配料可能被换成另一根纤维。这个取舍是接受的：能触发例外的本就是「页面
+    合计已经不对」的字段，而源属性里明写的纤维本来就比预填更硬；顺带一提，主纤维是
+    聚酯纤维时候选表给出的正是氨纶，与常见的弹性混纺预填一致。
+    """
+    if not (main_comp and main_comp.get("percent")):
+        return False
+    # 「产品属性」是包裹全部属性行的分组标题行，它的 numValues 是各字段百分比的大杂烩
+    # （详见 form._comp_total_problems 的同名排除）。当前 _is_main_comp_label 也会拒掉它
+    # （名字里没有「成分/材质」），但那是两个判据凑巧对齐，靠不住：这里显式挡一道。
+    if str(row.get("label") or "") == "产品属性":
+        return False
+    if not row.get("hasPercent"):
+        return False
+    if not attributes_composition._is_main_comp_label(str(row.get("label") or "")):
+        return False
+    return abs(attributes_composition._comp_percent_total(row) - 100) > 1e-6
+
+
 def _validate_attr_changes(changes: list, attrs: list,
                            main_comp: Optional[dict] = None) -> tuple:
     """对 LLM 的修改清单做二次校验，返回 (valid, rejected)。
@@ -15,7 +55,8 @@ def _validate_attr_changes(changes: list, attrs: list,
       2. 下拉行 value 不在该行 options 内 → 拒（编造值点不中，白跑一趟还留幽灵浮层）；
          数值输入行（kind=number，如里料克重）没有 options，改校验量级合理性，
          并把 LLM 常带的单位剥掉只留数字
-      3. 主面料成分字段：有源含量时按源值重建成分行，模型给的百分比不作准
+      3. 主面料成分字段：有源含量时按源值重建成分行，模型给的百分比不作准；页面现状
+         合计 ≠ 100 的字段连「保持原值」都不认，一并拉进重建（见 _stale_main_comp）
       4. 其余成分类合计必须 100%：不足则自动补一行填充纤维，超过则整组拒绝交人工
 
     main_comp 为 extract.parse_main_composition 的产物（可能为 {}）：为空时第 3 闸
@@ -42,9 +83,13 @@ def _validate_attr_changes(changes: list, attrs: list,
             rejected.append({**c, "rejectReason": "非必填且当前未填，按策略留空"})
         # 【保持原值识别】value == current 且 reason 包含"保持"关键词 → 标记为 keep_current
         # 这类 change 不需要实际写入（页面已经是这个值），但要记录下来，避免被误判为"该改没改"
+        # 【主面料成分的例外】页面合计不对时不吃"保持原值"，落回下面的正常流程走源值重建
+        # （见 _stale_main_comp）。这道例外必须加在这里、不能等进了 valid 再挑：keep_current
+        # 压根不进 valid，一旦记进去，这个字段就再没有别的分支会碰它了。
         elif (c.get("value") == cur and cur and not cur.startswith("(")
               and any(kw in str(c.get("reason", "")).lower()
-                     for kw in ["保持", "keep", "不动", "不改", "原值"])):
+                     for kw in ["保持", "keep", "不动", "不改", "原值"])
+              and not _stale_main_comp(row, main_comp)):
             keep_current.append({**c, "reason": c.get("reason", "") + "（已验证匹配）"})
         elif row.get("kind") == "number":
             # 【数值行不查 options】里料克重这类纯输入行 options 恒为空，走 options 闸
@@ -154,8 +199,9 @@ def _validate_attr_changes(changes: list, attrs: list,
         # 【必须用 _fiber_key 而不是 _norm_fiber】后者只去括号，「涤纶」与「聚酯纤维」
         # 归一后不相等，排除会失效并填出同字段两行同纤维。
         used = {attributes_composition._fiber_key(i.get("value", "")) for i in items}
-        filler = next((o for o in attributes_composition._COMP_FILLERS
-                       if o in opts and attributes_composition._fiber_key(o) not in used), None)
+        # 挑候选必须走 _pick_filler 的 _match_fiber 匹配，不能 `o in opts`：候选表是裸
+        # 写法、options 带括号注解，精确相等全数失配（见 _pick_filler 的说明）。
+        filler = attributes_composition._pick_filler(opts, used)
         if filler:
             valid.append({"label": label, "value": filler, "num": 100 - total,
                           "row": max((i.get("row") or 1) for i in items) + 1,
