@@ -996,7 +996,7 @@ async def extract_product(
         # 以下五个是【看图占位】，enrich_vision 回填，也可人工补（见 SKILL.md 阶段①看图要点）
         "sizeChart": {},
         "sizeMeasurements": {},
-        # 套装的分件实测表（源图按「部件：上衣/连衣裙」分开给时用），结构见 _VISION_PROMPT
+        # 套装的分件实测表（源图按「部件：上衣/连衣裙」分开给时用），结构见 _VISION_PROMPT_DETAIL
         "sizeMeasurementsByPart": [],
         "imageUnderstanding": {},
         "complianceNotes": {},
@@ -1079,7 +1079,21 @@ _VISION_SYSTEM = (
     "只输出 JSON，不要加 ``` 围栏、不要任何解释文字。"
 )
 
-_VISION_PROMPT = """商品标题：{title}
+# 【为什么拆成两发：单发在图多款多的商品上写不完】
+# 2026-09-12 取证（弹珠机 offer，46 张源图截到 40 张、6 个以上款式）：阶段①
+# 连续 3 次断尾，三次都断在 imageUnderstanding.colors 里——第一个字段就耗尽，
+# 后面 7 个字段压根没开始。completion 9765/4859/4726，而该档 max_tokens 配的
+# 32000 只用掉 30%，故不是额度截断（finish_reason 那条告警见 app/llm.py），
+# 是模型自己收笔；_JSON_TRUNCATED_HINT 已把输出压到 4726 仍闭合不了。
+# 同批 20/20/26/16/14 张的商品全部单发成功，40 张这单是唯一的失败——规模是
+# 唯一变量。故按【输出体积】切成两发，而不是去砍图片数或限制描述字数：
+#   第 1 发 imageUnderstanding（colors 逐款 + images 逐张，体积大头）
+#   第 2 发 尺码/成分/complianceNotes（逐张 7 键对象）/duplicates
+# 两发共用同一批图与同一段文件名前言（_VISION_HEAD），各自的输出都减半。
+# 【为什么不并发】两发都要重传整批 base64（40 张图），并发会让请求体同时占用
+# 两份上行带宽；而这里本来就在「几十秒到几分钟」的量级，串行更稳。
+
+_VISION_HEAD = """商品标题：{title}
 源商品属性：{attrs}
 源商品颜色（SKU 里的颜色名）：{colors}
 源商品尺码（SKU 里的尺码）：{sizes}
@@ -1091,8 +1105,11 @@ _VISION_PROMPT = """商品标题：{title}
 desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名的字段（imageUnderstanding
 的 images 键、complianceNotes 的 file、duplicates 的元素）都必须【逐字照抄】清单里那个
 文件名原文——含前缀和编号，【严禁】按「第 N 张」的序号自己编 main-N 之类的名字。
+"""
 
-请完成五件事，合并成一个 JSON 返回：
+
+# 第 1 发：只看懂商品实物。imageUnderstanding 的三个键都在这一发交齐。
+_VISION_PROMPT_UNDERSTAND = """请完成一件事，返回一个 JSON：
 
 1. imageUnderstanding —— 看懂商品实物：
    - "product"：一句话说明品类/款式/版型（如「男童短袖 POLO 衫 + 长裤两件套，翻领拼色」）
@@ -1100,14 +1117,23 @@ desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名�
      认不出某个颜色对应哪张图就不要写那个键。
    - "images"：每个文件名 → 该图内容一句话（模特实拍/平铺/细节特写/尺码表/中文海报…）
 
+
+只输出 JSON：{"imageUnderstanding": {"product": "...", "colors": {...},
+"images": {...}}}"""
+
+
+# 第 2 发：尺码 / 成分 / 合规标注 / 重复图。编号沿用原提示词的 2~6，不重排——
+# 那几段正文里互相引用过编号（如「同 3 的写法」），重排会把引用指错。
+_VISION_PROMPT_DETAIL = """请完成五件事，合并成一个 JSON 返回：
+
 2. sizeChart —— 尺码的【身高体重参考】表（通常印在某张详情图上）：
-   {{"<尺码>": "<身高/体重参考原文>"}}。
+   {"<尺码>": "<身高/体重参考原文>"}。
    尺码键用图里的写法但【不要带「码」字】（如 "120" 或 "120cm"，不要 "120码"）。
-   图里没有身高体重参考表就返回 {{}}。
+   图里没有身高体重参考表就返回 {}。
 
 3. sizeMeasurements —— 尺码的【成品实测尺寸】表（服装是衣长/胸围/袖长/裤长等；
    非服装如毯子/宠物窝/玩具则是直径/长/宽/高/重量等，单位 cm）：
-   {{"<尺码>": {{"<参数名>": <数值>}}}}。同样不带「码」字，值只填数字不带单位。
+   {"<尺码>": {"<参数名>": <数值>}}。同样不带「码」字，值只填数字不带单位。
    参数名照抄图里写法（「朵数/件数」这类非长度列也照抄，下游自己挑）。
    非服装的尺码名可能本身就写着尺寸（如毯子尺码「直径60cm」既是尺码也是直径值），
    尺码键照图里的写法即可。
@@ -1119,25 +1145,25 @@ desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名�
    全围，下游会当全围填进平台，买家拿到的腰围少一半），也【不要自己乘 2】、不要填算好
    的 40，下游会按平台参数要的量法换算。
    图里明确写「腰围全围」「一圈」的，照抄成全围写法即可，同样不要自己换算。
-   图里没有实测尺寸表就返回 {{}}——【不许按经验估算】，估算有后续阶段专门做。
+   图里没有实测尺寸表就返回 {}——【不许按经验估算】，估算有后续阶段专门做。
    注意：图里表格常有「供应商尺寸」「跳码规则」「允差」这类【非尺码列】，
    要取的是各尺码对应的【成品尺寸】那几列，不要把跳码规则/允差当成某个尺码的值。
 
 3a. 表格【没有尺码那一列】时（只有「衣长 胸围 肩宽 重量」这样的参数表头 +
    几行纯数值，行首不写 100/110/S/M）：不要因为凑不出尺码键就整表丢掉——
    这种表商家是靠行序对应尺码的。改填 sizeMeasurementsRows：
-   {{"params": ["<表头参数名，按列序照抄>"],
-     "rows": [[<第一行各列数值，按同一列序>], [<第二行…>]]}}
+   {"params": ["<表头参数名，按列序照抄>"],
+     "rows": [[<第一行各列数值，按同一列序>], [<第二行…>]]}
    行序【严格照图里从上到下】，一行都不要跳过、不要重排。
    参数名照抄表头原文（含「重量」这类非长度列也照抄，下游自己挑）。
-   这种情况 sizeMeasurements 仍返回 {{}}，两个字段不要同时填。
+   这种情况 sizeMeasurements 仍返回 {}，两个字段不要同时填。
 
 3b. sizeMeasurementsByPart —— 套装商品【按部件分开给】的实测表：
    源图上常见「(主) 部件：连衣裙」「(主) 部件：上衣」这样的小标题，各自带一张表，
    两件的测量部位完全不同（上衣量肩宽/袖长/胸围，裙子量裙长/腰围）。
    出现这种分件表时，逐件输出：
-   [{{"part": "<部件名，照抄图里的写法，如 上衣/连衣裙/裤子>",
-      "measurements": {{"<尺码>": {{"<参数名>": <数值>}}}}}}]
+   [{"part": "<部件名，照抄图里的写法，如 上衣/连衣裙/裤子>",
+      "measurements": {"<尺码>": {"<参数名>": <数值>}}}]
    只有一张表（非套装，或套装只给了一张合表）时返回 []。
    这个字段【很重要】：填平台尺码表时套装要填两张，两张的数值必须各按自己那件来，
    混用会给买家一份错尺码表。sizeMeasurements 仍照上面填（多张表时取第一张即可）。
@@ -1146,27 +1172,27 @@ desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名�
    图里若有洗水标、吊牌或成分说明，提取其中的纤维名与百分比。分两种情况：
 
    (a) 单一成分（整个商品统一成分，常见于洗水标特写）：
-       {{"main": {{"<纤维名>": <百分比数值>}}}}
-       例如洗水标写「35% Cotton 65% Polyester」→ {{"main": {{"Cotton": 35, "Polyester": 65}}}}
-       或中文「棉 35% 涤纶 65%」→ {{"main": {{"棉": 35, "涤纶": 65}}}}
+       {"main": {"<纤维名>": <百分比数值>}}
+       例如洗水标写「35% Cotton 65% Polyester」→ {"main": {"Cotton": 35, "Polyester": 65}}
+       或中文「棉 35% 涤纶 65%」→ {"main": {"棉": 35, "涤纶": 65}}
 
    (b) 按款式/颜色区分（不同款式成分不同，常见于多款吊牌并列）：
-       {{"byVariant": {{"<款式/颜色名>": {{"<纤维名>": <百分比数值>}}}}}}
+       {"byVariant": {"<款式/颜色名>": {"<纤维名>": <百分比数值>}}}
        例如图里有两张吊牌：卡通款「35% Cotton 65% Polyester」、花边款「82% Cotton 18% Polyester」
-       → {{"byVariant": {{"卡通款": {{"Cotton": 35, "Polyester": 65}},
-                         "花边款": {{"Cotton": 82, "Polyester": 18}}}}}}
+       → {"byVariant": {"卡通款": {"Cotton": 35, "Polyester": 65},
+                         "花边款": {"Cotton": 82, "Polyester": 18}}}
 
    成分提取规则：
    - 纤维名照抄图里的写法（中英文都可，不要自己翻译或归一）；
    - 百分比只填数字，不带 % 符号；
    - 图里只写纤维名没给百分比时，不要编造数值、留空；
    - 如果按款式区分，款式名尽量与「源商品颜色」对齐，但不强制——图里怎么写就怎么记录；
-   - 图里压根没有成分标签时返回 {{}}，【不要按商品照片猜材质】。
+   - 图里压根没有成分标签时返回 {}，【不要按商品照片猜材质】。
 
 5. complianceNotes —— 逐张标注合规风险（Temu 不接受中文/水印/他人 logo）：
-   "files"：[{{"file": "<文件名>", "chinese": true/false, "watermark": true/false,
+   "files"：[{"file": "<文件名>", "chinese": true/false, "watermark": true/false,
    "logo": true/false, "kind": "<模特实拍|平铺|细节|尺码表|洗水标|吊牌|中文海报|工厂图|其它>",
-   "clean": true/false, "note": "<10字内>"}}]
+   "clean": true/false, "note": "<10字内>"}]
    clean=true 的判据：无任何中文文字、无水印、无他人品牌 logo，且画面就是商品本身
    （阶段⑥ 挑素材图、阶段⑪ 删描述图直接读这个字段）。
 
@@ -1176,31 +1202,44 @@ desc-03.jpg，前缀可能是 main- 或 desc-）。下面所有要填文件名�
    【同款不同颜色/不同图案的图不算重复】——哪怕都是挂拍平铺、构图高度一致，只要
    颜色或图案不同，就各自保留、不要写进 duplicates。图里没有重复就返回 []。
 
-只输出 JSON：{{"imageUnderstanding": {{...}}, "sizeChart": {{...}},
-"sizeMeasurements": {{...}}, "sizeMeasurementsRows": {{...}},
-"sizeMeasurementsByPart": [...], "composition": {{...}},
-"complianceNotes": {{"files": [...]}}, "duplicates": [[...], ...]}}"""
+只输出 JSON：{"sizeChart": {...}, "sizeMeasurements": {...},
+"sizeMeasurementsRows": {...}, "sizeMeasurementsByPart": [...],
+"composition": {...}, "complianceNotes": {"files": [...]},
+"duplicates": [[...], ...]}"""
 
-class VisionResult(BaseModel):
-    """阶段① 视觉回填的必答字段（校验与重试见 llm._check_result）。
-
-    【为什么只声明这四个】它们对应提示词里的 1/2/3/5 条，任何商品都该有答案——
-    没有尺码表就回 {}，那也是答案。而 sizeMeasurementsRows（只有「没有尺码列的
-    表」才用得上）、sizeMeasurementsByPart（只有套装才有两件）、composition
-    （只有拍到成分标签才有）都是条件字段，声明成必填等于逼模型编。
-    未声明的字段不受影响：extra 默认 ignore，模型照答、_merge_vision 照读
-    （返回的是原始 dict，不是 model_dump 的产物，见 _check_result）。
+class VisionUnderstandResult(BaseModel):
+    """阶段① 第 1 发（看懂实物）的必答字段（校验与重试见 llm._check_result）。
 
     【这道闸拦的是哪一类】2026-09-03 offer 968804940018 那次是整份断尾、解析就
-    过不去；但同一个毛病还有一种更隐蔽的形态——模型只答完 imageUnderstanding 就
-    规规矩矩收尾，JSON 完全合法、解析通过，_merge_vision 挨个 isinstance(got, dict)
-    查下来全不成立，于是尺码字段静默留空，日志只报「尺码参考 0 | 实测尺寸 0」。
+    过不去；但同一个毛病还有一种更隐蔽的形态——模型规规矩矩收尾、JSON 完全合法、
+    解析通过，但该答的字段压根没答，_merge_vision 挨个 isinstance(got, dict) 查
+    下来全不成立，于是字段静默留空，日志只报「颜色理解 0」。
     那种解析这关拦不住，只能靠这里。
+
+    【拆两发后为什么各自单独声明】原先一个 VisionResult 声明四个字段，两发之后
+    每一发都只该交自己那部分：拿全四个字段去校验第 1 发，它必然缺尺码/合规而被
+    判「结构不合格」，重问三次照样缺——闸门会把本来正确的响应全部打回。
     """
 
     model_config = ConfigDict(strict=True)
 
     imageUnderstanding: dict
+
+
+class VisionDetailResult(BaseModel):
+    """阶段① 第 2 发（尺码/成分/合规/重复图）的必答字段。
+
+    【为什么只声明这三个】它们对应提示词里的 2/3/5 条，任何商品都该有答案——
+    没有尺码表就回 {}，那也是答案。而 sizeMeasurementsRows（只有「没有尺码列的
+    表」才用得上）、sizeMeasurementsByPart（只有套装才有两件）、composition
+    （只有拍到成分标签才有）、duplicates（可以为空数组）都是条件字段，声明成
+    必填等于逼模型编。
+    未声明的字段不受影响：extra 默认 ignore，模型照答、_merge_vision 照读
+    （返回的是原始 dict，不是 model_dump 的产物，见 _check_result）。
+    """
+
+    model_config = ConfigDict(strict=True)
+
     sizeChart: dict
     sizeMeasurements: dict
     complianceNotes: dict
@@ -1227,7 +1266,7 @@ def dedup_images(outdir: str) -> tuple[list, dict]:
     「商家重复上传给不同颜色的主图」误判成重复——前者被错误合并，后者（颜色主图）被
     标 duplicate 后阶段⑦ 配不上颜色（1071736188944 短裤套装 8 色全配不上就是它）。
     故本函数只保留 md5 轮（字节相同的副本，确定性、绝不误伤）；「画面相似但字节不同」
-    的近重复，交给 enrich_vision 的 LLM 看全图后按语义判断，见 _VISION_PROMPT 的
+    的近重复，交给 enrich_vision 的 LLM 看全图后按语义判断，见 _VISION_PROMPT_DETAIL 的
     duplicates 字段与 _merge_vision 的合并。_dedup_near 保留但不再被调用，理由同上。
     """
     import hashlib
@@ -1681,7 +1720,7 @@ async def _merge_vision(info: dict, vision: dict, dupes: dict,
         color_main = {v.get("mainFile") for v in (info.get("colorImages") or {}).values()
                       if isinstance(v, dict) and v.get("mainFile")}
         # 【近重复由 LLM 判断】dedup_images 现在只做 md5 精确去重，「画面相似但字节不同」
-        # 的近重复由视觉回填的 LLM 判（_VISION_PROMPT 第 6 条 duplicates），这里合并进
+        # 的近重复由视觉回填的 LLM 判（_VISION_PROMPT_DETAIL 第 6 条 duplicates），这里合并进
         # 局部 all_dupes 一起标 duplicate。LLM 看的是 md5 去重后的全图，能按画面语义
         # 区分「同款不同颜色」——那是 ahash 灰度哈希分不清、会误伤的（见 dedup_images）。
         # 不改 dupes 参数：result["duplicates"] 仍只报字节相同的副本，LLM 的近重复
@@ -1771,17 +1810,42 @@ async def enrich_vision(
 
     names = [os.path.basename(p) for p in uniq]
     listing = "\n".join(f"第{i} 张：{n}" for i, n in enumerate(names, 1))
-    prompt = _VISION_PROMPT.format(
+    head = _VISION_HEAD.format(
         title=info.get("title") or "（无）",
         attrs=json.dumps(info.get("attributes") or {}, ensure_ascii=False),
         colors=json.dumps(info.get("colors") or [], ensure_ascii=False),
         sizes=json.dumps(info.get("sizes") or [], ensure_ascii=False),
         n=len(names), listing=listing,
     )
+    # 【两发串行，各自带全部图】拆分动机见 _VISION_HEAD 上方那段取证。两发都要看
+    # 同一批图（第 1 发按图写 colors/images，第 2 发按图逐张标 complianceNotes），
+    # 图片清单前言也必须一模一样——两边的文件名语义得对得上，否则 _merge_vision
+    # 的幻影文件名还原会把两发的结论对到不同的图上。
     vision = await ask_json_with_images(
-        prompt, uniq, what="阶段①视觉回填", system=_VISION_SYSTEM, stage="extract",
-        result_model=VisionResult,
+        head + _VISION_PROMPT_UNDERSTAND, uniq,
+        what="阶段①视觉回填(1/2 看懂实物)", system=_VISION_SYSTEM, stage="extract",
+        result_model=VisionUnderstandResult,
     )
+    # 【第 2 发失败不能让第 1 发的成果一起丢】ask_json_with_images 失败是抛异常，
+    # 直接往上抛会让整个 enrich_vision 失败、连已拿到的 imageUnderstanding 一起作废，
+    # 而调用方 extract_product 只会记一句「视觉回填失败」——回到拆分前的下场。
+    # 故这里吞掉第 2 发的异常、只警告：颜色理解已经到手（属性/标题/选图都靠它），
+    # 尺码与合规标注留空由后续阶段各自的兜底处理（⑨ 尺码表自己会估算、⑥⑦ 选图
+    # 在 complianceNotes 空时会退回「看图挑」）。这与本项目 best-effort 的取向一致。
+    try:
+        detail = await ask_json_with_images(
+            head + _VISION_PROMPT_DETAIL, uniq,
+            what="阶段①视觉回填(2/2 尺码合规)", system=_VISION_SYSTEM, stage="extract",
+            result_model=VisionDetailResult,
+        )
+    except Exception as e:
+        logger.warning(
+            f"阶段①视觉回填第 2 发（尺码/成分/合规标注/重复图）失败，"
+            f"第 1 发的颜色理解已保留、本阶段继续：{e}")
+        detail = {}
+    # 第 1 发的键优先：两发的字段本来不重叠，重叠只可能是模型多答了不该答的，
+    # 那种情况以「本该由这一发负责」的那份为准（同 _merge_vision「已填不覆盖」的取向）
+    vision = {**detail, **vision}
 
     stat = await _merge_vision(info, vision, dupes, names=names)
     with open(info_path, "w", encoding="utf-8") as f:

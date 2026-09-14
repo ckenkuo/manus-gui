@@ -5,6 +5,7 @@ import re
 from app.logger import logger
 from app.publish import common, images, variant_dom
 from app.publish.browser import BrowserSession, DRAFT_LIST_URL, EDIT_URL, J
+from app.publish.media import carousel as media_carousel
 from app.publish.media import preview as media_preview
 from typing import Optional
 
@@ -416,6 +417,40 @@ _JS_LIVE_STATE = r"""(async () => {
     });
   }
 
+  // ⑤c 产品轮播图：产品信息区 .img-list，与上面 attrImg*（变种属性区）、preview*
+  // （变种信息表）都不是同一处图——2026-09-12 弹珠机那单正是 ⑦⑦b 都跑过、轮播图
+  // 从未被碰过而被平台拒「产品轮播图尺寸不能小于800*800」。
+  // 【只统计已勾选的】平台校验的是选用的那几张，候选池里的非 1:1 图不参与发布。
+  // 尺寸取每格的 .img-size 文本（格子里的 img 是 120px 缩略图，naturalWidth 读不到
+  // 源图尺寸）；文本读不到时不计入 bad——未知不等于不合格（同 carousel_state）。
+  let carouselPicked = 0, carouselBad = 0;
+  (() => {
+    // 定位判据与 media/carousel.pickCarouselList 一致：按「格子里有没有 checkbox」
+    // 认出轮播图区，不按「产品轮播图」标签文字找——素材图区的说明文字里也有这四个字
+    // （2026-09-13 真站实测，见那个函数上方的取证）。
+    const lists = Array.from(document.querySelectorAll('.img-list')).filter(L => {
+      const its = Array.from(L.querySelectorAll('.single-image'));
+      return its.length && its.some(el => !!el.querySelector('input.ant-checkbox-input'));
+    });
+    if (!lists.length) return;
+    lists.sort((a, b) => b.querySelectorAll('.single-image').length
+                       - a.querySelectorAll('.single-image').length);
+    const list = lists[0];
+    Array.from(list.querySelectorAll('.single-image')).forEach(el => {
+      const cb = el.querySelector('input.ant-checkbox-input');
+      const checked = /(^|\s)checked(\s|$)/.test(el.className) || !!(cb && cb.checked);
+      if (!checked) return;
+      carouselPicked++;
+      const m = /(\d+)\s*[xX×]\s*(\d+)/.exec(txt(el.querySelector('.img-size')));
+      if (!m) return;
+      const w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+      if (w && h && (Math.abs(w / h - 1) >= 0.01
+                     || w < __CAROUMIN__ || h < __CAROUMIN__)) {
+        carouselBad++;
+      }
+    });
+  })();
+
   // ③ 类目：三个信号一起读，任一命中即判「类目丢了/失效」，须从 ③ 重跑。
   // catText 取分类下拉的当前值（回落到认领旧值时这里是「其他（...）」这类占位类目）；
   // catUnset 读分类行下方那个暗红提示块（.category-list，实测文案「未选择分类」）——
@@ -476,6 +511,10 @@ _JS_LIVE_STATE = r"""(async () => {
     // ⑦b：预览图总数与其中不合规的张数（0 张说明该类目没有这一列，交阶段自己判）
     previewCount: previewCount,
     previewBad: previewBad,
+    // ⑤c：已选用的轮播图张数与其中不合规的张数（0 张说明区块没渲染/没找到，
+    // 交阶段自己判——它对 supported=None 会如实报 fail，不静默跳过）
+    carouselPicked: carouselPicked,
+    carouselBad: carouselBad,
     shippingSet: !!(shipSel && txt(shipSel)) && !!shipRadio,
     descImgCount: descImgs.length,
     descForeignCount: foreign.length,
@@ -492,6 +531,7 @@ async def live_state(session: BrowserSession) -> dict:
         _JS_LIVE_STATE.replace("__MINW__", str(images.CLOTH_MIN_W))
                       .replace("__MINH__", str(images.CLOTH_MIN_H))
                       .replace("__PREVMIN__", str(media_preview.PREVIEW_MIN_SIDE))
+                      .replace("__CAROUMIN__", str(media_carousel.CAROUSEL_MIN_SIDE))
                       .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if not st.get("rendered"):
         logger.warning("编辑页 SKU 区未渲染完，实况判定按「全部需重跑」处理")

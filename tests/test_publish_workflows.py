@@ -94,7 +94,9 @@ def test_size_normalization_is_source_specific():
     alibaba_size = size_normalizer(info_for("1688"))
     assert pdd_size("【直径 60cm+22朵玫瑰】") == "60"
     assert temu_size("110-120") == "110-120"
-    assert alibaba_size("110-120") == "110"
+    assert alibaba_size("110-120") == "110-120"
+    assert alibaba_size("36—37") == "36-37"
+    assert alibaba_size("36.5") == "36.5"
     assert temu_size("Asian Tall XL") == "Asian Tall XL"
     assert temu_size("6-9M") == "6-9m"
     assert alibaba_size("L背30") == "L"

@@ -119,7 +119,7 @@ def test_order_preserved(tmp_path):
 def test_dedup_images_md5_only_keeps_near_duplicates(tmp_path):
     """去掉了 ahash 近重复轮：放大版 main-02 不再被合并，dedup_images 只做 md5 字节去重。
 
-    近重复改由 enrich_vision 的 LLM 判断（_VISION_PROMPT 的 duplicates），故 dedup_images
+    近重复改由 enrich_vision 的 LLM 判断（_VISION_PROMPT_DETAIL 的 duplicates），故 dedup_images
     只合并字节相同的副本，duplicateOf 恒指向仍在 uniq 里的首见文件（无需 rehop）。
     """
     # main-01 是大图；desc-01 与 main-01 字节完全相同（md5 轮把 desc-01 → main-01）；

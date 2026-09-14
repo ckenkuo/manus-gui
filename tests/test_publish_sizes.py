@@ -6,6 +6,26 @@
 先把已勾选尺码全部取消、再报错（先破坏再失败）。故两侧必须共用同一归一函数。
 """
 from app.publish.pipeline import norm_size
+import pytest
+
+
+@pytest.mark.parametrize("value", ["36—37", "36–37", "36－37", "36-37码", "36 / 37"])
+def test_shoe_pair_size_preserves_both_ends(value):
+    assert norm_size(value) == "36-37"
+
+
+def test_shoe_single_half_and_pair_sizes_do_not_collide():
+    values = ["36", "36.5", "36-37", "36-38"]
+    assert len({norm_size(value) for value in values}) == len(values)
+
+
+def test_shoe_source_selects_only_its_three_pairs():
+    source = ["38—39", "40—41", "36—37"]
+    options = ["36", "36.5", "38", "38.5", "40", "40.5",
+               "36-37", "36-38", "38-39", "38-40", "40-41", "40-42"]
+    wanted = {norm_size(value) for value in source}
+    assert [value for value in options if norm_size(value) in wanted] == [
+        "36-37", "38-39", "40-41"]
 
 
 def test_带建议身高描述的数字码():

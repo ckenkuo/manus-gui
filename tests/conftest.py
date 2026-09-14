@@ -37,16 +37,6 @@ def _isolate_publish_cache(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _block_publish_recovery_network(monkeypatch):
-    from app.publish import recovery
-
-    def blocked(tools):
-        raise RuntimeError("离线测试禁止调用真实 Manus；恢复测试须注入假 agent")
-
-    monkeypatch.setattr(recovery, "_create_agent", blocked)
-
-
-@pytest.fixture(autouse=True)
 def _block_publish_alert(monkeypatch):
     """禁止单测把飞书告警真发出去。
 

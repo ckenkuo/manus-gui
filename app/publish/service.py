@@ -72,6 +72,7 @@ from app.publish.sizes import fix_sizes
 from app.publish.sku_codes import fix_sku_codes
 from app.publish.sources import base as sources_base
 from app.publish.stages import (
+    carousel as stages_carousel,
     cleaning as stages_cleaning,
     description as stages_description,
     extracting as stages_extracting,
@@ -115,6 +116,7 @@ from app.publish.stages.form import (
     _st_claim as _st_claim,
     _st_titles as _st_titles,
 )
+from app.publish.stages.carousel import _st_carousel as _st_carousel
 from app.publish.stages.material import _st_material as _st_material
 from app.publish.stages.preview import _st_sku_preview as _st_sku_preview
 from app.publish.stages.prewarm import (
@@ -163,7 +165,6 @@ from app.publish.state import (
     save_state as save_state,
 )
 from app.publish.stock import set_stock
-from app.publish.recovery import recover_stage
 from app.publish.titles import generate_titles, set_titles
 from app.publish.variant_colors import accessory_colors_from_rows, drop_accessory_colors
 from app.publish.variants import set_variant
@@ -183,6 +184,7 @@ STAGES = [
     ("attrs", "④ 属性审核"),
     ("titles", "⑤ 标题产地"),
     ("clean_images", "⑤b 图片清理"),
+    ("carousel", "⑤c 产品轮播图"),
     ("material", "⑥ 素材图"),
     ("drop_acc", "⑦a 剔配件色"),
     ("skc", "⑦ SKC颜色图"),
@@ -314,6 +316,7 @@ _STAGE_FUNCS = {
     "attrs": stages_form._st_attrs,
     "titles": stages_form._st_titles,
     "clean_images": stages_cleaning._st_clean_images,
+    "carousel": stages_carousel._st_carousel,
     "material": stages_material._st_material,
     "drop_acc": stages_skc._st_drop_acc,
     "skc": stages_skc._st_skc,
@@ -599,15 +602,9 @@ async def _run_product(
                 status, note = "fail", f"异常：{e}"
                 r = {"status": status, "note": note}
                 logger.exception(f"[{key}] 阶段 {sid} 异常")
-            if status == "fail":
-                r = await recover_stage(ctx, session, sid, r, handlers, emit)
-                status = r.get("status") if r.get("status") in stages_results._DONE else "fail"
-                note = r.get("note") or note
             elapsed = round(time.monotonic() - st0, 1)
             state["stages"][sid] = {"status": status, "elapsed_s": elapsed,
                                     "note": note[:200]}
-            if r.get("recovery"):
-                state["stages"][sid]["recovery"] = r["recovery"]
             # ctx 里后续的产出（rowid/info_path/workdir/title/cat_path/cat_id）回写状态，
             # 续跑全靠它们。cat_id 是阶段③选定的叶子类目 id，阶段④ 要用它查属性选项
             # ——续跑 from attrs 时阶段③被跳过，不持久化就取不到（旧状态文件没这个键
@@ -626,8 +623,7 @@ async def _run_product(
                 state["failed_stage"] = sid
                 publish_state.save_state(state)
                 # 【必须在 save_state 之后采】快照里的 state 是从断点文件重读的，先落盘
-                # 才对得上。主出口也是现场最全的一处：ctx/run_ids/stale_form 在手边，
-                # 兜底 Manus 的工具历史也已随上面写进 state（stage 的 recovery 键）。
+                # 才对得上。主出口也是现场最全的一处：ctx/run_ids/stale_form 在手边。
                 # 不传 traceback：阶段失败大多是「正常返回 fail」而非抛异常，异常那条
                 # （上面 except 转成 note="异常：…"）到这一步已经出了 except 块，
                 # 此时再 format_exc() 只会得到一句 NoneType: None。
@@ -644,7 +640,7 @@ async def _run_product(
             # ① 刚跑完就起预热，让它与 ② 认领、③ 类目并行（那两步实测 50~350s，
             # 期间浏览器在忙、LLM 完全空闲）。放在 stage_done 之后：预热失败不该影响
             # ① 的阶段结论，而它需要 ① 落下的 info_path/workdir。
-            if sid == "extract" and status in stages_results._DONE:
+            if sid == "auto_cat" and status in stages_results._DONE:
                 stages_prewarm._start_prewarm(ctx, emit)
 
         state["status"] = "ok"
@@ -745,8 +741,8 @@ async def run_batch(
     # 【视觉模型预检：错配直接中止批次】看图阶段（①/⑤b/⑥/⑦/⑬）的调用一进
     # ask_with_images 就查多模态白名单，config 的模型名与代码白名单错配时请求
     # 根本发不出去；① 的回填又是 best-effort 静默吞，第一个硬炸点要等到 ⑥——
-    # 每个商品白跑五个阶段、再各拖一轮 Manus 兜底才记 fail（2026-09-11 白名单
-    # 改名、两台生产机配置没跟上，25 个商品排队等人工）。开跑前一次拦清。
+    # 每个商品白跑五个阶段才记 fail（2026-09-11 白名单改名、两台生产机配置没跟上，
+    # 25 个商品排队等人工）。开跑前一次拦清。
     vision_problems = vision_model_problems()
     if vision_problems:
         await _emit(on_progress, {

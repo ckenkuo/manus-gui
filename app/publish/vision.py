@@ -114,6 +114,8 @@ class DescAction(BaseModel):
 
     pos: int
     action: Literal["keep", "delete", "replace", "sizechart"]
+    scope: Literal["skuRelevance", "productShared", "irrelevant"] = "productShared"
+    confidence: float = 0.0
 
 
 class DescPlan(BaseModel):
@@ -744,8 +746,15 @@ Temu 半托管发布只关心商品图，请逐张决定动作：
   ——保留画面，把中文英化并移除水印后替换；
 - "keep"：干净的商品图（无中文/水印/他人 logo）——保留。
 
+同时给出图片范围标注：
+- "skuRelevance"：明确展示某个已发布 SKU/颜色；
+- "productShared"：尺码、材质、洗护、包装或所有颜色共用的信息；
+- "irrelevant"：重复、装饰、工厂/公司介绍或与商品无关。
+只有明确属于 irrelevant 且 confidence >= 0.9 才删除；不确定一律保留。
+
 只输出 JSON：{{"actions": [{{"pos": 1, "action": "{acts_enum}",
-"reason": "<10字内>"}}]}}
+"reason": "<10字内>", "scope": "skuRelevance|productShared|irrelevant",
+"confidence": 0.0}}]}}
 actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     # pos 必须是整数：模型偶尔回字符串 "1"，下面 `pos not in valid_pos` 不成立就把
     # 那张图整条动作丢掉（既不删也不换、静默留着 1688 原图），故在这里先重问。
@@ -762,7 +771,18 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
         pos, act = a.get("pos"), a.get("action")
         if pos not in valid_pos:
             continue
-        if act == "delete":
+        scope = a.get("scope")
+        confidence = a.get("confidence")
+        if scope not in ("skuRelevance", "productShared", "irrelevant"):
+            scope, confidence = "productShared", 0.0
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        # Keep compatibility with older model responses/tests that only returned action.
+        legacy_delete = "scope" not in a
+        if act == "delete" and ((legacy_delete and confidence == 0.0)
+                                 or (scope == "irrelevant" and confidence >= 0.9)):
             delete.append(pos)
         elif act in ("replace", "sizechart"):
             rep = {"pos": pos, "url": valid_pos[pos]["url"],

@@ -580,7 +580,7 @@ async def set_attr(session: BrowserSession, label: str, value: str,
 
     clicked: dict = {}
     cur: Optional[dict] = None
-    for attempt in (1, 2):
+    for attempt in (1, 2, 3, 4):
         await attributes_dropdowns._open_attr_dropdown(session, label, sel_idx=row_no - 1)
         # 等浮层里的选项真渲染出来（替代固定 sleep(0.6)，上限同为 0.6s）：
         # _open_attr_dropdown 的收敛条件只是「浮层可见」，而浮层可见 ≠ 里面的

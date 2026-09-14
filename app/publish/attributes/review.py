@@ -485,6 +485,17 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
                     continue
                 # 从 changes 里提取该字段的所有行，用已有选项重新校验
                 comp_changes = [c for c in changes if c["label"] == label]
+                # 失败重试必须带上本轮已经写成功的同组行；否则只重写失败行
+                # 会把旧行留在页面上，形成 35% + 100% 这样的错误合计。
+                by_row = {int(c.get("row") or 1): c for c in comp_changes}
+                for a in applied:
+                    if (a.get("label") == label and a.get("num") is not None
+                            and a.get("kind") != "number"):
+                        by_row.setdefault(int(a.get("row") or 1), {
+                            "label": label, "value": a.get("value"),
+                            "num": a.get("num"), "row": a.get("row"),
+                            "kind": a.get("kind") or "select"})
+                comp_changes = list(by_row.values())
                 if not comp_changes:
                     continue
                 # 重新校验：只校验这一组，复用 _validate_attr_changes 的成分校验逻辑
@@ -519,6 +530,29 @@ async def _apply_attr_changes(session: BrowserSession, changes: list, row_map: d
                         logger.warning(f"{label} 行{c.get('row')} 重写仍失败：{r.get('reason')}")
                         break
                     await asyncio.sleep(1.0)  # 成分行间等待
+                if retry_ok:
+                    target_rows = max((int(c.get("row") or 1) for c in validated), default=1)
+                    trimmed = await attributes_form._trim_comp_rows(
+                        session, label, target_rows)
+                    if trimmed.get("err"):
+                        retry_ok = False
+                        logger.warning(
+                            f"{label} 整组重试裁剪旧行失败，保留 comp_failed: {trimmed['err']}")
+                if retry_ok:
+                    try:
+                        reread = await session.eval_json(attributes_form._JS_LIST_ATTR_ROWS)
+                        problems = attributes_form._comp_total_problems(
+                            (reread or {}).get("attrs", []))
+                        if any(p.get("label") == label for p in problems):
+                            retry_ok = False
+                            total = next(
+                                (p.get("total") for p in problems
+                                 if p.get("label") == label), "unknown")
+                            logger.warning(
+                                f"{label} 整组重试回读合计仍为 {total}%，保留 comp_failed")
+                    except Exception as e:
+                        retry_ok = False
+                        logger.warning(f"{label} 整组重试回读校验失败，保留 comp_failed: {e}")
                 if retry_ok:
                     comp_retry_ok.append(label)
                     logger.info(f"{label} 整组重试成功，从 comp_failed 移除")

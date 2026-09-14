@@ -49,9 +49,9 @@ async def _park_ghost_dropdowns(session: BrowserSession) -> dict:
     React 的 style diff，React 手里那份值没变就不重写 DOM，park 写的 0px 于是永久
     残留。浮层塌成 8px 宽（antd dropdown 的 padding 4×2），虚拟列表滚不动
     （scrollHeight == clientHeight，日志里 256/256），只渲染首屏 10 项，而目标
-    「色丁布」是第 21 项——点选与滚动都只能报 option-not-rendered，兜底 agent 从这
-    一步起全程无解，最后按「未能通过原阶段校验」判商品失败。日志里的铁证是
-    ddStyle 那两个值：`min-width: 0px; width: 0px`，全项目只有这段代码会那么写。
+    「色丁布」是第 21 项——点选与滚动都只能报 option-not-rendered，该行从此无解，
+    最后按「必填仍空」判商品失败。日志里的铁证是 ddStyle 那两个值：
+    `min-width: 0px; width: 0px`，全项目只有这段代码会那么写。
     用类就绕开了 React 管的属性：要恢复只需把类摘掉（_unpark_own_panel / _js_unpark）。
 
     归零宽度就够让它既看不见也点不到（外加 visibility/pointer-events 两道），
@@ -197,8 +197,8 @@ async def _open_attr_dropdown(session: BrowserSession, label: str,
         # 【已打开也要摘一次停靠类】Vue 的打开态与浮层的铺开状态是两回事：上一次读完
         # 选项后 park 过、而打开态没关（合成事件路径下很常见），这里就会一边报
         # already=true、一边把塌缩的浮层交出去。2026-09-11 商品 1044382261282 的
-        # 「面料类型」正是如此：兜底 agent 的 dxm_attribute_open 报 already=true，
-        # 紧接着的 dxm_attribute_click 却一律 option-not-rendered。
+        # 「面料类型」正是如此：本函数报 already=true，紧接着的
+        # _click_dropdown_option 却一律 option-not-rendered。
         await _unpark_own_panel(session, label, sel_idx)
         return {"opened": True, "already": True}
     # 没打开：先清残留浮层（park 停靠 + Escape 关 Vue 内部态），再点开。
@@ -267,7 +267,16 @@ def _js_own_panel(label: str, sel_idx: int = 0) -> str:
       let el = cid ? document.getElementById(cid) : null;
       for (let k = 0; el && k < 6 && !el.classList.contains('ant-select-dropdown'); k++)
         el = el.parentElement;
-      return (el && el.classList.contains('ant-select-dropdown')) ? el : null;
+      if (el && el.classList.contains('ant-select-dropdown')) return el;
+      // 部分页面的第二行 select 尚未挂 aria-controls；按当前行附近的
+      // 可见浮层兜底，避免把第 1 行的幽灵浮层当成目标。
+      const ry = it.getBoundingClientRect().top;
+      const ds = Array.from(document.querySelectorAll('.ant-select-dropdown'))
+        .filter(d => !d.classList.contains('dxm-ghost-parked'))
+        .map(d => ({d, r: d.getBoundingClientRect()}))
+        .filter(x => x.r.width > 50 && x.r.height > 0)
+        .sort((a, b) => Math.abs(a.r.top - ry) - Math.abs(b.r.top - ry));
+      return ds.length ? ds[0].d : null;
     })()""".replace("__LABEL__", J(label)).replace("__IDX__", str(sel_idx))
 
 

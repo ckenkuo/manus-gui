@@ -995,6 +995,22 @@ class LLM:
                     response.usage.prompt_tokens,
                     getattr(response.usage, "completion_tokens", 0) or 0,
                 )
+                # 【正文非空的截断必须留痕】_is_truncated_empty 那两道保险只认
+                # 「content 为空」，半截正文在这一层是漏网的（刻意：这层拿到的是裸
+                # 字符串，判 JSON 完整性是 app/publish/llm.py 的活）。但「被额度截断」
+                # 与「模型自己收笔」两者处置相反——前者要抬额度，后者要压输出体积，
+                # 而 finish_reason 到此为止就丢了，事后只能拿 completion_tokens 反推。
+                # 2026-09-12 弹珠机那单阶段①视觉回填连续 3 次断尾，日志里没有任何
+                # 截断迹象，排查时先把 32000 的额度误当成 8192 才把方向带偏。
+                # 故这里只记一条 warning，不改任何控制流。
+                _fr = getattr(response.choices[0], "finish_reason", "")
+                if _fr == "length":
+                    logger.warning(
+                        f"LLM 正文被额度截断（finish_reason=length，content 非空）："
+                        f"model={self.model} max_tokens={used_tokens} "
+                        f"completion={getattr(response.usage, 'completion_tokens', 0)}；"
+                        "下游若报「JSON 断尾未闭合」，根因是额度不够而非模型早停"
+                    )
                 return response.choices[0].message.content
 
             # 处理流式请求

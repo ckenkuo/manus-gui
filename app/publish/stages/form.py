@@ -130,14 +130,12 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
         # 【如实判 fail，不再静默放过】原先这里只发提示就 return ok，结果是④放过、
         # 后面⑨⑩⑪⑫⑬⑬b 十几个阶段白跑，到⑭ save 才报「产品信息校验未过」，那时
         # 现场早离开属性页（2026-09-11 商品 1052052060281 的「颜色」即此；与⑦b预览图
-        # 2026-09-01 两单是同一个静默放过模式，见 preview.py 的复盘）。判 fail 后交给
-        # Manus ReAct 兜底：agent 用 dxm_attribute_open/options/click 补选，再复跑
-        # dxm_stage_attrs —— 复跑走的还是本函数，故「必填是否还空」是主流程与兜底
-        # 共用的唯一判据，补不上就一路 fail 到商品终止，不会带着空属性往下跑。
+        # 2026-09-01 两单是同一个静默放过模式，见 preview.py 的复盘）。判 fail 后商品
+        # 在④ 终止并保留属性页现场，交人工按上面那条 manual_check 补选，不会带着空属性
+        # 往下跑。
         # 【清单放 note 开头】service 与状态文件都会把 note 截到 200 字符（service.py
-        # 的 note[:200]），改写统计被截掉无所谓，「还差哪几行」被截掉 agent 就没方向了。
-        # unfilledRequired 另以结构化字段透出：recover_stage 把整个 failure 字典塞进
-        # 给 agent 的 request，故那条路不受 200 字符限制。
+        # 的 note[:200]），改写统计被截掉无所谓，「还差哪几行」被截掉就看不出缺什么了；
+        # unfilledRequired 另以结构化字段原样透出，不受这 200 字符限制。
         return {"status": "fail",
                 "note": f"必填仍空：{'、'.join(miss)}；{note}"[:200],
                 "unfilledRequired": miss}
@@ -149,7 +147,7 @@ async def _st_attrs(ctx: dict, session: BrowserSession, emit) -> dict:
         # 商品 908737332112 的 117% 就是这么漏过去的，判据与两条来路见
         # attributes_form._comp_total_problems）。
         # 清单放 note 开头：note 会被截到 200 字符，改写统计被截掉无所谓，「哪个字段差多少」
-        # 被截掉 agent 就没方向了；badCompTotals 另以结构化字段透出，不受 200 字符限制。
+        # 被截掉就看不出缺什么了；badCompTotals 另以结构化字段透出，不受 200 字符限制。
         bad = "、".join(f"{p['label']} {p['total']:g}%" for p in r["badCompTotals"])
         await emit({"type": "manual_check", "stage": "attrs",
                     "message": f"成分百分比合计不等于 100 需人工修正：{bad}"})

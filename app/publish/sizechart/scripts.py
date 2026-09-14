@@ -67,14 +67,7 @@ __LOCATE__
   await sleep(1500);
   const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  let wrap = null;
-  for (const w of _scList) {
-    const r = w.getBoundingClientRect();
-    if (r.width === 0) continue;
-    const hit = document.elementFromPoint(r.x + r.width / 2, Math.min(r.y + 300, innerHeight - 10));
-    if (hit && w.contains(hit)) { wrap = w; break; }
-  }
-  if (!wrap) wrap = _scList[_scList.length - 1];
+  const wrap = _scList[_scList.length - 1];
   return JSON.stringify({opened: !!wrap});
 })()"""
 
@@ -100,14 +93,7 @@ _JS_SET_SIZECHART_CAT = r"""(async () => {
   const keyword = __CAT__;   // null 表示跟随平台预选，不指定具体分类
   const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  let wrap = null;
-  for (const w of _scList) {
-    const r = w.getBoundingClientRect();
-    if (r.width === 0) continue;
-    const hit = document.elementFromPoint(r.x + r.width / 2, Math.min(r.y + 300, innerHeight - 10));
-    if (hit && w.contains(hit)) { wrap = w; break; }
-  }
-  if (!wrap) wrap = _scList[_scList.length - 1];
+  const wrap = _scList[_scList.length - 1];
   if (!wrap) return JSON.stringify({ok: false, reason: 'no-modal'});
 
   const item = Array.from(wrap.querySelectorAll('.ant-form-item'))
@@ -369,6 +355,43 @@ _JS_FILL_SIZECHART = r"""(async () => {
   if (!wrap) return JSON.stringify({ok: false, reason: 'no-modal'});
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
   const setVal = (inp, v) => { setter.call(inp, String(v)); inp.dispatchEvent(new Event('input', {bubbles:true})); inp.dispatchEvent(new Event('change', {bubbles:true})); };
+  const setSelect = async (cell, value) => {
+    const select = cell && cell.querySelector('.ant-select');
+    if (!select) return false;
+    const want = String(value).trim();
+    const candidates = [want, want.replace(/\.0$/, ''), want + 'cm', want + '厘米'];
+    const input = select.querySelector('input');
+    const popupId = input && (input.getAttribute('aria-controls') || input.getAttribute('aria-owns'));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+      await sleep(80);
+      select.querySelector('.ant-select-selector').click();
+      for (let k = 0; k < 60; k++) {
+        const dropdowns = popupId && document.getElementById(popupId)
+          ? [document.getElementById(popupId).closest('.ant-select-dropdown') || document.getElementById(popupId)]
+          : Array.from(document.querySelectorAll('.ant-select-dropdown'));
+        const option = dropdowns
+          .filter(Boolean)
+          .filter(d => getComputedStyle(d).display !== 'none'
+                   && !d.classList.contains('ant-select-dropdown-hidden'))
+          .flatMap(d => Array.from(d.querySelectorAll('.ant-select-item-option')))
+          .find(o => candidates.includes(((o.querySelector('.ant-select-item-option-content') || o).textContent || '').trim()));
+        if (option) {
+          option.click();
+          await sleep(150);
+          const got = (select.querySelector('.ant-select-selection-item') || {}).textContent || '';
+          document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+          if (candidates.includes(got.trim()) || candidates.includes(((cell.innerText || '').split(/\n/).pop() || '').trim()))
+            return true;
+          break;
+        }
+        const holder = dropdowns.filter(Boolean).map(d => d.querySelector('.rc-virtual-list-holder')).find(Boolean);
+        if (holder) holder.scrollTop += holder.clientHeight || 200;
+        await sleep(100);
+      }
+    }
+    return false;
+  };
   const nameInp = wrap.querySelector('input[placeholder*="模板名称"]');
   if (nameInp && nameInp.value !== tplName) setVal(nameInp, tplName);
   const table = Array.from(wrap.querySelectorAll('table')).find(candidate =>
@@ -397,20 +420,27 @@ _JS_FILL_SIZECHART = r"""(async () => {
   // 拉量），接口要求两格要么都空、要么都填。源实测尺寸只有一组值（提取阶段要求值只填
   // 单个数字），故把同一源值重复填进单元格每个输入框，拉量缺失就沿用平量值——只填第一
   // 个 input 会留下空着的拉量格，点确定即被接口以「请全部填写」打回。
-  trs.forEach(tr => {
+  for (const tr of trs) {
     const tds = Array.from(tr.querySelectorAll('td'));
     const size = rowSize(tds[0]);
     if (!data[size]) { empty.push(size + ':缺少测量数据'); return; }
     for (const p of params) {
       const idx = colIdx[p];
       if (idx === undefined) { empty.push(`${size}-${p}:缺列`); continue; }
-      const inps = tds[idx] ? Array.from(tds[idx].querySelectorAll('input')) : [];
+      const cell = tds[idx];
+      if (cell && cell.querySelector('.ant-select')) {
+        const v = String(data[size][p] || '').trim();
+        // 下拉由 Python/CDP 真实鼠标路径逐列处理，避免 JS click 生成幽灵浮层。
+        empty.push(`${size}-${p}`);
+        continue;
+      }
+      const inps = cell ? Array.from(cell.querySelectorAll('input')) : [];
       if (!inps.length) empty.push(`${size}-${p}:无输入框`);
       const v = String(data[size][p] || '');
       if (!v) continue;
       inps.forEach(inp => { if (inp.value !== v) setVal(inp, v); });
     }
-  });
+  }
   await sleep(600);
   trs.forEach(tr => {
     const tds = Array.from(tr.querySelectorAll('td'));
@@ -419,7 +449,13 @@ _JS_FILL_SIZECHART = r"""(async () => {
     for (const p of params) {
       const idx = colIdx[p];
       if (idx === undefined) continue;
-      const inps = tds[idx] ? Array.from(tds[idx].querySelectorAll('input')) : [];
+      const cell = tds[idx];
+      if (cell && cell.querySelector('.ant-select')) {
+        const got = (cell.querySelector('.ant-select-selection-item') || {}).textContent || '';
+        if (!got.trim() || got.trim() === '请选择') empty.push(`${size}-${p}`);
+        continue;
+      }
+      const inps = cell ? Array.from(cell.querySelectorAll('input')) : [];
       inps.forEach(inp => { if (!inp.value) empty.push(`${size}-${p}`); });
     }
   });
@@ -446,5 +482,8 @@ _JS_CLICK_SIZECHART_OK = r"""(async () => {
   await sleep(2000);
   const stillOpen = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     .some(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  return JSON.stringify({stillOpen});
+  const errors = stillOpen ? Array.from(document.querySelectorAll(
+    '.ant-form-item-explain-error, .ant-form-item-explain, .ant-message-error'))
+    .map(e => (e.textContent || '').trim()).filter(Boolean) : [];
+  return JSON.stringify({stillOpen, errors});
 })()"""

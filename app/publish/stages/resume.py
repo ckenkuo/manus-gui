@@ -103,6 +103,14 @@ def _stale_form_stages(live: dict) -> list:
     # previewCount 为 0 时不判 stale：那说明该类目没有这一列，交阶段自己 skipped。
     if live.get("previewBad"):
         stale.append("sku_preview")
+    # ⑤c 产品轮播图：与 attrImg*（变种属性区）、preview*（变种信息表）平级的第四处
+    # 图位，且是 ⑥ 素材图的上游（页面原文「素材图将自动获取产品轮播图/颜色图的第一张
+    # 图片」）。2026-09-12 弹珠机那单 ⑦⑦b 都正常跑过，轮播图里 676x676 那张从未被
+    # 碰过，发布被拒「产品轮播图尺寸不能小于800*800」——续跑当时也不会自愈，因为
+    # 这里压根没有判据。carouselBad 为 0 时不判 stale：区块读不到时它也是 0，
+    # 交阶段自己按 supported=None 报 fail，不在这里替它猜。
+    if live.get("carouselBad"):
+        stale.append("carousel")
     # ⑦a 剔配件色：变种表里只要还有「单行有源数据」的颜色就得重跑。反选只改未保存
     # 表单，save 没成功过时页面会回到认领时的全勾状态（与 ⑤~⑬ 其它表单阶段同理）。
     # 判据完全取页面实况（源颜色名与页面色板名对不上，见 _JS_VARIANT_ROW_FILL），

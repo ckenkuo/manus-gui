@@ -19,8 +19,17 @@ async def _st_save(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "fail", "note": "保存前无法读取预览图状态，请等待变种表加载后重试"}
     invalid = [row for row in preview.get("rows", []) if row.get("empty") or row.get("bad")]
     if invalid:
-        rows = "、".join(f"第 {row['i'] + 1} 行「{row.get('color') or ''}」" for row in invalid[:8])
-        return {"status": "fail", "note": f"保存前预览图校验未过：{rows}，请重跑⑦b SKU预览图"}
+        # ⑦b 可能在变种表重建/图片刚加载完成前结束，保存时再给一次
+        # 完整重跑机会，避免把可自动修复的时序问题交给人工。
+        from app.publish.stages.preview import _st_sku_preview
+        retry = await _st_sku_preview(ctx, session, emit)
+        if retry.get("status") == "ok":
+            preview = await sku_preview_state(session)
+            invalid = [row for row in preview.get("rows", [])
+                       if row.get("empty") or row.get("bad")]
+        if invalid:
+            rows = "、".join(f"第 {row['i'] + 1} 行「{row.get('color') or ''}」" for row in invalid[:8])
+            return {"status": "fail", "note": f"保存前预览图校验未过：{rows}，⑦b自动重跑后仍未通过"}
     r = await save(session, ctx["rowid"])
     if r.get("status") != "ok":
         # 【别把已经抓到的证据丢掉】save 的 validation-error 有两条来路：走 explain-error
