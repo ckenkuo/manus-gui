@@ -14,44 +14,6 @@ from app.publish.sizechart import (
 from typing import Optional
 
 
-_OPTIONAL_SHOE_COUNTRY_PARAMS = (
-    "欧码", "英码", "美码", "日本码", "韩国码",
-    "墨西哥码", "巴西码", "哥伦比亚码", "智利码",
-)
-
-_SHOE_EU_CONVERSIONS = {
-    35: {"英码": 2.5, "美码": 5, "日本码": 22.5, "韩国码": 225, "墨西哥码": 22.5, "巴西码": 34, "哥伦比亚码": 35, "智利码": 35},
-    36: {"英码": 3.5, "美码": 6, "日本码": 23, "韩国码": 230, "墨西哥码": 23, "巴西码": 35, "哥伦比亚码": 36, "智利码": 36},
-    37: {"英码": 4.5, "美码": 7, "日本码": 23.5, "韩国码": 235, "墨西哥码": 23.5, "巴西码": 36, "哥伦比亚码": 37, "智利码": 37},
-}
-
-# 全量鞋码兜底：EU 20–50 每 0.5 码，覆盖童鞋、成人鞋和半码。
-# 各国家列最终仍以页面下拉实际存在的选项为准，不存在的值不会误选。
-for _eu_step in range(40, 101):
-    _eu = _eu_step / 2
-    _jp = _eu - 12.5
-    _SHOE_EU_CONVERSIONS.setdefault(_eu, {
-        "英码": _eu - 32.5,
-        "美码": _eu - 30,
-        "日本码": _jp,
-        "韩国码": int(round(_jp * 10)),
-        "墨西哥码": _jp,
-        "巴西码": _eu - 1,
-        "哥伦比亚码": _eu,
-        "智利码": _eu,
-    })
-
-
-def shoe_size_conversions(eu_size: float) -> dict:
-    """Return deterministic international conversions for any shoe EU size."""
-    try:
-        eu = float(eu_size)
-    except (TypeError, ValueError):
-        return {}
-    return dict(_SHOE_EU_CONVERSIONS.get(eu) or
-                _SHOE_EU_CONVERSIONS.get(int(eu)) or {})
-
-
 def _sc_js(template: str, which: int) -> str:
     """把尺码表 JS 模板里的 __LOCATE__（按 label 定位的工具函数）与 __IDX__ 填好。
 
@@ -207,7 +169,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
             # 无源数据时统一取消国家码列，保留脚长/鞋内长等可验证参数。
             if not src_meas:
                 to_uncheck = list(dict.fromkeys(
-                    to_uncheck + [p for p in _OPTIONAL_SHOE_COUNTRY_PARAMS if p in available]
+                    to_uncheck + [p for p in sizechart_parameters.SHOE_COUNTRY_PARAMS if p in available]
                 ))
             if to_check or to_uncheck:
                 setr = await session.eval_json(
@@ -242,6 +204,15 @@ async def add_sizechart(session: BrowserSession, info_path: str,
                 out[p] = vals[k]
         return out
 
+    # 【鞋类分支：区间值先折成单值】鞋类的脚长天然是区间（一个尺码适合一段脚长，
+    # 实测图上写「尺码 34 → 脚长 21.5-22」），而下面的 _valid_value 只认单个正有限数，
+    # 不折的话商家量好的真值会被判脏、转手交模型估一个单值顶掉。放在这里而不是和
+    # normalize_half_marks 并列，是因为判「是不是鞋类」要靠弹窗参数，而参数到这一步
+    # 才读出来（半围换算只看值本身的写法，不需要知道品类）。取证与「为什么取上界」
+    # 见 parameters.normalize_shoe_lengths。
+    if sizechart_parameters.is_shoe_chart(params):
+        src_meas = sizechart_parameters.normalize_shoe_lengths(src_meas)
+
     # 测量值来源：源商品实测平铺尺寸（sizeMeasurements）优先，弹窗要而源没有的参数交模型估算。
     # 尺码键与弹窗尺码行两侧都过 norm_size 再比（源键可能带「建议身高」描述，见 norm_size）
     #
@@ -269,7 +240,25 @@ async def add_sizechart(session: BrowserSession, info_path: str,
         return not _valid_value((row or {}).get(p))
 
     norm = {k: _align_params(v) for k, v in src_norm.items()}
-    need = [p for p in params
+
+    # 【鞋类国家码列由平台按脚长算，不归我们填、也不参与缺值判据】2026-09-14 真站取证
+    # （1076651064534，女士居家拖鞋）：欧码/英码/美码/日本码/韩国码/墨西哥码/巴西码/
+    # 哥伦比亚码/智利码 这 9 列在弹窗里是下拉框，选项是平台按脚长给出的固定全集，脚长
+    # 列表头的问号气泡原文就是「填写脚长，将自动填充鞋码大小」。原来这套是自己按欧码
+    # 换算各国码再逐格去选（_SHOE_EU_CONVERSIONS），对不上任何选项：欧码列没有 "36-37"，
+    # 巴西码列没有 "34-35" 这种区间，只有碰巧是单个数字的巴西码命中过一次，8 列全空、
+    # 整表报「填充不完整」，还因为逐格轮询空转到 1118 秒。故改为：有脚长列时，这 9 列
+    # 既不进 need（不交模型估）也不进 lacking（不判缺），值由页面自己产出，见
+    # scripts._JS_FILL_SIZECHART 的脚长校正段。
+    #
+    # 没有脚长列时不启用（平台没有推导依据，只能照旧由我们给值），故这里按脚长列存在
+    # 与否决定，而不是一见到国家码列就跳过。
+    foot_param = sizechart_parameters.foot_param_of(params)
+    derived_params = ([p for p in sizechart_parameters.SHOE_COUNTRY_PARAMS if p in params]
+                      if foot_param else [])
+    check_params = [p for p in params if p not in derived_params]
+
+    need = [p for p in check_params
             if any(_missing(norm.get(normalize_size(s)), p) for s in sizes)]
 
     # 【词表兜不住时先问名称映射，再退估算】源参数名是商家在图上随手写的自由文本
@@ -292,7 +281,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # （need 覆盖了全部 params）：经过上面 LLM 勾选后仍出现，说明源表头连语义匹配
     # 都对不上任何可选项（或源数据与商品严重不符）。源数据全白费意味着买家拿到一份
     # 维度对不上实物的尺码表，必须报出来交人工复核，不能静默填。
-    source_unused = bool(src_meas) and bool(need) and set(need) == set(params)
+    source_unused = bool(src_meas) and bool(need) and set(need) == set(check_params)
     if source_unused:
         logger.warning(
             "尺码表参数与源实测尺寸一列都没对上（源有数据却全走估算）："
@@ -321,21 +310,9 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # _JS_FILL_SIZECHART 按【页面原始尺码文本】取 data[size]，故归一只用于匹配，
     # 最终 norm 的键必须换回页面原文，否则填表时全部取不到值
     norm = {s: norm.get(normalize_size(s), {}) for s in sizes}
-    # 鞋类国际码以欧码为唯一基准确定性换算；仅当尺码表确实包含国家码列时启用，
-    # 避免把服装身高码/年龄码误当成鞋码。
-    is_shoe_chart = any(p in params for p in _OPTIONAL_SHOE_COUNTRY_PARAMS)
-    for size, row in (norm.items() if is_shoe_chart else []):
-        try:
-            eu = float(str(size).replace(",", "."))
-        except ValueError:
-            continue
-        conversion = shoe_size_conversions(eu)
-        if conversion:
-            row.setdefault("欧码", int(eu) if eu.is_integer() else eu)
-            row.update({p: v for p, v in conversion.items() if p in params})
     # 与上面的 need 共用 _missing：判据分家过一次（need 判键、这里判值），代价是脏值
     # 那两单永远填不出表，各自维护一套必然再次分家
-    lacking = [s for s in sizes if any(_missing(norm[s], p) for p in params)]
+    lacking = [s for s in sizes if any(_missing(norm[s], p) for p in check_params)]
     if lacking:
         return {"status": "error",
                 "reason": f"测量数据缺参数（对齐后仍缺）: 尺码{lacking} × 参数{params}"
@@ -346,9 +323,11 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     fill = await session.eval_json(sizechart_scripts._JS_FILL_SIZECHART
                                     .replace("__NAME__", J(tpl_name))
                                     .replace("__DATA__", J(norm))
-                                    .replace("__PARAMS__", J(params)))
+                                    .replace("__PARAMS__", J(params))
+                                    .replace("__DERIVED__", J(derived_params)))
     # 国际码等列是 Ant Design 下拉框，部分 CDP 页面只接受真实鼠标事件，
     # DOM click 会被组件忽略。对脚本回报为空的单元格走 Playwright 真实点击兜底。
+    # 鞋类国家码列正常由平台按脚长自己填（见上面 derived_params），走不到这里。
     selected_count = 0
     if getattr(session, "page", None) is not None:
         try:
@@ -356,7 +335,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
                 '.ant-modal-wrap:visible tbody tr .ant-select-selection-item').count()
         except Exception:
             selected_count = 0
-    select_params = sum(p in _OPTIONAL_SHOE_COUNTRY_PARAMS for p in params)
+    select_params = sum(p in sizechart_parameters.SHOE_COUNTRY_PARAMS for p in params)
     if ((not fill.get("ok") and fill.get("empty"))
             or (select_params and selected_count == 0)):
         page = getattr(session, "page", None)

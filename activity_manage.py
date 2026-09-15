@@ -9,21 +9,17 @@ function-calling 用的 tool，也用不上有状态图。故抽成 service 层�
 （app.py 的 FastAPI 接口）都调它。
 
 最高优先级安全（真实商家账号、操作不可逆）：默认 dry-run（只读 + 算计划 + 出报名清单，
-不点任何变更按钮）。只有显式加 --execute 才正式执行。
+不点任何变更按钮）。--execute 进入半程检查，正式报名请使用活动管理页面。
 
 用法：
-    python activity_manage.py --sheet 店A --spus "9072868889 9072868890"   # dry-run
-    python activity_manage.py --sheet 店A --spus-file spus.txt              # 从文件读清单
-    python activity_manage.py --sheet 店A --spus-file spus.txt --min-margin 0.2
-    python activity_manage.py --sheet 店A --spus-file spus.txt --execute    # 正式执行（危险）
-    # 逐品覆盖毛利率写在清单里：9072868890:0.25
+    python activity_manage.py --document "https://www.kdocs.cn/l/…" --sheet 店A --spus "9072868889"
+    python activity_manage.py --document "https://www.kdocs.cn/l/…" --sheet 店A --spus-file spus.txt --execute
 """
 import argparse
 import asyncio
 from pathlib import Path
 
 from app.activity import service as activity_service
-from app.collect import service as collect_service
 from app.logger import logger
 
 
@@ -70,7 +66,8 @@ def _print_progress(event: dict) -> None:
 
 async def main():
     parser = argparse.ArgumentParser(description="活动管理：关加速器→报活动→重开加速器")
-    parser.add_argument("--excel", default=None, help="成本核算表路径（缺省=上次选择/出厂默认）")
+    parser.add_argument("--document", "--excel", dest="document", required=True,
+                        help="金山 WPS 在线成本表分享链接")
     parser.add_argument("--sheet", required=True, help="目标 Sheet 名（对应店铺的成本表）")
     parser.add_argument("--spus", default="", help="SPU 清单文本（换行/逗号/空格分隔）")
     parser.add_argument(
@@ -98,7 +95,7 @@ async def main():
         "--execute",
         dest="dry_run",
         action="store_false",
-        help="正式执行：对真实商家账号做不可逆操作（关加速/报名/重开），谨慎使用",
+        help="半程检查：读取云端价格、打开活动页并填价，不提交、不切换流量",
     )
     args = parser.parse_args()
 
@@ -114,23 +111,12 @@ async def main():
         logger.error("SPU 清单为空：请用 --spus 或 --spus-file 提供清单。")
         return
 
-    # 解析目标工作簿（显式 > 上次选择 > 出厂默认），用于预检占用
-    excel = collect_service.resolve_excel(args.excel)
-
-    # 预检：Excel 被占用就别启动（省去 CDP/LLM 开销）；活动流程要读成本表
-    if collect_service.excel_write_locked(excel):
-        logger.error(
-            f"Excel 正被占用（疑似 WPS/Excel 打开中）：{excel}\n"
-            "   活动流程需读成本核算表，请先关闭该文件再重试。"
-        )
-        return
-
     if not args.dry_run:
-        logger.warning("正式执行模式：将对真实商家账号执行不可逆操作。")
+        logger.info("半程检查模式：填价后停止，不提交报名。")
 
     await activity_service.run_activity_batch(
         spus_text,
-        excel,
+        args.document,
         args.sheet,
         min_margin=args.min_margin,
         dry_run=args.dry_run,

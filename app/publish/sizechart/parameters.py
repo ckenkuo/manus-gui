@@ -252,6 +252,76 @@ def normalize_half_marks(rows: dict) -> dict:
     return out
 
 
+# ---- 鞋类尺码表 -------------------------------------------------------------
+#
+# 【为什么要单独一支、不和服装那套混】2026-09-14 真站取证（offer 901800054222，女士
+# 休闲鞋，商家把尺码表打成图）：图上写的是「尺码 34…40 / 脚长(cm) 21.5-22 …」——
+# 鞋类的脚长天然是【一段区间】（一个尺码适合一段脚长），与服装那套「衣长 33」这种
+# 单值不是一回事。同一张图实测：视觉侧 7 档全部照抄正确
+# （{"34": {"脚长": "21.5-22"}, …}），是【下游】把它丢掉的——值带着 "21.5-22" 往下走，
+# editor._valid_value 判它不是正有限数 → 判缺值 → 转手交模型估一个单值，把商家量好的
+# 真值顶掉。而这份源数据本来就是平台要的：平台自己的「脚长 → 欧码」表里 21.5 与 22
+# 都落在 33.5-34 这一桶，正好包住商家标的尺码 34。
+SHOE_LENGTH_PARAMS = ("脚长", "鞋内长", "鞋长", "靴筒高")
+SHOE_COUNTRY_PARAMS = ("欧码", "英码", "美码", "日本码", "韩国码",
+                       "墨西哥码", "巴西码", "哥伦比亚码", "智利码")
+
+
+def is_shoe_chart(params) -> bool:
+    """这张尺码表是不是鞋类。
+
+    判据只看弹窗参数：出现鞋类的【长度参数】或【国家码列】即是。服装那套（衣长/胸围
+    全围/袖长…）与玩具/家居那套（直径/长/宽/高/重量）都不会出现这两类词，故不用另问
+    品类标签，也不会把童装身高码误判成鞋——身高码是【尺码行】的写法（"110cm"），不是
+    参数名。
+
+    【为什么长度参数按子串比】平台把单位写在参数名里（实测表头是「脚长(cm)」），
+    字面相等对不上，按子串比才命中。
+    """
+    return any(any(k in str(p) for k in SHOE_LENGTH_PARAMS) or p in SHOE_COUNTRY_PARAMS
+               for p in (params or []))
+
+
+def foot_param_of(params) -> Optional[str]:
+    """弹窗里「脚长」那一列的参数名（平台上带单位写作「脚长(cm)」），没有则 None。
+
+    它是鞋类唯一能驱动平台自己算国家码列的入口（脚长列表头的问号气泡：「填写脚长，
+    将自动填充鞋码大小」），故调用方按它判「平台能不能自己算」。
+    """
+    return next((p for p in (params or []) if "脚长" in str(p)), None)
+
+
+def normalize_shoe_lengths(rows: dict) -> dict:
+    """鞋类长度参数（脚长/鞋内长/鞋长/靴筒高）的区间值取上界，返回新表（不改调用方那份）。
+
+    【为什么取上界】区间两端常常落在平台的同一个欧码桶里（21.5 与 22 都是 33.5-34），
+    取哪端结果相同；两端跨桶时分桶靠的是桶的标称脚长（34 码那桶标称 22.1），上界比
+    下界更贴近标称值，落桶更稳。
+
+    【为什么只动鞋类这几列、不做成通用规则】服装表的 "74-78" 是源表本身的脏值，
+    该照旧进 need 交模型重估（见 editor 里 _valid_value 上方那段取证）；对服装来说
+    「一档尺码对应一段衣长」没有意义，把区间折成单值反而是替商家做了主张。
+    """
+    out = {}
+    for sz, row in (rows or {}).items():
+        if not isinstance(row, dict):
+            out[sz] = row
+            continue
+        vals = {}
+        for p, v in row.items():
+            if not isinstance(v, str) or not any(k in str(p) for k in SHOE_LENGTH_PARAMS):
+                vals[p] = v
+                continue
+            nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", v)]
+            if len(nums) < 2:
+                vals[p] = v          # 单值/无值原样带过，脏不脏交 _valid_value 判
+                continue
+            top = max(nums)
+            vals[p] = int(top) if top.is_integer() else top
+        out[sz] = vals
+    return out
+
+
 # 交模型做参数名映射时的提示词。词表兜不住的写法才走这里（见 _map_params_by_llm）。
 _PARAM_MAP_PROMPT = """你是服装尺码表数据对齐助手。
 

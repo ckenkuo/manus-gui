@@ -16,7 +16,7 @@ import os
 import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.logger import logger
 from app.publish import images
@@ -38,6 +38,7 @@ _SKIP_KINDS = ("尺码表", "工厂图", "中文海报")
 # 不该为一个常量吃进整个 pipeline 模块（它会拖进浏览器那一串依赖）。
 # 调用方（service）传的就是 SKC_ROW_MIN_IMAGES，这里的默认值只是离线单测的兜底。
 MIN_CLEAN_IMAGES = 3
+TOY_DESC_MAX_IMAGES = 10
 
 # 颜色缩略图与主图「比画面」时的距离上限（images.color_distance 的平均通道差，0~255）。
 # 2026-09-03 用真实产物 product-969144784315（11 色 16 主图）标定：缩略图与它自己那张
@@ -124,6 +125,12 @@ class DescPlan(BaseModel):
     model_config = ConfigDict(strict=True)
 
     actions: list[DescAction]
+
+
+class DescPlanWithCategory(DescPlan):
+    """超量描述图须明确识别是否玩具，决定是否启用数量限制。"""
+
+    isToy: bool
 
 
 class DescAuditItem(BaseModel):
@@ -661,6 +668,44 @@ rows 必须覆盖上面每一个颜色（没图的给 "images": []），uncertai
             "dirtyUsed": sorted(forced)}
 
 
+async def _rank_toy_desc(pairs: list, info: Optional[dict] = None) -> list:
+    """按销售表达价值排序全部可见候选图，返回完整且不重复的 pos 列表。"""
+    positions = [module["pos"] for module, _ in pairs]
+
+    class DescRanking(BaseModel):
+        model_config = ConfigDict(strict=True)
+
+        ranking: list[int]
+
+        @field_validator("ranking")
+        @classmethod
+        def complete_ranking(cls, value: list[int]) -> list[int]:
+            if len(value) != len(positions) or set(value) != set(positions):
+                raise ValueError(f"ranking 必须恰好覆盖所有候选 pos 且不能重复：{positions}")
+            return value
+
+    listing = "\n".join(f"第{module['pos']} 张（pos={module['pos']}）"
+                        for module, _ in pairs)
+    prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
+下面是玩具商品的全部候选描述图，图片与序号一一对应：
+{listing}
+
+请通过视觉理解，按对买家购买决策的价值从高到低排序。系统只保留排序前
+{TOY_DESC_MAX_IMAGES} 张，必须先看完全部候选，不能直接按原始位置截断。
+优先覆盖：尺寸/长宽高/大小对比、核心功能介绍、玩法与操作演示；然后是配件清单、
+材质与结构细节、适龄及安全使用说明、使用场景、整体外观和不同款式。
+前列应覆盖不同销售重点：尺寸和功能都有图时两类都优先保留，避免多张相同角度
+或重复卖点挤占名额。同类信息选表达清楚、信息完整的图；纯氛围、装饰、重复外观靠后。
+中文会在后续英化，不得因为图上有中文而降低尺寸、功能等关键说明图的优先级。
+只依据图片可见内容，不编造卖点。信息价值相同时保持原始顺序。
+只输出 JSON：{{"ranking": [<按优先级排列的全部 pos>]}}
+ranking 必须恰好覆盖 {positions}，不得遗漏、重复或加入其他序号。"""
+    data = await ask_json_with_images(
+        prompt, [reference for _, reference in pairs], what="阶段⑬玩具描述图销售重点排序",
+        system=_SYS, stage="desc", result_model=DescRanking)
+    return DescRanking.model_validate(data).ranking
+
+
 async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
     """阶段⑬：对 desc_map 列出的描述模块逐个判「删/留/英化替换」。
 
@@ -702,6 +747,7 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
     if not mods:
         return {"status": "ok", "delete": [], "replace": [], "keep": [],
                 "reason": "描述区无模块"}
+    check_limit = len(mods) > TOY_DESC_MAX_IMAGES
 
     # 先解析成 data URL：空串表示源站取不到（见 llm.image_ref）。解析结果直接传给
     # ask_json_with_images（它对已是 data URL 的字符串原样透传），不会重复下载。
@@ -733,9 +779,17 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
         "换算成英寸(in)后替换（买家靠它选码或了解整体尺寸，别删）；\n"
         '- "delete"：工厂/公司介绍、与商品无关的图、与前面重复出现的图——直接删；\n'
         if size_missing else
-        '- "delete"：工厂/公司介绍、尺码表、与商品无关的图、与前面重复出现的图——直接删；\n'
+        '- "sizechart"：玩具商品的尺寸示意图——保留并英化、cm 换算为英寸，'
+        '即使已有实测尺寸也要保留，买家需要直观看到商品大小；\n'
+        '- "delete"：工厂/公司介绍、服装尺码表、与商品无关的图、与前面重复出现的图——直接删；\n'
     )
-    acts_enum = "keep|delete|replace" + ("|sizechart" if size_missing else "")
+    acts_enum = "keep|delete|replace|sizechart"
+    category_instruction = (
+        '\n同时结合标题和实物识别是否玩具（如积木、玩偶、拼图、模型、游戏玩具），'
+        f'在 JSON 顶层必填 "isToy": true/false；只有玩具会启用描述图 {TOY_DESC_MAX_IMAGES} 张上限。\n'
+        if check_limit else ""
+    )
+    category_output = '"isToy": true/false, ' if check_limit else ""
     prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
 
 下面是该商品详情描述区的 {len(mods)} 张图，按页面展示顺序，序号就是 pos：
@@ -751,8 +805,10 @@ Temu 半托管发布只关心商品图，请逐张决定动作：
 - "productShared"：尺码、材质、洗护、包装或所有颜色共用的信息；
 - "irrelevant"：重复、装饰、工厂/公司介绍或与商品无关。
 只有明确属于 irrelevant 且 confidence >= 0.9 才删除；不确定一律保留。
+玩具的尺寸、功能介绍、玩法、配件等属于销售重点，不能当作无关说明图删除。
+{category_instruction}
 
-只输出 JSON：{{"actions": [{{"pos": 1, "action": "{acts_enum}",
+只输出 JSON：{{{category_output}"actions": [{{"pos": 1, "action": "{acts_enum}",
 "reason": "<10字内>", "scope": "skuRelevance|productShared|irrelevant",
 "confidence": 0.0}}]}}
 actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
@@ -761,7 +817,8 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     # reason 只进日志不列必答。
     data = await ask_json_with_images(
         prompt, [r for _, r in pairs], what="阶段⑬描述图规划", system=_SYS,
-        stage="desc", result_model=DescPlan)
+        stage="desc", result_model=DescPlanWithCategory if check_limit else DescPlan)
+    is_toy = DescPlanWithCategory.model_validate(data).isToy if check_limit else False
 
     valid_pos = {m["pos"]: m for m in mods}
     delete, replace, keep = [], [], []
@@ -796,6 +853,24 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     missed = [p for p in valid_pos if p not in delete
               and p not in keep and all(r["pos"] != p for r in replace)]
     keep.extend(missed)  # LLM 漏判的一律按保留处理——保守方向，不删不该删的
+
+    ranked_urls = []
+    if is_toy:
+        candidates = [(module, reference) for module, reference in pairs
+                      if module["pos"] not in delete]
+        if len(candidates) + len(unreachable) > TOY_DESC_MAX_IMAGES:
+            available_slots = TOY_DESC_MAX_IMAGES - len(unreachable)
+            if available_slots <= 0:
+                raise RuntimeError(f"玩具描述图取不到的图片过多，无法按视觉销售重点筛选到 {TOY_DESC_MAX_IMAGES} 张以内")
+            ranking = await _rank_toy_desc(candidates, info)
+            selected = set(ranking[:available_slots])
+            dropped = {module["pos"] for module, _ in candidates} - selected
+            delete.extend(dropped)
+            keep = [pos for pos in keep if pos not in dropped]
+            replace = [item for item in replace if item["pos"] not in dropped]
+            ranked_urls = [valid_pos[pos]["url"] for pos in ranking[:available_slots]]
+            logger.info(f"玩具描述图限量：优先保留 pos {ranking[:available_slots]}，"
+                        f"另保留 {len(unreachable)} 张取不到的图，删去 {len(dropped)} 张低优先级图")
 
     # 尺寸兜底：keep 里但尺寸不达标的，改判 replace + needsUpscale（理由见 docstring）。
     # 已在 replace 里的不用管：它本来就要重新出图，出图收尾的 compress 会把尺寸拉够。
@@ -842,6 +917,9 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
 
     out = {"status": "ok", "delete": sorted(set(delete)),
            "replace": replace, "keep": sorted(set(keep) | unreach)}
+    if is_toy:
+        out["maxImages"] = TOY_DESC_MAX_IMAGES
+        out["rankedUrls"] = ranked_urls
     if unreachable:
         out["unreachable"] = sorted(unreach)
     return out

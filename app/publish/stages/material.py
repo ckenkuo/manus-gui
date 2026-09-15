@@ -21,6 +21,8 @@ async def _st_material(ctx: dict, session: BrowserSession, emit) -> dict:
         await emit({"type": "manual_check", "stage": "material",
                     "message": f"素材图选择没把握：{plan.get('reason')}（已用 "
                                f"{os.path.basename(plan['image'])} 继续）"})
+    if plan.get("uncertain"):
+        return {"status": "fail", "note": "素材图没有通过英化质检的可用图片"}
     sq = images.square_image(plan["image"],
                              out_path=os.path.join(ctx["workdir"], "material-square.jpg"))
     r = await set_material(session, sq["output"])

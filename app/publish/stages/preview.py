@@ -5,7 +5,7 @@ import asyncio
 import os
 import shutil
 from app.logger import logger
-from app.publish import extract, images, variant_colors
+from app.publish import extract, images, variant_colors, vision
 from app.publish.browser import BrowserSession
 from app.publish.media.preview import PREVIEW_MIN_SIDE, sku_preview_replace_row, sku_preview_state
 
@@ -42,8 +42,36 @@ def _pick_fill_source(row: dict, rows: list, color_files: dict,
                     f"（空图位会被平台硬拒，同款图只是辨识度差一点）")
     if peer is None:
         return ""
+    # 预览图兜底也必须复用已通过清理阶段的本地主图，不能直接回源下载未英化图片。
+    local_mains = sorted(
+        os.path.join(workdir, name) for name in os.listdir(workdir)
+        if name.lower().startswith("main-")
+        and name.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+    )
+    if local_mains:
+        return local_mains[0]
     raw = os.path.join(prep, f"fill{i:02d}-raw.jpg")
     return raw if extract._download_image(peer["url"], raw) else ""
+
+
+async def _clean_downloaded_preview(path: str, prep: str) -> str:
+    """回源下载的预览图必须先英化并通过质检。"""
+    if not path or "-raw" not in os.path.basename(path):
+        return path
+    output = os.path.join(prep, os.path.splitext(os.path.basename(path))[0] + "-clean.png")
+    prompt = "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、构图和颜色；移除水印、店铺名和第三方 logo。"
+    for _ in range(3):
+        try:
+            edited = await asyncio.to_thread(
+                images.edit_image, path, prompt=prompt, out_path=output,
+                no_downscale=True, timeout=90)
+            qc = await vision.check_cleaned(edited["output"])
+            if qc.get("clean"):
+                return edited["output"]
+            prompt += " 上一版仍有中文或乱码，请彻底清除所有中文字符并保持商品不变。"
+        except Exception:
+            continue
+    return ""
 
 
 async def _drop_unfixable_rows(session: BrowserSession, emit, rows: list) -> dict:
@@ -201,6 +229,13 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 logger.warning(f"预览图 {tag} 空位找不到任何可用源图，改为反选该规格")
                 unfixable.append(r)
                 continue
+            if "-raw" in os.path.basename(src_path):
+                src_path = await _clean_downloaded_preview(src_path, prep)
+                if not src_path:
+                    unfixable.append(r)
+                    await emit({"type": "manual_check", "stage": "sku_preview",
+                                "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"})
+                    continue
             try:
                 sq = images.square_image(src_path, out_path=out)
             except Exception as e:
@@ -292,6 +327,13 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                                        f"（发布会被拦，请人工换图）"})
                 fail_rows.append(tag)
                 continue
+            cleaned = await _clean_downloaded_preview(raw, prep)
+            if not cleaned:
+                fail_rows.append(tag)
+                await emit({"type": "manual_check", "stage": "sku_preview",
+                            "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"})
+                continue
+            raw = cleaned
             sq = images.square_image(raw, out_path=out)
         except Exception as e:
             # 下载或合规化失败：该行保持原样（原图还挂着，不会变空）

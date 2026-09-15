@@ -1,19 +1,15 @@
-"""活动管理管线（阶段1：只读 + dry-run）——对标 app/collect/pipeline.py 的确定性单商品例程。
+"""活动管理管线：读取活动、确定性算价、提交报名和切换流量。
 
 为什么是确定性管道而非 agent 自由循环：本质是「for 每个 SPU：几步确定性 DOM/接口只读 +
-纯本地算价筛选」，不需要 function-calling/LangGraph。浏览器操作全部裸 Playwright over CDP、
-纯只读。判定完全确定性（见下），不再用 LLM 选活动（judge_activity 保留但主流程未接入）。
+纯本地算价筛选」，不需要 function-calling/LangGraph。浏览器操作使用 Playwright over CDP。
+判定完全确定性，不再用 LLM 选活动（judge_activity 保留但主流程未接入）。
 
-判定逻辑（2026-07-16 用户重定义）：不再「LLM 选一个 + 毛利率红线」，而是【确定性筛选：
-申报价(=日常价×活动折扣率) ≥ 销售底价(Excel 销售价列) 且 商品库存 ≥ 活动库存门槛 的活动
-全部报名】（满足的都报，一个 SPU 可报多个活动）。销售底价完全替代旧毛利率红线。
+申报价(日常价×活动折扣率)达到 WPS 文档销售底价的活动全部入选。
+商品实时采购，库存不参与初筛。详情页仍由平台判定报名资格。
 
 最高优先级安全约束（真实商家账号、操作不可逆）：
-- 本模块阶段1 只提供【只读】函数（定位行/读加速态/读活动列表/读库存）+ 算价（纯本地）。
-- 变更动作（close_accel / enroll_activity / open_accel）一律留桩：函数存在、正式分支先
-  `raise NotImplementedError("阶段3")`，被 service 的 dry-run 分支跳过、绝不调用。
-- 关闭入口须在「流量加速中」筛选下才出现，尚未探测确认——read_accel_state 只读现有 DOM
-  尽力判断，探不到就返回 "unknown"，绝不臆造关闭选择器。
+- service 的 dry-run 分支只读和规划，变更函数各自通过 allow 参数控制最终动作。
+- 报名记录仅已标定的有效状态可判成功，场次失败只作提示；完整对账由 service 编排。
 
 页面事实（2026-07 实测 agentseller.temu.com，已写进选择器常量/解析逻辑）：
 - 流量页 main/flux-analysis：每商品一行，行文本内含 `SPU ID： {数字}`（全角冒号 + 空格）；
@@ -589,18 +585,8 @@ _MARK_ACTIVITY_LOG_SPU_JS = r"""
 """
 
 
-# 报名成功判据（用户实机规则 2026-07-24）：报名记录只要出现在 /log 列表、且不是「已退出」，
-# 即为成功报名。已实测标定的成功 enrollStatus：4=报名成功待开始（2026-07-22 标定）、
-# 1=进行中、3=进行中（2026-07-24 用户后台核对：夏季8折/破冰85折=1、半托管85折/新品8折=3，
-# 均为正常报名记录；已开始的场次报成功后不会是 4）。此前按 ==4 严判，把「进行中」的 1/3
-# 误伤成未成功，连带初始 off 商品被挡在开流量闸门外（报名未全部解析不新增开启）。
-# 「已退出」对应 enrollStatus=6（2026-07-24 用户后台核对确认）。数值命中即判退出，文本探测
-# 仅作兜底（接口偶尔带状态文案字段时多一层保险）。旧判据里的「有场次失败原因不算成功」随
-# 用户规则一并废弃——记录出现在列表即算成功，场次原因仅保留在记录里供人工查阅。
 _EXITED_ENROLL_STATUSES = frozenset({6})
 _EXITED_STATUS_WORDS = ("已退出",)
-# 已实测标定过的状态值：1/3=进行中、4=待开始、6=已退出；未见过的值按用户规则计为成功，
-# 但打校准日志供回填标定。
 _KNOWN_ENROLL_STATUSES = frozenset({1, 3, 4, 6})
 
 
@@ -610,20 +596,23 @@ def _parse_activity_log_item(item: dict) -> dict:
         if session.get("sessionFailReason")
     ]
     enroll_status = item.get("enrollStatus")
+    status_value = str(enroll_status).strip()
+    enroll_status = int(status_value) if re.fullmatch(r"\d+", status_value) else None
     status_text = " ".join(str(value) for value in item.values() if isinstance(value, str))
     exited = enroll_status in _EXITED_ENROLL_STATUSES or any(
         word in status_text for word in _EXITED_STATUS_WORDS
     )
     if enroll_status not in _KNOWN_ENROLL_STATUSES and not exited:
         logger.info(
-            f"[活动记录] 未标定的 enrollStatus={enroll_status}（按用户规则计为成功），"
-            f"enrollId={item.get('enrollId')}，请后台核对是否为「已退出」并回填标定"
+            f"[活动记录] 未标定的 enrollStatus={item.get('enrollStatus')}（不确认成功），"
+            f"enrollId={item.get('enrollId')}，请后台核对状态"
         )
     return {
         "spu": str(item.get("productId") or ""),
         "activity": item.get("activityThematicName") or item.get("activityTypeName") or "",
         "enroll_status": enroll_status,
-        "success": not exited,
+        "success": enroll_status in {1, 3, 4} and not exited,
+        "exited": exited,
         "enroll_time": item.get("enrollTime"),
         "enroll_id": item.get("enrollId"),
         "session_failures": session_failures,
@@ -658,8 +647,12 @@ _MARK_ACTIVITY_LOG_NEXT_JS = r"""
 
 async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
     """按首个响应的 total/pageSize 拉完当前 SPU 的报名记录分页。"""
-    first_items = first_result.get("list") or []
-    total = int(first_result.get("total") or 0)
+    if not isinstance(first_result.get("list"), list) or first_result.get("total") is None:
+        raise ValueError("报名记录响应缺少 list/total，无法确认查询完整性")
+    first_items = first_result["list"]
+    total = int(first_result["total"])
+    if total < 0:
+        raise ValueError("报名记录 total 无效")
     reported_size = int(first_result.get("pageSize") or first_result.get("page_size") or 0)
     page_size = reported_size or len(first_items) or 10
     expected_pages = max(1, (total + page_size - 1) // page_size)
@@ -670,6 +663,8 @@ async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
     for page_number in range(2, expected_pages + 1):
         try:
             result = await fetch_next(page_number)
+            if not isinstance(result.get("list"), list) or int(result.get("total", -1)) != total:
+                raise ValueError("报名记录分页响应不完整或 total 发生变化，请重新查询")
         except Exception as exc:
             error = str(exc)[:120]
             break
@@ -677,13 +672,18 @@ async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
         pages_read += 1
         items.extend(page_items)
 
+    identities = [str(item["enrollId"]) for item in items if item.get("enrollId") not in (None, "")]
+    unique_records = len(identities) == len(items) and len(set(identities)) == len(items)
+    if not unique_records and error is None:
+        error = "报名记录缺少 enrollId 或分页重复返回相同记录"
+
     return {
         "items": items,
         "total": total,
         "page_size": page_size,
         "expected_pages": expected_pages,
         "pages_read": pages_read,
-        "complete": pages_read == expected_pages and len(items) >= total,
+        "complete": error is None and pages_read == expected_pages and len(items) == total and unique_records,
         "error": error,
     }
 
@@ -775,6 +775,8 @@ async def read_activity_log_records(context, spus, region=None) -> dict:
 
                 collected = await _collect_activity_log_pages(first_result, fetch_next)
                 items = collected.pop("items")
+                if any(str(item.get("productId")) != spu for item in items):
+                    raise ValueError("报名记录接口返回了其他 SPU，查询结果未与当前输入匹配")
                 query = {"spu": spu, "returned": len(items), **collected}
                 queries.append(query)
                 logger.info(
@@ -1764,7 +1766,7 @@ async def enroll_activity(
         result["detail_eligible"] = False
         result["note"] = (
             "详情页查询结果为 0：该 SPU 不在本活动可报名商品列表中"
-            "（列表页折扣/库存初筛通过不等于详情资格通过）"
+            "（列表页价格初筛通过不等于详情资格通过）"
         )
         await report("query", True, result["note"])
         return result

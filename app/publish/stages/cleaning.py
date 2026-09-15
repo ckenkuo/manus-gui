@@ -56,6 +56,27 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
     # 颜色行凑不够合规图（见 vision.plan_clean 的说明）
     plan = vision.plan_clean(info, ctx["workdir"], min_clean=SKC_ROW_MIN_IMAGES)
     items = plan.get("items") or []
+    # 轮播图会被素材图和 SKU 预览图复用。plan_clean 为控制成本只补最低张数，
+    # 但明确标记含中文的其余主图不能原样发布，必须同样经过英化和质检。
+    planned = {item.get("file") for item in items}
+    notes = info.get("complianceNotes") or {}
+    main_dir = ctx["workdir"]
+    for entry in notes.get("files") or []:
+        filename = entry.get("file") if isinstance(entry, dict) else ""
+        if not filename or filename in planned or not entry.get("chinese"):
+            continue
+        path = os.path.join(main_dir, filename)
+        if not os.path.isfile(path) or entry.get("clean") or entry.get("duplicate"):
+            continue
+        items.append({
+            "file": filename,
+            "path": path,
+            "prompt": (
+                "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、"
+                "构图和颜色；同时移除水印、店铺名和第三方 logo。"
+            ),
+            "note": "轮播图中文复核",
+        })
     if not items:
         return {"status": "skipped", "note": plan.get("reason") or "无可清理项"}
 
@@ -136,7 +157,8 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
 
     note = f"清理 {len(ok_files)}/{len(items)} 张"
     if fail_files:
-        note += f"（未成功：{'、'.join(fail_files)}，按原图继续）"
+        note += f"（未通过：{'、'.join(fail_files)}）"
+        return {"status": "fail", "note": note[:300]}
     return {"status": "ok", "note": note}
 
 

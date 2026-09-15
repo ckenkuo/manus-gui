@@ -1,6 +1,5 @@
 {
   "permissions": {
-    "defaultMode": "bypassPermissions",
     "allow": [
       "Bash",
       "Read",
@@ -10,8 +9,10 @@
       "Glob",
       "Grep",
       "WebFetch",
-      "WebSearch"
-    ]
+      "WebSearch",
+      "Bash(python -)"
+    ],
+    "defaultMode": "bypassPermissions"
   },
   "skipDangerousModePermissionPrompt": true
 }

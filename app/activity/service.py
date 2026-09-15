@@ -6,16 +6,13 @@ UI / CLI 共用入口，进度经【结构化回调】抛出——对标 app/col
 和 UI（app.py 的 /activity 接口）都调这里。进度以结构化事件（dict）经 on_progress 抛出，
 UI 直接走 SSE 渲染。
 
-判定逻辑（2026-07-16 用户重定义，见 pipeline 模块 docstring）：确定性筛选——申报价 ≥ 销售底价
-(Excel 销售价列) 且 库存 ≥ 活动库存门槛 的活动全部报名（满足的都报，一个 SPU 报多个活动）。
-销售底价完全替代旧毛利率红线；不再用 LLM 选活动。
+判定逻辑：申报价达到 WPS 在线文档销售底价的活动全部入选，一个 SPU 可报多个活动。
+商品实时采购，不读取库存、不按库存门槛初筛；平台详情资格检查仍保留。无需 LLM 选活动。
 
 最高优先级安全约束（真实商家账号、操作不可逆）：
-- 阶段1 只做【只读 + dry-run】：只定位/只读/算计划/发 product_plan 事件，绝不点任何变更
-  按钮（关加速/报名/开加速）。变更函数在 pipeline 里留桩、正式分支 raise NotImplementedError。
-- 保守跳过：日常价或销售底价读不到（含公式单元格 `=` 开头）→ skip_nofloor；无任何活动同时
-  满足达底价+够库存 → skip_nomatch。一律不提交。库存读不到时，卡门槛的活动视为不达标（保守）。
-- 辅助路径（进度回调、CDP 探活、库存读取）best-effort：异常只 logger.warning 吞掉、不中断主流程。
+- 默认 dry-run 只生成计划；正式执行需要 dry_run=False 且 live=True。
+- 云端价格无效时中止；无固定折扣活动达底价时 skip_nomatch。
+- 报名成功由本次提交、完整前后快照和最新有效报名记录共同确认，历史成功不补作本次成功。
 
 事件契约（on_progress 收到的 dict，均含 "type"）：
     {"type":"batch_start","total":int,"todo":int,"batch":int,"dry_run":bool}
@@ -23,7 +20,7 @@ UI 直接走 SSE 渲染。
     # product_plan：一个 SPU 会发多条（每个达销售底价的活动一条）
     {"type":"product_plan","spu":str,"activity":str,"daily_price":float,"sale":float,
                            "cost":float|None,"submit_price":float,"within_floor":bool,
-                           "stock":int|None,"min_stock":int|None,"stock_ok":bool,
+                           "stock":None,"min_stock":int|None,"stock_ok":None,"stock_policy":"on_demand",
                            "selected":bool,"reason":str}
     {"type":"product_done","spu":str,"status":"done"|"skip_nofloor"|"skip_nomatch"|"fail",
                            "accel_closed":bool,"enrolled":bool,"submit_price":float|None,
@@ -65,16 +62,18 @@ from typing import Optional
 
 from playwright.async_api import async_playwright
 
-from app.activity import pipeline  # 以模块引用调用其函数，便于测试 monkeypatch（judge_activity 等）
+from app.activity import pipeline, source
+from app.activity.reconciliation import assess_registration
 # 复用采集 service 已实测的 CDP 护栏 / 进度回调 / LLM token 清零，避免重复实现。
 from app.collect.service import CDP_URL, _emit, ensure_cdp_alive, reset_pipeline_llms
 from app.config import PROJECT_ROOT, config_search_dirs
 from app.error_report import attach
 from app.logger import logger
-from app.tool.wps_excel_tool import WpsExcelTool
 
 # 单 SPU 超时护栏（秒）：阶段1 只有只读 + 1 次 LLM，给足余量即可。
 ACTIVITY_PRODUCT_TIMEOUT = 180
+LOG_VERIFY_TRIES = 3
+LOG_VERIFY_RETRY_DELAY = 2
 # 全局默认毛利率红线（config.toml [activity] 缺失时兜底）。
 _FALLBACK_MIN_MARGIN = 0.15
 
@@ -151,31 +150,11 @@ def parse_spu_list(text: str, batch_margin: float) -> list[dict]:
     return out
 
 
-def _read_cost(excel: str, sheet: str, spu: str) -> dict:
-    """按 SPU 从成本核算表读该行 {purchase, daily, sale} 原文（§9）。
-
-    - 各 Sheet 列序不同，先 resolve_field_columns 解析逻辑字段→真实列，绝不硬编码列号。
-    - 找不到该 SPU 行返回 {}。纯读、异常内部已被 WpsExcelTool 吞成 {}。
-    """
-    cols = WpsExcelTool.resolve_field_columns(excel, sheet)
-    return WpsExcelTool.read_row_by_key(
-        excel,
-        sheet,
-        key=spu,
-        cols={
-            "purchase": cols.get("purchase", "J"),
-            "daily": cols.get("daily", "G"),
-            "sale": cols.get("sale", "I"),
-        },
-        key_col=cols.get("spu", "D"),
-    )
-
-
 async def _connect_pages(cdp_url: str, region_label: str = ""):
-    """连 CDP、确认作业区域，并在【该区域的域名下】新建本批专用的流量、活动、商品页。
+    """连 CDP、确认作业区域，并在【该区域的域名下】新建本批专用的流量和活动页。
 
     不复用已有页签：其筛选条件、弹窗、局部状态和生命周期都不受管线控制，甚至可能正被
-    操作者关闭。三个页面均由本批创建并加入 owned_pages，调用方负责及时关闭；用户原本打开
+    操作者关闭。两个页面均由本批创建并加入 owned_pages，调用方负责及时关闭；用户原本打开
     的页签只【读一次区域】，不修改、不点击、也不关闭。
 
     区域为什么必须先确认：顶栏区域切换换的是域名（全球 agentseller.temu.com / 美国
@@ -216,8 +195,7 @@ async def _connect_pages(cdp_url: str, region_label: str = ""):
 
         flux_page = await open_owned_page("流量页", pipeline.FLUX_PATH)
         activity_page = await open_owned_page("活动页", pipeline.ACTIVITY_PATH)
-        goods_page = await open_owned_page("商品页", pipeline.GOODS_LIST_PATH)
-        return pw, browser, flux_page, activity_page, goods_page, owned_pages
+        return pw, browser, flux_page, activity_page, None, owned_pages
     except Exception:
         for page in reversed(owned_pages):
             try:
@@ -238,20 +216,19 @@ async def _connect_pages(cdp_url: str, region_label: str = ""):
 
 async def _process_one_spu(
     entry: dict,
-    excel: str,
-    sheet: str,
     flux_page,
     activity_page,
     dry_run: bool,
     on_progress,
     stock_map: Optional[dict] = None,
+    cost_map: Optional[dict] = None,
 ) -> dict:
     """单 SPU 确定性流程（重构版），返回结果 dict（供上层生成 product_done 事件）。
 
     2026-07-16 用户重定义判定：不再 LLM 选一个活动、不再用毛利率红线，改为【确定性筛选】——
-    遍历活动页全部活动，把「申报价(=日常价×活动折扣率) ≥ 销售底价(Excel 销售价格列) 且
-    商品库存 ≥ 活动库存门槛」的活动全部列入报名计划（满足的都报）。每个入选活动发一条
-    product_plan。阶段1 仍全 dry-run、零变更（变更桩绝不在 dry-run 调用）。
+    遍历活动页全部活动，把「申报价(=日常价×活动折扣率) ≥ 销售底价(WPS 销售价格列)」
+    的活动全部列入报名计划。商品实时采购，库存不参与初筛。每个入选活动发一条
+    product_plan。规划阶段不执行报名或切换流量。
     保守跳过：日常价或销售底价读不到 → skip_nofloor；无任何活动入选 → skip_nomatch。
     """
     spu = entry["spu"]
@@ -266,9 +243,9 @@ async def _process_one_spu(
 
     # 1. 读底价：daily(日常价) + sale(销售价=底价，用户手填常量)。成本 purchase 仅展示、不判定。
     #    daily 或 sale 缺失/公式(=开头)/解析不出 → skip_nofloor（底价读不到，保守跳过）。
-    row = _read_cost(excel, sheet, spu)
+    row = (cost_map or {}).get(spu)
     if not row:
-        result.update(status="skip_nofloor", note="成本核算表未找到该 SPU 行")
+        result.update(status="skip_nofloor", note="WPS 文档未找到该 SPU 的有效价格")
         return result
     daily_price = pipeline._to_number(row.get("daily"))
     sale_raw = str(row.get("sale", "")).strip()
@@ -287,14 +264,6 @@ async def _process_one_spu(
     # 3. 读活动列表（只读，已去重/去垃圾行）。
     activities = await pipeline.read_activities(activity_page) if activity_page else []
 
-    # 4. 该 SPU 库存（卡活动门槛用）。stock_map 由批次统一读；取不到 → None（保守：卡库存的
-    #    活动会因库存未知而不入选，见下）。
-    stock = None
-    if stock_map is not None:
-        stock = stock_map.get(str(spu))
-
-    # 5. 遍历活动：达底价 且 够库存 → 入选。只对「达底价」的活动发 product_plan（否则近百个
-    #    活动会刷屏）；达底价但库存不足的也发一条（标注原因），便于前端展示为何没入选。
     enrolled = []
     for act in activities:
         dr = act.get("discount_rate")
@@ -306,17 +275,14 @@ async def _process_one_spu(
         if not within_floor:
             continue  # 申报价够不到销售底价，直接淘汰、不发 plan
         min_stock = act.get("min_stock")
-        # 库存门槛：门槛为 None 视为无门槛；库存未知(None)时保守视为不达标（卡库存策略）。
-        stock_ok = (min_stock is None) or (stock is not None and stock >= min_stock)
-        selected = stock_ok
-        reason = "达底价且够库存" if selected else (
-            f"达底价但库存不足（有{stock if stock is not None else '未知'}<门槛{min_stock}）"
-        )
+        selected = True
+        reason = "申报价达底价；实时采购，不按库存筛选"
         await _emit(on_progress, {
             "type": "product_plan", "spu": spu, "activity": act["name"],
             "daily_price": daily_price, "sale": sale, "cost": cost,
             "submit_price": submit_price, "within_floor": within_floor,
-            "stock": stock, "min_stock": min_stock, "stock_ok": stock_ok,
+            "stock": None, "min_stock": min_stock, "stock_ok": None,
+            "stock_policy": "on_demand",
             "selected": selected, "reason": reason,
         })
         if selected:
@@ -339,8 +305,7 @@ async def _process_one_spu(
     # 6. 无任何活动入选 → skip_nomatch。
     if not enrolled:
         result.update(status="skip_nomatch",
-                      note="无活动同时满足 达底价 且 够库存"
-                           + ("（本 SPU 库存未读到）" if stock is None else f"（库存={stock}）"))
+                      note="无固定折扣活动的申报价达到销售底价")
         return result
 
     # 7. 计划可行（status=done，携带计划）。真正的变更在【执行遍】(_run_execution_phases) 里按
@@ -648,37 +613,40 @@ async def _capture_activity_log_baseline(plans, activity_page, on_progress, summ
 async def _reconcile_activity_log(plans, activity_page, on_progress, summary) -> None:
     """扫描结束后以报名记录页为准，对计划中的每个 SPU/活动做最终状态归并。"""
     spus = [plan["spu"] for plan in plans]
-    try:
-        result = await pipeline.read_activity_log_records(activity_page.context, spus)
-    except Exception as exc:
-        result = {
-            "records": [], "complete": False, "queries": [],
-            "note": f"报名记录页查询异常：{str(exc)[:120]}",
-        }
     baseline = summary.get("log_baseline") or {}
-    after_records = result.get("records") or []
-    baseline_records = baseline.get("records") or []
-    records = []
-    seen = set()
-    for record in [*baseline_records, *after_records]:
-        key = record.get("enroll_id") or (
-            str(record.get("spu")), record.get("activity"), record.get("enroll_time")
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        records.append(record)
+    attempts = summary.get("submitted_attempts") or {}
+    assessments = {}
+    snapshots = []
+    for attempt in range(LOG_VERIFY_TRIES):
+        try:
+            result = await pipeline.read_activity_log_records(activity_page.context, spus)
+        except Exception as exc:
+            result = {
+                "records": [], "complete": False, "queries": [],
+                "note": f"报名记录页查询异常：{str(exc)[:120]}",
+            }
+        snapshots.append(_log_snapshot(result))
+        pending = False
+        for plan in plans:
+            spu = str(plan["spu"])
+            for item in plan.get("enrolled_activities", []):
+                activity = item["activity"]
+                attempted = spu in attempts.get(activity, [])
+                assessment = assess_registration(baseline, result, spu, activity, attempted)
+                assessments[(spu, activity)] = assessment
+                if attempted and not assessment["ok"]:
+                    pending = True
+        if not pending or attempt + 1 == LOG_VERIFY_TRIES:
+            break
+        await _emit(on_progress, {
+            "type": "log", "level": "info",
+            "message": f"报名记录仍有未确认项，等待后第 {attempt + 2} 次复查（最多 {LOG_VERIFY_TRIES} 次）",
+        })
+        await asyncio.sleep(LOG_VERIFY_RETRY_DELAY)
     summary["log_verification"] = {
         **_log_snapshot(result),
         "baseline_queries": baseline.get("queries") or [],
-        "records": [{key: value for key, value in record.items() if key != "raw"} for record in records],
-    }
-    success_pairs = {
-        (str(record.get("spu")), record.get("activity")): record
-        for record in records if record.get("success")
-    }
-    record_pairs = {
-        (str(record.get("spu")), record.get("activity")): record for record in records
+        "attempts": snapshots,
     }
     scan_failures = summary.get("scan_failures") or []
 
@@ -687,7 +655,13 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary) ->
         for item in plan.get("enrolled_activities", []):
             activity = item["activity"]
             pair = (spu, activity)
-            success_record = success_pairs.get(pair)
+            assessment = assessments[pair]
+            success_record = assessment["record"] if assessment["ok"] else None
+            summary["enrolled_activities"][activity] = [
+                value for value in summary["enrolled_activities"].get(activity, []) if value != spu
+            ]
+            current = summary["activity_results"].setdefault(activity, {})
+            current.setdefault("log_results", {})[spu] = assessment
             if success_record:
                 enrolled = summary["enrolled_activities"].setdefault(activity, [])
                 if spu not in enrolled:
@@ -702,9 +676,8 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary) ->
                     failure for failure in summary["failed"]
                     if not (str(failure.get("spu")) == spu and failure.get("activity") == activity)
                 ]
-                current = summary["activity_results"].setdefault(activity, {})
                 # 场次失败原因不再否决成功（用户规则 2026-07-24），但仍附注出来供人工核对。
-                note = f"报名记录页确认成功（enrollId={success_record.get('enroll_id')}）"
+                note = assessment["note"]
                 if success_record.get("session_failures"):
                     note += f"；注意存在场次失败原因：{'、'.join(success_record['session_failures'])}"
                 current.update({
@@ -728,23 +701,13 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary) ->
                 })
                 continue
 
-            record = record_pairs.get(pair)
             scan_failure = next(
                 (failure for failure in scan_failures
                  if str(failure.get("spu") or "") in {"", spu}
                  and failure.get("activity") == activity),
                 None,
             )
-            if record:
-                # 走到这里说明记录在列表但被判「已退出」（2026-07-24 起列表内非退出即成功）。
-                reason = (
-                    f"报名记录存在但已退出（enrollStatus={record.get('enroll_status')}"
-                    f"，场次原因={record.get('session_failures') or '无'}）"
-                )
-            elif not result.get("complete"):
-                reason = f"报名记录查询不完整，无法确认：{result.get('note', '')}"
-            else:
-                reason = "报名记录页未查到该 SPU/活动的成功记录"
+            reason = assessment["note"]
             if scan_failure and scan_failure.get("note"):
                 reason = f"{reason}；扫描阶段：{scan_failure['note']}"
             if not any(
@@ -761,6 +724,14 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary) ->
                 "type": "exec_log_verify", "spu": spu, "activity": activity,
                 "ok": False, "status": "not_verified", "note": reason,
             })
+    for activity, current in summary["activity_results"].items():
+        outcomes = current.get("log_results", {})
+        enrolled = summary["enrolled_activities"].get(activity, [])
+        ineligible = summary["ineligible_activities"].get(activity, [])
+        current["verified"] = bool(enrolled) and all(
+            outcome["ok"] or spu in ineligible for spu, outcome in outcomes.items()
+        )
+        current["status"] = "log_verified" if current["verified"] else "not_verified"
 
 
 async def _enroll_by_activity(by_activity, activity_page, live, on_progress, summary) -> None:
@@ -934,13 +905,14 @@ async def run_activity_batch(
     live: bool = False,
     activity_allow=None,
     region_label: str = "",
+    cloud_url: str = "",
 ) -> dict:
     """跑一批 SPU 的活动管理编排（关流量→报名→开流量），进度经 on_progress 抛出。
 
     - spus：parse_spu_list 产出的 [{spu, margin}] 列表；也接受原始字符串（内部转解析）或
       裸 SPU 字符串列表。
-    - min_margin：本批统一毛利率红线（三级回退的中层）；None 时取 config 全局默认。逐品覆盖
-      在 parse_spu_list 阶段已并入各 entry 的 margin。
+    - cloud_url：WPS 在线成本表分享链接；excel 参数兼容旧调用，但也只接受在线链接。
+    - min_margin：保留兼容，价格筛选只使用文档日常价与销售底价。
     - dry_run=True（默认）：只算计划、发 product_plan，绝不点任何变更按钮、不跑执行遍。
     - dry_run=False：跑执行遍（活动维度：关流量→报名→重开流量）。其中 live 再分两档——
       live=False（半程，默认）：开提报页/填价但【不提交、不真关/开】，全部可逆，用于端到端验证；
@@ -977,6 +949,20 @@ async def run_activity_batch(
         await _emit(on_progress, {"type": "aborted", "reason": "SPU 清单为空或无有效 SPU。"})
         logger.error("活动批次：SPU 清单为空。")
         return {"done": 0, "skip": 0, "fail": 0, "results": []}
+
+    try:
+        document = source.validate_document(cloud_url or excel)
+        if not sheet:
+            raise ValueError("请先选择 WPS 文档的工作表。")
+        await _emit(on_progress, {
+            "type": "log", "level": "info", "message": "正在重新读取 WPS 文档价格…",
+        })
+        cost_map = await asyncio.to_thread(
+            source.read_costs, document, sheet, [entry["spu"] for entry in entries],
+        )
+    except Exception as exc:
+        await _emit(on_progress, {"type": "aborted", "reason": f"WPS 数据源读取失败：{exc}"})
+        return {"done": 0, "skip": 0, "fail": total, "results": []}
 
     # 页面句柄：测试可注入；否则连 CDP 取已打开的流量页/活动页标签。
     injected = flux_page is not None or activity_page is not None
@@ -1026,30 +1012,6 @@ async def run_activity_batch(
             "batch": total, "dry_run": dry_run,
         })
 
-        # 批次统一读本批 SPU 库存（一次捕获全店列表，按 productId 匹配），供卡活动库存门槛。
-        # 测试可经 stock_map 注入直接跳过。best-effort：读不到 → {}，按「库存未知」保守处理。
-        if stock_map is None:
-            if goods_page is not None:
-                try:
-                    stock_map = await pipeline.read_stock(
-                        goods_page, [e["spu"] for e in entries]
-                    )
-                    logger.info(f"活动批次：读到 {len(stock_map)} 个 SPU 库存")
-                except Exception as e:
-                    logger.warning(f"活动批次：库存读取失败（按库存未知保守处理）：{e}")
-                    stock_map = {}
-                finally:
-                    # 商品页只用于批次开头统一读库存；若由本任务创建，读完立即关闭。
-                    if goods_page in owned_pages:
-                        try:
-                            await goods_page.close()
-                        except Exception as e:
-                            logger.warning(f"关闭自动创建的商品页失败：{e}")
-                        owned_pages.remove(goods_page)
-                        goods_page = None
-            else:
-                stock_map = {}
-
         for i, entry in enumerate(entries, 1):
             spu = entry["spu"]
             await _emit(on_progress, {
@@ -1064,8 +1026,9 @@ async def run_activity_batch(
             try:
                 res = await asyncio.wait_for(
                     _process_one_spu(
-                        entry, excel, sheet, flux_page, activity_page, dry_run,
+                        entry, flux_page, activity_page, dry_run,
                         on_progress, stock_map,
+                        cost_map,
                     ),
                     timeout=ACTIVITY_PRODUCT_TIMEOUT,
                 )

@@ -104,14 +104,25 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             logger.info(f"描述图规划沿用提前预热的结果（{len(mods)} 张按页面序号重挂）")
         else:
             logger.info("页面描述图与预热时不一致（源图有增减），现场重出规划")
+    if plan and plan.get("maxImages") and len(mods) - len(plan["delete"]) > plan["maxImages"]:
+        plan = None
     if plan is None:
         plan = await vision.plan_desc(mods, info_for_desc)
+    if plan.get("status") == "error":
+        await ensure_desc_closed(session)
+        return {"status": "fail", "note": plan.get("reason") or "描述图规划失败"}
+    max_images = plan.get("maxImages")
     deleted, replaced = 0, 0
     if plan["delete"]:
         d = await desc_delete(session, plan["delete"])
         if d.get("status") != "ok":
             return {"status": "fail", "note": f"删描述模块失败：{str(d)[:150]}"}
         deleted = len(d.get("deleted") or [])
+        if max_images and (not isinstance(d.get("countAfter"), int)
+                           or d["countAfter"] > max_images):
+            await ensure_desc_closed(session)
+            return {"status": "fail", "note": f"玩具描述图删除后未确认数量 <= {max_images} 张："
+                                              f"{d.get('countAfter')}"}
     # 【英化产物按源 URL 落盘复用】gpt-image-2 每张都是一次生图调用，是本阶段最贵的
     # 一步。而 ⑬ 的成果只活在未保存的表单里，save 没成功就得整段重跑（见模块头
     # 「状态文件记的是跑过」那段）——重跑时若连图也重新生成，等于白烧一遍生图钱。
@@ -260,7 +271,7 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             # 绝不能让它把已经换好的那些图连坐掉
             logger.warning(f"描述图转存异常（保留外链，继续收尾）：{e}")
 
-    if not deleted and not replaced and not rehosted:
+    if not deleted and not replaced and not rehosted and not max_images:
         # 【这条早退路径也必须先关编辑器】2026-08-28 实测（1014675972015 仿真花）：
         # 9 张描述图全部替换失败（描述专属菜单未展开），走到这里 return skipped，
         # 把描述编辑器【留在页面上】。它是全屏 modal，于是 ⑭ save 点下去后：
@@ -288,6 +299,9 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
         await emit({"type": "manual_check", "stage": "desc",
                     "message": f"描述编辑器未能关闭（会挡住后续阶段的点击）："
                                f"{closed.get('reason')}"})
+    if max_images and (not isinstance(s.get("descImgs"), int) or s["descImgs"] > max_images):
+        return {"status": "fail", "note": f"玩具描述图保存后未确认数量 <= {max_images} 张："
+                                          f"{s.get('descImgs')}"}
     if s.get("status") == "validation-error":
         # 外链未转存与尺寸不达标是两回事，分别报出来——只说「外链」会让人以为
         # 尺寸没问题（本商品实际是尺寸那条，见 desc_save 的回读注释）
@@ -330,8 +344,10 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
                             f"{str(s['tooSmall'])[:120]}"}
     elif s.get("status") != "ok":
         return {"status": "fail", "note": f"desc_save 失败：{str(s)[:150]}"}
-    return {"status": "ok", "note": _desc_note(deleted, replaced, text_note,
-                                               upscaled, reused, rehosted)}
+    note = _desc_note(deleted, replaced, text_note, upscaled, reused, rehosted)
+    if max_images:
+        note += f" | 玩具描述图 {s['descImgs']}/{max_images} 张"
+    return {"status": "ok", "note": note}
 
 
 def _desc_note(deleted: int, replaced: int, text_note: str,

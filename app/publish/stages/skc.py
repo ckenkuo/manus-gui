@@ -327,4 +327,5 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
     if dirty_rows:
         # 进 note 是为了留在状态文件里：事后被 Temu 打回时能直接对上是哪几行
         note += f"；{len(dirty_rows)} 行含不合规图：{'、'.join(dirty_rows)}"
+        return {"status": "fail", "note": note[:300]}
     return {"status": "ok", "note": note}
