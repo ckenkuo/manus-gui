@@ -483,7 +483,7 @@ _JS_LIVE_STATE = r"""(async () => {
       const m = /(\d+)\s*[xX×]\s*(\d+)/.exec(txt(el.querySelector('.img-size')));
       if (!m) return;
       const w = parseInt(m[1], 10), h = parseInt(m[2], 10);
-      if (w && h && (Math.abs(w / h - 1) >= 0.01
+      if (w && h && (w !== h
                      || w < __CAROUMIN__ || h < __CAROUMIN__)) {
         carouselBad++;
       }

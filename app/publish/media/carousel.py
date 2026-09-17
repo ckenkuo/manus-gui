@@ -150,7 +150,7 @@ _JS_CAROUSEL_STATE = r"""(() => {
     const w = m ? parseInt(m[1], 10) : 0;
     const h = m ? parseInt(m[2], 10) : 0;
     const known = w > 0 && h > 0;
-    const square = known && Math.abs(w / h - 1) < 0.01;
+    const square = known && w === h;
     const cb = el.querySelector('input.ant-checkbox-input');
     const checked = /(^|\s)checked(\s|$)/.test(el.className) || !!(cb && cb.checked);
     items.push({i: i, url: src, w: w, h: h, sizeText: sizeText,

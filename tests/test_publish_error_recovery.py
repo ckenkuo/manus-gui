@@ -32,6 +32,36 @@ def test_1688_missing_data_diagnostic(context, expected):
     assert result["diagnostic"]["hasResult"] is expected
 
 
+@pytest.mark.parametrize("width,height,checked,bad", [
+    (1080, 1082, True, True),
+    (1082, 1080, True, True),
+    (800, 801, True, True),
+    (800, 800, True, False),
+    (799, 799, True, True),
+    (1080, 1082, False, False),
+    (0, 0, True, False),
+])
+def test_carousel_dom_rejects_near_square(width, height, checked, bad):
+    from app.publish.media.carousel import _JS_CAROUSEL_STATE, _JS_PICK_CAROUSEL_LIST
+
+    setup = "const dimensions = " + json.dumps({
+        "size": f"{width} X {height}", "checked": checked,
+    }) + ";" + r"""
+const checkbox = {checked: dimensions.checked};
+const item = {
+  className: '',
+  querySelector: selector => selector === '.img-size' ? {textContent: dimensions.size} : checkbox,
+  querySelectorAll: () => [{src: 'https://source.test/picture.jpg'}]
+};
+const list = {querySelectorAll: () => [item]};
+global.document = {querySelectorAll: () => [list]};
+"""
+    code = _JS_CAROUSEL_STATE.replace("__MIN__", "800").replace("__PICK__", _JS_PICK_CAROUSEL_LIST)
+    result = run_js(code, setup)
+    assert result["items"][0]["bad"] is bad
+    assert result["badPicked"] == int(bad)
+
+
 def test_1688_no_context_is_not_existing_result():
     result = run_js(extract._JS_EXTRACT, "global.window={}; global.location={href:'https://www.1688.com/'}; global.document={title:'首页',readyState:'complete'};")
     assert result["diagnostic"]["hasContext"] is False

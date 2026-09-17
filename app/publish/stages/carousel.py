@@ -91,7 +91,7 @@ async def _english_one(local_path: str, url: str, workdir: str,
     os.makedirs(os.path.dirname(out), exist_ok=True)
     if os.path.exists(out) and os.path.getsize(out) > 0:
         sz = images.image_size(out)
-        if sz and abs(sz[0] / sz[1] - 1) < 0.01 and min(sz) >= CAROUSEL_MIN_SIDE:
+        if sz and sz[0] == sz[1] and min(sz) >= CAROUSEL_MIN_SIDE:
             return {"ok": True, "path": out, "how": "cached"}
         logger.warning(f"轮播图英化产物尺寸已不合规（{sz}），当缓存未命中重做")
     prompt = (images.SIZECHART_TRANSLATE_PROMPT if sizechart
@@ -117,7 +117,7 @@ def _to_carousel_size(path: str, out_path: str, preserve_info: bool = False) -> 
     if not sz:
         return ""
     out = path
-    if abs(sz[0] / sz[1] - 1) >= 0.01 or min(sz) < CAROUSEL_MIN_SIDE:
+    if sz[0] != sz[1] or min(sz) < CAROUSEL_MIN_SIDE:
         if preserve_info:
             from PIL import Image, ImageOps
             with Image.open(path) as source:
@@ -292,7 +292,7 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
         # 「未知」，而下载件才是我们真正要上传的那个东西；读不出尺寸同样按未知处理
         # （未知不等于不合格，同 carousel_state 的取向）。
         sz = images.image_size(entry["path"])
-        need_size = bool(sz) and (abs(sz[0] / sz[1] - 1) >= 0.01
+        need_size = bool(sz) and (sz[0] != sz[1]
                                   or min(sz) < CAROUSEL_MIN_SIDE)
 
         if dirty is None:

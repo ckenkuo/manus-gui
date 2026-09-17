@@ -17,6 +17,7 @@ def scene(tmp_path, monkeypatch):
         def __init__(self):
             self.items = []
             self.sources = {}
+            self.sizes = {}
             self.paths = {}
             self.info = set()
             self.dirty = set()
@@ -47,7 +48,7 @@ def scene(tmp_path, monkeypatch):
                 return 0
             self.paths[str(destination)] = url
             color = (list(self.sources).index(url) * 27 % 255, 80, 100)
-            Image.new("RGB", (800, 800), color).save(destination)
+            Image.new("RGB", self.sizes.get(url, (800, 800)), color).save(destination)
             return os.path.getsize(destination)
 
         async def classify(self, entries, info):
@@ -123,6 +124,15 @@ def scene(tmp_path, monkeypatch):
     monkeypatch.setattr(carousel, "open_carousel_space", AsyncMock(return_value={"opened": True}))
     monkeypatch.setattr(carousel.media_space, "_pick_many_from_space", instance.pick)
     monkeypatch.setattr(carousel, "toggle_carousel", instance.toggle)
+    normalize = carousel._to_carousel_size
+
+    def normalize_and_track(path, out_path, preserve_info=False):
+        result = normalize(path, out_path, preserve_info)
+        if result:
+            instance.paths[result] = instance.paths[path]
+        return result
+
+    monkeypatch.setattr(carousel, "_to_carousel_size", normalize_and_track)
     return instance
 
 
@@ -326,3 +336,33 @@ async def test_expand_after_render_includes_hidden_information(scene, monkeypatc
     monkeypatch.setattr(carousel, "expand_carousel_pool", expand)
     assert (await scene.run())["status"] == "ok"
     assert sum(item["checked"] for item in scene.items) == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(1080, 1082), (1082, 1080), (800, 801)])
+async def test_clean_near_square_image_is_replaced(scene, size):
+    defaults = [scene.add() for _ in range(3)]
+    target = defaults[0]
+    scene.sizes[target] = size
+    result = await scene.run()
+    assert result["status"] == "ok"
+    assert not scene.edits
+    selected = [item for item in scene.items if item["checked"]]
+    assert len(selected) == 3
+    assert target not in {item["url"] for item in selected}
+    assert any(scene.sources[item["url"]] == target for item in selected)
+    with Image.open(Path(scene.ctx["workdir"]) / "carousel" / "pic00.jpg") as image:
+        assert image.width == image.height >= 800
+
+
+@pytest.mark.parametrize("preserve_info", [False, True])
+@pytest.mark.parametrize("size", [(1080, 1082), (1082, 1080), (800, 801), (800, 800)])
+def test_carousel_geometry_requires_exact_square(tmp_path, size, preserve_info):
+    source = tmp_path / "source.jpg"
+    destination = tmp_path / "square.jpg"
+    Image.new("RGB", size, "white").save(source)
+    output = carousel._to_carousel_size(str(source), str(destination), preserve_info)
+    with Image.open(output) as image:
+        assert image.width == image.height >= 800
+    if size == (800, 800):
+        assert output == str(source)
