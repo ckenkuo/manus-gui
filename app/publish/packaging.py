@@ -38,6 +38,25 @@ _APPAREL_EXCLUDE = ("玩具", "积木", "鞋盒", "收纳", "餐具", "水杯", 
                     "文具", "家具", "电器", "礼盒", "模型")
 
 
+# 鞋类词。只拿【最末一级类目】比，不看整条路径——平台把鞋和服装挂在同一个顶层
+# （「服装、鞋靴和珠宝饰品」），拿整条路径做子串会把所有童装裤子都判成鞋：实测
+# 「…/婴儿服饰及鞋靴/女婴服装/女婴下装/女婴长单裤」整条路径里带「鞋靴」二字。
+# 排除词防的是「卖鞋周边、不是卖鞋」：鞋盒/洗鞋袋/鞋架/鞋垫这些标题带「鞋」字，
+# 类目挂的却是家居或配件。
+_SHOE_WORDS = ("鞋", "靴")
+_SHOE_EXCLUDE = ("鞋盒", "洗鞋", "鞋架", "鞋垫", "鞋带", "鞋拔", "鞋撑", "鞋油",
+                 "鞋柜", "鞋套", "鞋刷", "鞋材", "鞋袜收纳")
+
+
+def _is_shoe(cat_path, title: str) -> bool:
+    """判断是否鞋类。类目【只取最末一级】（见 _SHOE_WORDS 上方），没有类目才退到标题。"""
+    leaf = str((cat_path or [])[-1]).strip() if cat_path else ""
+    blob = leaf or (title or "")
+    if any(w in blob for w in _SHOE_EXCLUDE):
+        return False
+    return any(w in blob for w in _SHOE_WORDS)
+
+
 def _is_apparel(cat_path, title: str) -> bool:
     """判断是否服装类（决定包裹尺寸走固定值还是模型估算）。
 
@@ -67,7 +86,17 @@ async def classify_category(title: str, cat_path=None) -> str:
     鱼缸/帐篷…），避免每加一个就补词表。set_variant 的同步路径 _is_apparel 仍独立。
 
     返回品类标签字符串：_CATEGORY_TAGS 之一。
+
+    【鞋类必须在 apparel 之前判，且只在这里判】平台的鞋类目与服装共用顶层
+    「服装、鞋靴和珠宝饰品」，故 _is_apparel 对鞋一律返回 True——先判 apparel 的话
+    "shoe" 这个标签永远发不出来，而下游两处早就在等它：_NONAPPAREL_KIND["shoe"]
+    （尺码表估算的「鞋类尺码专家」）与 accessories 的鞋类包装清单引导，二者此前都是
+    死代码（2026-09-14 实测：女鞋/男童鞋类目 classify_category 全部返回 apparel）。
+    不并进 _is_apparel 是因为它还驱动包裹尺寸（服装走 30x25x3 压平袋装）与变种表，
+    摘鞋会连带改掉那两处，不是这里要动的范围。
     """
+    if _is_shoe(cat_path, title):
+        return "shoe"
     if _is_apparel(cat_path, title):
         return "apparel"
     return await _llm_classify_nonapparel(title, cat_path)

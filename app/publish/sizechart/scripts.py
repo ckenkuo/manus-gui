@@ -53,6 +53,26 @@ __LOCATE__
 })()"""
 
 
+# 【弹窗要轮询等，别拿固定 sleep 当成败判据】2026-09-13 取证（1076651064534，女士居家
+# 拖鞋）：阶段⑨ 报「添加尺码表弹窗未打开: {'opened': False}」——返回里【没有】
+# reason:'no-link'，说明入口 link 找到了、也点了，纯粹是点完只等 1500ms 就一次性判死，
+# 那一刻弹窗还没渲染出来。故排除定位失败，_scItem 那段不动。
+#
+# 判据一字未改（.ant-modal-wrap 含「添加尺码表」且 getComputedStyle 的 display 非 none，
+# 取最后一个），只把「等法」从一次性 sleep 改成轮询到位。轮询放在 JS 内、写成 40 轮 ×
+# 300ms，与上面 _scItem 同一层同一风格，不引入第二套写法；不用 Python 侧的
+# common._poll_until 是因为点击与判定同在这一段注入 JS 里，让 Python 反复重跑整段等于
+# 反复点入口，会叠出多个弹窗。上限从 1.5s 放宽到 12s：这里的 sleep 本就是【不够】才出事
+# 的，照抄原时长等于没修（与 _poll_until「原 sleep 时长即 timeout 上限」的差别只在于，
+# 那边的原 sleep 是够用的保守量、这边的不是）。
+#
+# 【与 editor 里「开新前先关闭残留弹窗」的兼容性】已核对 editor.add_sizechart：那段清理是
+# 独立的一次 eval，本段 JS 在它 await 返回之后才跑；清理每点一次取消/关闭都跟 sleep(1000)
+# 再继续，远超 antd 弹窗淡出动画，故它返回时被关掉的 wrap 已经是 display:none。即首轮立即
+# 探测不可能把「正在关闭中」的残留弹窗误判成已打开。清理连点 5 轮仍关不掉的（根本找不到
+# 取消/关闭按钮）是真卡着没关，那种情形改前的固定 sleep 同样会判成 opened，非本次引入。
+#
+# waited 是给下次事故留的取证：能区分「等到上限仍没出来」和「立刻就成/立刻就没」。
 _JS_OPEN_SIZECHART_MODAL = r"""(async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 __LOCATE__
@@ -64,18 +84,19 @@ __LOCATE__
   link.scrollIntoView({block: 'center'});
   await sleep(500);
   link.click();
-  await sleep(1500);
-  const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
-    .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  let wrap = null;
-  for (const w of _scList) {
-    const r = w.getBoundingClientRect();
-    if (r.width === 0) continue;
-    const hit = document.elementFromPoint(r.x + r.width / 2, Math.min(r.y + 300, innerHeight - 10));
-    if (hit && w.contains(hit)) { wrap = w; break; }
+  const _scWrap = () => {
+    const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
+      .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
+    return _scList[_scList.length - 1];
+  };
+  let wrap = _scWrap();
+  let waited = 0;
+  for (let i = 0; i < 40 && !wrap; i++) {
+    await sleep(300);
+    waited += 300;
+    wrap = _scWrap();
   }
-  if (!wrap) wrap = _scList[_scList.length - 1];
-  return JSON.stringify({opened: !!wrap});
+  return JSON.stringify({opened: !!wrap, waited});
 })()"""
 
 
@@ -100,14 +121,7 @@ _JS_SET_SIZECHART_CAT = r"""(async () => {
   const keyword = __CAT__;   // null 表示跟随平台预选，不指定具体分类
   const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  let wrap = null;
-  for (const w of _scList) {
-    const r = w.getBoundingClientRect();
-    if (r.width === 0) continue;
-    const hit = document.elementFromPoint(r.x + r.width / 2, Math.min(r.y + 300, innerHeight - 10));
-    if (hit && w.contains(hit)) { wrap = w; break; }
-  }
-  if (!wrap) wrap = _scList[_scList.length - 1];
+  const wrap = _scList[_scList.length - 1];
   if (!wrap) return JSON.stringify({ok: false, reason: 'no-modal'});
 
   const item = Array.from(wrap.querySelectorAll('.ant-form-item'))
@@ -351,11 +365,31 @@ _JS_SET_SIZECHART_PARAMS = r"""(async () => {
 })()"""
 
 
+# 【鞋类国家码列是平台算的，别自己换算】2026-09-14 真站取证（1076651064534，女士
+# 居家拖鞋，尺码行 36-37 / 38-39 / 40-41）：欧码/英码/美码/日本码/韩国码/墨西哥码/
+# 巴西码/哥伦比亚码/智利码 这 9 列在弹窗里是【下拉框】，其选项是平台按脚长给出的固定
+# 全集（欧码是 30.5-31…50.5-51 这样的半码桶，巴西码/哥伦比亚码/智利码是单个数字），
+# 与行无关、与卖家写的尺码标签也无关。脚长列表头的问号气泡原文就是「填写脚长，将自动
+# 填充鞋码大小」——给脚长框打真实键盘事件（input/change/blur）后，实测 300ms 内 9 列
+# 全部被平台自己填上。
+#
+# 原实现（把欧码当唯一基准、自己算各国码再逐格去点下拉）对不上任何选项：欧码列没有
+# "36-37" 这个选项，巴西码列没有 "34-35" 这种区间值，只有碰巧是单个数字的巴西码命中
+# 过一次，于是 8 列全空、整表报「表格填充不完整」，还因为 setSelect 每格 2 轮 × 60 次
+# 轮询空转到 1118 秒。故改成：先填文本列 → 把脚长调准 → 等平台把国家码列填完 →
+# 只对仍空着的下拉格兜底（正常情况一格都不会走到）。
+#
+# 【为什么脚长要来回调】平台的脚长→欧码表并不等于「欧码 = 脚长 + 12」，实测
+# 20→30.5-31、23→35.5-36、24→36.5-37、25→38.5-39、26→40.5-41、28→43.5-44，斜率在
+# 0.5cm/码 到 1cm/码 之间跳，且这张表按类目走、我们无从穷举。故不写死换算，改成拿
+# 页面当唯一权威：设一个脚长、读回平台算出的欧码、按差值修正，收敛即停（每行 <=6 次，
+# 每次约 350ms）。这样无论类目、无论尺码标签是区间还是单码都对得上。
 _JS_FILL_SIZECHART = r"""(async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const tplName = __NAME__;
   const data = __DATA__;
   const params = __PARAMS__;
+  const derived = __DERIVED__;   // 由平台按脚长自动算出的国家码列（无脚长列时为空）
   const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
   let wrap = null;
@@ -369,6 +403,49 @@ _JS_FILL_SIZECHART = r"""(async () => {
   if (!wrap) return JSON.stringify({ok: false, reason: 'no-modal'});
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
   const setVal = (inp, v) => { setter.call(inp, String(v)); inp.dispatchEvent(new Event('input', {bubbles:true})); inp.dispatchEvent(new Event('change', {bubbles:true})); };
+  const setSelect = async (cell, value) => {
+    const select = cell && cell.querySelector('.ant-select');
+    if (!select) return false;
+    const want = String(value).trim();
+    const candidates = [want, want.replace(/\.0$/, ''), want + 'cm', want + '厘米'];
+    const input = select.querySelector('input');
+    const popupId = input && (input.getAttribute('aria-controls') || input.getAttribute('aria-owns'));
+    for (let attempt = 0; attempt < 2; attempt++) {
+      document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+      await sleep(80);
+      const selector = select.querySelector('.ant-select-selector');
+      ['mousedown','mouseup','click'].forEach(type =>
+        selector.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true, view: window})));
+      await sleep(180);
+      for (let k = 0; k < 60; k++) {
+        const dropdowns = popupId && document.getElementById(popupId)
+          ? [document.getElementById(popupId).closest('.ant-select-dropdown') || document.getElementById(popupId)]
+          : Array.from(document.querySelectorAll('.ant-select-dropdown'));
+        const option = dropdowns
+          .filter(Boolean)
+          .filter(d => getComputedStyle(d).display !== 'none'
+                   && !d.classList.contains('ant-select-dropdown-hidden'))
+          .flatMap(d => Array.from(d.querySelectorAll('.ant-select-item-option')))
+          .find(o => candidates.includes(((o.querySelector('.ant-select-item-option-content') || o).textContent || '').trim()));
+        if (option) {
+          const box = option.getBoundingClientRect();
+          ['mousedown','mouseup','click'].forEach(type =>
+            option.dispatchEvent(new MouseEvent(type, {bubbles: true, cancelable: true,
+              clientX: box.left + box.width / 2, clientY: box.top + box.height / 2, view: window})));
+          await sleep(150);
+          const got = (select.querySelector('.ant-select-selection-item') || {}).textContent || '';
+          document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+          if (candidates.includes(got.trim()) || candidates.includes(((cell.innerText || '').split(/\n/).pop() || '').trim()))
+            return true;
+          break;
+        }
+        const holder = dropdowns.filter(Boolean).map(d => d.querySelector('.rc-virtual-list-holder')).find(Boolean);
+        if (holder) holder.scrollTop += holder.clientHeight || 200;
+        await sleep(100);
+      }
+    }
+    return false;
+  };
   const nameInp = wrap.querySelector('input[placeholder*="模板名称"]');
   if (nameInp && nameInp.value !== tplName) setVal(nameInp, tplName);
   const table = Array.from(wrap.querySelectorAll('table')).find(candidate =>
@@ -392,37 +469,108 @@ _JS_FILL_SIZECHART = r"""(async () => {
   if (!trs.length) return JSON.stringify({ok: false, reason: 'no-data-rows'});
   const rowSize = cell => ((cell.querySelector('input') || {}).value || cell.textContent || '').trim();
   const empty = [];
+  const numOf = text => (String(text || '').match(/\d+(?:\.\d+)?/g) || []).map(Number);
+  const cellText = cell => {
+    if (!cell) return '';
+    if (cell.querySelector('.ant-select'))
+      return ((cell.querySelector('.ant-select-selection-item') || {}).textContent || '').trim();
+    const inp = cell.querySelector('input');
+    return inp ? inp.value.trim() : '';
+  };
+  const blurInput = inp => { inp.dispatchEvent(new Event('blur', {bubbles: true})); inp.blur(); };
+  const rows = trs.map(tr => ({tr, tds: Array.from(tr.querySelectorAll('td'))}))
+    .map(r => Object.assign(r, {size: rowSize(r.tds[0])}));
+  const cellOf = (row, p) => colIdx[p] === undefined ? null : row.tds[colIdx[p]];
+
   // 【平量/拉量同一单元格两个输入框都要填】2026-09-08 商品 875335387236（猫狗服饰）：
   // 勾选「平量」+「拉量」两种测量方式后，同一参数单元格会渲染出上下两个输入框（平量/
   // 拉量），接口要求两格要么都空、要么都填。源实测尺寸只有一组值（提取阶段要求值只填
   // 单个数字），故把同一源值重复填进单元格每个输入框，拉量缺失就沿用平量值——只填第一
   // 个 input 会留下空着的拉量格，点确定即被接口以「请全部填写」打回。
-  trs.forEach(tr => {
-    const tds = Array.from(tr.querySelectorAll('td'));
-    const size = rowSize(tds[0]);
-    if (!data[size]) { empty.push(size + ':缺少测量数据'); return; }
+  //
+  // 文本格与下拉格分两遍走：脚长属文本格，填完它平台才会去算国家码列；原先按行交错，
+  // 脚长落值的同一瞬间就去读国家码下拉，那时平台还没算，必然读到空。
+  for (const row of rows) {
+    if (!data[row.size]) { empty.push(row.size + ':缺少测量数据'); return; }
     for (const p of params) {
       const idx = colIdx[p];
-      if (idx === undefined) { empty.push(`${size}-${p}:缺列`); continue; }
-      const inps = tds[idx] ? Array.from(tds[idx].querySelectorAll('input')) : [];
-      if (!inps.length) empty.push(`${size}-${p}:无输入框`);
-      const v = String(data[size][p] || '');
+      if (idx === undefined) { empty.push(`${row.size}-${p}:缺列`); continue; }
+      const cell = row.tds[idx];
+      if (cell && cell.querySelector('.ant-select')) continue;   // 下拉留到第二遍
+      const inps = cell ? Array.from(cell.querySelectorAll('input')) : [];
+      if (!inps.length) empty.push(`${row.size}-${p}:无输入框`);
+      const v = String(data[row.size][p] || '');
       if (!v) continue;
       inps.forEach(inp => { if (inp.value !== v) setVal(inp, v); });
     }
-  });
-  await sleep(600);
-  trs.forEach(tr => {
-    const tds = Array.from(tr.querySelectorAll('td'));
-    const size = rowSize(tds[0]);
-    if (!data[size]) return;
-    for (const p of params) {
-      const idx = colIdx[p];
-      if (idx === undefined) continue;
-      const inps = tds[idx] ? Array.from(tds[idx].querySelectorAll('input')) : [];
-      inps.forEach(inp => { if (!inp.value) empty.push(`${size}-${p}`); });
+  }
+
+  // ---- 让平台按脚长自己算国家码列 ----
+  // 目标：本行欧码桶的上端点 = 本行尺码标签的上端点（36-37 → 36.5-37）。标签不是数字
+  // （S/M/L 之类）就不管，留给平台按现成的脚长自己填。
+  const footParam = params.find(p => p.indexOf('脚长') === 0);
+  if (derived.length && footParam && colIdx[footParam] !== undefined) {
+    const euParam = derived.indexOf('欧码') >= 0 ? '欧码' : null;
+    const upperOf = text => { const ns = numOf(text); return ns.length ? Math.max.apply(null, ns) : null; };
+    for (const row of rows) {
+      if (!data[row.size]) continue;
+      const footInp = (cellOf(row, footParam) || {querySelector: null}).querySelector
+        ? cellOf(row, footParam).querySelector('input') : null;
+      if (!footInp) continue;
+      const want = upperOf(row.size);
+      if (want === null) continue;
+      let cur = parseFloat(footInp.value);
+      if (!isFinite(cur)) cur = want - 13;   // 无可用初值时的粗起点，靠下面几轮修正
+      for (let k = 0; k < 6; k++) {
+        setVal(footInp, String(cur));
+        blurInput(footInp);
+        await sleep(350);
+        const got = euParam ? upperOf(cellText(cellOf(row, euParam))) : null;
+        if (got === null) break;
+        if (got === want) break;
+        cur = Math.round((cur + (want - got) / 2) * 2) / 2;   // 实测斜率 0.5~1cm/欧码，半码步逼近
+        if (cur <= 0) break;
+      }
+      blurInput(footInp);
     }
-  });
+    // 等平台把国家码列填完：连续两轮取值不变且无空格才算收敛（实测 <300ms，留足余量）
+    let prev = null;
+    for (let k = 0; k < 20; k++) {
+      await sleep(250);
+      const snap = rows.map(row => derived.map(p => cellText(cellOf(row, p))).join('|')).join('#');
+      const blank = rows.some(row => data[row.size] && derived.some(p => !cellText(cellOf(row, p))));
+      if (snap === prev && !blank) break;
+      prev = snap;
+    }
+  }
+
+  // ---- 第二遍：只补平台没填上的下拉格（正常一格都不会走到）----
+  for (const row of rows) {
+    if (!data[row.size]) continue;
+    for (const p of params) {
+      const cell = cellOf(row, p);
+      if (!cell || !cell.querySelector('.ant-select')) continue;
+      if (cellText(cell)) continue;   // 平台已算好，别覆盖
+      const v = String(data[row.size][p] || '').trim();
+      if (!v || !(await setSelect(cell, v))) empty.push(`${row.size}-${p}`);
+    }
+  }
+  await sleep(600);
+  for (const row of rows) {
+    if (!data[row.size]) continue;
+    for (const p of params) {
+      const cell = cellOf(row, p);
+      if (!cell) continue;
+      if (cell.querySelector('.ant-select')) {
+        const got = cellText(cell);
+        if (!got || got === '请选择') empty.push(`${row.size}-${p}`);
+        continue;
+      }
+      Array.from(cell.querySelectorAll('input')).forEach(inp => {
+        if (!inp.value) empty.push(`${row.size}-${p}`);
+      });
+    }
+  }
   return JSON.stringify({ok: empty.length === 0, empty});
 })()"""
 
@@ -446,5 +594,8 @@ _JS_CLICK_SIZECHART_OK = r"""(async () => {
   await sleep(2000);
   const stillOpen = Array.from(document.querySelectorAll('.ant-modal-wrap'))
     .some(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  return JSON.stringify({stillOpen});
+  const errors = stillOpen ? Array.from(document.querySelectorAll(
+    '.ant-form-item-explain-error, .ant-form-item-explain, .ant-message-error'))
+    .map(e => (e.textContent || '').trim()).filter(Boolean) : [];
+  return JSON.stringify({stillOpen, errors});
 })()"""

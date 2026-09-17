@@ -153,6 +153,101 @@ async def crawl_link(session: BrowserSession, url: str, timeout: float = 60) -> 
     return {"status": "timeout", "text": text}
 
 
+# ---- 2a+ 按来源链接查采集记录（取记录自己的标题）-------------------------------
+# 【为什么要有这一步】阶段② 原来拿【源商品标题】填搜索框、并按它匹配行，而源标题与
+# 采集箱里记录的标题可能不是一回事：2026-09-12 实测 Temu 墙纸那条，① 复用的是用户
+# 开着的中文站页签（goodsName 是中文「17.7 英寸 x 118 英寸…」），店小秘插件却是在
+# 英文站采的（记录标题「17.7 Inches by 118 Inches…」）——中文搜不到英文记录，报
+# 「采集列表未找到商品」，而人在页面上一搜就有，白等一轮还指不到根因。
+# 记录自己的标题（list.json 的 name）就是列表里显示的那一个，拿它去搜必然命中；
+# 按来源链接查（productSearchType=url）更是完全绕开标题——实测记录里的 sourceUrl
+# 与任务传进来的 URL 逐字符相等，故再按 sourceUrl 精确比对一次认领那条。
+_JS_CRAWL_RECORD = r"""async (q) => {
+  // 【先自证在店小秘域】接口走的是同源相对路径，页签停在别的域（如 www.temu.com）
+  // 时这一 fetch 打的是那个域的 /api/crawl/list.json：返回 404/HTML，解析后 rows 为空，
+  // 表现与「采集箱里真没这条记录」一模一样。故跑错域要显式报出来，不要静默当没找到。
+  if (!location.hostname.endsWith('dianxiaomi.com')) {
+    return JSON.stringify({found: false, wrongHost: location.hostname});
+  }
+  const p = new URLSearchParams({
+    pageNo: '1', pageSize: '50', state: q.state, collectStatus: 'CLAIM_TAB',
+    site: 'all', searchValue: q.url, productSearchType: 'url',
+    sortTime: '', accountName: '', commentType: '', commentValue: '',
+    sourcePriceUsdMin: '', sourcePriceUsdMax: '', orderName: '', orderValue: ''
+  });
+  const r = await fetch('/api/crawl/list.json?' + p.toString(), {credentials: 'include'});
+  const j = await r.json();
+  const rows = (((j.data || {}).page || {}).list) || [];
+  const hit = rows.find(x => (x.sourceUrl || '') === q.url);
+  return JSON.stringify(hit ? {found: true, id: hit.id, name: hit.name,
+                               productId: hit.productId}
+                            : {found: false, total: rows.length});
+}"""
+
+
+async def _ensure_dianxiaomi(session: BrowserSession) -> None:
+    """把会话页签带回店小秘域（已经在店小秘域上则什么都不做）。
+
+    采集箱/草稿列表的取数一律走【同源相对路径 fetch】，页签停在别的域时请求会打到
+    那个域上、静默返回空——见 find_crawl_record 里记的 2026-09-12 那次事故。
+    故凡是「先读列表再操作」的入口都要先过这一关。
+
+    导航目标取数据采集页而不是首页：后面 claim_to_store 找不到已开弹窗时也要导航到
+    这一页，提前到这儿导航等于把那一次省掉，不是多跑一趟。
+    """
+    here = await session.eval_json(
+        "JSON.stringify({host: location.hostname})")
+    if str(here.get("host") or "").endswith("dianxiaomi.com"):
+        return
+    logger.info(f"当前页签在 {here.get('host') or '未知域'}，先导航回店小秘采集页再查采集记录")
+    r = await session.navigate(CRAWL_URL)
+    if not r.get("ok"):
+        raise RuntimeError(f"导航到数据采集页失败（查采集记录需停在店小秘域）: {r}")
+    await asyncio.sleep(3)
+
+
+async def find_crawl_record(session: BrowserSession, url: str,
+                            attempts: int = 3, interval: float = 2.0) -> dict:
+    """按来源链接在采集箱里找这条记录，返回 {"id", "name", "productId"}；没有返回 {}。
+
+    【两个列表都要查】state=no 是「未认领」、state=claimed 是「已认领」（2026-09-12
+    实测确认：stat 字段里的 all/no/claimed 三个计数就是这三个列表的规模）。同一商品
+    重新认领到另一个站点时记录已落在「已认领」列表里——这与 _open_claim_modal 找不到
+    就切「已认领」标签重试是同样两个真实入口，不是兜底。
+
+    采集是异步任务，记录落库有秒级延迟，故带重试；重试耗尽返回空，由调用方报错。
+
+    【必须先把页签带回店小秘域】2026-09-12 实测：Temu 源跑到这里时会话页签停在
+    www.temu.com 的买家商品页——① 抽取靠 adopt_open_page 复用用户开着的那个页签取数
+    （Temu 导航不可复现，见 browser.adopt_open_page），而 Temu 分支 skip_crawl=True
+    跳过了 crawl_link，恰好 crawl_link 是这一段里唯一会导航回店小秘的一步。于是本函数
+    的同源 fetch 打在了 temu.com 上，查不到记录，报「采集箱里没有这条 Temu 商品」，
+    而人在店小秘页面上一搜就有。1688 源不跳 crawl_link，所以从没暴露。
+    """
+    await _ensure_dianxiaomi(session)
+    for i in range(1, attempts + 1):
+        for state in ("no", "claimed"):
+            r = await session.eval_json(_JS_CRAWL_RECORD, arg={"url": url, "state": state})
+            if r.get("wrongHost"):
+                raise RuntimeError(
+                    f"查采集记录时页签跑到了 {r['wrongHost']}——采集箱接口是同源相对"
+                    f"路径，必须停在店小秘域（导航回店小秘这一步没生效）")
+            if r.get("found"):
+                logger.info(f"采集记录已找到（{'已认领' if state == 'claimed' else '未认领'}）："
+                            f"id={r.get('id')}，记录标题「{str(r.get('name'))[:40]}」")
+                # 带上「在哪个列表里找到的」：调用方据此判断是不是已经认领过一次
+                # （见 collect_and_claim 的防重）。
+                return {**r, "claimed": state == "claimed"}
+            if r.get("total"):
+                # 按链接搜到了行、却没一条 sourceUrl 对得上：链接被改写过或命中的是
+                # 别的商品。留一条日志，免得排查时只有一句「查不到记录」。
+                logger.warning(f"按链接搜到 {r.get('total')} 行但 sourceUrl 均不匹配：{url}")
+        if i < attempts:
+            logger.info(f"采集箱里暂未出现该链接的记录，{interval}s 后重试（{i}/{attempts}）")
+            await asyncio.sleep(interval)
+    return {}
+
+
 # ---- 2b 搜索 + 点「认领」-----------------------------------------------------
 # 搜索框 id 是实测得来的 #c-searchValue（采集列表页专用）。原生 setter + input 事件
 # 是店小秘 Vue 表单唯一可靠的填值方式：直接赋 .value 不触发 v-model，点搜索时查的是空值。
@@ -593,6 +688,41 @@ async def claim_to_store(
             "unchecked": picked.get("unchecked") or [], "result": result}
 
 
+def _pick_candidates(rows: list, store: str, site: str):
+    """从草稿列表行里两级收窄出目标行，返回 (候选行, 匹配方式)。
+
+    第一级要站点+店铺都出现在行文本里，第二级只要站点——理由见 pick_rowid 的说明。
+    店铺名在行里是「店铺名」这种带书名号的写法（2026-09-12 实测草稿列表
+    `…RW138.「Pawly」哥伦比亚家居装修 > …`），故用 `in` 匹配即可。
+    """
+    ns = _norm_site(site)
+    strict = [r for r in rows if ns in (r.get("text") or "") and store in (r.get("text") or "")]
+    loose = [r for r in rows if ns in (r.get("text") or "")]
+    return (strict, "store+site") if strict else (loose, "site")
+
+
+async def find_draft_rowid(
+    session: BrowserSession,
+    title: str,
+    store: str,
+    site: str = "",
+    keyword: Optional[str] = None,
+) -> dict:
+    """只读查草稿列表里这个商品在目标店铺/站点的行；没有返回 {}（不抛异常）。
+
+    与 pick_rowid 的唯一区别是「找不到」不当错误：认领【前】先用它探一次，那时
+    「还没有」是正常结果。用途见 collect_and_claim 里的防重说明。
+    """
+    kw = keyword or title[:12]
+    data = await find_rowid(session, kw)
+    rows = data.get("matched") or []
+    cands, how = _pick_candidates(rows, store, site)
+    if not cands:
+        return {}
+    return {"rowid": cands[0].get("rowid"), "matchedBy": how, "keyword": kw,
+            "candidates": cands, "total": data.get("total")}
+
+
 async def pick_rowid(
     session: BrowserSession,
     title: str,
@@ -620,14 +750,11 @@ async def pick_rowid(
         raise RuntimeError(
             f"草稿列表未匹配到「{kw}」（列表共 {data.get('total')} 行，认领可能还在同步，稍后重试）"
         )
-    ns = _norm_site(site)
-    strict = [r for r in rows if ns in (r.get("text") or "") and store in (r.get("text") or "")]
-    loose = [r for r in rows if ns in (r.get("text") or "")]
-    cands, how = (strict, "store+site") if strict else (loose, "site")
+    cands, how = _pick_candidates(rows, store, site)
     if not cands:
         raise RuntimeError(
             f"草稿列表未找到店铺「{store}」站点「{site}」的行，"
-            f"匹配到的行：{[r.get('text', '')[:60] for r in rows][:5]}"
+            f"匹配到的行：{[r.get('text', '')[:160] for r in rows][:5]}"
         )
     if len(cands) > 1:
         logger.warning(
@@ -656,13 +783,44 @@ async def collect_and_claim(
     返回 {"status": "ok", "rowid": ..., "crawl": {...}, "claim": {...}, "pick": {...}}，
     rowid 可直接喂给 pipeline.open_edit 进入阶段③。
 
+    【title 参数只用于日志】搜索与匹配一律用【采集记录自己的标题】（见
+    _JS_CRAWL_RECORD 上方：源标题与记录标题可能不同语言，用源标题搜必然落空）。
+
     【不可逆副作用】采集在账号下创建采集记录、认领创建草稿商品，都只能到列表里手动删。
     """
     crawl = {"status": "skipped"} if skip_crawl else await crawl_link(session, url)
-    claim = await claim_to_store(session, title, store, site)
+    # 查不到记录说明商品压根不在采集箱（或链接与记录里的 sourceUrl 不一致），此时
+    # 直接报错。错误信息里保留「采集列表未找到商品」这句话——stages/form.py 靠它给
+    # Temu 源补一条「先用浏览器插件采集」的可照做提示，别改成别的措辞。
+    record = await find_crawl_record(session, url)
+    if not record:
+        raise RuntimeError(
+            f"采集列表未找到商品（按来源链接查不到采集记录，采集可能还没完成，"
+            f"稍后重跑）：{url}")
+    # 源头是中文、记录是英文这类语言错位在这里被抹平：后续搜索与草稿列表筛选都用
+    # 记录自己的标题，它与两个列表里显示的文本必然一致。
+    match_title = record["name"]
+    logger.info(f"商品「{(title or '')[:30]}」改按采集记录标题匹配「{match_title[:40]}」")
+
+    # 【记录已在「已认领」列表 + 草稿列表里也有该店铺/站点的行】= 上次认领其实成了，
+    # 只是后面某一步失败。此时若再走一遍认领，会在账号下多建一条同标题同站点的草稿
+    # ——2026-09-12 实测重跑两次就攒出两条，只能到列表里手动删。故直接复用已有行。
+    # 只在【记录已认领】时才查这一次：首次跑记录还在「未认领」列表里，不为此多付
+    # 一次草稿列表导航。想认领到【另一个站点】时，草稿列表里没有那个站点的行，
+    # 这里查不到、照样往下走认领，不会把多站点铺货挡掉。
+    if record.get("claimed"):
+        existing = await find_draft_rowid(session, match_title, store, site)
+        if existing.get("rowid"):
+            logger.info(f"草稿列表已有该店铺/站点的行（rowid={existing['rowid']}），"
+                        f"跳过认领，不重复建草稿")
+            return {"status": "ok", "rowid": existing["rowid"], "crawl": crawl,
+                    "claim": {"status": "skipped", "reason": "草稿已存在"},
+                    "pick": existing}
+
+    claim = await claim_to_store(session, match_title, store, site)
     # 认领后列表要等后台同步，直接查常查不到；等一下再查比在 find_rowid 里加长
     # 超时更省——find_rowid 是只读通用件，不该为阶段② 的时序特例加等待。
     await asyncio.sleep(5)
-    pick = await pick_rowid(session, title, store, site)
+    pick = await pick_rowid(session, match_title, store, site)
     return {"status": "ok", "rowid": pick.get("rowid"),
             "crawl": crawl, "claim": claim, "pick": pick}

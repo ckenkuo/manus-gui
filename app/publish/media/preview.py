@@ -2,6 +2,7 @@
 
 import asyncio
 from app.logger import logger
+from app.publish import variant_dom
 from app.publish.browser import BrowserSession, J
 from app.publish.media import space as media_space
 from app.publish.upload import upload_image
@@ -72,9 +73,13 @@ PREVIEW_MIN_SIDE = 800
 # 读变种信息表每行的预览图状态：颜色名 + 图 URL + 尺寸，并标出不合规的行。
 #
 # 【表格与列都按结构定位，不写死下标】#skuDataInfo 里有两张 table（第一张是价格/
-# 尺寸/重量，第二张是库存/SKU分类），预览图在【第一张】的第一列。颜色列同样按表头
-# 找，与 _JS_READ_SKU_CODES 一套判据——无尺码类目下表头是
-# ['预览图( 批量)', '颜色', ...]，写死下标会整体错位（那次的病根，见 fix_sku_codes）。
+# 尺寸/重量，第二张是库存/SKU分类），预览图在【第一张】的第一列。
+#
+# 【行标识列取「第一个变种维」，不是硬找「颜色」】与 ⑩a 共用 variant_dom._JS_DIM_COLS
+# （预览图之后、SKU货号之前即变种维列）。2026-09-12 取证（Temu 商品 601101104447803
+# 车贴）：该类目唯一那维叫【型号】，原判据 /^颜色/ 落空 → colorIdx=-1，于是
+# sku_preview_replace_row 的 expect_color 恒为空、行序核对整体失效（Vue 重排后会把图
+# 挂到别的 SKU 上），空位补图也拿不到「同色行」去找源图。名字随类目变、位置不变。
 #
 # bad 的判据是「非 1:1 或短边 < 800」，与 PREVIEW_MIN_SIDE 一致。naturalWidth 为 0
 # 表示图还没加载完，按【读不到】处理而不是判不合格：未知不等于不合格（同
@@ -96,7 +101,8 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
   if (!t0) return JSON.stringify({err: 'no-table'});
   const heads = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
   const iPrev = heads.findIndex(h => h.includes('预览图'));
-  const iColor = heads.findIndex(h => /^颜色/.test(h));
+  __DIM_COLS__
+  const {colorIdx: iColor} = dimIdx(heads);
   if (iPrev < 0) return JSON.stringify({err: 'no-preview-column', heads: heads});
   const MIN = __MIN__;
   const rows = [];
@@ -144,7 +150,8 @@ async def sku_preview_state(session: BrowserSession) -> dict:
     supported=None：表没渲染完（零行）时证据不足，别当「不支持」，让真失败暴露。
     """
     st = await session.eval_json(
-        _JS_SKU_PREVIEW_STATE.replace("__MIN__", J(PREVIEW_MIN_SIDE)))
+        _JS_SKU_PREVIEW_STATE.replace("__MIN__", J(PREVIEW_MIN_SIDE))
+                             .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if st.get("err"):
         return {"supported": None, **st}
     rows = st.get("rows") or []
@@ -186,8 +193,11 @@ _JS_OPEN_SKU_PREVIEW_SPACE = r"""(async () => {
       .find(x => (x.currentSrc || x.src || '').startsWith('http'));
     return im ? (im.currentSrc || im.src || '') : '';
   })();
-  trig.scrollIntoView({block: 'center'});
-  await sleep(700);
+  // 【这里不能 scrollIntoView】2026-09-16 毛绒玩偶有图行换图实测：scrollIntoView 会
+  // 让紧随其后的合成 hover 展开的菜单丢失（复刻带 scroll 时「菜单未展开」、去掉后
+  // 能正常出 9 项菜单），跟空位补图那次 scroll 破坏菜单是同一性质。触发器和它的
+  // 换图菜单都靠页面当前视口，不再主动滚动。
+  await sleep(300);
   // 【合成 hover 即可展开——2026-08-30 实测】trigger 与它内层的 .single-image
   // 都派发：实测 trigger 那层就绑了事件，但两个都发更稳（多余那次无副作用，
   // 同 _JS_OPEN_MATERIAL_SPACE 的做法）
@@ -262,21 +272,22 @@ _JS_OPEN_SKU_PREVIEW_FILL_SPACE = r"""(async () => {
   const cell = tds[PREV];
   if (!cell) return JSON.stringify({stage: 'locate', err: '该行没有预览图单元格'});
   const nowColor = ICOLOR >= 0 ? txt(tds[ICOLOR]) : '';
-  // 点击目标：空位的图格（.img-out 是 .single-image 内层、实测点它就能出菜单）
-  const box = cell.querySelector('.img-out') || cell.querySelector('.single-image') || cell;
   const before = (() => {
     const im = Array.from(cell.querySelectorAll('img'))
       .find(x => (x.currentSrc || x.src || '').startsWith('http'));
     return im ? (im.currentSrc || im.src || '') : '';
   })();
-  box.scrollIntoView({block: 'center'});
-  await sleep(500);
   // 【点击展开，不是 hover】空位没有 trigger，hover 无菜单；点击才出。
-  // 【必须用原生 box.click()，不能 dispatchEvent(new MouseEvent('click'))】2026-09-08
-  // 实跑（offer 1044697103545 宠物裙 3色×4码，L/XL 码 6 行空位）发现 dispatchEvent 的
-  // 合成 click 不触发店小秘空位菜单（轮询 3s 菜单仍 display:none），而 box.click() 原生
-  // 方法能正常展开 5 项菜单——两者同为 isTrusted=false，但组件只认原生 click 的事件链。
-  box.click();
+  // 点击动作不在这里做：2026-09-16 实测（毛绒玩偶 51 行空位全卡 open-space）发现
+  // 空位图格的合成点击（box.click() / dispatchEvent）在本版页面都出不来菜单，
+  // 只有 Playwright 的真实鼠标点击（Input.dispatchMouseEvent，见 BrowserSession.
+  // mouse_click）能展开 5 项菜单，且真实点击目标必须是 .single-image——点 .img-out
+  // 或 <img> 都无效。故这里只负责等菜单，真实点击由调用方在进入本函数前完成
+  // （sku_preview_replace_row 的 fill_empty 分支）。
+  // 【这里不能再 scrollIntoView】真实点击已经把元素滚进视口、菜单已展开，这里再
+  // scroll 会触发 ant-design 浮层关闭/重定位，把刚展开的菜单弄丢，导致后面选图确定
+  // 挂错行甚至挂不上（2026-09-16 毛绒玩偶实测：去掉这次 scroll 后稳定挂对行）。
+  await sleep(300);
   const WANT = __ITEMS__;
   let menu = null;
   for (let k = 0; k < 30; k++) {
@@ -356,6 +367,50 @@ async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
     open_js = _JS_OPEN_SKU_PREVIEW_FILL_SPACE if fill_empty else _JS_OPEN_SKU_PREVIEW_SPACE
     menu_items = (("本地图片", "空间图片") if fill_empty
                   else SKU_PREVIEW_MENU_ITEMS)
+    # 【先关掉上一行残留的菜单/弹窗，否则行绑定错乱】连续补图/换图时，上一行选图确定
+    # 后 ant-design 浮层未必同步销毁；下一次展开的虽是本行菜单，但等菜单那段 JS 轮询
+    # 可能先命中还挂着的旧菜单，点它的「空间图片」就把弹窗绑到了上一行——选图确定后
+    # 图挂回上一行（2026-09-16 毛绒玩偶实测：空位补图第 4 行成功后第 5 行起全盖到前
+    # 一行；有图换图第 9、11 行同样 readback 失败）。弹窗点「取消」、菜单靠真实点击
+    # 外部收起。空位补图与有图换图两条路都要清，故放在 fill_empty 分支外。
+    await session.eval_json(
+        """(() => {
+          const modals = Array.from(document.querySelectorAll('.ant-modal'))
+            .filter(m => m.offsetHeight > 0);
+          for (const m of modals) {
+            const cancel = Array.from(m.querySelectorAll('button'))
+              .find(b => (b.textContent || '').trim() === '取消')
+              || m.querySelector('.ant-modal-close');
+            if (cancel) cancel.click();
+          }
+          return JSON.stringify({closedModals: modals.length});
+        })()""")
+    # 真实点击页面空白处收起残留菜单（ant-design 只认真实鼠标事件，dispatchEvent 无效）
+    try:
+        await session.page.mouse.click(15, 250)
+    except Exception:
+        pass
+    await asyncio.sleep(0.3)
+    if fill_empty:
+        # 【空位菜单只能靠真实点击展开，合成 click 无效】2026-09-16 实测（毛绒玩偶
+        # 51 行空位全卡 open-space）：本版页面下 box.click() 与 dispatchEvent 都出不来
+        # 空位菜单，只有 Playwright 真实鼠标点击能出 5 项菜单，且目标必须是 .single-image
+        # （点 .img-out / <img> 无效，见 _JS_OPEN_SKU_PREVIEW_FILL_SPACE 上方注释）。
+        # 先真实点开菜单，再交给下面那段 JS 去等菜单、点「空间图片」、等弹窗。
+        # 用 table:first-of-type 锁第一张表：#skuDataInfo 里有两张表（第一张是预览图/
+        # 颜色/存储容量/尺寸/重量，第二张是 SKU分类/包装清单），两张 tbody tr 行数一致，
+        # 不锁表的话选择器会同时瞄到第二张表的同序号行。
+        sel = (f"#skuDataInfo table:first-of-type tbody tr:nth-child({row_idx + 1}) "
+               f"td:nth-child({preview_idx + 1}) .single-image")
+        clicked = await session.mouse_click(sel, timeout=5)
+        if not clicked.get("ok"):
+            return {"status": "error", "stage": "open-space", "row": row_idx,
+                    "detail": {"stage": "click", "err": f"空位图格真实点击失败：{clicked.get('err')}"},
+                    "upload": up}
+        # 真实点击展开菜单是异步的，等它稳定再交给 JS 去点「空间图片」——立刻进
+        # eval 时菜单可能还没挂到这一行，选图确定会挂错行/挂不上（实测见
+        # _JS_OPEN_SKU_PREVIEW_FILL_SPACE 上方注释）。
+        await asyncio.sleep(0.5)
     opened = await session.eval_json(
         open_js
         .replace("__IDX__", J(row_idx))

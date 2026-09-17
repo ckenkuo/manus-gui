@@ -76,9 +76,12 @@ def norm_size(s: str, *, unwrap=True, diameter=True) -> str:
     if my:
         unit = "m" if my.group(3).lower() in ("m", "月", "个月") else "y"
         return (my.group(1) + ("-" + my.group(2) if my.group(2) else "")) + unit
-    # 童装身高码主体：110cm → 110、110-120 → 110（2026-08-21 起的既有行为，
-    # 身高码在页面上只有单值 90/100/110/120/130，没有上面那种区间碰撞）
-    m = re.match(r"^(\d+)", t)
+    numeric = re.match(
+        r"^(\d+(?:\.\d+)?)\s*[-—–－~～/]\s*(\d+(?:\.\d+)?)(?:\s*(?:cm|码|厘米))?$",
+        t, re.I)
+    if numeric:
+        return numeric.group(1) + "-" + numeric.group(2)
+    m = re.match(r"^(\d+(?:\.\d+)?)", t)
     if m:
         return m.group(1)
     # 【直径类尺码名取 cm 数作判别】（仍是上面花毯案例）：剥完外层括号剩

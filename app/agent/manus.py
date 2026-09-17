@@ -45,8 +45,7 @@ class Manus(ToolCallAgent):
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     # Manus 使用专门配置的 DeepSeek Flash；其它 agent 和默认 LLM 保持原配置。
-    # 这样发布失败兜底与 CLI/Web 创建的 Manus 都会统一切换，且复用已有
-    # [llm.publish-deepseek] 的端点、密钥和 token 配置。
+    # 复用已有 [llm.publish-deepseek] 的端点、密钥和 token 配置，不另开一段。
     llm: LLM = Field(default_factory=lambda: LLM(config_name="publish-deepseek"))
 
     max_observe: int = 10000

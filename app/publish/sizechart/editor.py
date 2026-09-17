@@ -89,7 +89,10 @@ async def add_sizechart(session: BrowserSession, info_path: str,
       const list = () => Array.from(document.querySelectorAll('.ant-modal-wrap'))
         .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
       let n = 0;
-      for (const w of list()) {
+      for (let pass = 0; pass < 5; pass++) {
+        const pending = list();
+        if (!pending.length) break;
+        const w = pending[pending.length - 1];
         const cancel = Array.from(w.querySelectorAll('button')).find(b => /取消|关闭/.test((b.textContent||'').trim()))
           || w.querySelector('.ant-modal-close');
         if (cancel) { cancel.click(); await sleep(1000); n++; }
@@ -109,7 +112,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
         return {"status": "error", "reason": f"尺码分类选择失败: {sel}"}
 
     # 【套装按部件取数】源图分开给了「部件：上衣」「部件：连衣裙」两张表时（见
-    # extract._VISION_PROMPT 的 sizeMeasurementsByPart），两张平台尺码表各取自己那件；
+    # extract._VISION_PROMPT_DETAIL 的 sizeMeasurementsByPart），两张平台尺码表各取自己那件；
     # 只有扁平表时照旧共用（那本就是一张合表）。真站取证见 _pick_part_measurements。
     # 配对放在勾参数复选框【之前】：勾哪些可选参数也按本张表那件的参数名判——原先
     # 固定拿 parts[0]，第一件是裤子时连马甲表都按裤子的参数名去勾（2026-09-08
@@ -161,6 +164,13 @@ async def add_sizechart(session: BrowserSession, info_path: str,
             pick = await sizechart_parameters._pick_params_by_llm(title, available, src_param_names)
             to_check = pick.get("check") or []
             to_uncheck = pick.get("uncheck") or []
+            # 国家码列在部分鞋类模板中是可选下拉，且页面可能不提供对应选项。
+            # 模型仍会估算这些列，但勾上后平台要求逐格选择，最终无法保存；
+            # 无源数据时统一取消国家码列，保留脚长/鞋内长等可验证参数。
+            if not src_meas:
+                to_uncheck = list(dict.fromkeys(
+                    to_uncheck + [p for p in sizechart_parameters.SHOE_COUNTRY_PARAMS if p in available]
+                ))
             if to_check or to_uncheck:
                 setr = await session.eval_json(
                     sizechart_scripts._JS_SET_SIZECHART_PARAMS
@@ -194,6 +204,15 @@ async def add_sizechart(session: BrowserSession, info_path: str,
                 out[p] = vals[k]
         return out
 
+    # 【鞋类分支：区间值先折成单值】鞋类的脚长天然是区间（一个尺码适合一段脚长，
+    # 实测图上写「尺码 34 → 脚长 21.5-22」），而下面的 _valid_value 只认单个正有限数，
+    # 不折的话商家量好的真值会被判脏、转手交模型估一个单值顶掉。放在这里而不是和
+    # normalize_half_marks 并列，是因为判「是不是鞋类」要靠弹窗参数，而参数到这一步
+    # 才读出来（半围换算只看值本身的写法，不需要知道品类）。取证与「为什么取上界」
+    # 见 parameters.normalize_shoe_lengths。
+    if sizechart_parameters.is_shoe_chart(params):
+        src_meas = sizechart_parameters.normalize_shoe_lengths(src_meas)
+
     # 测量值来源：源商品实测平铺尺寸（sizeMeasurements）优先，弹窗要而源没有的参数交模型估算。
     # 尺码键与弹窗尺码行两侧都过 norm_size 再比（源键可能带「建议身高」描述，见 norm_size）
     #
@@ -221,7 +240,25 @@ async def add_sizechart(session: BrowserSession, info_path: str,
         return not _valid_value((row or {}).get(p))
 
     norm = {k: _align_params(v) for k, v in src_norm.items()}
-    need = [p for p in params
+
+    # 【鞋类国家码列由平台按脚长算，不归我们填、也不参与缺值判据】2026-09-14 真站取证
+    # （1076651064534，女士居家拖鞋）：欧码/英码/美码/日本码/韩国码/墨西哥码/巴西码/
+    # 哥伦比亚码/智利码 这 9 列在弹窗里是下拉框，选项是平台按脚长给出的固定全集，脚长
+    # 列表头的问号气泡原文就是「填写脚长，将自动填充鞋码大小」。原来这套是自己按欧码
+    # 换算各国码再逐格去选（_SHOE_EU_CONVERSIONS），对不上任何选项：欧码列没有 "36-37"，
+    # 巴西码列没有 "34-35" 这种区间，只有碰巧是单个数字的巴西码命中过一次，8 列全空、
+    # 整表报「填充不完整」，还因为逐格轮询空转到 1118 秒。故改为：有脚长列时，这 9 列
+    # 既不进 need（不交模型估）也不进 lacking（不判缺），值由页面自己产出，见
+    # scripts._JS_FILL_SIZECHART 的脚长校正段。
+    #
+    # 没有脚长列时不启用（平台没有推导依据，只能照旧由我们给值），故这里按脚长列存在
+    # 与否决定，而不是一见到国家码列就跳过。
+    foot_param = sizechart_parameters.foot_param_of(params)
+    derived_params = ([p for p in sizechart_parameters.SHOE_COUNTRY_PARAMS if p in params]
+                      if foot_param else [])
+    check_params = [p for p in params if p not in derived_params]
+
+    need = [p for p in check_params
             if any(_missing(norm.get(normalize_size(s)), p) for s in sizes)]
 
     # 【词表兜不住时先问名称映射，再退估算】源参数名是商家在图上随手写的自由文本
@@ -244,7 +281,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # （need 覆盖了全部 params）：经过上面 LLM 勾选后仍出现，说明源表头连语义匹配
     # 都对不上任何可选项（或源数据与商品严重不符）。源数据全白费意味着买家拿到一份
     # 维度对不上实物的尺码表，必须报出来交人工复核，不能静默填。
-    source_unused = bool(src_meas) and bool(need) and set(need) == set(params)
+    source_unused = bool(src_meas) and bool(need) and set(need) == set(check_params)
     if source_unused:
         logger.warning(
             "尺码表参数与源实测尺寸一列都没对上（源有数据却全走估算）："
@@ -275,7 +312,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     norm = {s: norm.get(normalize_size(s), {}) for s in sizes}
     # 与上面的 need 共用 _missing：判据分家过一次（need 判键、这里判值），代价是脏值
     # 那两单永远填不出表，各自维护一套必然再次分家
-    lacking = [s for s in sizes if any(_missing(norm[s], p) for p in params)]
+    lacking = [s for s in sizes if any(_missing(norm[s], p) for p in check_params)]
     if lacking:
         return {"status": "error",
                 "reason": f"测量数据缺参数（对齐后仍缺）: 尺码{lacking} × 参数{params}"
@@ -286,7 +323,112 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     fill = await session.eval_json(sizechart_scripts._JS_FILL_SIZECHART
                                     .replace("__NAME__", J(tpl_name))
                                     .replace("__DATA__", J(norm))
-                                    .replace("__PARAMS__", J(params)))
+                                    .replace("__PARAMS__", J(params))
+                                    .replace("__DERIVED__", J(derived_params)))
+    # 国际码等列是 Ant Design 下拉框，部分 CDP 页面只接受真实鼠标事件，
+    # DOM click 会被组件忽略。对脚本回报为空的单元格走 Playwright 真实点击兜底。
+    # 鞋类国家码列正常由平台按脚长自己填（见上面 derived_params），走不到这里。
+    selected_count = 0
+    if getattr(session, "page", None) is not None:
+        try:
+            selected_count = await session.page.locator(
+                '.ant-modal-wrap:visible tbody tr .ant-select-selection-item').count()
+        except Exception:
+            selected_count = 0
+    select_params = sum(p in sizechart_parameters.SHOE_COUNTRY_PARAMS for p in params)
+    if ((not fill.get("ok") and fill.get("empty"))
+            or (select_params and selected_count == 0)):
+        page = getattr(session, "page", None)
+        if page is not None:
+            try:
+                modal = page.locator('.ant-modal-wrap:visible').last
+                # 弹窗内只有一张尺码数据表；不要用动态 `has` 过滤，Vue 重绘时
+                # 该 locator 会失效并让整个真实点击兜底被异常吞掉。
+                table = modal.locator('table').first
+                headers = await table.locator('thead th').all_inner_texts()
+                row_locs = table.locator('tbody tr')
+                for miss in list(dict.fromkeys(fill.get("empty") or [])):
+                    # 每个单元格点击都会触发 Vue 重绘，所有 locator 必须在本轮重新获取。
+                    modal = page.locator('.ant-modal-wrap:visible').last
+                    table = modal.locator('table').first
+                    headers = await table.locator('thead th').all_inner_texts()
+                    row_locs = table.locator('tbody tr')
+                    if ":" in miss:
+                        miss = miss.split(":", 1)[0]
+                    param = next((p for p in params if miss.endswith("-" + p)), None)
+                    size = miss[:-len(param)-1] if param else ""
+                    if not param or param not in headers:
+                        continue
+                    col = headers.index(param)
+                    for ri in range(await row_locs.count()):
+                        row = row_locs.nth(ri)
+                        cells = row.locator('td')
+                        if not await row.locator('input').count():
+                            continue
+                        if (await cells.nth(0).inner_text()).strip() != size:
+                            continue
+                        value = str((norm.get(size) or {}).get(param) or "").strip()
+                        if not value:
+                            continue
+                        cell = cells.nth(col)
+                        if not await cell.locator('.ant-select').count():
+                            continue
+                        candidates = {value, value.rstrip('0').rstrip('.') if '.' in value else value,
+                                      value + 'cm', value + '厘米'}
+                        # 虚拟列表必须从首屏逐屏扫到末屏；固定 3/12 次会漏掉
+                        # 列表中后段的国家码选项。
+                        for attempt in range(60):
+                            # 选项点击后表格可能重建，重新定位到同一行/列。
+                            modal = page.locator('.ant-modal-wrap:visible').last
+                            table = modal.locator('table').first
+                            row = table.locator('tbody tr').nth(ri)
+                            cells = row.locator('td')
+                            cell = cells.nth(col)
+                            await page.keyboard.press('Escape')
+                            await cell.locator('.ant-select-selector').click(force=True)
+                            popup_id = await cell.locator('.ant-select input').get_attribute('aria-controls')
+                            if not popup_id:
+                                popup_id = await cell.locator('.ant-select input').get_attribute('aria-owns')
+                            popup = (page.locator(f'#{popup_id}').locator(
+                                "xpath=ancestor::div[contains(@class, 'ant-select-dropdown')]")
+                                     if popup_id else page.locator('.ant-select-dropdown').last)
+                            holder = popup.locator('.rc-virtual-list-holder')
+                            if await holder.count():
+                                await holder.evaluate(
+                                    "(e, n) => { e.scrollTop = Math.min(e.scrollHeight, n); }",
+                                    attempt * 220)
+                            await page.wait_for_timeout(180)
+                            options = popup.locator('.ant-select-item-option:visible')
+                            clicked = False
+                            for oi in range(await options.count()):
+                                option = options.nth(oi)
+                                if (await option.inner_text()).strip() in candidates:
+                                    box = await option.bounding_box()
+                                    if box:
+                                        await page.mouse.click(box["x"] + box["width"] / 2,
+                                                               box["y"] + box["height"] / 2)
+                                        clicked = True
+                                    break
+                            await page.keyboard.press('Escape')
+                            await page.wait_for_timeout(150)
+                            fresh = page.locator('.ant-modal-wrap:visible').last.locator(
+                                'table tbody tr').nth(ri).locator('td').nth(col)
+                            if clicked and (await fresh.inner_text()).strip() not in ("", "请选择"):
+                                break
+                        break
+                await page.wait_for_timeout(500)
+                # 【四个占位符必须与上面首次填表那处完全一致】2026-09-15 引入
+                # __DERIVED__ 时只改了首次填表那一处，这条兜底重填漏了，于是注入的
+                # JS 里 __DERIVED__ 原样留着 → ReferenceError: __DERIVED__ is not
+                # defined，被下面那个 except 吞成一句 warning，fill 仍是兜底前那个
+                # 不完整的旧值，最终照旧报「表格填充不完整」——真因反被掩盖。
+                fill = await session.eval_json(sizechart_scripts._JS_FILL_SIZECHART
+                                                .replace("__NAME__", J(tpl_name))
+                                                .replace("__DATA__", J(norm))
+                                                .replace("__PARAMS__", J(params))
+                                                .replace("__DERIVED__", J(derived_params)))
+            except Exception as e:
+                logger.warning(f"尺码表下拉真实点击兜底失败：{e}")
     if not fill.get("ok"):
         return {"status": "error", "reason": f"表格填充不完整: {fill.get('empty')}",
                 "data": norm}

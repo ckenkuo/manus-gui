@@ -8,6 +8,22 @@ from app.publish.browser import BrowserSession, J
 from typing import Optional
 
 
+# 「修饰词 + Top(s)」是服装品类词（Tank Top 工字背心 / Crop Top 露脐上衣），不是
+# Temu 禁的「顶级/第一」宣称。_has_subjective_claim 的 \btop\b 不区分这两种用法，
+# 2026-09-11 实测女童背心（1041397908049）两轮 6 个候选全因 "Tank Top"/"Summer Top"
+# 被拦死（title-generation-failed）。故查禁词前先把这些已知搭配整体摘掉。
+# 【名单之外仍按禁词拦】营销用法的 "Top" 在名词前（Top Quality）或独立出现
+# （Our Top Pick 的 Our 不在名单），都不受这个掩码影响，闸门没有变松。
+_TOP_GARMENT_RE = re.compile(
+    r"\b(?:tank|crop|tube|halter|bandeau|camisole?|bikini|vest|peplum|corset|"
+    r"bralette|bra|polo|knit(?:ted)?|ribbed|smocked|ruffled?|lace|mesh|denim|"
+    r"satin|silk(?:y)?|cotton|linen|wool(?:en)?|fleece|thermal|seamless|"
+    r"sleeveless|short[- ]sleeve|long[- ]sleeve|spaghetti[- ]strap|backless|"
+    r"strapless|padded|sports?|yoga|swim|lounge|sleep|maternity|nursing|"
+    r"basic|casual|summer|winter|plus[- ]size)\s+tops?\b",
+    re.I)
+
+
 def _js_fill_by_label(label: str, value: str) -> str:
     """按 label 填 input/textarea（产品标题/英文标题等文本框）。返回 JS 代码字符串。"""
     return r"""(() => {
@@ -223,6 +239,9 @@ async def generate_titles(info: dict) -> dict:
         第一类（#1/Top/Leading）、完美类（Perfect/Flawless）等。
         中文同样拦截「好物/神器/必备/最好/第一/完美」等。
         """
+        # 先摘掉「Tank Top / Crop Top」这类服装品类词里的 top（理由见
+        # _TOP_GARMENT_RE 的注释），再查禁词
+        text = _TOP_GARMENT_RE.sub(" ", text)
         # 英文主观营销词
         en_pats = (
             r"\b(best|perfect|flawless|ultimate|ideal)\b",

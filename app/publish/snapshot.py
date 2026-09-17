@@ -2,8 +2,8 @@
 
 为什么需要它：多台 PC 并发跑发布，失败时错误上报只带一条 note（见 app/error_report.py），
 在开发机上只能看到「某某校验未过」。而定位问题真正需要的信息大多已经在那台机器上了——
-断点文件里有各阶段的结论与 Manus 兜底的工具调用历史，「本次计划跑哪些阶段、哪些按页面
-实况判为需重跑」则连断点文件都不记、只在 SSE 事件流里一闪而过（事件不落盘，随进程消失）。
+断点文件里有各阶段的结论，「本次计划跑哪些阶段、哪些按页面实况判为需重跑」则连断点文件
+都不记、只在 SSE 事件流里一闪而过（事件不落盘，随进程消失）。
 这些信息从不离开那台机器，跨机排查时等于不存在。本模块把它们采成一份 JSON 加一张失败页
 截图，交给 error_report.report_snapshot 写库。
 
@@ -33,14 +33,10 @@ _CTX_KEYS = ("workflow_id", "source_platform", "url", "title", "rowid", "info_pa
              "price", "keep_video", "warehouse", "from_stage")
 
 # 断点文件里值得跨机看的部分；skc_done 单独排除的理由见 _condense_state。
-# cat_id 在这里是因为兜底 agent 复跑阶段④ 要用它查属性选项（见 attributes/server_options）。
 _STATE_KEYS = ("key", "status", "failed_stage", "title", "rowid", "info_path", "workdir",
                "cat_path", "cat_id", "source_platform", "workflow_id", "updated_at")
 
-_HISTORY_STEPS = 20
-_HISTORY_TEXT = 500
-
-# 页面只读快照。选择器沿用 agent_tools.observe 里那套（已验证可用），不另造没验过的。
+# 页面只读快照。选择器是实测可用的那套，不另造没验过的。
 _JS_PAGE = r"""(() => ({
   url: location.href, title: document.title,
   text: (document.body.innerText || '').slice(0, 6000),
@@ -55,44 +51,6 @@ def _brief(value: Any, limit: int = 500) -> Any:
     if value is None or isinstance(value, (bool, int, float)):
         return value
     return (value if isinstance(value, str) else str(value))[:limit]
-
-
-def _condense_recovery(recovery: dict) -> dict:
-    """瘦身 Manus 兜底记录：history 只留最后 20 步、每步观察截 500 字符。
-
-    原始每步 2000 字符，全灌进去会顶掉其他现场；20 步够看出模型试过哪个方向了。
-    """
-    recovery = recovery or {}
-    history = []
-    for item in (recovery.get("history") or [])[-_HISTORY_STEPS:]:
-        item = item or {}
-        step = {"tool": _brief(item.get("tool"), 100)}
-        if item.get("error"):
-            step["error"] = _brief(item["error"], _HISTORY_TEXT)
-        elif item.get("result") is not None:
-            step["result"] = _brief(item["result"], _HISTORY_TEXT)
-        history.append(step)
-    out = {key: _brief(recovery.get(key)) for key in ("status", "error") if recovery.get(key)}
-    out["history"] = history
-    if recovery.get("initial_failure") is not None:
-        out["initial_failure"] = recovery["initial_failure"]
-    return out
-
-
-def _pick_recovery(state: dict, stage: str) -> Optional[dict]:
-    """取失败阶段的兜底记录；该阶段没有就退到最后一个有记录的阶段。
-
-    【为什么要退】商品可能「先在某阶段失败、兜底跑通、又在后一阶段失败」，此时失败
-    阶段自己没有 recovery，而前一次兜底的过程恰恰是判断模型试过什么的关键。
-    """
-    stages = (state or {}).get("stages") or {}
-    picked = (stages.get(stage) or {}).get("recovery")
-    if picked:
-        return _condense_recovery(picked)
-    for value in reversed(list(stages.values())):
-        if (value or {}).get("recovery"):
-            return _condense_recovery(value["recovery"])
-    return None
 
 
 def _condense_state(state: dict) -> dict:
@@ -129,14 +87,6 @@ def _fit(snapshot: dict, max_kb: int) -> dict:
         return snapshot
 
     trimmed = []
-    for item in ((snapshot.get("recovery") or {}).get("history") or []):
-        if "result" in item:
-            item["result_len"] = len(str(item.pop("result")))
-    trimmed.append("recovery.history.result")
-    if size() <= limit:
-        snapshot["trimmed"] = trimmed
-        return snapshot
-
     stages = (snapshot.get("state") or {}).get("stages")
     if stages:
         snapshot["state"]["stages_count"] = len(snapshot["state"].pop("stages"))
@@ -189,7 +139,6 @@ def build_snapshot(*, exit_tag: str, key: str, task: dict, state: dict, stage: s
                                  if (value or {}).get("status") in _DONE][:20],
         },
         "state": _condense_state(state),
-        "recovery": _pick_recovery(state, stage),
         # 【必须拷一层】_fit 超限降级时会 pop 掉这里的 "text" 换成 text_len，直接引用调用方
         # 的 dict 就等于把它改坏——本函数对外声称是纯函数（离线可直调自检），不能有这个
         # 暗坑：调用方随手复用一个 page 对象，第二次调用就再也取不到正文了。
@@ -203,7 +152,7 @@ async def _capture_shot(session, max_kb: int) -> tuple[Optional[bytes], dict]:
     """截当前工作页。截不到只返回原因，绝不为截图失败干扰上报。
 
     两个已知的坑：
-    - 图像 base64 在 CDP 返回体的**里层** data.data，不是外层（agent_tools 那边踩过）。
+    - 图像 base64 在 CDP 返回体的**里层** data.data，不是外层。
     - Chrome 窗口被最小化或完全遮挡时可能拿到黑帧/旧帧。故把字节数一并交出去：几 KB
       就基本是空白页，看库的人一眼能判，不用把图拉下来才发现是废的。
     """

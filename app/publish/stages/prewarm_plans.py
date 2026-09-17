@@ -91,8 +91,11 @@ def _replan_desc_by_url(pre_plan: dict, mods: list) -> dict:
     keep = [m["pos"] for m in mods
             if m.get("pos") not in set(delete)
             and all(r["pos"] != m.get("pos") for r in replace)]
-    return {"status": "ok", "delete": sorted(set(delete)),
-            "replace": replace, "keep": sorted(set(keep))}
+    out = {"status": "ok", "delete": sorted(set(delete)),
+           "replace": replace, "keep": sorted(set(keep))}
+    if pre_plan.get("maxImages"):
+        out["maxImages"] = pre_plan["maxImages"]
+    return out
 
 
 async def _prewarm_desc(ctx: dict, info: dict, emit) -> dict:
@@ -106,6 +109,8 @@ async def _prewarm_desc(ctx: dict, info: dict, emit) -> dict:
     if not mods:
         return {}
     plan = await vision.plan_desc(mods, info)
+    if plan.get("status") != "ok":
+        return {}
     # delete 只回 pos，而 ⑬ 那边要按 URL 重挂序号（见 _replan_desc_by_url），故这里
     # 就把 pos 翻成 URL 存下来——翻译要用的映射只在此刻手上有。
     by_pos = {m["pos"]: m["url"] for m in mods}

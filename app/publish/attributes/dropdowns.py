@@ -49,9 +49,9 @@ async def _park_ghost_dropdowns(session: BrowserSession) -> dict:
     React 的 style diff，React 手里那份值没变就不重写 DOM，park 写的 0px 于是永久
     残留。浮层塌成 8px 宽（antd dropdown 的 padding 4×2），虚拟列表滚不动
     （scrollHeight == clientHeight，日志里 256/256），只渲染首屏 10 项，而目标
-    「色丁布」是第 21 项——点选与滚动都只能报 option-not-rendered，兜底 agent 从这
-    一步起全程无解，最后按「未能通过原阶段校验」判商品失败。日志里的铁证是
-    ddStyle 那两个值：`min-width: 0px; width: 0px`，全项目只有这段代码会那么写。
+    「色丁布」是第 21 项——点选与滚动都只能报 option-not-rendered，该行从此无解，
+    最后按「必填仍空」判商品失败。日志里的铁证是 ddStyle 那两个值：
+    `min-width: 0px; width: 0px`，全项目只有这段代码会那么写。
     用类就绕开了 React 管的属性：要恢复只需把类摘掉（_unpark_own_panel / _js_unpark）。
 
     归零宽度就够让它既看不见也点不到（外加 visibility/pointer-events 两道），
@@ -107,21 +107,24 @@ async def _press_escape(session: BrowserSession) -> None:
     )
 
 
-def _js_dropdown_options_rendered(label: str) -> str:
-    """探「该行自己的浮层里已渲染出几个选项」。
+def _js_dropdown_options_rendered(label: str, sel_idx: int = 0) -> str:
+    """探「该行第 sel_idx 个 select 自己的浮层里已渲染出几个选项」。
 
     给「开下拉之后等什么」用：_open_attr_dropdown 的收敛条件是浮层可见，而浮层可见
     ≠ 里面的 rc-virtual-list 已挂上 .ant-select-item-option（虚拟列表要一帧才渲染）。
     原先靠固定 sleep(0.6) 兜这段，现在等这个真实信号（上限仍 0.6s）。
     浮层按 _js_own_panel 的 aria 关联取——原先按「距本行最近」猜，会数到幽灵浮层里
     上一行的选项条数，于是本行还没渲染就被判成「已就绪」。
+
+    sel_idx 同 _click_dropdown_option：漏传会恒按第 1 行取浮层，成分第 2 行起这个判据
+    等的是别人家的浮层，本行还没渲染就放行（等于把这段条件等待整个废掉）。
     """
     return r"""(() => {
       const target = __PANEL__;
       if (!target) return JSON.stringify({n: 0});
       return JSON.stringify({
         n: target.querySelectorAll('.ant-select-item-option').length});
-    })()""".replace("__PANEL__", _js_own_panel(label))
+    })()""".replace("__PANEL__", _js_own_panel(label, sel_idx))
 
 
 async def _visible_dropdown_near(session: BrowserSession, label: str,
@@ -194,8 +197,8 @@ async def _open_attr_dropdown(session: BrowserSession, label: str,
         # 【已打开也要摘一次停靠类】Vue 的打开态与浮层的铺开状态是两回事：上一次读完
         # 选项后 park 过、而打开态没关（合成事件路径下很常见），这里就会一边报
         # already=true、一边把塌缩的浮层交出去。2026-09-11 商品 1044382261282 的
-        # 「面料类型」正是如此：兜底 agent 的 dxm_attribute_open 报 already=true，
-        # 紧接着的 dxm_attribute_click 却一律 option-not-rendered。
+        # 「面料类型」正是如此：本函数报 already=true，紧接着的
+        # _click_dropdown_option 却一律 option-not-rendered。
         await _unpark_own_panel(session, label, sel_idx)
         return {"opened": True, "already": True}
     # 没打开：先清残留浮层（park 停靠 + Escape 关 Vue 内部态），再点开。
@@ -264,7 +267,16 @@ def _js_own_panel(label: str, sel_idx: int = 0) -> str:
       let el = cid ? document.getElementById(cid) : null;
       for (let k = 0; el && k < 6 && !el.classList.contains('ant-select-dropdown'); k++)
         el = el.parentElement;
-      return (el && el.classList.contains('ant-select-dropdown')) ? el : null;
+      if (el && el.classList.contains('ant-select-dropdown')) return el;
+      // 部分页面的第二行 select 尚未挂 aria-controls；按当前行附近的
+      // 可见浮层兜底，避免把第 1 行的幽灵浮层当成目标。
+      const ry = it.getBoundingClientRect().top;
+      const ds = Array.from(document.querySelectorAll('.ant-select-dropdown'))
+        .filter(d => !d.classList.contains('dxm-ghost-parked'))
+        .map(d => ({d, r: d.getBoundingClientRect()}))
+        .filter(x => x.r.width > 50 && x.r.height > 0)
+        .sort((a, b) => Math.abs(a.r.top - ry) - Math.abs(b.r.top - ry));
+      return ds.length ? ds[0].d : null;
     })()""".replace("__LABEL__", J(label)).replace("__IDX__", str(sel_idx))
 
 
@@ -379,12 +391,23 @@ async def _read_active_options(session: BrowserSession, label: str,
 # ---- 阶段④ 属性写入 ---------------------------------------------------------
 
 async def _click_dropdown_option(session: BrowserSession, label: str,
-                                 value: str) -> dict:
-    """在【目标行附近唯一可见浮层】里点选项。
+                                 value: str, sel_idx: int = 0) -> dict:
+    """在【目标行第 sel_idx 个 select 自己的浮层】里点选项。
 
     绝不扫全页浮层（坑1）：上装成分/下装成分/材质/辅料成分共用同一份 67 项纤维列表，
     按文本匹配会在多个浮层里全命中；而点在隐藏浮层上事件照样生效，结果改掉别的字段。
     找不到目标选项时返回 option-not-rendered，交 _scroll_click_option 滚动去找。
+
+    【sel_idx 必须由调用方传】2026-09-12 真页面取证（rowid 184807703146625231 的
+    「成分」）：本函数原先没有这个参数，内部 _js_own_panel(label) 取默认 [0]，即恒按
+    【第 1 行】的 aria-controls 找浮层。而调用方 set_attr 写成分第 2 行时，
+    _open_attr_dropdown(sel_idx=row_no-1) 打开的是第 2 行的下拉——第 1 行的浮层此刻
+    关着（懒挂载）或已被 park，于是取到 null / 取到一个不含目标项的过期浮层，一律报
+    option-not-rendered。表现为「成分第 1 行永远写得上、第 2 行起永远写不上」：
+    _retry_row 重试同样失败，整组重试也失败，最后 comp_failed 触发「跳过裁行」，页面
+    留着认领带来的旧行，合计不等于 100，保存被平台拦（那次是 90+5+22=117%）。
+    滚动查找本身是好的（实测第 2 轮即命中、初始 scrollTop 甚至开屏就命中），坑全在
+    「找错了浮层」这一步。
     """
     js = r"""(() => {
       const target = __PANEL__;
@@ -399,17 +422,20 @@ async def _click_dropdown_option(session: BrowserSession, label: str,
         value: __VALUE__});
       opt.click();
       return JSON.stringify({clicked: true, value: __VALUE__});
-    })()""".replace("__PANEL__", _js_own_panel(label)).replace("__VALUE__", J(value)) \
+    })()""".replace("__PANEL__", _js_own_panel(label, sel_idx)).replace("__VALUE__", J(value)) \
         .replace("__UNPARK__", _js_unpark())
     return await session.eval_json(js)
 
 
 async def _scroll_click_option(session: BrowserSession, label: str,
-                               value: str) -> dict:
+                               value: str, sel_idx: int = 0) -> dict:
     """滚动虚拟列表找到目标选项渲染出来后点击（选项在可视窗口外时用）。
 
     滚动等待同 _read_active_options 的 180ms（见那里的注释）：原脚本 120ms 在
     Playwright 直连下不够，会滚过目标却没采到，误报 option-not-rendered。
+
+    sel_idx 与 _click_dropdown_option 同理，必须由调用方传：找错浮层时这里滚的是
+    别人家的列表，滚到底也不会命中（见那里的取证）。
     """
     js = r"""(async () => {
       const sleep = ms => new Promise(res => setTimeout(res, ms));
@@ -439,6 +465,6 @@ async def _scroll_click_option(session: BrowserSession, label: str,
       const last = hitNow();
       if (last) { last.click(); return JSON.stringify({clicked: true, value: __VALUE__, atEnd: true}); }
       return JSON.stringify({clicked: false, reason: 'option-not-rendered', value: __VALUE__});
-    })()""".replace("__PANEL__", _js_own_panel(label)).replace("__VALUE__", J(value)) \
+    })()""".replace("__PANEL__", _js_own_panel(label, sel_idx)).replace("__VALUE__", J(value)) \
         .replace("__UNPARK__", _js_unpark())
     return await session.eval_json(js)

@@ -144,7 +144,7 @@ async def test_联动新增必填行会被补填(_stub_dom, monkeypatch):
     s = _FakeSession([_sel_row("里衬成分"), _num_row()])
     asked = {}
 
-    async def _ask(rows, info, main_comp):
+    async def _ask(rows, info, main_comp, site=""):
         asked["rows"] = rows
         return {"changes": [
             {"label": "里衬成分", "value": "聚酯纤维(涤纶）", "num": 100, "row": 1},
@@ -349,7 +349,7 @@ def _stub_round(monkeypatch):
 
     patch_publish(monkeypatch, "pipeline", "fetch_attr_options", _fetch)
 
-    async def _ask(rows, info, main_comp):
+    async def _ask(rows, info, main_comp, site=""):
         # 每行都给一个 options 里的合法值，成分行凑满 100%
         changes = []
         for r in rows:
@@ -390,7 +390,7 @@ async def test_不再冒新行就停止不白转(_stub_dom, _stub_round, monkeyp
     s = _MultiRoundSession([r1, done, done, done])
     asked = []
 
-    async def _ask(rows, info, main_comp):
+    async def _ask(rows, info, main_comp, site=""):
         asked.append([r["label"] for r in rows])
         return {"changes": [{"label": r["label"], "value": "棉", "num": 100}
                             for r in rows], "notes": []}
@@ -450,7 +450,7 @@ async def test_已见过的行不重复补(_stub_dom, _stub_round, monkeypatch):
     s = _MultiRoundSession([stuck, r2, r2])
     asked = []
 
-    async def _ask(rows, info, main_comp):
+    async def _ask(rows, info, main_comp, site=""):
         asked.append([r["label"] for r in rows])
         return {"changes": [{"label": r["label"], "value": "棉", "num": 100}
                             for r in rows if r["kind"] != "number"], "notes": []}

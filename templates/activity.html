@@ -67,6 +67,24 @@
         max-height: 480px;
         overflow-y: auto;
       }
+      .source-table-wrap {
+        max-height: 460px;
+        overflow: auto;
+      }
+      #sourceTable th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: var(--bs-tertiary-bg);
+        white-space: nowrap;
+      }
+      #sourceTable td {
+        max-width: 280px;
+        min-width: 90px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
       .cell-ellipsis {
         max-width: 220px;
         overflow: hidden;
@@ -76,6 +94,23 @@
       #spusInput {
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 0.85rem;
+      }
+      @media (max-width: 576px) {
+        .navbar-brand {
+          white-space: normal;
+          font-size: 1rem;
+        }
+        .navbar-brand small {
+          display: block;
+        }
+        .navbar > .container-fluid {
+          flex-wrap: wrap;
+          gap: 0.5rem;
+        }
+        .card-body > .d-flex {
+          flex-wrap: wrap;
+          gap: 0.5rem;
+        }
       }
     </style>
   </head>
@@ -101,12 +136,6 @@
     </nav>
 
     <div class="container-fluid px-4 pb-5">
-      <!-- Excel 占用告警 -->
-      <div id="lockAlert" class="alert alert-warning d-none" role="alert">
-        <i class="bi bi-exclamation-triangle-fill"></i>
-        成本核算表正被 WPS/Excel 占用，读价可能失败。建议先关闭该文件。
-      </div>
-
       <!-- 安全告警：正式执行开启时才出现 -->
       <div id="execAlert" class="alert alert-danger d-none" role="alert">
         <i class="bi bi-exclamation-octagon-fill"></i>
@@ -142,24 +171,80 @@
         </div>
       </div>
 
-      <!-- 目标选择：工作簿 → Sheet（级联，复用采集页数据源） -->
       <div class="card mb-3">
         <div class="card-body">
-          <div class="row g-2 align-items-end">
-            <div class="col-12 col-md-7">
-              <label class="form-label small text-muted mb-1">成本核算表（工作簿）</label>
-              <select id="selExcel" class="form-select form-select-sm"></select>
-              <input
-                id="inputExcelPath"
-                type="text"
-                class="form-control form-control-sm mt-1 d-none"
-                placeholder="粘贴 .xlsx 完整路径后按回车"
-              />
+          <div class="d-flex justify-content-between align-items-center mb-3">
+            <div>
+              <h5 class="mb-1">WPS 文档商品库</h5>
+              <div class="small text-muted">读取在线成本表，核对日常价与销售底价，再勾选要做活动的商品。</div>
             </div>
-            <div class="col-12 col-md-5">
-              <label class="form-label small text-muted mb-1">目标 Sheet</label>
+            <a id="openSourceDoc" class="btn btn-sm btn-outline-secondary d-none" target="_blank" rel="noopener noreferrer">打开原文档</a>
+          </div>
+          <div class="row g-2 align-items-end">
+            <div class="col-12 col-md-4">
+              <label for="sourceDoc" class="form-label small text-muted mb-1">已保存的金山文档</label>
+              <select id="sourceDoc" class="form-select form-select-sm"><option value="">选择文档或粘贴新链接</option></select>
+            </div>
+            <div class="col-12 col-md-6">
+              <label for="sourceUrl" class="form-label small text-muted mb-1">WPS 在线表格链接</label>
+              <input id="sourceUrl" type="url" class="form-control form-control-sm" placeholder="https://www.kdocs.cn/l/…" />
+            </div>
+            <div class="col-12 col-md-2">
+              <button id="loadSourceDoc" class="btn btn-primary btn-sm w-100">读取文档</button>
+            </div>
+            <div class="col-12">
+              <div class="input-group input-group-sm" style="max-width: 520px">
+                <label for="sourceName" class="input-group-text">文档名称</label>
+                <input id="sourceName" class="form-control" placeholder="选填，例如：店铺 A 成本表" />
+                <button id="saveSourceDoc" class="btn btn-outline-primary" disabled>保存链接</button>
+              </div>
+              <div id="sourceSaveStatus" class="small mt-1" role="status" aria-live="polite"></div>
+            </div>
+            <div class="col-12 col-md-4">
+              <label for="selSheet" class="form-label small text-muted mb-1">工作表</label>
               <select id="selSheet" class="form-select form-select-sm"></select>
             </div>
+            <div class="col-12 col-md-8">
+              <label class="form-label small text-muted mb-1">列表筛选（可添加组合条件）</label>
+              <div class="input-group input-group-sm">
+                <select id="filterField" class="form-select" style="max-width: 180px" disabled><option>字段</option></select>
+                <select id="filterOperator" class="form-select" style="max-width: 150px" disabled></select>
+                <input id="filterValue" class="form-control" placeholder="模糊文字或数字" disabled />
+                <button id="addFilter" class="btn btn-outline-primary" disabled>添加条件</button>
+              </div>
+            </div>
+            <div class="col-12 col-md-4">
+              <label for="sourceFilter" class="form-label small text-muted mb-1">全文搜索（可选）</label>
+              <div class="input-group input-group-sm">
+                <input id="sourceFilter" class="form-control" placeholder="任意单元格内容" />
+                <button id="refreshSource" class="btn btn-outline-secondary" disabled>刷新数据</button>
+              </div>
+            </div>
+          </div>
+          <div id="sourceError" class="alert alert-danger small mt-3 mb-0 d-none" role="alert"></div>
+          <div id="sourceWarning" class="alert alert-warning small mt-3 mb-0 d-none" role="status"></div>
+          <div class="d-flex flex-wrap gap-2 align-items-center my-3">
+            <span id="filterModeLabel" class="small text-muted">组合条件：同时满足</span>
+            <select id="filterMode" class="form-select form-select-sm" style="width: 120px" disabled>
+              <option value="all">同时满足</option><option value="any">任一满足</option>
+            </select>
+            <div id="filterChips" class="d-flex flex-wrap gap-1"></div>
+            <span id="sourceStatus" class="small text-muted" role="status" aria-live="polite">请选择金山文档。首次使用请先完成 kdocs-cli 登录。</span>
+            <span id="sourceSelectionCount" class="badge text-bg-primary ms-auto">已选 0 个 SPU</span>
+            <button id="selectSourceFiltered" class="btn btn-outline-primary btn-sm" disabled>选择筛选结果</button>
+            <button id="clearSourceSelection" class="btn btn-outline-secondary btn-sm" disabled>清空选择</button>
+            <button id="toggleHiddenSource" class="btn btn-outline-secondary btn-sm">显示已隐藏</button>
+          </div>
+          <div class="source-table-wrap border rounded">
+            <table id="sourceTable" class="table table-sm table-hover mb-0 small">
+              <thead id="sourceHead"></thead>
+              <tbody id="sourceBody"><tr><td class="text-center text-muted p-4">文档数据将在这里显示</td></tr></tbody>
+            </table>
+          </div>
+          <div class="d-flex gap-2 align-items-center mt-2">
+            <span id="sourcePageInfo" class="small text-muted me-auto"></span>
+            <button id="sourcePrev" class="btn btn-outline-secondary btn-sm" disabled>上一页</button>
+            <button id="sourceNext" class="btn btn-outline-secondary btn-sm" disabled>下一页</button>
           </div>
         </div>
       </div>
@@ -168,17 +253,18 @@
       <div class="card mb-3">
         <div class="card-body">
           <label class="form-label small text-muted mb-1">
-            SPU 清单（换行 / 逗号 / 空格分隔）
+            已选商品（同一 SPU 多行只执行一次）
           </label>
           <textarea
             id="spusInput"
             class="form-control mb-2"
-            rows="4"
-            placeholder="9072868889&#10;9072868890&#10;9072868891"
+            rows="2"
+            readonly
+            placeholder="请在上方 WPS 文档数据中勾选商品"
           ></textarea>
           <div class="alert alert-light border small py-2 mb-2" role="note">
             <i class="bi bi-info-circle"></i>
-            红线取自 Excel 销售价（销售底价）：申报价 ≥ 销售底价且库存 ≥ 活动库存门槛时标记为初筛通过；最终能否报名以进入活动详情后查询到可报名商品行为准。
+            底价取自 WPS 文档销售价列；公式价格使用文档当前计算结果。商品实时采购，初筛只判断申报价是否达到底价；平台详情页仍会检查报名资格。
           </div>
           <div class="d-flex flex-wrap gap-2 align-items-center">
             <div class="form-check form-switch ms-1">
@@ -267,8 +353,8 @@
                 <th style="width: 80px">销售底价</th>
                 <th style="width: 80px">申报价</th>
                 <th style="width: 80px">达底价</th>
-                <th style="width: 70px">库存</th>
-                <th style="width: 70px">门槛</th>
+                <th style="width: 90px">供货方式</th>
+                <th style="width: 90px">平台库存要求</th>
                 <th style="width: 130px">入选</th>
                 <th style="width: 170px">状态</th>
               </tr>
@@ -276,7 +362,7 @@
             <tbody id="planBody">
               <tr>
                 <td colspan="10" class="text-center text-muted py-4">
-                  填入 SPU 清单后点「开始」，计划将在此逐条出现
+                  在 WPS 文档中勾选商品后点「开始」，计划将在此逐条出现
                 </td>
               </tr>
             </tbody>
@@ -297,14 +383,18 @@
     </div>
 
     <script src="/static/bootstrap.bundle.min.js"></script>
+    <script src="/static/activity-source.js"></script>
     <script>
       // 活动管理页前端：全部走 /activity/* 接口，进度经 SSE 消费 service 抛出的结构化事件。
-      // 工作簿/Sheet 下拉复用采集页的数据源（/activity/worklist 内部转调采集 service）。
       const $ = (id) => document.getElementById(id);
       let evtSource = null;
-      // 当前选择：工作簿 / Sheet（后端回显「上次选择」作初值）
-      let sel = { excel: "", sheet: "" };
-      const MANUAL = "__manual__"; // 工作簿下拉里「手填路径」哨兵值
+      let sel = { cloud_url: "", sheet: "" };
+      let batchRunning = false;
+      const sourcePicker = new ActivitySourcePicker((selection) => {
+        sel = { cloud_url: selection.cloud_url, sheet: selection.sheet };
+        $("spusInput").value = selection.spus.join("\n");
+        updateStartEnabled();
+      });
       // 计划表状态：order 记录 SPU 首次出现顺序；plans[spu] 是「达底价」活动数组（一 SPU 多行）；
       // dones[spu] 存 SPU 级最终状态；activityStates[spu][activity] 存每个活动行的实时状态。
       let order = [];
@@ -332,11 +422,6 @@
         box.scrollTop = box.scrollHeight;
       }
 
-      // 短化工作簿路径为文件名（下拉更好读；title 保留完整路径）
-      function baseName(p) {
-        return (p || "").split(/[\\/]/).pop() || p;
-      }
-
       function fmtNum(v) {
         return v == null || v === "" ? "–" : v;
       }
@@ -344,66 +429,14 @@
         return v == null ? "–" : `${(v * 100).toFixed(1)}%`;
       }
 
-      function fillSelectors(s) {
-        // 工作簿下拉：扫描到的 .xlsx + 「手填路径」
-        const excelSel = $("selExcel");
-        const wbs = s.workbooks || [];
-        excelSel.innerHTML =
-          wbs
-            .map(
-              (p) =>
-                `<option value="${p}" title="${p}"${
-                  p === s.excel ? " selected" : ""
-                }>${baseName(p)}</option>`
-            )
-            .join("") + `<option value="${MANUAL}">手填路径…</option>`;
-        // 当前生效工作簿不在扫描列表里（手填过的）→ 也补一项选中
-        if (s.excel && !wbs.includes(s.excel)) {
-          const opt = document.createElement("option");
-          opt.value = s.excel;
-          opt.title = s.excel;
-          opt.textContent = baseName(s.excel);
-          opt.selected = true;
-          excelSel.insertBefore(opt, excelSel.lastElementChild);
-        }
-
-        // Sheet 下拉：选中工作簿的所有表；首项为「请选择」
-        const sheetSel = $("selSheet");
-        sheetSel.innerHTML =
-          `<option value="">— 请选择 —</option>` +
-          (s.sheets || [])
-            .map(
-              (n) =>
-                `<option value="${n}"${n === s.sheet ? " selected" : ""}>${n}</option>`
-            )
-            .join("");
-      }
-
-      async function loadWorklist() {
-        try {
-          const qs = new URLSearchParams({ excel: sel.excel, sheet: sel.sheet });
-          const r = await fetch("/activity/worklist?" + qs.toString());
-          const s = await r.json();
-          // 用后端回显的生效值同步本地选择（首屏即「上次选择」）
-          sel.excel = s.excel || "";
-          sel.sheet = s.sheet || "";
-          fillSelectors(s);
-          $("lockAlert").classList.toggle("d-none", !s.excel_locked);
-          // 红线改为来自 Excel 销售价列，本页不再需要毛利率入参；worklist 若仍回显 min_margin 直接忽略。
-          updateStartEnabled();
-        } catch (e) {
-          showToast("加载失败", String(e), "danger");
-        }
-      }
-
       // 未选 Sheet / SPU 清单为空时禁用「开始」
       function updateStartEnabled() {
-        const bad = !sel.sheet || !$("spusInput").value.trim();
+        const bad = batchRunning || !sel.cloud_url || !sel.sheet || !$("spusInput").value.trim();
         $("btnStart").disabled = bad;
         $("btnStart").title = !sel.sheet
           ? "请先选目标 Sheet"
           : bad
-          ? "请先填入 SPU 清单"
+          ? "请先勾选 WPS 文档中的商品"
           : "";
       }
 
@@ -540,7 +573,6 @@
           : '<span class="text-danger"><i class="bi bi-x-lg"></i> 否</span>';
       }
 
-      // 「入选」列：selected=true 绿「是」；false 黄「否」并带 reason（多为库存不足）
       function selectedCell(p) {
         if (p.selected) {
           return '<span class="badge text-bg-info">初筛通过</span>';
@@ -586,7 +618,7 @@
               <td class="small">${fmtNum(p.sale)}</td>
               <td class="small fw-semibold">${fmtNum(p.submit_price)}</td>
               <td class="small">${floorCell(p.within_floor)}</td>
-              <td class="small">${fmtNum(p.stock)}</td>
+              <td class="small">实时采购</td>
               <td class="small">${fmtNum(p.min_stock)}</td>
               <td class="small">${selectedCell(p)}</td>
               <td class="small">${activityStatusBadge(spu, p.activity)}</td>
@@ -646,9 +678,7 @@
             logLine(
               `[计划] SPU=${data.spu} 入选活动「${data.activity || ""}」 申报价${fmtNum(
                 data.submit_price
-              )}（底价${fmtNum(data.sale)}，库存${fmtNum(data.stock)}≥门槛${fmtNum(
-                data.min_stock
-              )}）`
+              )}（底价${fmtNum(data.sale)}，实时采购，不按库存筛选）`
             );
           }
           renderPlanTable();
@@ -965,6 +995,8 @@
       }
 
       function finishRun() {
+        batchRunning = false;
+        sourcePicker.setRunning(false);
         if (evtSource) {
           evtSource.close();
           evtSource = null;
@@ -975,13 +1007,14 @@
       }
 
       async function startBatch() {
+        if (batchRunning) return;
         if (!sel.sheet) {
           showToast("无法开始", "请先选择目标 Sheet", "warning");
           return;
         }
         const spus = $("spusInput").value.trim();
         if (!spus) {
-          showToast("无法开始", "请先填入 SPU 清单", "warning");
+          showToast("无法开始", "请先勾选 WPS 文档中的商品", "warning");
           return;
         }
         const execute = isExecute();
@@ -991,6 +1024,9 @@
         )) {
           return;
         }
+        batchRunning = true;
+        sourcePicker.setRunning(true);
+        delete $("statusText").dataset.final;
         // 复位表格与统计
         order = [];
         plans = {};
@@ -1008,13 +1044,15 @@
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              excel: sel.excel,
+              cloud_url: sel.cloud_url,
               sheet: sel.sheet,
               spus,
               dry_run: !execute, // 默认 dry-run；仅「正式执行」勾选才 false
             }),
           });
-          const { job_id } = await r.json();
+          const response = await r.json();
+          if (!r.ok) throw new Error(response.error || "启动失败");
+          const { job_id } = response;
           evtSource = new EventSource(`/activity/batch/${job_id}/events`);
           [
             "batch_start",
@@ -1059,36 +1097,7 @@
       });
 
       $("btnStart").addEventListener("click", startBatch);
-      $("spusInput").addEventListener("input", updateStartEnabled);
-
-      // 工作簿切换：选「手填路径」→ 显示输入框；否则换 excel、清空 sheet（表可能不同）后重拉
-      $("selExcel").addEventListener("change", (e) => {
-        const v = e.target.value;
-        if (v === MANUAL) {
-          $("inputExcelPath").classList.remove("d-none");
-          $("inputExcelPath").focus();
-          return;
-        }
-        $("inputExcelPath").classList.add("d-none");
-        sel.excel = v;
-        sel.sheet = ""; // 换工作簿，旧 Sheet 未必存在
-        loadWorklist();
-      });
-      $("inputExcelPath").addEventListener("keydown", (e) => {
-        if (e.key !== "Enter") return;
-        const v = e.target.value.trim();
-        if (!v) return;
-        sel.excel = v;
-        sel.sheet = "";
-        $("inputExcelPath").classList.add("d-none");
-        loadWorklist();
-      });
-      $("selSheet").addEventListener("change", (e) => {
-        sel.sheet = e.target.value;
-        updateStartEnabled();
-      });
-
-      loadWorklist();
+      sourcePicker.init();
     </script>
   </body>
 </html>

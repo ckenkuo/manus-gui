@@ -157,7 +157,10 @@ global.setTimeout=callback=>callback();
 const sizeInput=new Input();sizeInput.value='均码';
 const sizeCell={querySelector:()=>sizeInput,textContent:''};
 const measurement=new Input();
-const valueCell={querySelectorAll:()=>[measurement]};
+// querySelector 是 2026-09-15 新增的 cellText/cellOf 要读的（判本格是不是下拉、
+// 取输入框值）；非鞋类没有 .ant-select，故只对 'input' 给值，其余选择器回 null。
+const valueCell={querySelectorAll:()=>[measurement],
+                 querySelector:selector=>selector==='input'?measurement:null};
 const row={matches:()=>false,querySelector:()=>measurement,querySelectorAll:()=>[sizeCell,valueCell]};
 const hidden={matches:()=>true};
 const table={querySelector:()=>({}),querySelectorAll:selector=>selector==='thead th'?
@@ -167,7 +170,9 @@ const wrap={textContent:'添加尺码表',getBoundingClientRect:()=>({width:0}),
 global.document={querySelectorAll:()=>[wrap]};
 global.getComputedStyle=()=>({display:'block'});
 """
-    code = scripts._JS_FILL_SIZECHART.replace("__NAME__", '"猫窝尺码表"').replace("__DATA__", '{"均码":{"宽":55}}').replace("__PARAMS__", '["宽"]')
+    # __DERIVED__ 是 2026-09-15 随鞋类国家码自动填充加的第四个占位符；猫窝没有脚长列，
+    # 故这里给空表（非鞋类走的就是这条）。漏替换会让注入的 JS 直接 ReferenceError。
+    code = scripts._JS_FILL_SIZECHART.replace("__NAME__", '"猫窝尺码表"').replace("__DATA__", '{"均码":{"宽":55}}').replace("__PARAMS__", '["宽"]').replace("__DERIVED__", '[]')
     result = run_js("(async()=>{const result=JSON.parse(await (" + code + "));return {result,value:measurement.value}})()", setup)
     assert result == {"result": {"ok": True, "empty": []}, "value": "55"}
 

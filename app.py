@@ -611,25 +611,20 @@ activity_jobs: dict = {}
 
 
 @app.get("/activity/worklist")
-async def activity_worklist(excel: str = "", sheet: str = ""):
-    """活动页首屏：可选工作簿/Sheet 列表 + 上次选择回显 + 全局毛利率红线默认。
+async def activity_worklist(cloud_url: str = "", sheet: str = ""):
+    """读取 WPS 在线表格的工作表和商品数据，不读取本地 Excel。"""
+    from app.activity import source
 
-    工作簿/Sheet 枚举直接复用采集 service 的 get_worklist_status（同一数据源，不重复造），
-    只额外附上活动模块的全局默认毛利率（config [activity].min_margin，缺失兜底 0.15）。
-    纯读、不触发任何变更。
-    """
-    status = collect_service.get_worklist_status(
-        excel=excel or None, sheet=sheet or None,
-    )
-    return JSONResponse(content={
-        "excel": status.get("excel", ""),
-        "sheet": status.get("sheet", ""),
-        "workbooks": status.get("workbooks", []),
-        "sheets": status.get("sheets", []),
-        "excel_locked": status.get("excel_locked", False),
-        # 活动模块的全局默认毛利率红线（前端批量毛利率输入框初值）
-        "min_margin": activity_service.global_min_margin(),
-    })
+    if not cloud_url:
+        return {"docs": cloud_docs.list_docs(), "sheets": [], "rows": []}
+    try:
+        result = await asyncio.to_thread(source.read_document, cloud_url, sheet)
+        cloud_docs.remember(result["cloud_url"])
+        return result
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    except Exception as exc:
+        return JSONResponse(status_code=502, content={"error": f"WPS 文档读取失败：{exc}"})
 
 
 @app.post("/activity/batch")
@@ -639,15 +634,23 @@ async def activity_batch(
     spus: str = Body("", embed=True),
     min_margin: Optional[float] = Body(None, embed=True),
     dry_run: bool = Body(True, embed=True),
+    cloud_url: str = Body("", embed=True),
 ):
     """启动一批活动管理作业，返回 job_id；进度经 /activity/batch/{job_id}/events (SSE) 消费。
 
-    安全：dry_run 默认 True（只读+算计划+出报名清单，不点任何变更按钮）；只有前端显式
-    开「正式执行」才传 False。spus 为原始清单文本（支持逐品 "spu:margin" 语法），min_margin
-    为本批统一毛利率红线（缺省走 config 全局默认）。excel/sheet 为目标成本核算表与 Sheet。
+    cloud_url 为在线成本表分享链接，sheet 为工作表名；excel 兼容旧客户端传链接。
+    dry_run 默认 True；开始前重新读取所选 SPU 的云端价格。
     """
+    from app.activity.source import validate_document
+
+    try:
+        document = validate_document(cloud_url or excel)
+        if not sheet.strip() or not spus.strip():
+            raise ValueError("请选择工作表并勾选要做活动的商品。")
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
     job_id = str(uuid.uuid4())
-    job = ActivityJob(job_id, excel, sheet, dry_run)
+    job = ActivityJob(job_id, document, sheet, dry_run)
     activity_jobs[job_id] = job
 
     async def _on_progress(event: dict):
@@ -656,7 +659,7 @@ async def activity_batch(
     async def _run():
         try:
             job.summary = await activity_service.run_activity_batch(
-                spus, excel, sheet,
+                spus, document, sheet,
                 min_margin=min_margin, dry_run=dry_run, live=not dry_run,
                 on_progress=_on_progress,
             )

@@ -3,7 +3,7 @@
 import json
 import re
 from app.logger import logger
-from app.publish import packaging
+from app.publish import packaging, variant_dom
 from app.publish.browser import BrowserSession, J
 from typing import Optional
 
@@ -37,8 +37,11 @@ _JS_FILL_VARIANT = r"""(async () => {
   // 表头文案带「(批量)」这类后缀，故一律用 includes 而不是全等。
   const heads = Array.from(sku.querySelectorAll('thead th')).map(txt);
   const findCol = (...keys) => heads.findIndex(h => keys.some(k => h.includes(k)));
-  const iColor = heads.findIndex(h => /^颜色/.test(h));
-  const iSize = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
+  // 变种维列（本段只拿来回读 sample 里的行标识，不参与写值）按结构位置认，与 ⑩a/⑦a/⑦b
+  // 共用 variant_dom._JS_DIM_COLS：车贴类目那维叫「型号」，按名字认会读成空串，
+  // 让 sample 与 bad 的日志失去行标识（写值本身按申报价/尺寸/重量列，不受影响）。
+  __DIM_COLS__
+  const {colorIdx: iColor, sizeIdx: iSize} = dimIdx(heads);
   const iPrice = findCol('申报价');
   const iDims = findCol('尺寸');
   const iWeight = findCol('重量');
@@ -250,7 +253,8 @@ async def set_variant(session: BrowserSession, info_path: str,
           .replace("__PRICE__", J(str(price)))
           .replace("__DIMS__", J(d_list))
           .replace("__WEIGHT__", J(str(w_g)))
-          .replace("__MSRP__", J(msrp)))
+          .replace("__MSRP__", J(msrp))
+          .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     res = await session.eval_json(js)
     # 缺列是硬错误：过去按下标猜列时，错位表现为「填了但填错格子」，一路带到 save
     # 才被平台以含糊文案拒掉（见 _JS_FILL_VARIANT 的取证）。宁可在这里就失败。

@@ -11,6 +11,11 @@ import pytest
 from app.activity import service
 
 
+@pytest.fixture(autouse=True)
+def fast_log_retries(monkeypatch):
+    monkeypatch.setattr(service, "LOG_VERIFY_RETRY_DELAY", 0)
+
+
 class FakePage:
     """占位页面对象（执行遍里只作为句柄透传给被 patch 的 pipeline 函数）。"""
     def __init__(self, tag=""):
@@ -183,12 +188,11 @@ def _expected_urls(host):
     return [
         f"https://{host}{service.pipeline.FLUX_PATH}",
         f"https://{host}{service.pipeline.ACTIVITY_PATH}",
-        f"https://{host}{service.pipeline.GOODS_LIST_PATH}",
     ]
 
 
 def test_connect_pages_opens_all_missing_tabs(monkeypatch):
-    """流量/活动/商品页都缺失时自动打开，并全部标为本批 owned 页签。
+    """自动打开流量和活动页，不再打开库存商品页。
 
     context 里必须有一个用户页签供确认区域——_connect_pages 现在会先确认区域再开页面。
     """
@@ -206,12 +210,13 @@ def test_connect_pages_opens_all_missing_tabs(monkeypatch):
 
     assert pw is playwright and got_browser is browser
     assert [page.url for page in owned] == _expected_urls(GLOBAL_HOST)
-    assert (flux, activity, goods) == tuple(owned)
+    assert (flux, activity) == tuple(owned)
+    assert goods is None
     assert dismissed == [page.url for page in owned]
 
 
 def test_connect_pages_opens_tabs_in_user_selected_region(monkeypatch):
-    """核心：用户选的是美国区，本批三个页面就必须开在美国域，不能回落到全球域。
+    """核心：用户选的是美国区，本批页面就必须开在美国域，不能回落到全球域。
 
     区域切换换域名（全球 agentseller.temu.com / 美国 agentseller-us.temu.com），旧代码
     的写死全球域 URL 会把操作者选定的美国区悄悄换掉，报名/开加速器打在错误的一批商品上。
@@ -252,7 +257,7 @@ def test_connect_pages_aborts_when_no_seller_page_open(monkeypatch):
 
 
 def test_connect_pages_ignores_existing_tabs_and_opens_owned_tabs(monkeypatch):
-    """已有页签状态不受管线控制；任务必须忽略它们并新建三个专用页签。
+    """已有页签状态不受管线控制；任务必须忽略它们并新建两个专用页签。
 
     「忽略」的唯一例外是只读一次区域（不 goto、不点击、不关闭），断言里仍校验这一点。
     """
@@ -261,12 +266,13 @@ def test_connect_pages_ignores_existing_tabs_and_opens_owned_tabs(monkeypatch):
     result = asyncio.run(service._connect_pages("http://localhost:9222"))
     _, _, flux, activity, goods, owned = result
 
-    assert (flux, activity, goods) == tuple(owned)
+    assert (flux, activity) == tuple(owned)
+    assert goods is None
     assert [page.url for page in owned] == _expected_urls(GLOBAL_HOST)
     assert all(page not in existing for page in owned)
     assert all(page.goto_calls == [] for page in existing)
     assert all(page.closed is False for page in existing)
-    assert len(context.pages) == 6
+    assert len(context.pages) == 4
 
 
 def _plan(spu, activities, accel_will_close, sale=46.5, accel_state=None):
@@ -282,13 +288,17 @@ def _plan(spu, activities, accel_will_close, sale=46.5, accel_state=None):
 
 
 def _patch_log(monkeypatch, pairs=(), complete=True):
+    reads = 0
+
     async def fake_read_log(_context, spus):
+        nonlocal reads
+        reads += 1
         records = [
             {
                 "spu": str(spu), "activity": activity, "success": True,
                 "enroll_status": 4, "enroll_id": f"{spu}-{activity}",
             }
-            for spu, activity in pairs
+            for spu, activity in (pairs if reads > 1 else [])
         ]
         return {
             "records": records, "complete": complete,
@@ -339,7 +349,7 @@ def _run(results, live, monkeypatch, runtime_states=None):
         calls["read_log"].append(list(_spus))
         calls["sequence"].append("read_log")
         records = []
-        if live:
+        if live and len(calls["read_log"]) > 1:
             for plan in results:
                 for item in plan.get("enrolled_activities", []):
                     records.append({
@@ -400,7 +410,7 @@ def test_live_reads_activity_log_baseline_before_enrollment(monkeypatch):
     assert calls["read_log"] == [["111"], ["111"]]
     assert calls["sequence"].index("close") < calls["sequence"].index("read_log")
     assert calls["sequence"].index("read_log") < calls["sequence"].index("open_page")
-    assert summary["log_baseline"]["queries"] == [{"spu": "111", "total": 1}]
+    assert summary["log_baseline"]["queries"] == [{"spu": "111", "total": 0}]
 
 
 def test_each_enroll_page_closed_after_activity(monkeypatch):

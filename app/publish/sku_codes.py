@@ -3,6 +3,7 @@
 import asyncio
 import re
 from app.logger import logger
+from app.publish import variant_dom
 from app.publish.browser import BrowserSession, J
 
 
@@ -64,39 +65,33 @@ def has_cjk(text: str) -> bool:
     return any(ord(c) > 127 for c in str(text or ""))
 
 
-# 【颜色/尺码列必须按表头定位，不能写死 tds[0]/tds[1]】2026-08-28 真站取证
-# （草稿 173539495451708963，类目仿真花）：无尺码类目的表头是
+# 【变种维列必须按表头结构定位，不能写死 tds[0]/tds[1]、也不能按名字穷举】
+# 2026-08-28 真站取证（草稿 173539495451708963，类目仿真花）：无尺码类目的表头是
 #   ["预览图( 批量)", "颜色", "SKU货号…", "EAN…", "申报价格…", …]
 # 即 tds[0] 是【预览图】（文本空）、tds[1] 才是颜色，压根没有尺码列。原实现按下标取，
 # 于是 color='' / size='【大吉大梨】梨花筒（life盆）'——颜色尺码整体错位一列，
 # 货号会拼成「颜色名当尺码」的形状，且中文颜色被当尺码送去翻译。
 # 服装类目下 tds[0] 恰好是颜色纯属巧合（那边表头第一列就是颜色）。
-# 故改为读 thead 找「颜色」「尺码」两列的真实下标，与项目「按 Sheet 真实表头写入」
-# 的既有取向一致（见 CLAUDE.md 的已知陷阱）。尺码列不存在时 sizeIdx=-1，
-# 该列按空串处理——单维商品的货号只用颜色，见 fix_sku_codes 的拼装逻辑。
+#
+# 2026-09-11 派对桌布（rowid 184807703146387073）唯一那维装在「尺码」列、2026-09-12
+# 车贴（商品 601101104447803）唯一那维叫【型号】——按名字认列的路子已经补过两次，
+# 每换一个类目就再补一次。故改按结构位置认（预览图之后、SKU货号之前即变种维列），
+# 判据收敛进 variant_dom._JS_DIM_COLS 一处、⑦a/⑦b/⑩a/⑩/续跑判定共用，
+# 与项目「按 Sheet 真实表头写入」的既有取向一致（见 CLAUDE.md 的已知陷阱）。
+# 第二维不存在时 sizeIdx=-1，该列按空串处理——单维商品的货号只用第一维，
+# 见 fix_sku_codes 的拼装逻辑。
 _JS_READ_SKU_CODES = r"""(() => {
   const sku = document.getElementById('skuDataInfo');
   if (!sku) return JSON.stringify({err: 'no-skuDataInfo'});
   const tb = sku.querySelectorAll('tbody')[0];
   if (!tb) return JSON.stringify({err: 'no-first-tbody'});
   const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
-  // 表头定位：取第一个精确等于「颜色」/含「尺码」（排除「尺码表」）的列下标。
-  // 表头文案带「(批量)」这类后缀，故颜色用「以颜色开头」而不是全等（实测第 9 列
-  // 也叫「颜色」——那是 SKU分类区的列，取第一个即可）。
   const heads = Array.from(sku.querySelectorAll('thead th')).map(th => txt(th));
-  let colorIdx = heads.findIndex(h => /^颜色/.test(h));
-  let sizeIdx = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
-  // 【没有颜色列时，唯一那维可能就是装在「尺码」列里的】2026-09-11 真机取证
-  // （rowid 184807703146387073，类目派对桌布）：表头是
-  //   ["预览图(批量)", "尺码", "SKU货号", "EAN…", …]  ← 压根没有「颜色」列
-  // 而 9 行的「尺码」值就是颜色名（亮光雨丝桌裙-粉色/红色/金色…），即平台这个类目
-  // 把唯一的变种维挂在了尺码位上。原判据硬性要求 /^颜色/，匹配不到直接 no-color-column
-  // 判失败——整个 ⑩a 卡死、交 Manus 兜底也无解（页面上确实没有颜色列可读）。
-  // 此时把这一列当颜色维用、尺码维按不存在处理：既有的「维度取舍」与「两个维度都空
-  // 才算读不到」两道逻辑照常生效，货号退化成纯单维，正是这类目该有的形状。
-  // 真·双维（颜色+尺码）与真·无维度（两个表头都没有）都不受影响。
-  if (colorIdx < 0 && sizeIdx >= 0) { colorIdx = sizeIdx; sizeIdx = -1; }
-  if (colorIdx < 0) return JSON.stringify({err: 'no-color-column', heads: heads});
+  __DIM_COLS__
+  const {colorIdx, sizeIdx} = dimIdx(heads);
+  // 维度列一个都认不出来（连 SKU货号 锚点都没有）：页面结构与实测的全不一样，
+  // 报出真实表头交人工，别猜下标（静默按下标猜正是 2026-08-28 那次的病根）。
+  if (colorIdx < 0) return JSON.stringify({err: 'no-dim-column', heads: heads});
   const rows = [];
   Array.from(tb.querySelectorAll('tr')).forEach((tr, i) => {
     const inp = tr.querySelector('input[name=variationSku]');
@@ -124,15 +119,13 @@ _JS_FILL_SKU_CODES = r"""(async () => {
   const tb = sku.querySelectorAll('tbody')[0];
   if (!tb) return JSON.stringify({err: 'no-first-tbody'});
   const rows = Array.from(tb.querySelectorAll('tr'));
-  // 列下标与 _JS_READ_SKU_CODES 用同一套表头判据：逐行核对必须比对同样两列，
-  // 否则无尺码类目下会因为「读的是颜色、核的是预览图」而全行 row-moved（见那边注释）。
+  // 列下标与 _JS_READ_SKU_CODES 用同一段判据（都注入 variant_dom._JS_DIM_COLS）：
+  // 逐行核对必须比对同样两列，否则无尺码类目下会因为「读的是颜色、核的是预览图」
+  // 而全行 row-moved、货号一个都填不进去。别在这里另写一套。
   const heads = Array.from(sku.querySelectorAll('thead th')).map(th => txt(th));
-  let colorIdx = heads.findIndex(h => /^颜色/.test(h));
-  let sizeIdx = heads.findIndex(h => h.includes('尺码') && !h.includes('尺码表'));
-  // 判据与 _JS_READ_SKU_CODES 完全一致（含「唯一维装在尺码列」那条），别只改一边：
-  // 读与写取的列不同，逐行核对会整表 row-moved，货号一个都填不进去。
-  if (colorIdx < 0 && sizeIdx >= 0) { colorIdx = sizeIdx; sizeIdx = -1; }
-  if (colorIdx < 0) return JSON.stringify({err: 'no-color-column', heads: heads});
+  __DIM_COLS__
+  const {colorIdx, sizeIdx} = dimIdx(heads);
+  if (colorIdx < 0) return JSON.stringify({err: 'no-dim-column', heads: heads});
   const cellAt = (tds, idx) => (idx >= 0 ? txt(tds[idx]) : '');
   const filled = [], mismatch = [];
   for (const p of PLAN) {
@@ -234,9 +227,10 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     翻译失败不兜底（不转拼音、不留中文）：货号填错会一路带到发布，比这一阶段直接
     失败更糟，交上层重试处理。
     """
-    read = await session.eval_json(_JS_READ_SKU_CODES)
+    read = await session.eval_json(
+        _JS_READ_SKU_CODES.replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if read.get("err"):
-        # 【失败必须带上真实表头】单看 no-color-column 只知道「没有颜色列」，而表头长
+        # 【失败必须带上真实表头】单看 no-dim-column 只知道「没认出维度列」，而表头长
         # 什么样决定了它是「这个类目的变种结构本就不同」还是「页面没渲染完」——
         # 2026-09-11 商品 1044382261282 排查时就卡在日志里只有 err、没有现场。
         return {"status": "error",
@@ -244,11 +238,12 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     rows = read.get("rows") or []
     if not rows:
         return {"status": "error", "reason": "变种表无 variationSku 输入框（尺码未勾选？）"}
-    # 无尺码类目（仿真花/玩具等）没有尺码列，货号退化成纯颜色。记一行日志说明这不是
-    # 读漏了列——sizeIdx=-1 是页面事实，见 _JS_READ_SKU_CODES 上方的表头取证。
+    # 单维类目（仿真花/玩具/车贴等）只有一个变种维，货号退化成纯第一维。记一行日志说明
+    # 这不是读漏了列——sizeIdx=-1 是页面事实，见 _JS_READ_SKU_CODES 上方的表头取证。
+    # 维度名一并报出来：车贴那单的唯一维叫「型号」，只说「无尺码列」会让人以为读漏了。
     if read.get("sizeIdx", -1) < 0:
-        logger.info(f"变种表无尺码列（本类目无尺码维），货号按纯颜色拼；"
-                    f"表头：{read.get('heads')}")
+        logger.info(f"变种表只有一个变种维（第 {read.get('colorIdx')} 列），"
+                    f"货号按单维拼；表头：{read.get('heads')}")
 
     # 1) 词表：颜色与尺码各自去重
     colors = sorted({r["color"] for r in rows if r.get("color")})
@@ -295,10 +290,11 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
             parts.append(mapping.get(r["size"], ""))
         base = "-".join(p for p in parts if p)
         if not base:
-            # 颜色列也空：这才是真读不到（无尺码类目下 size 空是正常的，见上方日志）
+            # 第一维也空：这才是真读不到（单维类目下第二维空是正常的，见上方日志）
             return {"status": "error",
-                    "reason": f"第 {r['i'] + 1} 行颜色/尺码列都读不到，无法拼货号"
-                              f"（表头 {read.get('heads')}，颜色列 {read.get('colorIdx')}）"}
+                    "reason": f"第 {r['i'] + 1} 行两个变种维列都读不到，无法拼货号"
+                              f"（表头 {read.get('heads')}，维度列 "
+                              f"{read.get('colorIdx')}/{read.get('sizeIdx')}）"}
         if len(base) > cap:
             # 硬切在单词中间也比被平台拒了强；切完的尾部可能是那个分隔符，去掉更干净
             base = base[:cap].rstrip("-")
@@ -306,7 +302,9 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
         code = base if used[base] == 1 else f"{base}-{used[base]}"
         plan.append({"i": r["i"], "color": r["color"], "size": r["size"], "code": code})
 
-    res = await session.eval_json(_JS_FILL_SKU_CODES.replace("__PLAN__", J(plan)))
+    res = await session.eval_json(
+        _JS_FILL_SKU_CODES.replace("__PLAN__", J(plan))
+                          .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if res.get("err"):
         return {"status": "error", "reason": f"填货号失败：{res['err']}"}
 

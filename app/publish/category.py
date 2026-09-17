@@ -5,7 +5,8 @@ import re
 from app.logger import logger
 from app.publish import cache, category_api, common, navigation, size_rules, workflows
 from app.publish.browser import BrowserSession, J
-from typing import Optional
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Optional
 
 
 # ---- 阶段③ 产品类目（写入）---------------------------------------------------
@@ -181,16 +182,17 @@ _CAT_PROMPT = """你是跨境电商类目分类助手。根据商品标题，从
 规则：
 1. 若商品标题表明是套装类商品（含"套装""两件套""三件套""套裙"等），候选中有套装/两件套类类目时，必须优先选套装类类目，而不是按单品材质/上衣/裤子归类。
 2. 性别、年龄段（婴儿/女童/男童/女士/男士）必须与标题一致；若下方给出了「商品线索」，以线索为准。【线索里的年龄段/尺码写法优先于标题措辞】：1688 标题常把"女"（指女款）与"宝宝/童"并列，只看"女"字会误判成成人女装。源尺码是月龄码（6-9m）、岁码（2-3y/3T）或身高码（90/110cm）时，商品必为婴幼童/童装，禁止选女士/男士等成人分支；源尺码是 S/M/L/XL 等成人字母码时，禁止选婴儿/女童/男童分支。源尺码里出现 2 岁及以上的岁码（2y/3T/5岁/7-8岁）时，商品必为童装（女童/男童），禁止选「婴儿」分支；只有月龄码（≤12m，如 6-9m/9-12m）或 1 岁码（1y/1岁/12m）才可能是婴儿。
-3. "其他（...）"类目只有在所有其他候选都语义不符时才能选；只要存在更具体的候选（如按裙/长裤/短裤、开衫/套头衫区分），就必须选最具体匹配的那个，依据标题中的实体信息判断（如"牛仔裤"=长裤下装）。
+3. "其他（...）"类目只有在所有其他候选都语义不符时才能选；只要存在更具体的候选（如按裙/长裤/短裤、开衫/套头衫区分），就必须选最具体匹配的那个，依据标题中的实体信息判断（如"牛仔裤"=长裤下装）。本级候选里没有"其他（...）"项时，这个兜底出口就不存在，仍须按规则 6 在现有候选里选一支。
 4. 商品的风格属性（运动/休闲/正装/居家）要与类目分支一致：运动风商品（含"运动""卫衣""POLO""卫裤""速干"等）应优先进"运动服/休闲运动"这类分支。
 5. 【重要】选择时必须综合本级名字和它的子类目：若某候选本身不如另一个贴切，但其子类目里有明显更匹配商品的项，应选它。反之，某候选名字看着匹配但子类目全都不符，则不该选。
+6. 【本级必须选一个，没有"都不匹配"这个选项】只能回候选清单里已列出的序号，禁止返回 -1、清单以外的序号或空值。这不是逼你硬答：类目树逐级收窄，本级候选就是上一级选中分支的【全部】下级，商品必然落在其中某一支之下，所以"一个都不匹配"这个结论在这一级不成立——真实情形是"没有字面完全对应的候选"，此时按规则 5 看子类目，选【往下走能到达最贴切叶子】的那一支，并在 reason 里说明是凭哪个子类目判断的。
 
 商品标题：{title}
 {clues}已选路径：{path}
 候选类目：
 {options}
 
-只输出JSON: {{"index": <序号>, "reason": "<一句话理由，说明是依据本级名字还是子类目做的判断>"}}"""
+只输出JSON: {{"index": <上方候选清单里的序号>, "reason": "<一句话理由，说明是依据本级名字还是子类目做的判断>"}}"""
 
 
 async def _pick_category(title: str, options: list, path: list,
@@ -203,8 +205,29 @@ async def _pick_category(title: str, options: list, path: list,
 
     clues 是 cat_clues() 产出的年龄段/尺码线索（见其上方的 2026-08-29 取证）。
     为空时整行省掉，不给模型留空占位——空占位会诱导模型自己编线索。
+
+    【index 的范围校验交给 ask_json 的 result_model，不留在返回之后自己判】
+    2026-09-13 商品 1064554331425 事故：模型第一次就回 index=-1（候选 13 个），
+    当时范围校验写在 ask_json 返回【之后】，于是直接抛错——ask_json 自带的 3 次
+    重试一次都没用上，而它恰恰是为「单次抖动」准备的。把范围声明成 result_model
+    的字段约束后，越界与「解析不出 JSON」同等对待：落进重试圈，_retry_hint 还会
+    把 Pydantic 的错因（index: Input should be greater than or equal to 0）原话
+    拼进下一轮提示词，模型知道自己错在哪。
+    【为什么不改成在这里显式重问】那等于在 ask_json 的重试循环外面再套一层自己的
+    循环：重试次数、提醒措辞、日志格式全要重写一遍，还会与 _retry_hint「每次都从
+    原始 prompt 重拼、不累加」的取向打架（外层重问拿到的是已拼过提醒的 prompt）。
+    重试机制项目里只该有一处。
+
+    【为什么模型在函数里现声明】上界是本级候选个数，逐级都不一样，没法做成模块级
+    常量。strict=True 沿用 llm._check_result 的既定要求：lax 模式会把字符串 "1"
+    悄悄转成 1 放行，而 ask_json 返回的仍是原 dict、下游 options[idx] 会 TypeError。
     """
     from app.publish.llm import ask_json
+
+    class _CatPick(BaseModel):
+        model_config = ConfigDict(strict=True)
+
+        index: Annotated[int, Field(ge=0, lt=len(options))]
 
     lines = []
     for i, name in enumerate(options):
@@ -223,9 +246,13 @@ async def _pick_category(title: str, options: list, path: list,
             path=" > ".join(path) or "（根级）",
             options="\n".join(lines),
         ),
-        what="类目选择", stage="auto_cat",
+        what="类目选择", stage="auto_cat", result_model=_CatPick,
     )
     idx = data.get("index")
+    # 上面的 result_model 已经保证 idx 是范围内的真整数（不合格的三次都重问过、
+    # 仍不合格由 ask_json 抛错），这里留着是本模块「宁可失败不可硬选」的兜底闸门：
+    # 选错类目要人工回滚，代价不对称（见 _try_cached_category 上方的注释块），
+    # 故绝不因为「理论上进不来」就把闸门撤掉。
     if not isinstance(idx, int) or idx < 0 or idx >= len(options):
         raise RuntimeError(f"类目选择：LLM 返回非法 index={idx}（候选 {len(options)} 个）")
     return idx, str(data.get("reason", ""))

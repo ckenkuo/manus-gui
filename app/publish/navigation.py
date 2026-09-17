@@ -3,8 +3,9 @@
 import os
 import re
 from app.logger import logger
-from app.publish import common, images
+from app.publish import common, images, variant_dom
 from app.publish.browser import BrowserSession, DRAFT_LIST_URL, EDIT_URL, J
+from app.publish.media import carousel as media_carousel
 from app.publish.media import preview as media_preview
 from typing import Optional
 
@@ -49,6 +50,12 @@ async def find_rowid(session: BrowserSession, keyword: str) -> dict:
     rowid 是草稿列表行的 <tr rowid="..."> 属性（18 位数字），后续所有阶段都靠它拼
     编辑页 URL。一个商品可能被认领到多个站点、出现多行，故返回全部匹配交调用方按
     店铺/站点筛（见 service 层的 pick_rowid）。
+
+    【text 必须够长】调用方（claim.pick_rowid）就是拿这个 text 按站点/店铺筛行的，
+    而这两列排在标题【之后】：2026-09-12 实测 Temu 英文标题单是标题就 230+ 字符，
+    原来 slice(0,120) 把站点和店铺整段切掉，于是报「草稿列表未找到店铺/站点」——
+    而同一行人在页面上看得清清楚楚。1688 标题短（中文 30 来字）所以一直没暴露。
+    500 足够容纳长标题 + 站点 + 店铺。
     """
     r = await session.navigate(DRAFT_LIST_URL)
     if not r.get("ok"):
@@ -57,7 +64,7 @@ async def find_rowid(session: BrowserSession, keyword: str) -> dict:
       const rows = Array.from(document.querySelectorAll('tr[rowid]'));
       const m = rows.filter(r => (r.textContent||'').includes(__KW__))
         .map(r => ({rowid: r.getAttribute('rowid'),
-                    text: (r.textContent||'').replace(/\s+/g,' ').slice(0,120)}));
+                    text: (r.textContent||'').replace(/\s+/g,' ').slice(0,500)}));
       return JSON.stringify({total: rows.length, matched: m});
     })()""".replace("__KW__", J(keyword))
     data = await session.wait_for(js, lambda d: d.get("total", 0) > 0, timeout=30)
@@ -285,6 +292,8 @@ _JS_LIVE_STATE = r"""(async () => {
   }
   const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
   const host = u => { try { return new URL(u, location.href).host; } catch (e) { return ''; } };
+  // 变种维列的共用判据（下方 variantByColor 用 dimIdx）：与 ⑦a/⑦b/⑩a/⑩ 同一段代码
+  __DIM_COLS__
 
   // ⑤ 标题：按 label 定位「英文标题」框——它空或含中文（非 ASCII）都说明英文标题
   // 成果已丢/未填，要重跑。不能抓基本信息区所有框：中文标题框（产品标题）本来就
@@ -318,6 +327,45 @@ _JS_LIVE_STATE = r"""(async () => {
     return !v || Array.from(v).some(c => c.charCodeAt(0) > 127);
   }).length;
 
+  // ⑩ 变种信息「申报价/重量缺失」的行数：按列头定位（与下方 variantByColor 同判据），
+  // 任一为空即算这行没填全。skuFilledRows 只判「有没有行填过」，抓不到「46 行缺
+  // 申报价/重量」这种半成品（2026-09-17 毛绒玩偶续跑：skuFilled 非 0，save 却报
+  // 「请填写表格中缺少的字符」）。列头读不到时算 0，不据此误判。
+  const _skuHeads = (sku || document).querySelector('table')
+    ? Array.from((sku || document).querySelector('table').querySelectorAll('thead th'))
+        .map(th => txt(th))
+    : [];
+  const _iPriceCol = _skuHeads.findIndex(h => h.includes('申报价格'));
+  const _iWeightCol = _skuHeads.findIndex(h => h.includes('重量'));
+  const skuVariantMissing = skuRows.filter(tr => {
+    const tds = Array.from(tr.children);
+    const val = k => {
+      if (k < 0 || !tds[k]) return '';
+      const ins = Array.from(tds[k].querySelectorAll('input'));
+      for (const x of ins) { const v = (x.value || '').trim(); if (v) return v; }
+      return '';
+    };
+    return !val(_iPriceCol) || !val(_iWeightCol);
+  }).length;
+
+  // ⑪ 仓库：读「选择仓库」下拉的选中值（定位同 stock_scripts._JS_WH_STATE）。
+  // 保存失败后页面刷新会清空下拉，仓库空 = stock 成果丢了，续跑必须重跑 stock 补。
+  // null = 读不到仓库块（交阶段自己判），空数组才是真没选。
+  const whLab = Array.from(document.querySelectorAll('*'))
+    .filter(el => el.childElementCount === 0 && el.closest('#skuDataInfo') &&
+      (el.textContent || '').trim().startsWith('选择仓库'))[0];
+  let warehouseSelected = null;
+  if (whLab) {
+    let box = whLab.parentElement, sel = null;
+    for (let k = 0; k < 5 && box; k++) {
+      sel = box.querySelector('.ant-select'); if (sel) break; box = box.parentElement;
+    }
+    if (sel) {
+      warehouseSelected = Array.from(sel.querySelectorAll('.ant-select-selection-item'))
+        .map(x => (x.title || x.textContent || '').trim());
+    }
+  }
+
   // ⑨ 尺码表：控件文本仍是「添加尺码表」说明没加。
   // 套装商品有两张表（label「尺码表」「尺码表2」），按 label 取而不是靠
   // .skuAttrSizeChart——那个类只挂在第一张上，第二张没加会被判成「已加」而不重跑
@@ -349,12 +397,14 @@ _JS_LIVE_STATE = r"""(async () => {
     });
   // ⑦a 剔配件色：变种信息表按颜色统计「有源数据的行数」。续跑判定据此认配件色
   // （反选只改未保存表单，save 没成功过就会回到认领时的全勾状态）。
-  // 判据与列定位同 _JS_VARIANT_ROW_FILL，见那里的真站取证。
+  // 判据与列定位同 _JS_VARIANT_ROW_FILL（都注入 variant_dom._JS_DIM_COLS：变种维列
+  // 按「预览图之后、SKU货号之前」的结构位置认，不按颜色/尺码这两个名字猜），见那里的
+  // 真站取证。两边判据必须一致：这里认不出维度列会让续跑判定永不安排 ⑦a。
   const variantByColor = (() => {
     const t0 = (sku || document).querySelector('table');
     if (!t0) return null;
     const hs = Array.from(t0.querySelectorAll('thead th')).map(th => txt(th));
-    const iC = hs.findIndex(h => /^颜色/.test(h));
+    const iC = dimIdx(hs).colorIdx;
     const iCode = hs.findIndex(h => h.includes('SKU货号'));
     const iPrice = hs.findIndex(h => h.includes('申报价格'));
     const iW = hs.findIndex(h => h.includes('重量'));
@@ -406,6 +456,40 @@ _JS_LIVE_STATE = r"""(async () => {
     });
   }
 
+  // ⑤c 产品轮播图：产品信息区 .img-list，与上面 attrImg*（变种属性区）、preview*
+  // （变种信息表）都不是同一处图——2026-09-12 弹珠机那单正是 ⑦⑦b 都跑过、轮播图
+  // 从未被碰过而被平台拒「产品轮播图尺寸不能小于800*800」。
+  // 【只统计已勾选的】平台校验的是选用的那几张，候选池里的非 1:1 图不参与发布。
+  // 尺寸取每格的 .img-size 文本（格子里的 img 是 120px 缩略图，naturalWidth 读不到
+  // 源图尺寸）；文本读不到时不计入 bad——未知不等于不合格（同 carousel_state）。
+  let carouselPicked = 0, carouselBad = 0;
+  (() => {
+    // 定位判据与 media/carousel.pickCarouselList 一致：按「格子里有没有 checkbox」
+    // 认出轮播图区，不按「产品轮播图」标签文字找——素材图区的说明文字里也有这四个字
+    // （2026-09-13 真站实测，见那个函数上方的取证）。
+    const lists = Array.from(document.querySelectorAll('.img-list')).filter(L => {
+      const its = Array.from(L.querySelectorAll('.single-image'));
+      return its.length && its.some(el => !!el.querySelector('input.ant-checkbox-input'));
+    });
+    if (!lists.length) return;
+    lists.sort((a, b) => b.querySelectorAll('.single-image').length
+                       - a.querySelectorAll('.single-image').length);
+    const list = lists[0];
+    Array.from(list.querySelectorAll('.single-image')).forEach(el => {
+      const cb = el.querySelector('input.ant-checkbox-input');
+      const checked = /(^|\s)checked(\s|$)/.test(el.className) || !!(cb && cb.checked);
+      if (!checked) return;
+      carouselPicked++;
+      const m = /(\d+)\s*[xX×]\s*(\d+)/.exec(txt(el.querySelector('.img-size')));
+      if (!m) return;
+      const w = parseInt(m[1], 10), h = parseInt(m[2], 10);
+      if (w && h && (Math.abs(w / h - 1) >= 0.01
+                     || w < __CAROUMIN__ || h < __CAROUMIN__)) {
+        carouselBad++;
+      }
+    });
+  })();
+
   // ③ 类目：三个信号一起读，任一命中即判「类目丢了/失效」，须从 ③ 重跑。
   // catText 取分类下拉的当前值（回落到认领旧值时这里是「其他（...）」这类占位类目）；
   // catUnset 读分类行下方那个暗红提示块（.category-list，实测文案「未选择分类」）——
@@ -456,6 +540,8 @@ _JS_LIVE_STATE = r"""(async () => {
     skuFilledRows: skuFilled,
     skuCodeCount: skuCodeInps.length,
     skuCodeBad: skuCodeBad,
+    skuVariantMissing: skuVariantMissing,
+    warehouseSelected: warehouseSelected,
     sizechartAdded: !!scText && !scText.includes('添加尺码表'),
     // 第二张表：null 表示该类目没有这一栏；false 表示有栏但没填（套装商品必须填，
     // 否则平台打回「套装尺码模板数量不合法」）
@@ -466,6 +552,10 @@ _JS_LIVE_STATE = r"""(async () => {
     // ⑦b：预览图总数与其中不合规的张数（0 张说明该类目没有这一列，交阶段自己判）
     previewCount: previewCount,
     previewBad: previewBad,
+    // ⑤c：已选用的轮播图张数与其中不合规的张数（0 张说明区块没渲染/没找到，
+    // 交阶段自己判——它对 supported=None 会如实报 fail，不静默跳过）
+    carouselPicked: carouselPicked,
+    carouselBad: carouselBad,
     shippingSet: !!(shipSel && txt(shipSel)) && !!shipRadio,
     descImgCount: descImgs.length,
     descForeignCount: foreign.length,
@@ -481,7 +571,9 @@ async def live_state(session: BrowserSession) -> dict:
     st = await session.eval_json(
         _JS_LIVE_STATE.replace("__MINW__", str(images.CLOTH_MIN_W))
                       .replace("__MINH__", str(images.CLOTH_MIN_H))
-                      .replace("__PREVMIN__", str(media_preview.PREVIEW_MIN_SIDE)))
+                      .replace("__PREVMIN__", str(media_preview.PREVIEW_MIN_SIDE))
+                      .replace("__CAROUMIN__", str(media_carousel.CAROUSEL_MIN_SIDE))
+                      .replace("__DIM_COLS__", variant_dom._JS_DIM_COLS))
     if not st.get("rendered"):
         logger.warning("编辑页 SKU 区未渲染完，实况判定按「全部需重跑」处理")
     # 类目异常单独打一行：这是整单卡死的上游根因，而页面那条 d-message 几秒就自己消失，

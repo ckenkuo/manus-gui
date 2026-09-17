@@ -37,6 +37,7 @@ async def run_batch(tasks, **kwargs):
 
 
 def build_stages():
+    from app.publish.stages import carousel
     from app.publish.stages import cleaning
     from app.publish.stages import description
     from app.publish.stages import extracting
@@ -56,6 +57,7 @@ def build_stages():
         Stage("attrs", "④ 属性审核", form._st_attrs),
         Stage("titles", "⑤ 标题产地", form._st_titles),
         Stage("clean_images", "⑤b 图片清理", cleaning._st_clean_images),
+        Stage("carousel", "⑤c 产品轮播图", carousel._st_carousel),
         Stage("material", "⑥ 素材图", material._st_material),
         Stage("drop_acc", "⑦a 剔配件色", skc._st_drop_acc),
         Stage("skc", "⑦ SKC颜色图", skc._st_skc),

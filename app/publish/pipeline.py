@@ -369,6 +369,7 @@ from app.publish.variant_colors import (
 )
 from app.publish.variant_dom import (
     _JS_CLICK_SIZE_CB as _JS_CLICK_SIZE_CB,
+    _JS_DIM_COLS as _JS_DIM_COLS,
     _JS_COLOR_GROUP_STATES as _JS_COLOR_GROUP_STATES,
     _JS_SIZE_GROUP_PRESENCE as _JS_SIZE_GROUP_PRESENCE,
     _JS_SIZE_GROUP_STATES as _JS_SIZE_GROUP_STATES,

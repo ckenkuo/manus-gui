@@ -303,7 +303,12 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
                 else images.DEFAULT_TRANSLATE_PROMPT)
         prompt = base
         if attempt > 1 and last_issues:
-            prompt = base + stages_cleaning_rules._retry_hint(last_issues, cjk_left)
+            # 【末发改成「全抹掉」，但尺码表图豁免】见 cleaning_rules._retry_hint 的
+            # last_chance 段。尺码表图抹掉文字就只剩一张空网格、买家按它选码，等于废图，
+            # 故这类图末发仍走原来的加码，宁可退回原图交人工。
+            prompt = base + stages_cleaning_rules._retry_hint(
+                last_issues, cjk_left,
+                last_chance=attempt == tries and not rep.get("sizechart"))
         try:
             # desc_mode：按描述图口径出图与收尾，不套服装 1340x1785 闸门
             # （见 images.edit_image 的 desc_mode 说明）

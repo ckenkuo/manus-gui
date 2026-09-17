@@ -29,12 +29,23 @@ Temu 直接在 store 顶层。共用一个适配器会在任一平台改版时�
 【价格单位是「最小货币单位」还是「元」要按币种判】实测日元站 salePrice=426 对应
 「426円」——日元无小数，故这里是整数元。别照 1688 那样无脑当元处理，见 _price_of。
 """
+import asyncio
 import re
 
 from app.logger import logger
 from app.publish.browser import BrowserSession
 from app.publish.sources.base import (SourceProduct, source_id, wait_for_open_tab,
                                       wait_human)
+
+# 【人工处理完、以及读完之后，都要静置】2026-09-12 实测：人刚过完 bgn_verification，
+# 页面自己还在刷新/跳转，管线紧接着 evaluate 取数会被判成异常访问、又把验证激出来；
+# 数据刚读到手就被导航切走（下一步就是去店小秘，那个 Temu 页签会被覆盖）同样会激。
+# 故这两个时机各静置这么久再继续：
+#   1) 人工介入之后（等到页签打开 / 等到校验通过）读数据之前；
+#   2) 数据读完、fetch 即将返回（下一步就是导航离开 Temu）之前。
+# 30 秒是实测经验值。测试里由 autouse 的「人工等待缩到毫秒级」一并压到 0，
+# 否则每个走 ① 的用例都要白挂半分钟。
+COOLDOWN_SECONDS = 30.0
 
 _JS_EXTRACT = r"""(() => {
   const st = ((window.rawData || {}).store || {});
@@ -188,15 +199,18 @@ async def fetch(session: BrowserSession, url: str,
                 on_manual=None, timeout: float = 40.0) -> SourceProduct:
     """抽 Temu 买家侧详情页的 SourceProduct。只读。
 
-    【取数策略：只复用人工开好的页签，绝不导航】2026-09-10 真站实测（探测脚本见
-    workspace/_probe_temu_*.py）：Temu 现在对自动导航一律跳 bgn_verification 安全
-    验证页，导航这个动作本身就足以把验证激出来，之后 wait_human 只会白等 600 秒。
-    反过来，人工从站内点开的页签里数据完整（12 个实测全部可读），且只读取数不触发
-    任何风控。故缺页签时不再退回导航，改为提示人工打开该商品页并原地等
-    （wait_for_open_tab）——人开好即继续，不必重跑整个商品。
+    【取数策略：读只靠复用页签，导航只用于「替人把页签开出来」】2026-09-10 真站实测
+    （探测脚本见 workspace/_probe_temu_*.py）：Temu 对自动导航一律跳 bgn_verification
+    安全验证页，导航这个动作本身就足以把验证激出来，之后 wait_human 只会白等 600 秒；
+    而人工过完验证的页签里数据完整（12 个实测全部可读），只读取数不触发任何风控。
 
-    与 2026-08-27 那版（先 adopt、失败退回 navigate）只差这一处：当时拦的是 302 到
-    login.html，navigate 尚有一线可能；现在导航必被拦，退回导航已无意义。
+    故【读】只走 adopt_open_page，绝不导航去刷新既有页签；唯一一次导航是缺页签时
+    新开一个指向该商品的页签（2026-09-12 加）——把「URL 抄给人、人再复制粘贴开页签」
+    这道手工活省掉。新开的页签多半停在验证页，人恰好就在那儿过验证；matches_page
+    跳过验证页 URL，所以等待会一直等到页面变回商品页。
+
+    与 2026-08-27 那版（先 adopt、失败退回 navigate）的区别在【导航的落点】：那版是
+    在当前页签上 goto，会把用户正开着的页签冲掉；这版是新开页签，不动已有的。
     """
     gid = source_id(url, "temu")
     if not gid:
@@ -204,12 +218,25 @@ async def fetch(session: BrowserSession, url: str,
     # 按商品 ID 找页签而不是整个 URL 相等：用户打开的链接带区域段（/us-zh-Hans/）与
     # 一长串 _oak_* 参数，跟任务里填的那条几乎不会字节相同，但 -g-<id> 这段是稳定的。
     if not (await session.adopt_open_page(f"-g-{gid}")).get("ok"):
-        message = ("Temu 商品页签未打开：请在调试 Chrome 里从站内点开该商品页"
-                   "（需先人工登录、过人机验证）并保持开着，开好后流程自动继续。"
-                   f"商品 URL：{url}")
+        # 【替人把页签打开】原实现只把 URL 写进提示里，人要自己复制、自己新开页签、
+        # 自己粘进去——多一道纯手工的活。这一步管线就能做：新开一个指向该商品的页签，
+        # 它多半会停在 bgn_verification 安全验证页，而那正是需要人处理的页面，人只需
+        # 在那个页签上过验证。adopt_open_page 的 matches_page 会跳过验证页 URL，故下面
+        # 的等待会一直等到验证过关、页面变回商品页才继续。
+        opened = await session.navigate(url, new_tab=True)
+        if opened.get("ok"):
+            message = ("Temu 商品页已打开（通常会停在安全验证页）：请在浏览器里完成"
+                       f"人机验证，过关后流程自动继续。商品 URL：{url}")
+        else:
+            message = ("Temu 商品页未能自动打开：请在调试 Chrome 里打开下面的商品页"
+                       f"并过人机验证，开好后流程自动继续。商品 URL：{url}")
         if not await wait_for_open_tab(session, f"-g-{gid}", message,
                                        on_manual=on_manual):
             raise RuntimeError(f"{message}（等待超时）")
+        # 人刚把页签点开（多半还顺带过了验证页），页面往往还在自己跳转/刷新，
+        # 这时立刻读会被当成异常访问，先让页面静下来。
+        logger.info(f"人工已开好页签，静置 {COOLDOWN_SECONDS:.0f}s 再取数")
+        await asyncio.sleep(COOLDOWN_SECONDS)
 
     data = await session.wait_for(_JS_EXTRACT, lambda d: d.get("found"), timeout=timeout)
     # 【商品不可售要最先判，且 found 为真时也要判】两类不可售的形态不同：
@@ -251,6 +278,8 @@ async def fetch(session: BrowserSession, url: str,
 
             if await wait_human(session, _JS_BLOCKED, "hasData", message,
                                 on_manual=on_manual, before_probe=recover_page):
+                logger.info(f"人工已处理完校验，静置 {COOLDOWN_SECONDS:.0f}s 再取数")
+                await asyncio.sleep(COOLDOWN_SECONDS)
                 data = await session.wait_for(_JS_EXTRACT, lambda d: d.get("found"),
                                               timeout=timeout)
             if not data.get("found"):
@@ -311,4 +340,8 @@ async def fetch(session: BrowserSession, url: str,
     logger.info(f"Temu 提取完成：属性 {len(attrs)} 项 / SKU {len(skus)} 个 / "
                 f"主图 {len(prod.mainImages)} 张 / 详情图 {len(prod.descImages)} 张"
                 + (f" / 币种 {currency}" if currency else ""))
+    # 下一步管线就导航去店小秘，当前这个 Temu 页签会被覆盖。刚加载完就离开在 Temu
+    # 看来是反常轨迹，故先静置再交还控制权。
+    logger.info(f"静置 {COOLDOWN_SECONDS:.0f}s 后再让管线导航离开 Temu")
+    await asyncio.sleep(COOLDOWN_SECONDS)
     return prod

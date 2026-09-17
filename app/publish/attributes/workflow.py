@@ -74,7 +74,7 @@ async def _read_linkage_options(session: BrowserSession, new_rows: list,
 
 async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dict,
                               main_comp: Optional[dict], rowid: str = "",
-                              cat_id: str = "") -> tuple:
+                              cat_id: str = "", site: str = "") -> tuple:
     """补填一轮：读选项 → 问 LLM → 校验 → 写入，返回 (applied, compFailed)。
 
     与主轮共用 _validate_attr_changes 与 _apply_attr_changes：闸门（非必填留空、
@@ -94,7 +94,9 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
                  "numValues": a.get("numValues"), "options": a.get("options", [])}
                 for a in new_rows]
     try:
-        decision = await attributes_review._ask_attr_review(ask_rows, info, main_comp)
+        # site 对本轮尤其要紧：「插头规格」「工作电压」正是「供电方式=插头供电」联动
+        # 出来的行（2026-09-12 商品 pdd-250293857545），它们只能按发布站点判。
+        decision = await attributes_review._ask_attr_review(ask_rows, info, main_comp, site)
     except Exception as e:
         logger.warning(f"联动行补填问 LLM 失败（忽略，交末尾复扫报人工）：{e}")
         return [], []
@@ -118,7 +120,7 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
 
 async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dict,
                              main_comp: Optional[dict], rowid: str = "",
-                             cat_id: str = "") -> dict:
+                             cat_id: str = "", site: str = "") -> dict:
     """补填「联动新增的必填行」，循环追到不再冒新行为止。
 
     为什么必须单独一轮而不能并进主轮：这些行是【改了别的行才出现的】——阶段④开头
@@ -150,8 +152,15 @@ async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dic
         all_new.extend(labels)
         logger.info(f"联动新增必填行 {len(labels)} 条（第 {rnd}/{_LINKAGE_MAX_ROUNDS} 轮），"
                     f"开始补填：{'、'.join(labels)}")
+        # 【cat_id 必须透传】漏传它，_read_linkage_options 会按「草稿已保存的类目」查
+        # 服务端属性清单，而阶段③ 是运行中改类目、还没保存的——查回来的是上一版类目的
+        # 选项。2026-09-12 商品 pdd-250293857545 实测：主轮按页面现值查类目 12989（20 个
+        # 属性），本轮却按草稿旧值查了 13624（30 个属性），联动行「插头规格」拿着旧清单
+        # 里的值去点，一律 option-not-rendered 写不上，末尾复扫报必填留空。这与
+        # server_options._JS_ATTR_OPTIONS 注释里 2026-09-11 记的是同一个坑，主轮当时
+        # 修好了、本轮漏了。
         applied, comp_failed = await _fill_linkage_round(
-            session, new_rows, info, main_comp, rowid)
+            session, new_rows, info, main_comp, rowid, cat_id, site)
         all_applied.extend(applied)
         all_comp_failed.extend(comp_failed)
         if not any(a.get("result") == "ok" for a in applied):
@@ -167,7 +176,8 @@ async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dic
 
 
 async def _try_default_attrs(session: BrowserSession, info: dict,
-                             main_comp: Optional[dict]) -> Optional[dict]:
+                             main_comp: Optional[dict],
+                             site: str = "") -> Optional[dict]:
     """默认属性快路径：草稿预填的属性值若全都与商品相符，整个阶段④都不用跑。
 
     【为什么值得单开一条】编辑页草稿本来就带着属性值（认领时店小秘按源商品映射的），
@@ -208,7 +218,8 @@ async def _try_default_attrs(session: BrowserSession, info: dict,
     if not rows:
         return None
     try:
-        verdict = await attributes_review._ask_default_attr_review(rows, info, main_comp)
+        verdict = await attributes_review._ask_default_attr_review(
+            rows, info, main_comp, site)
     except Exception as e:
         # 与两条类目快路径同一取向：加速手段自己的 LLM 调用失败不该拖垮整个阶段
         logger.warning(f"默认属性判断失败，落回逐项审核：{e}")
@@ -243,6 +254,18 @@ async def _try_default_attrs(session: BrowserSession, info: dict,
                     f"（{'、'.join(grown[:6])}{'…' if len(grown) > 6 else ''}），"
                     "快路径前提不成立，走逐项审核")
         return None
+    # 【成分合计也在「预填值是否相符」之内】_ATTR_DEFAULT_PROMPT 的判据是「预填值与商品
+    # 是否明显矛盾」，规则 2 只管主面料成分的纤维与比例对不对得上源参数，管不到合计；
+    # 而本路径【一行都不写】，阶段④ 里的 _rebuild_main_comp 源值重建也不会跑，认领带来的
+    # 旧行（如 90+5+22=117%）会被原样放行、一路带到保存被平台拦。故这里判出合计不对就
+    # 当「前提不成立」落回完整流程——完整流程按源主面料成分含量重建这几行，正好是它该
+    # 干的活（不是判 fail 交人工：这一条本就有确定性解法，别把能自动修的推给人）。
+    bad = attributes_form._comp_total_problems(attrs3)
+    if bad:
+        logger.info("默认属性不适用（成分百分比合计不等于 100："
+                    + "、".join(f"{p['label']} {p['total']:g}%" for p in bad)
+                    + "），走逐项审核")
+        return None
     unfilled = [a["label"] for a in attrs3
                 if a.get("required") and a.get("visible") is not False
                 and str(a.get("current") or "").startswith("(")]
@@ -252,13 +275,17 @@ async def _try_default_attrs(session: BrowserSession, info: dict,
             "mainComposition": main_comp or None,
             "applied": [], "cacheRefreshed": [], "compFailed": [],
             "linkageFilled": [], "linkageNewRequired": [],
+            # 恒为空：合计不对的在上面的 early-return 里就落回完整流程了，能走到这儿的
+            # 表单必然已过复验。留着这个键只为与 check_attrs 的成功返回同构，调用方
+            # （stages.form._st_attrs）不必按 source 分叉读它。
+            "badCompTotals": [],
             "unfilledRequired": unfilled, "parkedGhosts": 0}
 
 
 async def check_attrs(session: BrowserSession, info_path: str,
                       apply: bool = False, required_only: bool = True,
                       use_cache: bool = True, rowid: str = "",
-                      cat_id: str = "") -> dict:
+                      cat_id: str = "", site: str = "") -> dict:
     """阶段④：LLM 比对源商品信息与表单属性，产出修改清单（apply=True 时执行）。
 
     不导航——须紧跟 auto_cat 在同一页执行（类目决定属性行）。
@@ -273,6 +300,10 @@ async def check_attrs(session: BrowserSession, info_path: str,
     cat_id 是页面上当前生效的叶子类目 id（阶段③ 选定后经 ctx 传下来）——类目是运行中
     改的、还没保存，接口只能按已保存的类目回答，不传就会查出上一版类目的属性清单。
     写入失败的行走 _retry_row 原值再试一次，不重读选项（选项当次现取、不存在过期）。
+
+    site 是发布站点（中文站点名），喂给两条路径的 LLM 判据：插头规格、工作电压这类字段
+    由目标市场的电气标准决定，源商品信息里推不出来——1688/国内源商品必然是中规两插
+    220V，照抄到北美站买家插不上（2026-09-12 商品 pdd-250293857545 的哥伦比亚站即此）。
 
     成分比例防漂移（原脚本踩的坑）：LLM 两次调用结果会漂移（55/45 变成 90/10）。
     2026-08-21 起改成【源值确定性覆盖】：主面料成分字段的纤维与百分比按
@@ -297,7 +328,7 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 这里传的是【未归约】的 main_comp：归约主纤维要读表单 options（见下方 _resolve_
     # main_fiber），排在快路径之后；对判断而言它只是背景信息，归不归约不影响判据。
     if apply and use_cache:
-        hit = await _try_default_attrs(session, info, main_comp)
+        hit = await _try_default_attrs(session, info, main_comp, site)
         if hit:
             return hit
 
@@ -342,7 +373,7 @@ async def check_attrs(session: BrowserSession, info_path: str,
                     + (f"，另有 {len(main_comp.get('byVariant', {}))} 款式分组"
                        if main_comp.get('byVariant') else ""))
 
-    decision = await attributes_review._ask_attr_review(rows, info, main_comp)
+    decision = await attributes_review._ask_attr_review(rows, info, main_comp, site)
     valid, rejected, keep_current = attributes_validation._validate_attr_changes(
         decision.get("changes", []), attrs, main_comp)
     logger.info(
@@ -386,7 +417,7 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 会在联动显示后进入补填轮正常补上。
     fill = await _fill_linkage_rows(
         session, {a["label"] for a in attrs if a.get("visible") is not False},
-        info, main_comp, rowid, cat_id)
+        info, main_comp, rowid, cat_id, site)
     result["linkageFilled"] = fill.get("applied") or []
     result["linkageNewRequired"] = fill.get("newRequired") or []
     if fill.get("compFailed"):
@@ -395,11 +426,17 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 末尾复扫：补填轮之后仍空着的必填行，一律报出来（含补填没救回来的）。
     # 这是本阶段交给调用方的唯一「还差什么」清单，service 层据此提示人工。
     rows3 = await session.eval_json(attributes_form._JS_LIST_ATTR_ROWS)
+    attrs3 = rows3.get("attrs", [])
     result["unfilledRequired"] = [
-        a["label"] for a in rows3.get("attrs", [])
+        a["label"] for a in attrs3
         if a.get("required") and a.get("visible") is not False
         and str(a.get("current") or "").startswith("(")
     ]
+    # 成分合计复验：与「必填是否留空」并列的第二道收尾闸。上面那道只看 current 是不是
+    # 占位符，而成分行的 current 是纤维名（有值），百分比再离谱也扫不出来——2026-09-12
+    # 商品 908737332112 的 117% 就是这么穿过整个阶段④ 的。判据与两条来路见
+    # attributes_form._comp_total_problems。
+    result["badCompTotals"] = attributes_form._comp_total_problems(attrs3)
     parked = await attributes_dropdowns._park_ghost_dropdowns(session)
     result["parkedGhosts"] = parked.get("parked", 0)
     return result

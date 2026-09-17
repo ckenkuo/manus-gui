@@ -439,10 +439,15 @@ async def test_5b质检未过绝不顶替原图(tmp_path, monkeypatch):
     r = await service._clean_main_images(
         {"info_path": str(info_path), "workdir": str(tmp_path)}, _emit)
 
-    # 清理是增益路径：全失败也算 ok，绝不 fail 掉整个商品
-    assert r["status"] == "ok" and "未成功" in r["note"]
+    # 【2026-09-15 起判 fail，不再「增益路径全失败也算 ok」】英化质检没过的图带着中文，
+    # 不能原样发上真店（Temu 最硬的红线），故如实判失败、停在现场交人工换图；
+    # 原先返回 ok 会让商品带着中文主图一路跑到发布。本条测试的钉子不变：
+    # 无论判 ok 还是 fail，失败的产物都绝不能顶替原图。
+    assert r["status"] == "fail" and "未完成" in r["note"]
     assert src.read_bytes() == original, "质检未过的产物绝不能顶替原图"
     # 标注保持脏：该图仍以脏图身份参与 ⑥⑦ 兜底打分
     got = _json.loads(info_path.read_text(encoding="utf-8"))
     assert got["complianceNotes"]["files"][0]["clean"] is False
-    assert any(e["type"] == "manual_check" for e in events)
+    # 这一档（产物确实带中文）才是真该人工换图的失败，文案要与出图失败区分开
+    mc = [e for e in events if e["type"] == "manual_check"]
+    assert mc and "请人工换图" in mc[0]["message"]

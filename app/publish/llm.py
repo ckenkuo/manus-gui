@@ -105,6 +105,9 @@ LLM_STAGES = [
     {"id": "comp_norm", "label": "④b 成分纤维归一（合成词→主纤维）", "vision": False},
     {"id": "titles", "label": "⑤ 标题生成", "vision": False},
     {"id": "clean_images", "label": "⑤b 图片英化质检", "vision": True},
+    # ⑤c 的视觉判断点（挑信息图 + 查中文）：与 ⑤b 同为「看图查中文」，但输入是轮播
+    # 候选池（源站外链图，不是本地 main-NN），故单独登记，好让用户按阶段换模型。
+    {"id": "carousel", "label": "⑤c 轮播图判定", "vision": True},
     {"id": "material", "label": "⑥ 素材图选图", "vision": True},
     {"id": "skc", "label": "⑦ SKC 分色选图", "vision": True},
     {"id": "sizechart", "label": "⑨ 尺码表估算", "vision": False},
@@ -267,6 +270,36 @@ def list_llm_choices() -> list:
             "multimodal": _choice_multimodal(cid),
         })
     return out
+
+
+def vision_model_problems() -> list:
+    """批次开跑前的视觉模型预检：返回问题描述列表，空列表 = 所有看图阶段都能看图。
+
+    【为什么要有这道预检】看图调用一进 ask_with_images 就查多模态白名单
+    （app/llm.py 的 ModelNotMultimodalError 闸），config.toml 的模型名与代码
+    白名单没对齐时请求根本发不出去。而 ① 的视觉回填是 best-effort 会静默吞掉，
+    第一个硬炸点要等到 ⑥——于是错配时每个商品都白跑前五个阶段才记 fail
+    （2026-09-11 白名单改名、两台生产机配置没跟上，25 个商品排队等人工）。
+    开跑前一次查清，把错配中止在批次起点。
+
+    判据与运行时同一条函数（_choice_multimodal）：预检放行的配置运行时必然
+    过得去入闸校验，不会出现「预检说行、跑起来又炸」的两张皮。
+    """
+    problems = []
+    for s in LLM_STAGES:
+        if not s["vision"]:
+            continue
+        choice = get_stage_choice(s["id"])
+        if _choice_multimodal(choice):
+            continue
+        meta = LLM_CHOICES[choice]
+        section = (config.llm or {}).get(meta["config_name"])
+        model = getattr(section, "model", "") if section else ""
+        problems.append(
+            f"{s['label']} 用 {meta['label']}（[llm.{meta['config_name']}] "
+            f"model={model or '（缺配置段）'}），它不在多模态白名单，带图调用会直接抛错；"
+            "请改 config.toml 的模型名，或在发布页给该阶段换能看图的模型")
+    return problems
 
 
 def active_llm_label() -> str:
