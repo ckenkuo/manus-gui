@@ -17,40 +17,56 @@ from app.tool.wps_excel_tool import WpsExcelTool
 
 # --- 判重键：清单侧与读表侧必须同源 ---------------------------------------
 
-def test_dedupe_key_uses_full_spec_text():
-    """键是 `SPU|规格全文`。货号列存的就是规格文本，两侧同源。
-
-    【不能按空格截断】实测有「1-2 Pack Black/Large-X-Large」这种带空格的规格，
-    截断会把它和同 SPU 的其它规格并成一个键、漏掉一整行。
-    """
-    assert S.dedupe_key("7948115685", "奶白+黑色/10双") == "7948115685|奶白+黑色/10双"
-    assert S.dedupe_key("6715341608", "1-2 Pack Black/Large-X-Large") == (
-        "6715341608|1-2 Pack Black/Large-X-Large"
-    )
+def test_dedupe_key_uses_only_spu():
+    assert S.dedupe_key("7948115685") == "7948115685"
+    assert S.dedupe_key(" 6715341608 ") == "6715341608"
 
 
-def test_worklist_key_reads_sku_spec():
-    """清单侧的键取自 sku_spec，与写进货号列的值同源（见 _build_column_values）。"""
-    assert S.worklist_key({"spu": "123", "sku_spec": "白色/5双"}) == "123|白色/5双"
-    # 老清单没有 sku_spec → 退化成 `SPU|`，等价纯 SPU 判重
-    assert S.worklist_key({"spu": "123"}) == "123|"
+def test_worklist_key_ignores_sku_spec_and_sku_id():
+    assert S.worklist_key({"spu": "123", "sku_spec": "白色/5双", "sku_id": "11"}) == "123"
+    assert S.worklist_key({"spu": "123", "sku_spec": "黑色/10双", "sku_id": "12"}) == "123"
+    assert S.worklist_key({"spu": "123"}) == "123"
 
 
 # --- 同价 SKU 折叠 -----------------------------------------------------------
 
-def test_collapse_keeps_one_row_per_distinct_price():
-    """同 SPU 里价格一样的规格只留第一条，价格不同的各留一行。
-
-    这是本次改造的核心口径：成本核算表按价核算，同价规格的整行数值完全相同，
-    逐行写只会把 Sheet 撑长；价格不同（2 双 / 10 双装）的规格必须各占一行。
-    """
+def test_collapse_keeps_one_row_per_spu_even_when_prices_differ():
+    """同 SPU 不同规格、不同价格也只保留首个可采规格。"""
     items = [
         {"spu": "1", "sku_id": "11", "sku_spec": "红色/5双", "price": "46.10¥"},
         {"spu": "1", "sku_id": "12", "sku_spec": "蓝色/5双", "price": "46.10¥"},
         {"spu": "1", "sku_id": "13", "sku_spec": "黑色/10双", "price": "299.68¥"},
     ]
-    got = S.collapse_same_price_skus(items)
-    assert [it["sku_spec"] for it in got] == ["红色/5双", "黑色/10双"]
+    got = S.collapse_spus(items)
+    assert [it["sku_spec"] for it in got] == ["红色/5双"]
+
+
+def test_collapse_skips_voided_sku_before_choosing_same_price_representative():
+    items = [
+        {"spu": "1", "sku_id": "11", "price": "9¥", "price_review_status": 3},
+        {"spu": "1", "sku_id": "12", "price": "9¥", "price_review_status": 2},
+        {"spu": "1", "sku_id": "13", "price": "10¥", "price_review_status": "3"},
+    ]
+
+    assert S.collapse_spus(items) == [items[1]]
+
+
+def test_voided_status_does_not_confuse_zero_unknown_or_other_status_fields():
+    for status in (0, 1, 2, None, "", 4):
+        assert not S.is_voided_item({"price_review_status": status, "selectStatus": 3})
+    assert S.is_voided_item({"price_review_status": "已作废"})
+
+
+def test_load_worklist_with_only_voided_skus_is_empty_without_changing_snapshot(tmp_path, monkeypatch):
+    import json
+
+    snapshot = [{"spu": "1", "sku_id": "11", "price_review_status": 3}]
+    worklist = tmp_path / "worklist.json"
+    worklist.write_text(json.dumps(snapshot), encoding="utf-8")
+    monkeypatch.setattr(S, "WORKLIST", worklist)
+
+    assert S.load_worklist() == []
+    assert json.loads(worklist.read_text(encoding="utf-8")) == snapshot
 
 
 def test_collapse_compares_price_numerically():
@@ -63,7 +79,7 @@ def test_collapse_compares_price_numerically():
         {"spu": "1", "sku_id": "12", "sku_spec": "蓝", "price": "46.1"},
         {"spu": "1", "sku_id": "13", "sku_spec": "绿", "price": 46.1},
     ]
-    assert len(S.collapse_same_price_skus(items)) == 1
+    assert len(S.collapse_spus(items)) == 1
 
 
 def test_collapse_never_merges_across_stores_or_regions():
@@ -73,17 +89,17 @@ def test_collapse_never_merges_across_stores_or_regions():
         {"spu": "1", "mallid": "m1", "region": "us", "sku_spec": "红", "price": "9¥"},
         {"spu": "1", "mallid": "m2", "region": "global", "sku_spec": "红", "price": "9¥"},
     ]
-    assert len(S.collapse_same_price_skus(items)) == 3
+    assert len(S.collapse_spus(items)) == 3
 
 
-def test_collapse_keeps_unpriced_rows_separate():
-    """价读不出的行不与任何有价行合并，也不互相合并——它们要留给人工逐行补价。"""
+def test_collapse_ignores_price_when_deduplicating_spu():
+    """价格缺失不改变按 SPU 判重的条件。"""
     items = [
         {"spu": "1", "sku_id": "11", "sku_spec": "红", "price": ""},
         {"spu": "1", "sku_id": "12", "sku_spec": "蓝", "price": "46¥"},
     ]
-    got = S.collapse_same_price_skus(items)
-    assert [it["sku_spec"] for it in got] == ["红", "蓝"]
+    got = S.collapse_spus(items)
+    assert [it["sku_spec"] for it in got] == ["红"]
 
 
 def test_collapse_leaves_legacy_worklist_untouched():
@@ -92,7 +108,7 @@ def test_collapse_leaves_legacy_worklist_untouched():
         {"spu": "1", "price": "10¥"},
         {"spu": "2", "price": "20¥"},
     ]
-    assert S.collapse_same_price_skus(items) == items
+    assert S.collapse_spus(items) == items
 
 
 def test_load_worklist_collapses_same_price(monkeypatch, tmp_path):
@@ -111,13 +127,39 @@ def test_load_worklist_collapses_same_price(monkeypatch, tmp_path):
     assert len(json.loads(wl.read_text(encoding="utf-8"))) == 2
 
 
+def test_worklist_status_preserves_store_with_no_collectible_products(monkeypatch, tmp_path):
+    import json
+
+    snapshot = [
+        {"spu": "VOID", "mallid": "A", "region": "global", "price_review_status": 3},
+        {"spu": "LIVE", "mallid": "B", "region": "global", "price_review_status": 2},
+        {"spu": "LIVE", "mallid": "B", "region": "global", "price_review_status": 2},
+    ]
+    worklist = tmp_path / "worklist.json"
+    worklist.write_text(json.dumps(snapshot), encoding="utf-8")
+    monkeypatch.setattr(S, "WORKLIST", worklist)
+    monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
+    monkeypatch.setattr(S, "load_collect_config", lambda: {})
+    monkeypatch.setattr(S, "list_workbooks", lambda: [])
+    monkeypatch.setattr(S.WpsExcelTool, "list_sheets", classmethod(lambda cls, path: []))
+    S.save_prefs(store="A@global", sheet="pawly全球", doc_mode="local")
+
+    status = S.get_worklist_status(excel="", doc_mode="local")
+
+    assert status["store"] == "A@global"
+    assert status["items"] == [] and status["todo"] == 0
+    assert {store["key"]: store["count"] for store in status["stores"]} == {"A@global": 0, "B@global": 1}
+    assert S.load_worklist_snapshot() == snapshot
+    assert [item["spu"] for item in S.load_worklist()] == ["LIVE"]
+
+
 def test_worklist_status_reports_todo_spu_and_sku_counts(monkeypatch, tmp_path):
     """待采 SPU 按商品去重，SKU 数按实际待采清单行计数。"""
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     monkeypatch.setattr(S, "list_workbooks", lambda: [])
     monkeypatch.setattr(S.WpsExcelTool, "list_sheets", classmethod(lambda cls, _p: []))
-    monkeypatch.setattr(S, "load_worklist", lambda: [
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [
         {"spu": "1", "sku_id": "11", "sku_spec": "白色"},
         {"spu": "1", "sku_id": "12", "sku_spec": "黑色"},
         {"spu": "2", "sku_id": "21", "sku_spec": "大号"},
@@ -126,8 +168,8 @@ def test_worklist_status_reports_todo_spu_and_sku_counts(monkeypatch, tmp_path):
     status = S.get_worklist_status(excel="", sheet="", doc_mode="local")
 
     assert status["todo_spu"] == 2
-    assert status["todo_sku"] == 3
-    assert status["todo"] == 3, "旧 todo 字段继续表示可采 SKU 行数"
+    assert status["todo_sku"] == 2
+    assert status["todo"] == 2, "待采行数必须按过滤、SPU 去重后的实际清单计算"
 
 
 def test_collect_page_shows_dual_todo_metrics_and_syncs_limit_after_enumerate():
@@ -144,18 +186,18 @@ def test_collect_page_shows_dual_todo_metrics_and_syncs_limit_after_enumerate():
 
 def test_dedupe_key_strips_whitespace():
     """两侧都 strip：表格里手工录入常带前后空格，不归一会永远比不上。"""
-    assert S.dedupe_key("  123  ", "  白色/5双  ") == "123|白色/5双"
+    assert S.dedupe_key("  123  ") == "123"
 
 
 # --- done_flags：组合键命中 + 历史 SPU 整体跳过 -----------------------------
 
 def test_done_flags_exact_key_hit():
-    """规格精确命中 → 已入库；同 SPU 的其它规格照采。"""
+    """SPU 已入库则全部规格都跳过。"""
     items = [
         {"spu": "1", "sku_spec": "白色/5双"},
         {"spu": "1", "sku_spec": "黑色/5双"},
     ]
-    assert S.done_flags(items, {"1|白色/5双"}) == [True, False]
+    assert S.done_flags(items, {"1"}) == [True, True]
 
 
 def test_done_flags_skips_legacy_spu_entirely():
@@ -168,53 +210,42 @@ def test_done_flags_skips_legacy_spu_entirely():
         {"spu": "1", "sku_spec": "白色/5双"},
         {"spu": "1", "sku_spec": "黑色/5双"},
     ]
-    assert S.done_flags(items, {"1|5双"}) == [True, True]
+    assert S.done_flags(items, {"1"}) == [True, True]
 
 
-def test_done_flags_keeps_collecting_partially_written_spu():
-    """本管线已写过该 SPU 的一个规格 → 只跳过命中的，其余规格继续采。
-
-    分批采集（limit=20）必然把同一 SPU 的规格拆到多批。若「表里有这个 SPU 就跳过」，
-    第二批起剩余规格就永远补不上了——这条用例把那个陷阱钉死。
-    """
+def test_done_flags_skips_remaining_variants_of_existing_spu():
+    """历史表已有一个规格，后续批次不再补录同 SPU 的其它规格。"""
     items = [
         {"spu": "1", "sku_spec": "白色/5双"},
         {"spu": "1", "sku_spec": "黑色/5双"},
         {"spu": "1", "sku_spec": "红色/5双"},
     ]
-    assert S.done_flags(items, {"1|白色/5双"}) == [True, False, False]
+    assert S.done_flags(items, {"1"}) == [True, True, True]
 
 
 def test_done_flags_new_spu_all_todo():
     """表里完全没有该 SPU → 全部待采。"""
     items = [{"spu": "9", "sku_spec": "白色/5双"}, {"spu": "9", "sku_spec": "黑色/5双"}]
-    assert S.done_flags(items, {"1|白色/5双"}) == [False, False]
+    assert S.done_flags(items, {"1"}) == [False, False]
 
 
 # --- existing_keys：本地/云端分支与降级 -------------------------------------
 
-def test_existing_keys_uses_combo_key_when_sku_column_present(monkeypatch):
-    """有货号列 → 读两列组合键，并把「skuId 规格」归一成 skuId。"""
+def test_existing_keys_reads_only_spu_even_with_sku_column(monkeypatch):
     seen = {}
 
-    def fake_tuples(cls, path, sheet, cols, header_row=1):
-        seen["cols"] = cols
-        return {
-            ("7948115685", "奶白+黑色/10双"),
-            ("7948115685", "奶白+黑色/2双"),
-        }
+    def fake_values(cls, path, sheet, col, header_row=1):
+        seen["col"] = col
+        return {"7948115685", " 7948115685 ", ""}
 
     monkeypatch.setattr(
         WpsExcelTool, "resolve_field_columns",
-        classmethod(lambda cls, e, s: {"spu": "E", "sku": "G"}),
+        classmethod(lambda cls, excel, sheet: {"spu": "E", "sku": "G"}),
     )
-    monkeypatch.setattr(WpsExcelTool, "existing_key_tuples", classmethod(fake_tuples))
+    monkeypatch.setattr(WpsExcelTool, "existing_key_values", classmethod(fake_values))
 
-    got = S.existing_keys("book.xlsx", "pawly全球")
-    assert seen["cols"] == ["E", "G"], "要按真实表头读 SPU 列 + 货号列"
-    assert got == {"7948115685|奶白+黑色/10双", "7948115685|奶白+黑色/2双"}, (
-        "同一 SPU 的两个规格必须是两个键，否则第二个规格会被判成已入库而漏采"
-    )
+    assert S.existing_keys("book.xlsx", "pawly全球") == {"7948115685"}
+    assert seen["col"] == "E"
 
 
 def test_existing_keys_falls_back_to_spu_when_no_sku_column(monkeypatch):
@@ -227,7 +258,7 @@ def test_existing_keys_falls_back_to_spu_when_no_sku_column(monkeypatch):
         WpsExcelTool, "existing_key_values",
         classmethod(lambda cls, e, s, c, header_row=1: {"111", "222"}),
     )
-    assert S.existing_keys("book.xlsx", "老表") == {"111|", "222|"}
+    assert S.existing_keys("book.xlsx", "老表") == {"111", "222"}
 
 
 def test_existing_keys_cloud_passes_header_row(monkeypatch):
@@ -235,16 +266,16 @@ def test_existing_keys_cloud_passes_header_row(monkeypatch):
     calls = {}
 
     class FakeCloud:
-        def existing_key_tuples(self, sheet, cols, header_row):
-            calls["args"] = (sheet, cols, header_row)
-            return {("7948115685", "奶白+黑色/10双")}
+        def existing_key_values(self, sheet, col, header_row):
+            calls["args"] = (sheet, col, header_row)
+            return {"7948115685"}
 
     got = S.existing_keys(
         "", "pawly全球", cloud=FakeCloud(),
         fields={"spu": "E", "sku": "G"}, header_row=3,
     )
-    assert calls["args"] == ("pawly全球", ["E", "G"], 3)
-    assert got == {"7948115685|奶白+黑色/10双"}
+    assert calls["args"] == ("pawly全球", "E", 3)
+    assert got == {"7948115685"}
 
 
 # --- 表头解析：货号列 --------------------------------------------------------
@@ -291,7 +322,7 @@ def test_build_column_values_writes_plain_spec_into_sku_column():
     values = P._build_column_values(item, res, _schema())
     assert values["G"] == "奶白+黑色/10双"
     # 写进去的值必须与判重键同源，否则写完立刻判不出「已入库」
-    assert S.dedupe_key(item["spu"], values["G"]) == S.worklist_key(item)
+    assert S.dedupe_key(item["spu"]) == S.worklist_key(item)
 
 
 def test_build_column_values_writes_per_sku_price_not_range():

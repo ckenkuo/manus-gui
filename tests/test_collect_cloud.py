@@ -996,8 +996,9 @@ class FakeCloud:
 def _patch_common(monkeypatch, tmp_path, cloud):
     """把 run_batch 的外部依赖全换成假的（清单/prefs/结构解析/单商品写入）。"""
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
-    monkeypatch.setattr(S, "load_worklist",
-                        lambda: [{"spu": "S1", "name": "n", "mallid": "m"}])
+    monkeypatch.setattr(S, "load_worklist_snapshot",
+                        lambda: [{"spu": "S1", "name": "n", "mallid": "m",
+                                  "price_review_status": 2}])
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": cloud)
     seen = {}
@@ -1312,7 +1313,7 @@ def test_run_batch_local_without_excel_aborts(monkeypatch, tmp_path):
 
 def test_worklist_status_cloud_branch(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
-    monkeypatch.setattr(S, "load_worklist", lambda: [])
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [])
     monkeypatch.setattr(S, "list_workbooks", lambda: [])
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     cloud = FakeCloud(sheets=("pawly全球", "wintak美国"))
@@ -1331,7 +1332,7 @@ def test_worklist_status_cloud_branch(monkeypatch, tmp_path):
 def test_worklist_status_cloud_error_not_raised(monkeypatch, tmp_path):
     """云端读失败（未认证/网络）不抛错：空列表 + cloud_error 交 UI 红条展示。"""
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
-    monkeypatch.setattr(S, "load_worklist", lambda: [])
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [])
     monkeypatch.setattr(S, "list_workbooks", lambda: [])
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
 
@@ -1399,7 +1400,10 @@ def test_kdocs_sheet_link_scheme_case_insensitive():
 def _patch_local_batch(monkeypatch, tmp_path, worklist):
     """本地基础模式跑 run_batch 的最小 patch 集，供 store 失配护栏用例复用。"""
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
-    monkeypatch.setattr(S, "load_worklist", lambda: worklist)
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [
+        dict(item, price_review_status=item.get("price_review_status", 2))
+        for item in worklist
+    ])
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     monkeypatch.setattr(S, "excel_write_locked", lambda _p: False)
     monkeypatch.setattr(S, "spu_col_of", lambda e, s: "C")
@@ -1480,6 +1484,43 @@ def test_run_batch_explicit_store_still_filters(monkeypatch, tmp_path):
 
     assert res == {"ok": 1, "fail": 0, "batch": 1}
     assert done == ["S2"]
+
+
+@pytest.mark.parametrize("explicit_store", [None, "A@global"])
+def test_run_batch_all_voided_store_never_falls_back_to_other_store(monkeypatch, tmp_path, explicit_store):
+    cloud = FakeCloud()
+    _patch_common(monkeypatch, tmp_path, cloud)
+    snapshot = [
+        {"spu": "VOID-A", "mallid": "A", "region": "global", "price_review_status": 3},
+        {"spu": "LIVE-B", "mallid": "B", "region": "global", "price_review_status": 2},
+    ]
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: snapshot)
+    S.save_prefs(excel=cloud.file_id, sheet="pawly全球", store="A@global")
+    events = []
+
+    result = asyncio.run(S.run_batch(
+        base_only=True, excel=cloud.file_id, sheet="pawly全球", store=explicit_store,
+        on_progress=events.append,
+    ))
+
+    assert result == {"ok": 0, "fail": 0, "batch": 0}
+    assert cloud.writes == [] and cloud.key_reads == []
+    assert S.load_prefs()["store"] == "A@global"
+    assert any("没有可采商品" in event.get("reason", "") for event in events)
+
+
+def test_local_batch_all_voided_region_never_collects_another_region(monkeypatch, tmp_path):
+    done = _patch_local_batch(monkeypatch, tmp_path, [
+        {"spu": "VOID", "mallid": "A", "region": "global", "price_review_status": 3},
+        {"spu": "LIVE", "mallid": "A", "region": "us", "price_review_status": 2},
+    ])
+    S.save_prefs(excel="D:/wb.xlsx", sheet="pawly全球", store="A@global")
+
+    result = asyncio.run(S.run_batch(base_only=True, excel="D:/wb.xlsx", sheet="pawly全球"))
+
+    assert result == {"ok": 0, "fail": 0, "batch": 0}
+    assert done == []
+    assert S.load_prefs()["store"] == "A@global"
 
 
 # ---- 云端批量写（基础模式）----------------------------------------------------
@@ -1604,9 +1645,9 @@ def test_run_batch_cloud_batch_write_failure_reports_all_failed(monkeypatch, tmp
 
     cloud = BoomCloud()
     monkeypatch.setattr(S, "COLLECT_PREFS", tmp_path / "collect_prefs.json")
-    monkeypatch.setattr(S, "load_worklist", lambda: [
-        {"spu": "S1", "name": "n", "mallid": "m"},
-        {"spu": "S2", "name": "n", "mallid": "m"},
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [
+        {"spu": "S1", "name": "n", "mallid": "m", "price_review_status": 2},
+        {"spu": "S2", "name": "n", "mallid": "m", "price_review_status": 2},
     ])
     monkeypatch.setattr(S, "load_collect_config", lambda: {})
     monkeypatch.setattr(S, "cloud_backend", lambda cfg, cloud_url="": cloud)
@@ -1626,6 +1667,67 @@ def test_run_batch_cloud_batch_write_failure_reports_all_failed(monkeypatch, tmp
     fails = [e for e in events if e.get("status") == "fail"]
     assert len(fails) == 2, "两个商品都要报失败，不能静默"
     assert any("429002" in str(e.get("note", "")) for e in fails)
+
+
+def test_run_batch_requires_refresh_for_legacy_statusless_worklist(monkeypatch, tmp_path):
+    cloud = FakeCloud()
+    _patch_common(monkeypatch, tmp_path, cloud)
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [{"spu": "S1", "mallid": "m"}])
+    events = []
+
+    result = asyncio.run(S.run_batch(
+        base_only=True, excel="https://www.kdocs.cn/l/abc123", sheet="pawly全球",
+        on_progress=events.append,
+    ))
+
+    assert result == {"ok": 0, "fail": 0, "batch": 0}
+    assert any("重新枚举" in event.get("reason", "") for event in events)
+    assert not cloud.writes and not cloud.key_reads
+
+
+def test_run_batch_never_writes_voided_items(monkeypatch, tmp_path):
+    cloud = FakeCloud()
+    _patch_common(monkeypatch, tmp_path, cloud)
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [
+        {"spu": "S1", "mallid": "m", "price_review_status": 3},
+        {"spu": "S2", "mallid": "m", "price_review_status": 2},
+    ])
+
+    async def schema_cloud(backend, sheet, landing_row=None):
+        return P.SheetSchema(sheet=sheet, fields={"spu": "C"}, ok=True, header_row=1)
+
+    monkeypatch.setattr(P, "resolve_sheet_schema_cloud", schema_cloud)
+    result = asyncio.run(S.run_batch(
+        base_only=True, excel="https://www.kdocs.cn/l/abc123", sheet="pawly全球",
+    ))
+
+    assert result == {"ok": 1, "fail": 0, "batch": 1}
+    assert [row["values"]["C"] for row in cloud.writes[0][1]] == ["S2"]
+
+
+def test_run_batch_writes_spu_once_and_skips_existing_spu_regardless_of_sku(monkeypatch, tmp_path):
+    cloud = FakeCloud()
+    _patch_common(monkeypatch, tmp_path, cloud)
+    monkeypatch.setattr(cloud, "existing_key_values", lambda *args: {"EXISTING"})
+    monkeypatch.setattr(S, "load_worklist_snapshot", lambda: [
+        {"spu": "EXISTING", "sku_id": "new-sku", "sku_spec": "新规格", "price_review_status": 2},
+        {"spu": "NEW", "sku_id": "voided", "price_review_status": 3},
+        {"spu": "NEW", "sku_id": "first", "sku_spec": "小号", "price": "10¥", "price_review_status": 2},
+        {"spu": "NEW", "sku_id": "second", "sku_spec": "大号", "price": "20¥", "price_review_status": 2},
+    ])
+
+    async def schema_cloud(backend, sheet, landing_row=None):
+        return P.SheetSchema(sheet=sheet, fields={"spu": "C", "sku": "D"}, ok=True, header_row=1)
+
+    monkeypatch.setattr(P, "resolve_sheet_schema_cloud", schema_cloud)
+    result = asyncio.run(S.run_batch(
+        base_only=True, excel="https://www.kdocs.cn/l/abc123", sheet="pawly全球", store="",
+    ))
+
+    assert result == {"ok": 1, "fail": 0, "batch": 1}
+    assert len(cloud.writes) == 1
+    values = [row["values"] for row in cloud.writes[0][1]]
+    assert [(row["C"], row["D"]) for row in values] == [("NEW", "小号")]
 
 
 # ---- 落点四模式 --------------------------------------------------------------

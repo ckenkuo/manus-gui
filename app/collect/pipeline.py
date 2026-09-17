@@ -1017,12 +1017,6 @@ def _build_column_values(item: dict, res: CollectResult, schema: SheetSchema) ->
     else:
         weight_cell = ""
 
-    # 货号列＝逐 SKU 标识：清单已是一个 SKU 一行（见 service._FETCH_ALL_JS），同一 SPU 会
-    # 占多行、SPU 列必然重复，必须靠它区分。
-    # 写【纯规格值】（如 `奶白+黑色/10双`）而不是 skuId：这列本来就是人工在记规格，历史值
-    # 形如「5双」「直径32CM」「单人」，塞一串平台 skuId 进去会让新旧行风格割裂、也没法人工核对。
-    # 判重因此认这串文本（见 service.dedupe_key），代价是平台改文案会多写一行。
-    # 没有 sku_spec（老清单/无 SKU 结构）就不写这列，行为与改造前一致。
     sku_cell = str(item.get("sku_spec") or "").strip()
 
     # 按解析出的真实列填逐商品字段（字段没解析到就跳过该列，不误写）。

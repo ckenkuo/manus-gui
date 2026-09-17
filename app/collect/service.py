@@ -366,64 +366,19 @@ def spu_col_of(excel: str, sheet: str) -> str:
     return WpsExcelTool.spu_column(excel, sheet, default="D")
 
 
-def dedupe_key(spu, sku="") -> str:
-    """把（SPU, 规格文本）归一成判重键 `SPU|规格`。清单侧与读表侧共用同一个口径。
-
-    货号列存的就是规格文本（如 `奶白+黑色/10双`，见 pipeline._build_column_values），
-    两侧都用本函数造键，键与写入值同源、不会各写一套悄悄漂移（对齐 orders 的 dedupe_key）。
-
-    【只 strip、不做别的归一】规格串里空格是有意义的（实测有「1-2 Pack Black/Large-X-Large」
-    这种），不能按空格截断；大小写与全半角也照原样比——平台给什么就是什么，自作主张归一
-    反而会把两个真不同的规格并成一个。
-    代价是平台改文案（"10双"→"10 双"）会让同一个 SKU 算成新键、多写一行；这是选「纯规格值
-    货号」换来的，取舍见本次改动的决策记录。
-    """
-    return f"{str(spu or '').strip()}|{str(sku or '').strip()}"
+def dedupe_key(spu) -> str:
+    """成本表只按 SPU ID 判重，规格、SKU ID 和价格均不参与。"""
+    return str(spu or "").strip()
 
 
 def worklist_key(it: dict) -> str:
-    """清单条目 → 判重键。老清单没有 sku_spec 时退化成 `SPU|`，与纯 SPU 判重等价。"""
-    return dedupe_key(it.get("spu"), it.get("sku_spec"))
+    """清单条目与目标表共用 SPU ID 判重键。"""
+    return dedupe_key(it.get("spu"))
 
 
 def done_flags(items: list, done: set) -> list:
-    """逐行判「是否已入库」，返回与 items 等长的布尔列表。两条规则叠加：
-
-    ① **组合键精确命中**（`SPU|规格` 已在表里）→ 已入库。这是常规判重。
-
-    ② **历史 SPU 整体跳过**：表里已有该 SPU 的行，但那些行的货号没有一个能对上本清单里
-       该 SPU 的任何规格 → 判定它们是改造前的人工行，整个 SPU 跳过。
-       为什么需要这条：历史行是「一个 SPU 一行」，货号由人手填（实测 wintak美国 是「5双」、
-       pawly全球 是「直径32CM」「单人」），与本管线生成的规格串对不上，纯按组合键判重会把
-       整表 388 行全判成待采、重写一遍。操作者选定的口径是「跳过已有 SPU」。
-
-    【为什么用「有没有交集」而不是「SPU 在不在表里」】后者会误伤分批采集：本管线第一批
-    写了某 SPU 的 2 个规格，第二批时该 SPU 已在表里，剩下的规格就永远补不上了。
-    改用交集判据后，只要表里有一行是本管线写的（货号能对上清单里的某个规格），就说明这个
-    SPU 正在被本管线采，此时只跳过精确命中的那几行，其余规格照采。
-    """
-    sheet_specs: dict = {}
-    for k in done:
-        spu, _, spec = str(k).partition("|")
-        sheet_specs.setdefault(spu, set()).add(spec)
-
-    list_specs: dict = {}
-    for it in items:
-        list_specs.setdefault(str(it.get("spu") or "").strip(), set()).add(
-            str(it.get("sku_spec") or "").strip()
-        )
-
-    flags = []
-    for it in items:
-        spu = str(it.get("spu") or "").strip()
-        in_sheet = sheet_specs.get(spu)
-        if worklist_key(it) in done:
-            flags.append(True)
-        elif in_sheet and not (in_sheet & list_specs.get(spu, set())):
-            flags.append(True)  # 表里是历史人工行 → 整个 SPU 跳过
-        else:
-            flags.append(False)
-    return flags
+    """目标表已有 SPU 时，跳过该商品的全部规格。"""
+    return [worklist_key(item) in done for item in items]
 
 
 def existing_keys(
@@ -433,16 +388,9 @@ def existing_keys(
     fields: Optional[dict] = None,
     header_row: int = 1,
 ) -> set:
-    """读目标表已入库的判重键集合 `{"SPU|skuId"}`；本地/云端只在最后一步分叉。
+    """按真实表头定位 SPU 列，读取本地或云端表的 SPU ID 集合。
 
-    【为什么必须是组合键】2026-08-11 起清单是一个 SKU 一行，同一 SPU 占多行、SPU 列必然
-    重复。仍按纯 SPU 判重的话，该商品第一行写进去之后，其余规格全被判成"已入库"跳过——
-    一个商品永远只落一行，正是要修的症状。
-
-    货号列不存在（老表没这列）→ 退回纯 SPU 判重（键的 SKU 位为空），与改造前行为一致。
-    读表失败由底层各自吞成空集（判重失效只会多写、不会写坏表），此处不另加 try。
-
-    header_row：云端是 0-based、本地是 1-based（两边底层约定不同，别传串）。
+    不读取货号列；header_row 沿用对应后端的行号约定。
     """
     if fields is None:
         fields = (
@@ -455,25 +403,12 @@ def existing_keys(
     )
     if not spu_col:
         return set()
-    sku_col = fields.get("sku")
-
-    if cloud is not None:
-        rows = (
-            cloud.existing_key_tuples(sheet, [spu_col, sku_col], header_row)
-            if sku_col
-            else [(v,) for v in cloud.existing_key_values(sheet, spu_col, header_row)]
-        )
-    else:
-        rows = (
-            WpsExcelTool.existing_key_tuples(
-                excel, sheet, [spu_col, sku_col], header_row)
-            if sku_col
-            else [
-                (v,) for v in WpsExcelTool.existing_key_values(
-                    excel, sheet, spu_col, header_row)
-            ]
-        )
-    return {dedupe_key(*r) for r in rows}
+    values = (
+        cloud.existing_key_values(sheet, spu_col, header_row)
+        if cloud is not None
+        else WpsExcelTool.existing_key_values(excel, sheet, spu_col, header_row)
+    )
+    return {dedupe_key(value) for value in values if dedupe_key(value)}
 
 
 def list_workbooks() -> list:
@@ -550,15 +485,34 @@ async ({mallid, url, body}) => {
   try { tpl = JSON.parse(body); } catch (e) { return out; }
   const size = tpl.pageSize || 50;
   // 取该 SKU 在本商品站点下的申报价：先按站点名匹配，匹配不上退第一条有价的。
-  const skuPrice = (sku, site) => {
+  const skuPriceInfo = (sku, site) => {
     const list = sku.siteSupplierPriceList || [];
     const hit = list.find(x => x && String(x.siteName || '') === String(site || ''));
     const pick = hit || list.find(x => x && x.supplierPrice);
-    return (pick && pick.supplierPrice) || '';
+    return pick || null;
+  };
+  const sameSite = (left, right) => {
+    if (!left || !right) return false;
+    if (left.siteId != null && right.siteId != null) {
+      return String(left.siteId) === String(right.siteId);
+    }
+    return !!left.siteName && left.siteName === right.siteName;
+  };
+  const skuPriceStatus = (skc, sku, priceInfo) => {
+    for (const review of (skc.supplierPriceReviewInfoList || [])) {
+      if (!review) continue;
+      for (const reviewedSku of (review.productSkuList || [])) {
+        if (!reviewedSku || String(reviewedSku.skuId) !== String(sku.skuId)) continue;
+        const matches = (reviewedSku.siteSupplierPriceList || []).some(info =>
+          sameSite(info, priceInfo) && (!(review.siteList || []).length ||
+            review.siteList.some(site => sameSite(site, info))));
+        if (matches && review.status != null) return review.status;
+      }
+    }
+    return priceInfo?.priceReviewStatus ?? sku.priceReviewStatus ?? null;
   };
   // 规格文本：只取属性【值】拼成「奶白+黑色/10双」，写进货号列。
   // 【为什么不带属性名】这列本来就是人工在记规格，历史值形如「5双」「直径32CM」「单人」，
-  // 带上「颜色=…/数量=…」会让新旧行风格割裂。判重也认这串文本（见 service.dedupe_key）。
   const skuSpec = (sku) => (sku.productPropertyList || [])
       .map(p => String(p.value == null ? '' : p.value).trim()).filter(Boolean).join('/');
   for (let pageNum = 1; pageNum <= 40; pageNum++) {
@@ -583,11 +537,13 @@ async ({mallid, url, body}) => {
       for (const skc of (it.skcList || [])) {
         for (const sku of (skc.skuList || [])) {
           if (!sku || sku.skuId === undefined || sku.skuId === null) continue;
+          const priceInfo = skuPriceInfo(sku, site);
           out.push(Object.assign({}, base, {
             sku_id: String(sku.skuId),
             sku_spec: skuSpec(sku),
             // 该 SKU 自己的申报价；读不到就留空（宁可空着待人工，也不写别的 SKU 的价）
-            price: skuPrice(sku, site),
+            price: (priceInfo && priceInfo.supplierPrice) || '',
+            price_review_status: skuPriceStatus(skc, sku, priceInfo),
             // 不同颜色的 SKU 有各自预览图，缺则退回 SPU 主图
             sku_image: sku.skuPreviewImage || (skc.previewImgUrlList && skc.previewImgUrlList[0]) || base.image
           }));
@@ -597,7 +553,8 @@ async ({mallid, url, body}) => {
       if (!expanded) {
         // 没有可用的 SKU 结构 → 退回一个商品一条（与改造前一致）
         out.push(Object.assign({}, base, {
-          sku_id: '', sku_spec: '', price: it.supplierPrice || '', sku_image: base.image
+          sku_id: '', sku_spec: '', price: it.supplierPrice || '', sku_image: base.image,
+          price_review_status: it.priceReviewStatus ?? null
         }));
       }
     }
@@ -976,13 +933,6 @@ async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> in
         finally:
             await browser.close()
 
-    # 合并去重：同一 spu 可能出现在不同店/不同区域 → 按 (店铺+区域, spu, sku) 去重，各留一份
-    # （可落不同 Sheet）。键必须含区域：同一 SPU 在全球区和美国区各有一条时，只按 mallid
-    # 去重会误删掉其中一条（mallid 跨区域不变，见 _store_key）。
-    # 键还必须含 SKU：清单已是一个 SKU 一条（见 _FETCH_ALL_JS），只按 spu 去重会把同一
-    # 商品的其余规格全当重复项删掉，只剩第一个 SKU。老结构（无 sku_id）该位是空串，行为不变。
-    # 这里用 sku_id（平台主键）而非规格文本：同一商品下两个 SKU 规格文案偶有雷同，
-    # 用文本会在枚举阶段就把其中一个丢掉；判重落表用的才是规格文本（见 dedupe_key）。
     seen, uniq = set(), []
     for it in all_items:
         spu = it.get("spu")
@@ -1009,92 +959,60 @@ async def enumerate_worklist(status_tab: str = "", region_label: str = "") -> in
     # 想改折叠判据或回看某个规格的原始价，不必重新连浏览器枚举一遍。
     # 返回值报【折叠后】的行数，与 UI 待采统计、实际写表行数同口径——报全量会让操作者按
     # 388 去设本批数量，而实际可采只有折叠后那些行。
-    collapsed = collapse_same_price_skus(uniq)
-    merged = len(uniq) - len(collapsed)
+    collapsed = collapse_spus(uniq)
+    voided = sum(is_voided_item(item) for item in uniq)
+    merged = len(uniq) - voided - len(collapsed)
     logger.info(
         f"枚举完成（页签「{status_tab}」）：{len(uniq)} 行原始 SKU，"
-        f"同 SPU 同价折叠后 {len(collapsed)} 行（合并 {merged} 行），"
+        f"跳过 {voided} 行已作废规格，"
+        f"按 SPU 去重后 {len(collapsed)} 行（合并 {merged} 行），"
         f"来自 {store_count} 个店铺标签 → {WORKLIST}"
     )
     return len(collapsed)
 
 
-def _price_bucket(v) -> str:
-    """把 SKU 申报价归一成「用于比较是否同价」的桶键。
-
-    平台同一价格的文本形态并不统一（实测有 `46.10¥` / `46.1` / `1,299.00¥`），直接比
-    字符串会把同价的两个 SKU 判成不同价、白白多写一行；故复用 pipeline._to_number 剥成
-    数字再比——那也正是最终写进销售价列的值，「同价」的判据与落表的值同源。
-    保留两位小数：申报价就是两位精度，浮点直接比会因 46.1 与 46.10 的表示差异出岔。
-    读不出数字（空价/脏值）→ 返回原始文本做桶键，不与任何有价 SKU 合并：价读不到的行
-    本就要留给人工，不能被同 SPU 的别的行「代表」掉。
-    """
-    from app.collect.pipeline import _to_number
-
-    n = _to_number(v)
-    return f"n:{round(n, 2)}" if n is not None else f"s:{str(v or '').strip()}"
+def is_voided_item(item: dict) -> bool:
+    """申报价状态 3 为已作废；只认价格审核状态，不混用商品上下架状态。"""
+    return str(item.get("price_review_status", "")).strip() in {"3", "已作废"}
 
 
-def collapse_same_price_skus(items: list) -> list:
-    """同一 SPU 下申报价相同的多个 SKU 只保留一条，返回折叠后的清单。
+def collapse_spus(items: list) -> list:
+    """先排除作废规格，再按店铺、区域、SPU 保留首个可采规格。
 
-    【为什么要折叠】清单一个 SKU 一条后，一个 SPU 常展开出十几行（实测 128 商品 → 388
-    行），但成本核算表关心的是【采购价与销售价】：同 SPU 里价格一样的规格（比如只是颜色
-    不同的 5 双装），每行的销售价、采购价、重量、折扣全都一模一样，逐行写只会把 Sheet
-    撑得又长又难看，人工核对时还得逐行确认「这几行是不是重复的」。价格不同的规格（2 双
-    /10 双装那种）才是真正需要各占一行、各自核价的对象，一条都不能少。
-
-    折叠键是 (店铺+区域, SPU, 价格桶)：
-    - 必须带店铺+区域：同一 SPU 在全球区与美国区各有一条、落进不同 Sheet，跨区域合并会
-      直接抹掉其中一个店的行（与 enumerate_worklist 里合并去重的理由相同）。
-    - 价格桶按数值比，见 _price_bucket。
-
-    保留组内【第一条】（即平台返回顺序里的首个 SKU），它的 sku_spec 就成了这一行的货号。
-    这样判重键 `SPU|规格`（见 dedupe_key）仍与写进表里的值同源，不会因为折叠而漂移。
-    代价是平台调整 SKU 顺序后，同一价格组的「代表规格」可能换成另一个规格名，届时该组会
-    被判成新键、多写一行；这是选「货号写纯规格文本」换来的，与平台改文案的既有代价同源。
-
-    老清单（无 sku_id / 无 price）不受影响：价读不出时各自独立成桶（见 _price_bucket），
-    一条也不会被合并掉。
+    清单文件仍保留完整 SKU 快照；读取和待采数量统一按 SPU 计算。
+    不同店铺或区域的商品保留独立条目，写入同一目标表时再按 SPU 判重。
     """
     seen: set = set()
     out: list = []
-    for it in items:
-        if not isinstance(it, dict):
+    for item in items:
+        if not isinstance(item, dict) or is_voided_item(item):
             continue
-        spu = str(it.get("spu") or "").strip()
+        spu = worklist_key(item)
         if not spu:
-            out.append(it)  # 无 SPU 的行不参与折叠，原样透传给下游护栏处理
+            out.append(item)
             continue
-        key = (_store_key(it), spu, _price_bucket(it.get("price")))
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(it)
-    dropped = len(items) - len(out)
-    if dropped:
-        # 走 debug：本函数在每次 UI 刷新状态时都会被调（load_worklist），打 info 会刷屏。
-        # 给操作者看的那条汇总由 enumerate_worklist 在枚举结束时打一次。
-        logger.debug(
-            f"同价 SKU 折叠：{len(items)} 行 → {len(out)} 行（合并掉 {dropped} 行同 SPU 同价规格）"
-        )
+        key = (_store_key(item), spu)
+        if key not in seen:
+            seen.add(key)
+            out.append(item)
     return out
 
 
-def load_worklist() -> list:
-    """读工作清单，并在返回前做【同 SPU 同价 SKU 折叠】（见 collapse_same_price_skus）。
-
-    落盘的 worklist.json 始终是平台全量快照（一个 SKU 一条），折叠只发生在读取侧——
-    判重水位、UI 待采统计、写表全都走这个入口，口径天然一致。
-    """
+def load_worklist_snapshot() -> list:
+    """读取完整清单，保留作废规格所属店铺的身份信息。"""
     if not WORKLIST.exists():
         return []
     try:
         data = json.loads(WORKLIST.read_text(encoding="utf-8"))
-        return collapse_same_price_skus(data) if isinstance(data, list) else []
-    except Exception as e:
-        logger.warning(f"读取工作清单失败：{e}")
+        return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+    except Exception as error:
+        logger.warning(f"读取工作清单失败：{error}")
         return []
+
+
+def load_worklist() -> list:
+    """从完整快照中排除作废规格，并按 SPU 合并可采商品。"""
+    return collapse_spus(load_worklist_snapshot())
 
 
 def _store_key(it: dict) -> str:
@@ -1207,8 +1125,12 @@ def get_worklist_status(
     if store is None:
         store = prefs.get("store") or ""
 
-    worklist = load_worklist()
-    stores = summarize_stores(worklist)
+    snapshot = load_worklist_snapshot()
+    worklist = collapse_spus(snapshot)
+    stores = summarize_stores(snapshot)
+    collectible_counts = {entry["key"]: entry["count"] for entry in summarize_stores(worklist)}
+    for entry in stores:
+        entry["count"] = collectible_counts.get(entry["key"], 0)
     workbooks = list_workbooks()
     cloud_err = cloud_missing
     if cloud_missing:
@@ -1260,8 +1182,6 @@ def get_worklist_status(
     # 选中的 store 若不在清单里（换清单）→ 视为未选（全部）
     store_valid = bool(store) and any(s["key"] == store for s in stores)
 
-    # 判重按 SPU|规格 组合键 + 历史 SPU 整体跳过（见 done_flags）：同一 SPU 的多个规格
-    # 各占一行，纯 SPU 比对会把后面的规格全算成已入库。
     scoped = [
         it for it in worklist
         if not (store_valid and _store_key(it) != store)
@@ -1465,13 +1385,7 @@ async def collect_one(
             except Exception:
                 pass
 
-        # 【这条路径仍按纯 SPU 确认，是刻意的】agent 是照提示词自己写表的，提示词没教它写
-        # 货号列（也没法教稳——它连列号都按老表硬编码在提示词里），写出来的行货号是空的。
-        # 若这里改用 SPU|skuId 组合键，就会永远确认不到、重试到耗尽。
-        # 代价是多 SKU 商品在这条路径上可能把「本行没写进去」误判成已入库（同 SPU 的前一行
-        # 已在列里）。属已知局限：agent 路径只是兜底，主路径是基础/管道模式，两者都走
-        # write_product_row(_cloud)、会正确写货号列。
-        if spu in {k.split("|", 1)[0] for k in existing_keys(excel, sheet)}:
+        if dedupe_key(spu) in existing_keys(excel, sheet):
             return True
         if attempt < PRODUCT_RETRIES:
             logger.info(f"↻ SPU={spu} 未入库，重试（{attempt + 1}/{PRODUCT_RETRIES}）")
@@ -1540,8 +1454,6 @@ async def collect_one_pipeline(
             return spu in cloud.read_new_rows_column(
                 sheet, schema.fields["spu"], cloud_first_row["v"], 1
             )
-        # 本地按 SPU|skuId 组合键确认：一个 SKU 一行后，同 SPU 的前一行早就在 SPU 列里，
-        # 只比 SPU 会把「这一行没写进去」误判成成功、静默漏掉该规格。
         return worklist_key(item) in existing_keys(excel, sheet)
 
     reset_pipeline_llms()  # 单商品护栏：清零 samematch/default 单例 token 计数
@@ -1870,14 +1782,15 @@ async def run_batch(
         logger.error(reason)
         return {"ok": 0, "fail": 0, "batch": 0}
 
-    worklist = load_worklist()
+    snapshot = load_worklist_snapshot()
+    worklist = collapse_spus(snapshot)
     # store 失配护栏（口径对齐 get_worklist_status 的 store_valid）：prefs 里记的店可能
     # 已不在当前清单里（重新枚举时只开了另一家店的标签），此时【回填来的】store 降级成
     # 「全部」并告警，不是报错——UI 那边失配就回显空 store、下拉显示「全部店铺」，若这里
     # 仍按失效 mallid 硬过滤，就会出现「页面写着全部、后端却过滤到 0 条」的静默不一致
     # （2026-08-06 实机：prefs 存着上一家的 mallid，本次枚举换了店，直接报「清单里没有商品」）。
     # 显式传入的 store 不降级：那是调用方明确的意图，失配要如实报错，别悄悄改成全量采。
-    if store and not any(s["key"] == store for s in summarize_stores(worklist)):
+    if store and not any(s["key"] == store for s in summarize_stores(snapshot)):
         if store_from_prefs:
             logger.warning(
                 f"上次选的店铺（{store}）不在当前清单里（清单可能已重新枚举），"
@@ -1892,9 +1805,15 @@ async def run_batch(
             return {"ok": 0, "fail": 0, "batch": 0}
     if store:  # 只采选中店铺的商品
         worklist = [it for it in worklist if _store_key(it) == store]
+    if any("price_review_status" not in item for item in worklist):
+        reason = "工作清单缺少规格状态，无法排除已作废商品。请先重新枚举，再开始采集。"
+        await _emit(on_progress, {"type": "aborted", "reason": reason})
+        logger.error(reason)
+        return {"ok": 0, "fail": 0, "batch": 0}
+    worklist = [item for item in worklist if not is_voided_item(item)]
     if not worklist:
         reason = (
-            f"选中店铺（{store}）在工作清单里没有商品。"
+            f"选中店铺（{store}）没有可采商品（可能已全部作废），不会采集其他店铺。"
             if store
             else f"工作清单为空（{WORKLIST}）。请先枚举（--refresh / enumerate）。"
         )
@@ -1965,22 +1884,17 @@ async def run_batch(
         it for it, is_done in zip(worklist, done_flags(worklist, done))
         if str(it.get("spu", "")).strip() and not is_done
     ]
-    # 同批撞键护栏：本批里若有多行判重键相同（SKU 展开异常/清单被手工改过/接口给了重复
-    # skuId），它们会各写一行进表、却只留下一个判重键——下次重跑时其余份全被判成已入库，
-    # 人工很难看出表里那几行是重复的。只告警不拦：数据仍写得进去，但必须让操作者看见
-    # （对齐 orders 侧 _stage_order 区分「本批内撞键」与「表里已有」的取向）。
+    unique_todo = []
     seen_keys: set = set()
-    collided: set = set()
-    for it in todo:
-        k = worklist_key(it)
-        if k in seen_keys:
-            collided.add(k)
-        seen_keys.add(k)
-    if collided:
-        logger.warning(
-            f"本批有 {len(collided)} 个判重键重复（如 {list(collided)[:3]}），"
-            f"这些行会重复写入且下批会被判为已入库，请检查清单"
-        )
+    for item in todo:
+        key = worklist_key(item)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique_todo.append(item)
+    if len(unique_todo) < len(todo):
+        logger.info(f"按 SPU 跳过本批 {len(todo) - len(unique_todo)} 行重复商品")
+    todo = unique_todo
     batch = min(limit, len(todo))
     mode_label = "基础(价/重人工填)" if base_only else ("管道" if use_pipeline else "agent")
     target_label = (f"协作文档（{cloud.file_id}）" if cloud is not None
@@ -1995,8 +1909,6 @@ async def run_batch(
     logger.info(
         f"=== 采集批次：模式={mode_label} {target_label} Sheet={sheet} 店铺={store or '全部'} "
         f"落点={append_label}；"
-        # 计量单位是【行】不是商品：清单一个 SKU 一行，一个多规格商品占多行，
-        # 说"个"会让人以为采少了（128 个商品会显示成 388 行）。
         f"清单 {len(worklist)} 行，已入库 {len(done)}，待采 {len(todo)}，本批 {batch} 行 ==="
     )
     await _emit(on_progress, {
