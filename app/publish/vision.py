@@ -155,9 +155,39 @@ class DescAudit(BaseModel):
     dirty: list[DescAuditItem]
 
 
+class CarouselScanItem(BaseModel):
+    """⑤c 轮播候选池里一张图的结论。
+
+    【file 必须是文件名，不是位序号】响应按文件名回读：位序号会因「取不到的图被
+    剔除」而整体前移，结论落到邻图上（见 plan_carousel 的说明）。故这里用
+    NonEmptyStr 逼着模型回一个非空标识，而不是给个默认值让它悄悄混过去。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    file: NonEmptyStr
+    isInfo: bool
+    kind: str = ""
+    value: int = 0
+    chinese: bool = False
+    what: str = ""
+
+
+class CarouselScan(BaseModel):
+    """⑤c 轮播候选池逐张判定（信息图 + 叠加文案层中文）。"""
+
+    model_config = ConfigDict(strict=True)
+
+    items: list[CarouselScanItem]
+
+
 # 中文复核每批传图数：复核是单任务判断、不需要跨图对比，小批量比一次几十张可靠
 # （初判 50 张一次过漏掉中文卡片的实测见 plan_desc 里的复核段注释）。
 _DESC_AUDIT_CHUNK = 8
+
+# ⑤c 候选池每批传图数：与 _DESC_AUDIT_CHUNK 同值同理由（同一类「逐张看图下结论」的
+# 判断，池子常见的 15~20 张一次过会漏）。超出的分片并发，按文件名合并。
+_CAROUSEL_CHUNK = 8
 
 
 def _main_files(workdir: str) -> list:
@@ -416,6 +446,98 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
         reason = (f"干净图 {clean_n} 张不足 {want} 张，只清缺口 {need} 张"
                   f"（另有 {len(cands) - need} 张脏图留着不清）")
     return {"status": "ok", "items": items, "reason": reason}
+
+
+async def plan_carousel(entries: list, info: Optional[dict] = None) -> dict:
+    """⑤c 轮播图：对一批候选图逐张判「是不是信息图」与「叠加文案层有没有中文」。
+
+    entries: [{"file": 文件名, "path": 本地图片路径}]。返回
+    {"status": "ok", "items": {文件名: {"isInfo","kind","value","chinese","what"}},
+     "unreachable": [文件名…]}。
+
+    本判定用于挑选候选信息图；最终选用图另由 check_cleaned 逐张执行完整英化质检。
+
+    【为什么按文件名回读而不是位序号】提示词按文件名标识每张图，响应也按文件名收。
+    位序号在「取不到的图被剔除」后会整体前移、结论落到邻图上（plan_desc 那段实测：
+    28 张少传 1 张，pos 16/19 拿到邻图的结论）。文件名是稳定标识。
+
+    【取不到的图先剔掉，不能少传】image_ref 解析不出的图连同它的名字一起摘掉，
+    listing 与传图列表始终一一对应；摘掉的报在 unreachable 里由调用方处置
+    （挑图侧不选它，查中文侧按「无结论」交人工）。
+
+    【模型漏答的图不补默认值】编一个 isInfo=false/chinese=false 出来，等于把
+    「没看」伪装成「看过且干净」——正是本阶段要防的那件事。调用方按缺项处理。
+    """
+    items_in = [e for e in (entries or []) if e.get("file") and e.get("path")]
+    if not items_in:
+        return {"status": "ok", "items": {}, "unreachable": []}
+
+    async def _one(chunk: list) -> tuple:
+        # image_ref 要读盘/下载，是同步阻塞调用，故过 to_thread（同 plan_desc 的写法）
+        refs = await asyncio.to_thread(lambda: [image_ref(e["path"]) for e in chunk])
+        pairs = [(e, r) for e, r in zip(chunk, refs) if r]
+        unreach = [e["file"] for e, r in zip(chunk, refs) if not r]
+        if not pairs:
+            return {}, unreach
+        names = {e["file"] for e, _ in pairs}
+        listing = "\n".join(f"- {e['file']}" for e, _ in pairs)
+        prompt = f"""商品标题：{(info or {}).get('title') or '（无）'}
+
+下面是同一件商品的 {len(pairs)} 张图片，文件名是它们的标识：
+{listing}
+
+请逐张回答两件事：
+
+1. isInfo —— 这张图是不是【承载商品信息文字】的图：尺码表、尺寸示意图、规格/参数表、
+   材质成分说明、功能卖点介绍、使用说明、注意事项这类，买家靠它了解商品。
+   多张实物图拼成一格、并在每格下方标注款式名/规格/尺寸的，也算（那是款式说明图）。
+   以下一律 isInfo=false：纯实物照片、白底图/场景主图、模特图、纯图案或色卡、
+   工厂/公司介绍、促销海报、与商品无关的图。认不准就填 false。
+   是信息图时另填 kind（10 字内，如「尺码表」「尺寸示意图」「材质成分」）与
+   value（信息价值 1~3：尺码/尺寸=3，材质/规格/功能=2，其它说明=1）。
+
+2. chinese —— 图上【叠加在画面上的文案层】有没有中文字符或中文标点：后期加在图上
+   的标题大字、说明文字、表格文字、水印、店铺名、角标、海报文案都算。
+   英文、数字、符号不算。
+   【商品实物本身的一切都不算】——玩偶/衣物上缝的吊牌与布标、织标、刺绣、印花、
+   图案上的字母，都是实物的一部分，选品时已人工确认过，不需要清理；它们上面印的
+   字【看不清也不要报】（看不清不等于中文，实物照上的吊牌小字通常根本不成字）。
+   只有当你确实看清了【叠加文案层】里有汉字或中文标点时才算 true。
+   叠加文案层拿不准时算有中文：漏掉的代价是它原样发上真店。
+   （实物标签不适用这条——那类图误报的代价是每张图白烧一次生图、还会把整单卡住，
+   而真站实测这种误报是压倒性的：21 张商品图 21 张被实物吊牌带成「有中文」。）
+
+只输出 JSON：{{"items": [{{"file": "<上面清单里的文件名，逐字照抄>",
+"isInfo": true/false, "kind": "", "value": 0, "chinese": true/false,
+"what": "<20 字内，说清中文在哪；没有就留空>"}}]}}
+items 必须覆盖上面列出的每一张图。"""
+        data = await ask_json_with_images(
+            prompt, [r for _, r in pairs], what="⑤c 轮播图判定", system=_SYS,
+            stage="carousel", result_model=CarouselScan)
+        out = {}
+        for it in data.get("items") or []:
+            name = it.get("file")
+            # 认不出的文件名一律丢：宁可这张没结论，也不能把结论安到别的图上
+            if name not in names or name in out:
+                continue
+            out[name] = {"isInfo": bool(it.get("isInfo")),
+                         "kind": (it.get("kind") or "")[:12],
+                         "value": int(it.get("value") or 0),
+                         "chinese": bool(it.get("chinese")),
+                         "what": (it.get("what") or "")[:20]}
+        return out, unreach
+
+    chunks = [items_in[i:i + _CAROUSEL_CHUNK]
+              for i in range(0, len(items_in), _CAROUSEL_CHUNK)]
+    got, unreach = {}, []
+    for res, miss in await asyncio.gather(*(_one(c) for c in chunks)):
+        got.update(res)
+        unreach.extend(miss)
+    n_cjk = sum(1 for v in got.values() if v["chinese"])
+    logger.info(f"⑤c 轮播判定：{len(got)}/{len(items_in)} 张有结论"
+                f"（信息图 {sum(1 for v in got.values() if v['isInfo'])} 张、"
+                f"带中文 {n_cjk} 张，取不到 {len(unreach)} 张）")
+    return {"status": "ok", "items": got, "unreachable": unreach}
 
 
 async def pick_material(info: dict, workdir: str) -> dict:
@@ -1050,7 +1172,7 @@ async def check_cleaned(image_path: str) -> dict:
     清理的文字层」。误报的后果不是保守而是更糟：退回原图 = 中文外链图留在描述区，
     既过不了 1340×1785 闸门、也过不了合规。故这里把判据收窄到【叠加在图上的文案层】。
     """
-    prompt = """这张图片刚经过 AI 英化处理（把叠加在图上的中文文案改成英文）。请质检：
+    prompt = """请对这张商品图片做英化质检（可能是原图，也可能已将中文文案改成英文）：
 
 只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）：
 - residualChinese：是否还残留任何中文字符或中文标点（『』「」、，。！？；：《》等）；
@@ -1071,6 +1193,12 @@ async def check_cleaned(image_path: str) -> dict:
     # 不需要靠重试解决。
     data = await ask_json_with_images(prompt, [image_path], what="英化质检", system=_SYS,
                                       stage="clean_images")
+    fields = ("residualChinese", "garbled", "brokenSubject")
+    if not (all(isinstance(data.get(field), bool) for field in fields)
+            or (not any(field in data for field in fields)
+                and isinstance(data.get("clean"), bool))):
+        return {"status": "error", "clean": False, "issues": "英化质检响应不完整",
+                "residualChinese": False, "garbled": False}
     cjk = bool(data.get("residualChinese"))
     garbled = bool(data.get("garbled"))
     bad = cjk or garbled or bool(data.get("brokenSubject"))

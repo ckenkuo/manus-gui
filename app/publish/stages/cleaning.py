@@ -27,6 +27,33 @@ def _save_info(info_path: str, info: dict) -> None:
         logger.warning(f"回写 product-info.json 失败（忽略）：{e}")
 
 
+def _fail_message(r: dict) -> str:
+    """把一条清理失败翻成【与事实相符】的人工提醒（manual_check 用）。
+
+    【为什么必须分类，不能一句话套所有失败】清理失败有三种，处置完全不同：
+    出图那一步失败时图片根本没被碰过、原图原样，重跑即可；质检环节自己报错时
+    产物合规与否根本没判过；只有「质检判定不合格」才是产物真带中文/乱码，得人工换图。
+    原先三种共用「该图带中文/水印不能发布，请人工换图」，只有第三种说得对——
+    2026-09-17 凌晨代理节点 cf.yfjc.sbs 失效那次，11 张图全栽在「出图失败」上，
+    却逐张报成「该图带中文不能发布、请人工换图」，用户据此去换一批本就合格的图，
+    白费工。
+
+    出图失败里再分「出网链路异常」和「接口/本地报错」：前者重发就可能好，后者
+    重跑多少次都是同一个错（判据是 images.TransientNetError，见 _CURL_TRANSIENT_RC）。
+    """
+    why = r.get("why") or ""
+    kind = r.get("kind")
+    if kind == "edit":
+        s = ("出网链路异常、重试后仍不通，请检查网络/代理后重跑本步"
+             if r.get("transient") else "出图接口或本地报错，请按报错处理后重跑本步")
+        return f"{r['file']} 英化出图失败（{s}）：原图未被改动、不必换图。{why}"
+    if kind == "qc_error":
+        return (f"{r['file']} 清理后的质检环节报错、没能判定产物是否合规："
+                f"原图未被改动、不必换图，请查看报错后重跑本步。{why}")
+    return (f"{r['file']} 英化质检未通过、仍是原图，"
+            f"该图带中文/水印不能发布，请人工换图后续跑：{why}")
+
+
 async def _clean_main_images(ctx: dict, emit) -> dict:
     """把带中文/水印/他人 logo 的主图送 gpt-image-2 清理，产物顶替原图。
 
@@ -37,9 +64,12 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
     complianceNotes 里对应条目改成 clean=true 并指向新文件，⑥⑦ 的选图逻辑一行不用改
     就自动挑到干净图。
 
-    【绝不阻塞流程】这是用户明确要求：单张失败/超时/质检不过一律保留原标注，
-    该图仍以脏图身份参与⑥⑦ 的兜底打分（见 vision._dirty_score），本步照常 ok。
-    清理是「能修就修」的增益路径，不是硬前置。
+    【失败判 fail，停在现场交人工】2026-09-15 起改的取向。原先是「清理是增益路径，
+    单张失败也照常 ok、该图以脏图身份参与⑥⑦ 兜底打分」——但那意味着一张带中文的图
+    会被⑥⑦ 挑去当素材图/颜色图，一路发上真店，而中文是 Temu 最硬的红线。
+    单张失败仍保留原标注、原图不被顶替（那是安全底线，见下面 copy 前的 continue），
+    但本步如实判 fail：商品停在⑤b、现场还在，人工换图后可续跑。
+    manual_check 照旧逐张发出，说明是哪张、为什么。
 
     并发而非串行：单张实测约 35s，4 张串行 140s 会明显拖慢单商品耗时。
     edit_image 是同步 curl 子进程，故用 to_thread 丢线程池 + Semaphore 限流。
@@ -68,13 +98,22 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         path = os.path.join(main_dir, filename)
         if not os.path.isfile(path) or entry.get("clean") or entry.get("duplicate"):
             continue
+        # 【尺码表图走专用提示词，并在末发豁免「全抹掉」】2026-09-17 修。
+        # plan_clean 的 _SKIP_KINDS 只在【它自己的候选池】里排除了尺码表，本段补充
+        # 循环是按 chinese 标注直接追加的，带中文的尺码表照样会走进来（_one 的
+        # docstring 原先写着「尺码表已排除、不会走到这里」，与事实不符）。
+        # 而 _one 的末发会把「原位译写」改成【把文字层全部抹掉】——尺码表被抹掉文字
+        # 就只剩一张空网格，买家靠它选码，等于废图。⑬ 早为这件事单开了豁免
+        # （description_images 的 sizechart 分支），这里对齐它：换成要求 cm→英寸的
+        # 专用提示词，并让末发不进「全抹掉」那一档。
+        is_sizechart = (entry.get("kind") or "") == "尺码表"
         items.append({
             "file": filename,
             "path": path,
-            "prompt": (
-                "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、"
-                "构图和颜色；同时移除水印、店铺名和第三方 logo。"
-            ),
+            "prompt": (images.SIZECHART_TRANSLATE_PROMPT if is_sizechart else
+                       "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、"
+                       "构图和颜色；同时移除水印、店铺名和第三方 logo。"),
+            "sizechart": is_sizechart,
             "note": "轮播图中文复核",
         })
     if not items:
@@ -86,11 +125,26 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
     sem = asyncio.Semaphore(conc)
 
     async def _one(item: dict) -> dict:
-        """清一张：出图 → 质检 → 通过才算成功。返回 {"file", "ok", "path", "why"}。
+        """清一张：出图 → 质检 → 通过才算成功。
+
+        成功返回 {"file", "ok": True, "path"}；失败返回 {"file", "ok": False,
+        "kind", "why"}，kind 标出栽在哪一环（edit 出图 / qc_error 质检环节报错 /
+        qc 质检判定不合格），供 _fail_message 给出与事实相符的提醒。
 
         质检未过时再烧一发（DESC_QC_TRIES）：生图有随机性，同图同提示词两发结果不同，
         理由与 ⑬ 那边同源，见 _prepare_desc_image 里那段实测记录。这一路的失败代价
         更大——主图脏着会以脏图身份参与⑥⑦选图（vision._dirty_score）。
+
+        【最后一发改成「全抹掉」而不是再赌一次翻译】2026-09-15 定案，理由见
+        cleaning_rules._retry_hint 的 last_chance 段。走到末发说明「原位译写」这件事
+        在这张图上做不成，同一个要求再发一遍只是换随机种子；抹除是容易得多的任务，
+        产物「无文案的干净商品图」对主图/轮播图够用。
+
+        【尺码表图不进这一档】抹掉文字后它只剩一张空网格，买家靠它选码，等于废图。
+        原先这里写着「尺码表已由 plan_clean 的 _SKIP_KINDS 排除、不会走到这里」，那是
+        错的——补充循环（调用方那段按 chinese 标注追加的）不受 _SKIP_KINDS 约束，
+        2026-09-17 修：那一段给尺码表换专用提示词并打上 sizechart 标记，这里按标记
+        豁免（同 ⑬ 的 sizechart 分支）。
         """
         async with sem:
             dst = os.path.join(outdir, os.path.splitext(item["file"])[0] + "-clean.png")
@@ -102,18 +156,30 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                 # 原样重发只是赌随机性，把上一发残留了什么当新约束喂回去命中率更高。
                 prompt = item["prompt"]
                 if attempt > 1 and last_why:
-                    prompt += stages_cleaning_rules._retry_hint(last_why, cjk_left)
+                    # tries 会在循环里被抬高（中文残留/乱码抬到 DESC_QC_TRIES_TEXT），
+                    # 故「是不是末发」要拿当前的 tries 判，不能用固定常量。
+                    # 尺码表图豁免末发的「全抹掉」（理由见本函数 docstring 末段）
+                    prompt += stages_cleaning_rules._retry_hint(
+                        last_why, cjk_left,
+                        last_chance=attempt == tries and not item.get("sizechart"))
                 try:
                     # 素材图是轮播首图，糊了最伤转化，故这一路不降采样出图（见 pick_size 注释）
                     ed = await asyncio.to_thread(
                         images.edit_image, item["path"], prompt=prompt,
                         out_path=dst, no_downscale=True, timeout=CLEAN_TIMEOUT)
                 except Exception as e:
-                    return {"file": item["file"], "ok": False, "why": f"出图失败：{e}"[:120]}
+                    # 【失败要带类型，供 _fail_message 分类】这一步栽了说明图压根
+                    # 没被处理过，与「质检判定不合格」是两回事，上报文案不能共用。
+                    # transient 只用来区分链路抖动和确定性报错（两者处置不同）。
+                    return {"file": item["file"], "ok": False, "kind": "edit",
+                            "transient": isinstance(e, images.TransientNetError),
+                            "why": str(e)[:120]}
                 try:
                     qc = await vision.check_cleaned(ed["output"])
                 except Exception as e:
-                    return {"file": item["file"], "ok": False, "why": f"质检失败：{e}"[:120]}
+                    # 质检自己报错时产物合规与否没判过，同样不能报成「图带中文」
+                    return {"file": item["file"], "ok": False, "kind": "qc_error",
+                            "why": str(e)[:120]}
                 if qc.get("clean"):
                     return {"file": item["file"], "ok": True, "path": ed["output"]}
                 last_why = f"质检未过：{qc.get('issues') or ''}"
@@ -126,7 +192,8 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                     logger.info(f"{item['file']} 清理质检未过（{attempt}/{tries}"
                                 f"{'，残留中文' if cjk_left else ''}），"
                                 f"重烧一发：{(qc.get('issues') or '')[:60]}")
-            return {"file": item["file"], "ok": False, "why": last_why[:120]}
+            return {"file": item["file"], "ok": False, "kind": "qc",
+                    "why": last_why[:120]}
 
     logger.info(f"图片清理：{len(items)} 张待处理（并发 {conc}）")
     results = await asyncio.gather(*(_one(it) for it in items))
@@ -138,7 +205,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         if not r.get("ok"):
             fail_files.append(r["file"])
             await emit({"type": "manual_check", "stage": "clean_images",
-                        "message": f"{r['file']} 清理未成功（仍用原图，不影响流程）：{r.get('why')}"})
+                        "message": _fail_message(r)})
             continue
         ok_files.append(r["file"])
         # 产物顶替原文件：⑥⑦ 都按 main-NN 文件名找图（vision._main_files 的 _IMG_RE），
@@ -157,7 +224,9 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
 
     note = f"清理 {len(ok_files)}/{len(items)} 张"
     if fail_files:
-        note += f"（未通过：{'、'.join(fail_files)}）"
+        # 「未完成」而不是「未通过」：出图失败/质检报错的那几张压根没走到判定，
+        # 说成「未通过」会把「没做成」讲成「做出来不合格」
+        note += f"（未完成：{'、'.join(fail_files)}）"
         return {"status": "fail", "note": note[:300]}
     return {"status": "ok", "note": note}
 

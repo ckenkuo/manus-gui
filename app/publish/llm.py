@@ -105,6 +105,9 @@ LLM_STAGES = [
     {"id": "comp_norm", "label": "④b 成分纤维归一（合成词→主纤维）", "vision": False},
     {"id": "titles", "label": "⑤ 标题生成", "vision": False},
     {"id": "clean_images", "label": "⑤b 图片英化质检", "vision": True},
+    # ⑤c 的视觉判断点（挑信息图 + 查中文）：与 ⑤b 同为「看图查中文」，但输入是轮播
+    # 候选池（源站外链图，不是本地 main-NN），故单独登记，好让用户按阶段换模型。
+    {"id": "carousel", "label": "⑤c 轮播图判定", "vision": True},
     {"id": "material", "label": "⑥ 素材图选图", "vision": True},
     {"id": "skc", "label": "⑦ SKC 分色选图", "vision": True},
     {"id": "sizechart", "label": "⑨ 尺码表估算", "vision": False},

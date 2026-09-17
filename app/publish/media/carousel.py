@@ -77,6 +77,50 @@ _JS_PICK_CAROUSEL_LIST = r"""
 CAROUSEL_MIN_PICKED = 3
 CAROUSEL_MAX_PICKED = 10
 
+# 单张体积上限（页面原文「大小在2M以内」）。此前全链路无人校验这条：upload_image 只查
+# 尺寸，square_image/compress 只管像素。⑤c 的生图产物（1:1 高清出图）与合规化产物都有
+# 超限的可能，故在备料收尾处按这条卡一道。
+CAROUSEL_MAX_BYTES = 2 * 1024 * 1024
+
+
+# 展开候选列表的「查看更多」。
+#
+# 【为什么必须点】池子超过约 21 格时，页面把后面的折叠起来、那些格子【压根不渲染】：
+# 2026-09-17 真站实测同一个编辑页，折叠态读到 21 格、点开后 36 格（另一个商品
+# 21 -> 33）。不展开就等于只看前 21 张候选，尺码表/产品介绍图若排在后面就永远补勾
+# 不到——而补勾正是 ⑤c 的职责之一。
+#
+# 【JS click 就够，不需要 CDP 真实点击】与「选择图片」那个触发器不同（它吞 JS click，
+# 见 _JS_CAROUSEL_BTN_POS 上方的实测记录），这个 span.link.view-more 是普通链接，
+# 真站实测 el.click() 一次就展开（21 -> 33 且按钮自身消失）。故不做坐标点击那一套。
+_JS_EXPAND_POOL = r"""(() => {
+  const txt = el => ((el||{}).textContent || '').replace(/\s+/g, ' ').trim();
+  const btn = Array.from(document.querySelectorAll('span.link.view-more'))
+    .find(el => txt(el) === '查看更多' && el.offsetHeight > 0);
+  if (!btn) return JSON.stringify({expanded: false, why: 'no-button'});
+  btn.scrollIntoView({block: 'center'});
+  btn.click();
+  return JSON.stringify({expanded: true});
+})()"""
+
+
+async def expand_carousel_pool(session: BrowserSession) -> dict:
+    """把轮播图候选列表展开（本来就没折叠时原样返回，不报错）。
+
+    判据取「折叠按钮消失」而不是 sleep 固定时长：按钮消失说明列表已重渲染完，
+    与 _JS_PICK_CAROUSEL_MENU 那段「等弹窗要轮询」同一取向。等不到也不抛——后面
+    carousel_state 自己还有一道等图格渲染的轮询，这里只是尽量把候选读全。
+    """
+    first = await session.eval_json(_JS_EXPAND_POOL)
+    if not first.get("expanded"):
+        return first
+    await common._poll_until(
+        lambda: session.eval_json(r"""(() => JSON.stringify({n: document.querySelectorAll(
+            'span.link.view-more').length}))()"""),
+        lambda d: d.get("n", 1) == 0,
+        timeout=8.0)
+    return first
+
 
 # 读产品轮播图区的现状：每格的图 URL、尺寸、勾选态，并标出不合规的格子。
 #
@@ -131,8 +175,16 @@ async def carousel_state(session: BrowserSession) -> dict:
     产品信息区，图格由 Vue 另行渲染，此刻往往一个都还没挂上。表现为阶段⑤c 在 0.3s
     内返回 no-carousel-list，而人在页面上看得清清楚楚（同一个 carousel_state 手动
     sleep 3 秒后读就完全正常）。判据取「带 checkbox 的图格出现」，与 pickCarouselList
-    的定位判据同一口径；超时给到 8s——18 张缩略图比表单项慢，比 inspect 那两处的
-    2.0s 宽一些。
+    的定位判据同一口径。
+
+    【上限 8s 对真站偏紧，2026-09-12~13 夜间批实测后抬到 20s】那批 3 个不同商品
+    （rowid-184807703147300533、1078663432052、908737332112）都在 8s 内没等到图格，
+    如实报了「读不到产品轮播图区」——8s 原是照着 inspect 那两处 2.0s 放宽来的估值，
+    不是量出来的。轮播图这一格与那些表单项不同：十几张缩略图要走 CDN，页面又是
+    open_edit 刚回来最忙的时刻，慢起来远超 8s。
+    抬上限只推迟【失败】的判定时刻，不推迟成功：_poll_until 一就绪就返回，页面正常时
+    这里照旧是零点几秒，20s 只有真读不到时才付满——而那种情形下本阶段的结论是
+    「发布必被拒尺寸、要人工换图」，多等十几秒远比误报划算。
     """
     await common._poll_until(
         lambda: session.eval_json(r"""(() => {
@@ -141,7 +193,7 @@ async def carousel_state(session: BrowserSession) -> dict:
             return JSON.stringify({n: n});
         })()"""),
         lambda d: d.get("n", 0) > 0,
-        timeout=8.0)
+        timeout=20.0)
     st = await session.eval_json(
         _JS_CAROUSEL_STATE.replace("__MIN__", J(CAROUSEL_MIN_SIDE))
                           .replace("__PICK__", _JS_PICK_CAROUSEL_LIST))
@@ -221,10 +273,21 @@ _JS_PICK_CAROUSEL_MENU = r"""(async () => {
   }
   if (!hit) return JSON.stringify({stage: 'menu', err: 'no-menu-item', seen: seen});
   hit.click();
-  await sleep(1500);
-  const modal = Array.from(document.querySelectorAll('.ant-modal'))
-    .find(m => m.offsetHeight > 0 &&
-      ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+  // 【等弹窗要轮询，不能点完 sleep 一次就判死】2026-09-12~13 夜间批报过一条
+  // 「打开选图弹窗失败[open]：」——err 为空、stage 已经是 open，说明菜单确实展开了、
+  // 「空间图片」也点中了，纯粹是原先那句 sleep(1500) 到点时弹窗还没渲染完，被一次性
+  // 判成 opened=false。判据（弹窗标题含「从图片空间选择」）一个字都没放宽，只把
+  // 「等法」从固定 sleep 改成条件等待，原来的 1.5s 变成下限、上限抬到 6s。
+  // 上限与 media/preview.py 里 ⑦b 点同一个「空间图片」项的两处取同一个值：那是同一个
+  // 弹窗组件实例，没有理由在这里另定一套。
+  let modal = null;
+  for (let k = 0; k < 60; k++) {
+    await sleep(100);
+    modal = Array.from(document.querySelectorAll('.ant-modal'))
+      .find(m => m.offsetHeight > 0 &&
+        ((m.querySelector('.ant-modal-title') || {}).textContent || '').includes(__TITLE__));
+    if (modal) break;
+  }
   return JSON.stringify({stage: 'open', opened: !!modal,
                          title: modal ? txt(modal.querySelector('.ant-modal-title')) : ''});
 })()"""

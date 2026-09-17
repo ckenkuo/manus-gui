@@ -133,16 +133,18 @@ def test_共用判据本身按锚点列取而不是穷举维度名():
 
 
 def test_反选能落到非颜色命名的维度组():
-    """反选 JS 不能只在「颜色」组里找：车贴那单的维度组叫「型号」。
+    """反选 JS 不能按「颜色」「尺码」组名找：车贴那单的维度组叫「型号」，
+    玩具类目（2026-09-16 毛绒玩偶）的复选框还不包在 .ant-form-item 里。
 
-    原实现找不到颜色组就直接返回 no-color-group，⑦a 剔配件色与 ⑦b「补不上预览图就
-    反选该规格」在这类类目上都无从落地。
+    原实现找不到颜色组就返回 no-color-group，且按 .ant-form-item 分组、复选框文本
+    精确匹配（不剥 replay），这两类类目上反选都无从落地。现改为全量找复选框 + 剥
+    replay 后缀匹配 + closest 定位同维组，不再依赖维度组名。
     """
     js = variant_dom._JS_UNCHECK_COLOR
-    assert "isDimGroup" in js, "没有「其余变种维组」兜底"
     assert "no-color-group" not in js, "仍会因为没有颜色组而直接失败"
-    # 颜色组仍要优先（真·颜色类目行为不变）
-    assert "isColorGroup" in js
+    assert ("querySelectorAll('#skuAttrsInfo label.d-checkbox')" in js), \
+        "应全量找复选框、不按维度组名分组"
+    assert "replay" in js, "页面复选框带 replay 后缀，匹配必须剥掉"
     # 【只反选不勾选】这条约束不许丢
     assert "input.checked" in js
 

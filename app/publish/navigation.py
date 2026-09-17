@@ -327,6 +327,45 @@ _JS_LIVE_STATE = r"""(async () => {
     return !v || Array.from(v).some(c => c.charCodeAt(0) > 127);
   }).length;
 
+  // ⑩ 变种信息「申报价/重量缺失」的行数：按列头定位（与下方 variantByColor 同判据），
+  // 任一为空即算这行没填全。skuFilledRows 只判「有没有行填过」，抓不到「46 行缺
+  // 申报价/重量」这种半成品（2026-09-17 毛绒玩偶续跑：skuFilled 非 0，save 却报
+  // 「请填写表格中缺少的字符」）。列头读不到时算 0，不据此误判。
+  const _skuHeads = (sku || document).querySelector('table')
+    ? Array.from((sku || document).querySelector('table').querySelectorAll('thead th'))
+        .map(th => txt(th))
+    : [];
+  const _iPriceCol = _skuHeads.findIndex(h => h.includes('申报价格'));
+  const _iWeightCol = _skuHeads.findIndex(h => h.includes('重量'));
+  const skuVariantMissing = skuRows.filter(tr => {
+    const tds = Array.from(tr.children);
+    const val = k => {
+      if (k < 0 || !tds[k]) return '';
+      const ins = Array.from(tds[k].querySelectorAll('input'));
+      for (const x of ins) { const v = (x.value || '').trim(); if (v) return v; }
+      return '';
+    };
+    return !val(_iPriceCol) || !val(_iWeightCol);
+  }).length;
+
+  // ⑪ 仓库：读「选择仓库」下拉的选中值（定位同 stock_scripts._JS_WH_STATE）。
+  // 保存失败后页面刷新会清空下拉，仓库空 = stock 成果丢了，续跑必须重跑 stock 补。
+  // null = 读不到仓库块（交阶段自己判），空数组才是真没选。
+  const whLab = Array.from(document.querySelectorAll('*'))
+    .filter(el => el.childElementCount === 0 && el.closest('#skuDataInfo') &&
+      (el.textContent || '').trim().startsWith('选择仓库'))[0];
+  let warehouseSelected = null;
+  if (whLab) {
+    let box = whLab.parentElement, sel = null;
+    for (let k = 0; k < 5 && box; k++) {
+      sel = box.querySelector('.ant-select'); if (sel) break; box = box.parentElement;
+    }
+    if (sel) {
+      warehouseSelected = Array.from(sel.querySelectorAll('.ant-select-selection-item'))
+        .map(x => (x.title || x.textContent || '').trim());
+    }
+  }
+
   // ⑨ 尺码表：控件文本仍是「添加尺码表」说明没加。
   // 套装商品有两张表（label「尺码表」「尺码表2」），按 label 取而不是靠
   // .skuAttrSizeChart——那个类只挂在第一张上，第二张没加会被判成「已加」而不重跑
@@ -501,6 +540,8 @@ _JS_LIVE_STATE = r"""(async () => {
     skuFilledRows: skuFilled,
     skuCodeCount: skuCodeInps.length,
     skuCodeBad: skuCodeBad,
+    skuVariantMissing: skuVariantMissing,
+    warehouseSelected: warehouseSelected,
     sizechartAdded: !!scText && !scText.includes('添加尺码表'),
     // 第二张表：null 表示该类目没有这一栏；false 表示有栏但没填（套装商品必须填，
     // 否则平台打回「套装尺码模板数量不合法」）

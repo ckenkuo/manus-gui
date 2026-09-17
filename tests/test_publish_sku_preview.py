@@ -260,6 +260,8 @@ class _ReplaceSession:
                    if self.readback_has_fid
                    else "https://cbu01.alicdn.com/old.jpg")
             return {"src": src, "w": 1785, "h": 1785}
+        if "closedModals" in js:            # 关残留浮层（replace_row 前置清理，不含「取消」误判）
+            return {}
         if "取消" in js:                     # _close_space_modal
             self.closed += 1
             return {"wasOpen": True, "clicked": True, "stillOpen": False}

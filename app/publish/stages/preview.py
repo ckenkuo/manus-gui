@@ -207,9 +207,14 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
         # 源颜色图映射：colorImages[颜色].mainFile 是本地已下载文件名，优先用；读不到
         # 或该颜色没映射就退化到同色行 url，不因读文件失败就判整段失败（best-effort）。
         color_files = {}
+        # 【配图颜色集合】colorImages 的全部 key＝商家在源站配过图的颜色。空位行颜色
+        # 不在里面，说明商家建了 SKU 却没上传图（如毛绒玩偶的「小鬼皮壳」「木乃伊皮壳」），
+        # 这种不能用别的颜色图去补——挂错图会被平台罚，直接反选（见下方循环）。
+        known_colors = set()
         try:
             with open(ctx["info_path"], encoding="utf-8") as f:
                 info = json.load(f)
+            known_colors = set((info.get("colorImages") or {}).keys())
             for c, v in (info.get("colorImages") or {}).items():
                 if isinstance(v, dict) and v.get("mainFile"):
                     color_files[c] = v["mainFile"]
@@ -220,6 +225,15 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
         for r in fillable:
             i, color = r["i"], r.get("color") or ""
             tag = f"第 {i + 1} 行" + (f"「{color}」" if color else "")
+            # 【没配图的颜色直接反选，不退化成同款图】商家建了 SKU 却不上传图（2026-09-16
+            # 毛绒玩偶 975173698426：颜色维 11 个里「小鬼皮壳」「木乃伊皮壳」两个在源站
+            # 颜色选择器里 hasImg=false），用别的颜色图补会挂错图、被平台罚款。仅当
+            # colorImages 提取到（非空）才做这个判断——提取得空说明是页面结构/提取问题
+            # 而非「商家没配图」，此时退回 _pick_fill_source 的同款退化逻辑，不误伤。
+            if color and known_colors and color not in known_colors:
+                logger.warning(f"预览图 {tag} 颜色「{color}」商家未配图，直接反选该规格")
+                unfixable.append(r)
+                continue
             out = os.path.join(prep, f"fill{i:02d}.jpg")
             # 取源：同规格源图 → 同规格其它行的图 → 同款任意行的图（见 _pick_fill_source）
             src_path = _pick_fill_source(r, rows, color_files, ctx["workdir"], prep)

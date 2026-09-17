@@ -53,6 +53,26 @@ __LOCATE__
 })()"""
 
 
+# 【弹窗要轮询等，别拿固定 sleep 当成败判据】2026-09-13 取证（1076651064534，女士居家
+# 拖鞋）：阶段⑨ 报「添加尺码表弹窗未打开: {'opened': False}」——返回里【没有】
+# reason:'no-link'，说明入口 link 找到了、也点了，纯粹是点完只等 1500ms 就一次性判死，
+# 那一刻弹窗还没渲染出来。故排除定位失败，_scItem 那段不动。
+#
+# 判据一字未改（.ant-modal-wrap 含「添加尺码表」且 getComputedStyle 的 display 非 none，
+# 取最后一个），只把「等法」从一次性 sleep 改成轮询到位。轮询放在 JS 内、写成 40 轮 ×
+# 300ms，与上面 _scItem 同一层同一风格，不引入第二套写法；不用 Python 侧的
+# common._poll_until 是因为点击与判定同在这一段注入 JS 里，让 Python 反复重跑整段等于
+# 反复点入口，会叠出多个弹窗。上限从 1.5s 放宽到 12s：这里的 sleep 本就是【不够】才出事
+# 的，照抄原时长等于没修（与 _poll_until「原 sleep 时长即 timeout 上限」的差别只在于，
+# 那边的原 sleep 是够用的保守量、这边的不是）。
+#
+# 【与 editor 里「开新前先关闭残留弹窗」的兼容性】已核对 editor.add_sizechart：那段清理是
+# 独立的一次 eval，本段 JS 在它 await 返回之后才跑；清理每点一次取消/关闭都跟 sleep(1000)
+# 再继续，远超 antd 弹窗淡出动画，故它返回时被关掉的 wrap 已经是 display:none。即首轮立即
+# 探测不可能把「正在关闭中」的残留弹窗误判成已打开。清理连点 5 轮仍关不掉的（根本找不到
+# 取消/关闭按钮）是真卡着没关，那种情形改前的固定 sleep 同样会判成 opened，非本次引入。
+#
+# waited 是给下次事故留的取证：能区分「等到上限仍没出来」和「立刻就成/立刻就没」。
 _JS_OPEN_SIZECHART_MODAL = r"""(async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 __LOCATE__
@@ -64,11 +84,19 @@ __LOCATE__
   link.scrollIntoView({block: 'center'});
   await sleep(500);
   link.click();
-  await sleep(1500);
-  const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
-    .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
-  const wrap = _scList[_scList.length - 1];
-  return JSON.stringify({opened: !!wrap});
+  const _scWrap = () => {
+    const _scList = Array.from(document.querySelectorAll('.ant-modal-wrap'))
+      .filter(m => (m.textContent||'').includes('添加尺码表') && getComputedStyle(m).display !== 'none');
+    return _scList[_scList.length - 1];
+  };
+  let wrap = _scWrap();
+  let waited = 0;
+  for (let i = 0; i < 40 && !wrap; i++) {
+    await sleep(300);
+    waited += 300;
+    wrap = _scWrap();
+  }
+  return JSON.stringify({opened: !!wrap, waited});
 })()"""
 
 

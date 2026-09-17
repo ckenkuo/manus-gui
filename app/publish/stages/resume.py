@@ -20,10 +20,13 @@ from app.publish.variant_colors import accessory_colors_from_rows
 _CAT_STAGES = ["auto_cat", "attrs"]
 
 
-# ⑤ 起的纯表单阶段（类目有效时只有这些需要按实况逐项细判）
+# ⑤ 起的纯表单阶段（类目有效时只有这些需要按实况逐项细判）。
+# 【carousel 必须在册】2026-09-17 修：下面 _stale_form_stages 里一直有
+# `stale.append("carousel")`，但它不在这张表里、末尾那行会把不在册的项全部过滤掉，
+# 于是那句是死代码——续跑时 ⑤c 永远不会被排进重跑集，即使轮播图实况已经破线。
 _FORM_STAGES_AFTER_CAT = [
-    "titles", "clean_images", "material", "drop_acc", "skc", "sku_preview", "fix_sizes",
-    "sizechart", "sku_code", "variant", "stock", "shipping", "desc", "video",
+    "titles", "clean_images", "carousel", "material", "drop_acc", "skc", "sku_preview",
+    "fix_sizes", "sizechart", "sku_code", "variant", "stock", "shipping", "desc", "video",
 ]
 
 
@@ -93,8 +96,18 @@ def _stale_form_stages(live: dict) -> list:
         # （skuCodeBad 已把「空」与「含非 ASCII」都算进去，见 _JS_LIVE_STATE）
         if live.get("skuCodeBad") or not live.get("skuCodeCount"):
             stale.append("sku_code")
-        if not live.get("skuFilledRows"):
+        # ⑩⑪ 变种/库存：整表空 或 有任一行缺申报价/重量，都要重跑。后者抓的是
+        # 「部分行没填全」——skuFilledRows 只判「有没有行填过」，半成品（46 行缺
+        # 申报价/重量）会漏掉，save 时被平台打回「请填写表格中缺少的字符」
+        # （2026-09-17 毛绒玩偶续跑取证）。variant 与 stock 总是一起进重跑集：
+        # 仓库勾选决定库存列是否渲染，两者是同一张表的上下游。
+        if not live.get("skuFilledRows") or live.get("skuVariantMissing"):
             stale += ["variant", "stock"]
+        # ⑪ 仓库单独判：下拉没选（保存失败后页面刷新清空）要重跑 stock 补仓库。
+        # warehouseSelected 为 None 表示读不到仓库块（交阶段自己判），空数组才是真没选。
+        wh = live.get("warehouseSelected")
+        if wh is not None and not wh:
+            stale.append("stock")
     # ⑦b SKU 预览图：【与 skuRowCount 那个分支平级，不放进 else】——它读的是变种
     # 【信息】表第一列，与 ⑥⑦ 看的 attrImg*（变种【属性】区）是两处不同的图，
     # 两处正交（2026-08-30 玩具类那单就是 ⑦ 合理跳过、⑦b 从未跑过而被平台拒）。
@@ -106,11 +119,12 @@ def _stale_form_stages(live: dict) -> list:
     # ⑤c 产品轮播图：与 attrImg*（变种属性区）、preview*（变种信息表）平级的第四处
     # 图位，且是 ⑥ 素材图的上游（页面原文「素材图将自动获取产品轮播图/颜色图的第一张
     # 图片」）。2026-09-12 弹珠机那单 ⑦⑦b 都正常跑过，轮播图里 676x676 那张从未被
-    # 碰过，发布被拒「产品轮播图尺寸不能小于800*800」——续跑当时也不会自愈，因为
-    # 这里压根没有判据。carouselBad 为 0 时不判 stale：区块读不到时它也是 0，
-    # 交阶段自己按 supported=None 报 fail，不在这里替它猜。
-    if live.get("carouselBad"):
-        stale.append("carousel")
+    # 碰过，发布被拒「产品轮播图尺寸不能小于800*800」。
+    #
+    # 【无条件进重跑集，细判交给阶段自己】carouselBad 只覆盖「已勾选的图破线」这一种
+    # 丢失形态（2026-09-17 起 ⑤c 还会替换带中文的图、补勾尺码/介绍信息图，那两类成果
+    # 被页面重载冲掉时，回到的是尺寸本来就没问题的源图，carouselBad 恒 0 判不出来），
+    stale.append("carousel")
     # ⑦a 剔配件色：变种表里只要还有「单行有源数据」的颜色就得重跑。反选只改未保存
     # 表单，save 没成功过时页面会回到认领时的全勾状态（与 ⑤~⑬ 其它表单阶段同理）。
     # 判据完全取页面实况（源颜色名与页面色板名对不上，见 _JS_VARIANT_ROW_FILL），

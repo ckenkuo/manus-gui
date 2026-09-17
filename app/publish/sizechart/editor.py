@@ -417,10 +417,16 @@ async def add_sizechart(session: BrowserSession, info_path: str,
                                 break
                         break
                 await page.wait_for_timeout(500)
+                # 【四个占位符必须与上面首次填表那处完全一致】2026-09-15 引入
+                # __DERIVED__ 时只改了首次填表那一处，这条兜底重填漏了，于是注入的
+                # JS 里 __DERIVED__ 原样留着 → ReferenceError: __DERIVED__ is not
+                # defined，被下面那个 except 吞成一句 warning，fill 仍是兜底前那个
+                # 不完整的旧值，最终照旧报「表格填充不完整」——真因反被掩盖。
                 fill = await session.eval_json(sizechart_scripts._JS_FILL_SIZECHART
                                                 .replace("__NAME__", J(tpl_name))
                                                 .replace("__DATA__", J(norm))
-                                                .replace("__PARAMS__", J(params)))
+                                                .replace("__PARAMS__", J(params))
+                                                .replace("__DERIVED__", J(derived_params)))
             except Exception as e:
                 logger.warning(f"尺码表下拉真实点击兜底失败：{e}")
     if not fill.get("ok"):

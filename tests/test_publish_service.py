@@ -538,9 +538,16 @@ async def test_st_clean_images_失败不阻塞且发人工检查(tmp_path, monke
     events = []
     ctx = {"info_path": info_path, "workdir": str(tmp_path)}
     r = await service._st_clean_images(ctx, None, _collect_async(events))
-    # 清理是增益路径：全失败也算 ok，绝不 fail 掉整个商品
-    assert r["status"] == "ok" and "未成功" in r["note"]
+    # 【2026-09-15 起判 fail】出图失败同样意味着该图仍带中文/水印，发上真店过不了合规，
+    # 故如实判失败停在现场（原先返回 ok 会让商品带着脏主图一路跑到发布）。
+    # manual_check 照旧发出，人工据它处置。
+    assert r["status"] == "fail" and "未完成" in r["note"]
     assert [e["type"] for e in events] == ["manual_check"]
+    # 【2026-09-17 起文案按失败环节分类】出图这一步没成时图根本没被碰过，不能报成
+    # 「该图带中文/水印不能发布，请人工换图」——那会把链路故障讲成图片问题，
+    # 让用户去换一批本就合格的图（代理节点失效那次的真实教训）。
+    msg = events[0]["message"]
+    assert "出图失败" in msg and "不必换图" in msg and "该图带中文" not in msg
     # 原标注保持脏，该图仍以脏图身份参与 ⑥⑦ 的兜底打分
     with open(info_path, encoding="utf-8") as f:
         assert json.load(f)["complianceNotes"]["files"][0]["clean"] is False
@@ -567,7 +574,8 @@ async def test_st_clean_images_质检未过保留原图(tmp_path, monkeypatch):
     events = []
     r = await service._st_clean_images(
         {"info_path": info_path, "workdir": str(tmp_path)}, None, _collect_async(events))
-    assert r["status"] == "ok"
+    # 【2026-09-15 起判 fail】理由同上：残留拼音的图不能发上真店。
+    assert r["status"] == "fail"
     # 质检不过的产物绝不能顶替原图（否则把带拼音乱码的图挂上真店）
     assert open(str(tmp_path / "main-01.jpg"), "rb").read() == original
     assert "残留拼音" in events[0]["message"]
@@ -711,7 +719,10 @@ async def test_实况显示表单还在时不重复重跑(tmp_path, monkeypatch)
     # ⑬b video 无条件进重跑集：videoUrl 不在 DOM 里、live_state 读不到它，
     # 故由阶段自己读接口判跳过（没视频/已合规都是 skipped，只花几秒）。
     # 见 service._stale_form_stages 末尾那段与 test_publish_video_stage.py。
-    assert calls == ["open_edit", "video", "save"]
+    # ⑤c carousel 同理无条件进重跑集：它的成果（替换/补勾上去的图床图）丢没丢，
+    # 实况里没有一个稳定信号（「本就没做过」与「做过又丢了」都表现为轮播区全是源站
+    # 外链），故也由阶段自己判——它开头有幂等短路（已选图里出现图床图即跳过）。
+    assert calls == ["open_edit", "carousel", "video", "save"]
 
 
 @pytest.mark.asyncio
@@ -732,7 +743,8 @@ async def test_尺码勾选丢了连带重跑尺码表变种库存(tmp_path, mon
                               "Pawly", on_progress=_collect(events))
 
     assert [c for c in calls if c != "open_edit"] == [
-        "fix_sizes", "sizechart", "sku_code", "variant", "stock", "video", "save"]
+        "carousel", "fix_sizes", "sizechart", "sku_code", "variant", "stock",
+        "video", "save"]
     assert "titles" not in calls and "skc" not in calls
 
 
@@ -983,7 +995,8 @@ async def test_货号是中文时单独重跑货号阶段(tmp_path, monkeypatch)
     await service.publish_one(None, {"rowid": "103", "info_path": "x.json"},
                               "Pawly", on_progress=_collect(events))
 
-    assert [c for c in calls if c != "open_edit"] == ["sku_code", "video", "save"]
+    assert [c for c in calls if c != "open_edit"] == [
+        "carousel", "sku_code", "video", "save"]
     # 贵阶段（图片/属性）不该被连带
     assert "skc" not in calls and "clean_images" not in calls
 
@@ -1237,6 +1250,22 @@ def test_stale判定_标题含中文时重跑标题():
 
 def test_stale判定_实况读不到时连类目一起保守重跑():
     assert set(service._stale_form_stages({"rendered": False})) == set(service._FORM_ONLY_STAGES)
+
+
+def test_stale判定_轮播图阶段必须在重跑集白名单里():
+    """⑤c 的成果（替换/补勾上去的图床图）会被页面重载冲掉，而实况判不出来——「本就没
+    做过」与「做过又丢了」在页面上都表现为「轮播区全是源站外链」，故它无条件进重跑集，
+    由阶段自己的幂等短路兜成本。
+
+    【这条钉的是 2026-09-17 修掉的死代码】_stale_form_stages 里一直有
+    stale.append("carousel")，但 carousel 不在 _FORM_STAGES_AFTER_CAT 里，末尾那行
+    [_FORM_ONLY_STAGES 交集] 会把它过滤掉——续跑时 ⑤c 永远不被重跑，即使轮播图实况
+    已经破线（2026-09-12 弹珠机那单就是发布时才被拒）。删掉白名单里的 carousel 会
+    让这条断红。
+    """
+    assert "carousel" in service._FORM_STAGES_AFTER_CAT
+    assert "carousel" in service._FORM_ONLY_STAGES
+    assert "carousel" in service._stale_form_stages({"rendered": True})
 
 
 def test_live_state_含类目三信号():

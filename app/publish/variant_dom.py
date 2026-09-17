@@ -68,59 +68,60 @@ _JS_DIM_COLS = r"""
 # 安全的；「尺码表」这类不是变种维的行排除掉。
 _JS_UNCHECK_COLOR = r"""(() => {
   const WANT = __WANT__;
-  const items = Array.from(document.querySelectorAll('#skuAttrsInfo .ant-form-item'));
-  const labelOf = it => {
-    const l = it.querySelector('.ant-form-item-label');
-    return (l ? l.textContent : '').trim();
-  };
-  const isColorGroup = it => {
-    const lab = labelOf(it);
-    return lab === '颜色' || (lab.includes('颜色') && !lab.includes('颜色表'));
-  };
-  // 变种维组 = 带复选框、且不是「尺码表/颜色表」这类附属行
-  const isDimGroup = it => {
-    const lab = labelOf(it);
-    if (!lab || lab.includes('尺码表') || lab.includes('颜色表')) return false;
-    return it.querySelectorAll('label.d-checkbox').length > 0;
-  };
-  // 颜色组排在前面：真·颜色类目下先在它里面找，与本函数原先的行为一致
-  const groups = items.filter(isColorGroup).concat(
-    items.filter(it => !isColorGroup(it) && isDimGroup(it)));
-  if (!groups.length) return JSON.stringify({found: false, err: 'no-dim-group'});
-  const checkedAll = [];
-  for (const it of groups) {
-    const cbs = Array.from(it.querySelectorAll('label.d-checkbox'));
-    cbs.forEach(l => {
-      const i = l.querySelector('input');
-      if (i && i.checked) checkedAll.push((l.textContent || '').trim());
-    });
-    const hit = cbs.find(l => (l.textContent || '').trim() === WANT);
-    if (!hit) continue;   // 这一维里没有，再看下一维
-    const input = hit.querySelector('input');
-    // 【绝不反选到「这一维一个都不剩」】变种维不能为空：把最后一个已勾选项也取消掉，
-    // 平台会把整张变种表清掉，比留着一个不合格规格坏得多（那只是这一个 SKU 有问题）。
-    // 判据放在这里而不是各调用方：⑦a 剔配件色、剔伪选项、⑦b 反选补不上图的规格三处
-    // 都会撞上「整维只剩一个」，在唯一出口上拦一次比三处各判一次可靠。
-    const checkedInGroup = cbs.filter(l => {
+  // 页面复选框文本带平台 replay 后缀（「小鬼皮壳replay」），源颜色名不带，精确匹配
+  // 必然落空；剥掉后缀再比，也兼容本来就不带后缀的旧类目。
+  const strip = t => (t || '').replace(/replay$/i, '');
+  // 【全量找复选框，不按 .ant-form-item 分组】不同类目变种属性区结构不同：服装类是
+  // .ant-form-item + 表单 label，玩具类（2026-09-16 毛绒玩偶）是 .checkbox-group-with-search
+  // + ant-select 维度下拉，按固定容器找组会把后者整个漏掉（no-dim-group）。选项文本
+  // 剥后缀后跨维度不会重名（颜色名不会撞尺码名），故全量找第一个匹配是安全的。
+  const all = Array.from(document.querySelectorAll('#skuAttrsInfo label.d-checkbox'));
+  const hit = all.find(l => {
+    const t = (l.textContent || '').trim();
+    return t === WANT || strip(t) === WANT;
+  });
+  if (!hit) {
+    const checkedAll = all.filter(l => {
       const i = l.querySelector('input'); return i && i.checked;
-    });
-    if (input.checked && checkedInGroup.length <= 1) {
-      return JSON.stringify({found: true, wasChecked: true, clicked: false,
-                             checked: true, err: 'last-checked-in-group',
-                             group: labelOf(it),
-                             checkedOptions: checkedInGroup.map(
-                               l => (l.textContent || '').trim())});
-    }
-    if (!input.checked) return JSON.stringify({found: true, wasChecked: false,
-                                               clicked: false, checked: false,
-                                               group: labelOf(it)});
-    input.click();
-    return JSON.stringify({found: true, wasChecked: true, clicked: true,
-                           checked: !!input.checked, group: labelOf(it)});
+    }).map(l => (l.textContent || '').trim());
+    return JSON.stringify({found: false, checkedOptions: checkedAll,
+                           groups: ['全部复选框']});
   }
-  // 各维度组里都没有这个选项：把已勾选项报出来供排查（同原先的返回形状）
-  return JSON.stringify({found: false, checkedOptions: checkedAll,
-                         groups: groups.map(labelOf)});
+  const input = hit.querySelector('input');
+  // 同维组 = 复选框最近的复选框组容器：服装类 .ant-form-item、玩具类
+  // .checkbox-group-with-search。last-checked 判据要的是「同维还剩几个已勾选」，
+  // 用最近组容器即可。
+  const group = hit.closest('.checkbox-group-with-search') || hit.closest('.ant-form-item');
+  const cbs = group ? Array.from(group.querySelectorAll('label.d-checkbox')) : [hit];
+  // 【绝不反选到「这一维一个都不剩」】变种维不能为空：把最后一个已勾选项也取消掉，
+  // 平台会把整张变种表清掉，比留着一个不合格规格坏得多（那只是这一个 SKU 有问题）。
+  // 判据放在这里而不是各调用方：⑦a 剔配件色、剔伪选项、⑦b 反选补不上图的规格三处
+  // 都会撞上「整维只剩一个」，在唯一出口上拦一次比三处各判一次可靠。
+  const checkedInGroup = cbs.filter(l => {
+    const i = l.querySelector('input'); return i && i.checked;
+  });
+  // 组名（日志用）：新结构取维度下拉「颜色/存储容量」，旧结构取表单 label
+  const groupName = (() => {
+    if (!group) return '';
+    const holder = group.closest('.mb-24') || group;
+    const sel = holder.querySelector('.ant-select-selection-item');
+    if (sel) return (sel.textContent || '').trim();
+    const fl = group.querySelector('.ant-form-item-label');
+    return fl ? (fl.textContent || '').trim() : '';
+  })();
+  if (input.checked && checkedInGroup.length <= 1) {
+    return JSON.stringify({found: true, wasChecked: true, clicked: false,
+                           checked: true, err: 'last-checked-in-group',
+                           group: groupName,
+                           checkedOptions: checkedInGroup.map(
+                             l => (l.textContent || '').trim())});
+  }
+  if (!input.checked) return JSON.stringify({found: true, wasChecked: false,
+                                             clicked: false, checked: false,
+                                             group: groupName});
+  input.click();
+  return JSON.stringify({found: true, wasChecked: true, clicked: true,
+                         checked: !!input.checked, group: groupName});
 })()"""
 
 
