@@ -21,8 +21,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from math import ceil
 from pathlib import Path
+from time import monotonic
 from typing import Any, Callable, Dict, List, Optional
+
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from app.collect.pipeline import _download_main_image
 from app.logger import logger
@@ -1361,12 +1365,59 @@ async def goto_next_page(page, timeout_ms: int = 20000) -> bool:
     # 悬浮球正压在分页条上，不先屏蔽会 30s 超时（见 _POINTER_OVERLAYS）。每次翻页都调：
     # 插件是 React 渲染，节点可能被重建，一次性设过不代表还生效。
     await disable_pointer_overlays(page)
-    await nxt.click()
+    deadline = monotonic() + timeout_ms / 1000
+    intercepted_attempts = 0
+    while True:
+        remaining_ms = ceil((deadline - monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise PlaywrightTimeoutError("等待下一页按钮可点击超时")
+        try:
+            await nxt.click(timeout=min(remaining_ms, 3000))
+            break
+        except PlaywrightTimeoutError as exc:
+            if await ul.get_attribute("data-status") != before:
+                break
+            if monotonic() >= deadline:
+                raise
+            if "intercepts pointer events" not in str(exc):
+                continue
+            if intercepted_attempts == 0:
+                intercepted_attempts += 1
+                await dismiss_site_popups(page)
+                await disable_pointer_overlays(page)
+                if await ul.get_attribute("data-status") != before:
+                    break
+                continue
+            logger.warning("下一页仍被浮层遮挡，改用受保护的 DOM 点击并校验分页状态")
+            clicked = await nxt.evaluate(r"""(element, previous) => {
+                const pagination = element.closest('ul[data-testid="beast-core-pagination"]');
+                if (!pagination) return false;
+                if (pagination.getAttribute('data-status') !== previous) return true;
+                const style = getComputedStyle(element);
+                if (!element.isConnected || !element.getClientRects().length ||
+                    style.visibility === 'hidden' || style.display === 'none' ||
+                    element.className.includes('PGT_disabled') ||
+                    element.getAttribute('aria-disabled') === 'true' ||
+                    element.hasAttribute('disabled')) return false;
+                element.click();
+                return true;
+            }""", before)
+            if not clicked:
+                raise RuntimeError("下一页不可见或已禁用，停止翻页") from exc
+            break
     waited = 0
     while waited < timeout_ms:
         await asyncio.sleep(0.25)
         waited += 250
-        if await ul.get_attribute("data-status") != before:
+        current = await ul.get_attribute("data-status")
+        if current != before:
+            previous_match = re.fullmatch(r"beast-core-pagination-(\d+)-(\d+)", before or "")
+            current_match = re.fullmatch(r"beast-core-pagination-(\d+)-(\d+)", current or "")
+            if not previous_match or not current_match or (
+                current_match[1] != previous_match[1]
+                or int(current_match[2]) != int(previous_match[2]) + 1
+            ):
+                raise RuntimeError(f"翻页状态异常：{before} → {current}，停止采集以免漏单")
             # 页码变了还要等表格行渲染出来，否则接着抓图会抓到上一页的残留
             try:
                 await page.wait_for_selector("table tbody tr", timeout=10000)

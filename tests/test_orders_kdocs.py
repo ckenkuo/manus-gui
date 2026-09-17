@@ -171,6 +171,51 @@ def test_existing_key_tuples_aligns_by_row(monkeypatch):
     assert values == {"PO-1", "PO-2"}
 
 
+def test_existing_keys_expand_merged_spu_without_filling_unmerged_blanks(monkeypatch):
+    from app.collect import service as collect
+
+    def range_data(payload):
+        cells = {
+            2: [{"rowFrom": 2, "rowTo": 3, "colFrom": 2, "cellText": "3250560654"}],
+            3: [
+                {"rowFrom": 2, "colFrom": 3, "cellText": "双人对战豪华版"},
+                {"rowFrom": 3, "colFrom": 3, "cellText": "双人对战（送游戏卡片）"},
+                {"rowFrom": 4, "colFrom": 3, "cellText": "未归属规格"},
+            ],
+        }
+        return {"rangeData": cells[payload["range"]["colFrom"]]}
+
+    cli = _make(monkeypatch, {
+        ("sheet", "get_range_data"): range_data,
+    })
+    cli._sheets = {"StoreA全球1": {"id": 7, "row_to": 4}}
+    keys = collect.existing_keys("", "StoreA全球1", cloud=cli,
+                                 fields={"spu": "C", "sku": "D"}, header_row=2)
+
+    assert keys == {"3250560654"}
+    assert cli.existing_key_tuples("StoreA全球1", ["C", "D"], header_row=2) == {
+        ("3250560654", "双人对战豪华版"), ("3250560654", "双人对战（送游戏卡片）"),
+        ("", "未归属规格"),
+    }
+    items = [
+        {"spu": "3250560654", "sku_spec": "双人对战豪华版"},
+        {"spu": "3250560654", "sku_spec": "双人对战（送游戏卡片）"},
+        {"spu": "3250560654", "sku_spec": "单人体验装（无卡片）"},
+    ]
+    assert collect.done_flags(items, keys) == [True, True, True]
+
+
+def test_existing_keys_clip_merged_ranges_to_scan_bounds(monkeypatch):
+    cli = _make(monkeypatch, {
+        ("sheet", "get_range_data"): {"rangeData": [
+            {"rowFrom": 1, "rowTo": 100, "colFrom": 2, "cellText": "SPU-1"},
+        ]},
+    })
+    cli._sheets = {"StoreA全球1": {"id": 7, "row_to": 3}}
+
+    assert cli._read_columns("StoreA全球1", ["C"], header_row=2) == [("SPU-1",), ("SPU-1",)]
+
+
 def test_write_rows_sequence_and_payload(monkeypatch):
     verify = {"rangeData": [{"rowFrom": 2, "colFrom": 2, "cellText": "PO-9"}]}
     routes = {

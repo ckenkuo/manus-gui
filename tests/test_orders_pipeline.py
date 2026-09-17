@@ -1199,10 +1199,17 @@ def test_disable_pointer_overlays_sets_descendants_too():
 class _NextPage:
     """页面替身：分页容器 + 「下一页」。data-status 在点击后才翻，模拟异步换页。"""
 
-    def __init__(self, next_cls="PGT_next_123 ", flip=True):
+    def __init__(self, next_cls="PGT_next_123 ", flip=True, click_errors=None,
+                 timeout_status=None, dom_clickable=True, simulate_elapsed=False):
         self.next_cls, self.flip = next_cls, flip
         self.status = "beast-core-pagination-20-1"
         self.calls: list = []
+        self.click_errors = list(click_errors or [])
+        self.click_timeouts = []
+        self.timeout_status = timeout_status
+        self.dom_clickable = dom_clickable
+        self.simulate_elapsed = simulate_elapsed
+        self.clock = 0
 
     async def evaluate(self, js, *a):
         self.calls.append("evaluate")
@@ -1223,10 +1230,24 @@ class _NextPage:
                     return page.next_cls if name == "class" else None
                 return page.status if name == "data-status" else None
 
-            async def click(s):
+            async def click(s, timeout=None):
                 page.calls.append("click")
+                page.click_timeouts.append(timeout)
+                if page.click_errors:
+                    if page.simulate_elapsed:
+                        page.clock += timeout / 1000
+                    if page.timeout_status:
+                        page.status = page.timeout_status
+                    raise page.click_errors.pop(0)
                 if page.flip:
                     page.status = "beast-core-pagination-20-2"
+
+            async def evaluate(self, script, previous):
+                page.calls.append("dom_click")
+                assert previous == "beast-core-pagination-20-1"
+                if page.flip and page.dom_clickable:
+                    page.status = "beast-core-pagination-20-2"
+                return page.dom_clickable
 
             def locator(s, sub):
                 return page.locator(sub)
@@ -1262,6 +1283,108 @@ def test_goto_next_page_raises_when_page_never_changes():
 
     with pytest.raises(RuntimeError, match="分页状态没变"):
         asyncio.run(P.goto_next_page(page, timeout_ms=500))
+
+
+def _patch_next_popup_cleanup(monkeypatch):
+    async def dismiss(page):
+        page.calls.append("dismiss")
+        return True
+
+    monkeypatch.setattr(P, "dismiss_site_popups", dismiss)
+
+
+def _intercepted_click():
+    return P.PlaywrightTimeoutError('<div class="_2aO2Moy7"> intercepts pointer events')
+
+
+def test_goto_next_page_retries_after_dismissing_new_popup(monkeypatch):
+    _patch_next_popup_cleanup(monkeypatch)
+    page = _NextPage(click_errors=[_intercepted_click()])
+
+    assert asyncio.run(P.goto_next_page(page)) is True
+    assert page.calls == ["evaluate", "click", "dismiss", "evaluate", "click"]
+    assert page.click_timeouts == [3000, 3000]
+
+
+def test_goto_next_page_uses_guarded_dom_click_for_persistent_overlay(monkeypatch):
+    _patch_next_popup_cleanup(monkeypatch)
+    page = _NextPage(click_errors=[_intercepted_click(), _intercepted_click()])
+
+    assert asyncio.run(P.goto_next_page(page)) is True
+    assert page.calls == ["evaluate", "click", "dismiss", "evaluate", "click", "dom_click"]
+
+
+def test_goto_next_page_does_not_bypass_unrelated_timeout(monkeypatch):
+    page = _NextPage(click_errors=[P.PlaywrightTimeoutError("element is not visible")] * 3,
+                     simulate_elapsed=True)
+    monkeypatch.setattr(P, "monotonic", lambda: page.clock)
+
+    with pytest.raises(P.PlaywrightTimeoutError, match="not visible"):
+        asyncio.run(P.goto_next_page(page, timeout_ms=7000))
+    assert page.calls == ["evaluate", "click", "click", "click"]
+    assert page.click_timeouts == [3000, 3000, 1000]
+
+
+def test_goto_next_page_retries_transient_loading_with_remaining_budget(monkeypatch):
+    page = _NextPage(click_errors=[P.PlaywrightTimeoutError("element is not stable")],
+                     simulate_elapsed=True)
+    monkeypatch.setattr(P, "monotonic", lambda: page.clock)
+
+    assert asyncio.run(P.goto_next_page(page, timeout_ms=5000)) is True
+    assert page.click_timeouts == [3000, 2000]
+    assert page.calls == ["evaluate", "click", "click"]
+
+
+def test_goto_next_page_does_not_retry_if_non_pointer_timeout_already_advanced_page():
+    page = _NextPage(click_errors=[P.PlaywrightTimeoutError("navigation timed out")],
+                     timeout_status="beast-core-pagination-20-2")
+
+    assert asyncio.run(P.goto_next_page(page)) is True
+    assert page.calls == ["evaluate", "click"]
+
+
+def test_goto_next_page_does_not_bypass_overlay_after_budget_exhaustion(monkeypatch):
+    page = _NextPage(click_errors=[_intercepted_click()], simulate_elapsed=True)
+    monkeypatch.setattr(P, "monotonic", lambda: page.clock)
+
+    with pytest.raises(P.PlaywrightTimeoutError, match="intercepts pointer events"):
+        asyncio.run(P.goto_next_page(page, timeout_ms=1000))
+    assert page.calls == ["evaluate", "click"]
+
+
+def test_goto_next_page_does_not_click_twice_if_timeout_already_advanced_page():
+    page = _NextPage(click_errors=[_intercepted_click()],
+                     timeout_status="beast-core-pagination-20-2")
+
+    assert asyncio.run(P.goto_next_page(page)) is True
+    assert page.calls == ["evaluate", "click"]
+
+
+def test_goto_next_page_rejects_page_jump_after_timeout():
+    page = _NextPage(click_errors=[_intercepted_click()],
+                     timeout_status="beast-core-pagination-20-3")
+
+    with pytest.raises(RuntimeError, match="翻页状态异常"):
+        asyncio.run(P.goto_next_page(page))
+    assert "dom_click" not in page.calls
+
+
+def test_goto_next_page_rejects_disabled_dom_fallback(monkeypatch):
+    _patch_next_popup_cleanup(monkeypatch)
+    page = _NextPage(click_errors=[_intercepted_click(), _intercepted_click()],
+                     dom_clickable=False)
+
+    with pytest.raises(RuntimeError, match="不可见或已禁用"):
+        asyncio.run(P.goto_next_page(page))
+
+
+def test_goto_next_page_dom_fallback_still_requires_page_change(monkeypatch):
+    _patch_next_popup_cleanup(monkeypatch)
+    page = _NextPage(click_errors=[_intercepted_click(), _intercepted_click()], flip=False)
+
+    with pytest.raises(RuntimeError, match="分页状态没变"):
+        asyncio.run(P.goto_next_page(page, timeout_ms=500))
+    assert page.click_timeouts == [500, 500]
 
 
 def test_sweep_pages_awaits_async_on_page(monkeypatch):

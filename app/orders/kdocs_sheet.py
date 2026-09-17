@@ -434,6 +434,7 @@ class KdocsSheet:
 
         行上限取 sheets_info 的 rowTo（实际数据区）与 _MAX_SCAN_ROWS 的较小者。
         只返回【至少有一列非空】的行——整列全空的尾部区域不产生垃圾键。
+        合并单元格按 rowFrom..rowTo 展开，不能把同一 SPU 下后续规格读成空 SPU。
         """
         row_from = header_row  # 0-based 的表头下一行
         row_to = min(int(self.sheets_info()[sheet_name].get("row_to", 0)),
@@ -447,7 +448,10 @@ class KdocsSheet:
             for c in self._get_range(sheet_name, row_from, row_to, ci, ci):
                 text = str(c.get("cellText") or "").strip()
                 if text:
-                    values[int(c["rowFrom"])] = text
+                    start = max(row_from, int(c["rowFrom"]))
+                    end = min(row_to, int(c.get("rowTo", c["rowFrom"])))
+                    for row in range(start, end + 1):
+                        values[row] = text
             per_col[col] = values
         rows = sorted({r for v in per_col.values() for r in v})
         return [tuple(per_col[col].get(r, "") for col in cols) for r in rows]
