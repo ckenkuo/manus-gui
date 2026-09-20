@@ -83,72 +83,25 @@ temperature = 0.0                          # Controls randomness for vision mode
 # 独立成段而不塞进 [llm.*]：那是 DashScope/Anthropic 链路，且段间合并会把 [llm]
 # 的 key 补给缺 key 的段，塞进去会拿错 key。
 [collect_image]
-# 主 key，packyapi 的 Bearer token。留空则跳过白底提取、退回原图搜索，不阻断采集
+# 主 key。留空则跳过白底提取、退回原图搜索，不阻断采集。
+# 2026-09-20 起与 [publish] 同一家（zzlye / gpt-image-2.5-flare，$0.03 按次固定计费），
+# 原先是 packyapi 的 gpt-image-2。两处通常填同一个 key。
 api_key = ""
-# 备用 key（更贵但稳定）：主 key 余额耗尽（"没有可用token"）或调用失败时自动切过去
+# 备用 key（主 key 余额耗尽 "没有可用token" 或调用失败时自动切过去）。
+# 【当前刻意留空，不是漏配】这个槽是当年 packyapi 的产物：那家主 key 便宜但会耗尽额度、
+# 备用 key 贵但稳，故做了双 key 兜底。换到 zzlye 后只用一个 key，留空即可——
+# _resolve_api_keys() 会自动只返回主 key 那一项，不会因空槽报错。
+# 要填就【必须与 base_url 同一家】：跨家填会在主 key 耗尽时切过去拿错分组、必然 503。
 api_key_expensive = ""
 # 以下选填，留空用代码里的默认值
-base_url = "https://www.packyapi.com/v1"
-model = "gpt-image-2"
+base_url = "https://api.zzlye.xyz/v1"
+model = "gpt-image-2.5-flare"
 size = "1024x1024"
-# medium 对搜索查询图够用；这是成本杠杆，别默认 high
+# medium 对搜索查询图够用；这是成本杠杆，别默认 high。
+# 【注意这家基础档有 ~157 万像素预算】请求 1024x1024 实得 1254x1254，size 基本只起
+# 定比例的作用。白底图只当搜索查询图，尺寸大小无所谓（不像发布管线要过服装尺寸红线）。
 quality = "medium"
 
-# Optional configuration for specific browser configuration
-# [browser]
-# Whether to run browser in headless mode (default: false)
-#headless = false
-# Viewport size in CSS pixels. Leave unset to use browser_use default 1280x1100.
-# Set these to match your real screen's usable area (e.g. 1920x953) so the DOM's
-# in-viewport visibility check stays consistent with the screenshot the GUI vision
-# model sees — a mismatch makes the model click on elements that are off-screen.
-#window_width = 1920
-#window_height = 953
-# Disable browser security features (default: true)
-#disable_security = true
-# Extra arguments to pass to the browser
-#extra_chromium_args = []
-# Path to a Chrome instance to use to connect to your normal browser
-# e.g. '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-#chrome_instance_path = ""
-# Connect to a browser instance via WebSocket
-#wss_url = ""
-# Connect to a browser instance via CDP
-#cdp_url = ""
-
-# Optional configuration, Proxy settings for the browser
-# [browser.proxy]
-# server = "http://proxy-server:port"
-# username = "proxy-username"
-# password = "proxy-password"
-
-# Optional configuration, Search settings.
-# [search]
-# Search engine for agent to use. Default is "Google", can be set to "Baidu" or "DuckDuckGo" or "Bing".
-#engine = "Google"
-# Fallback engine order. Default is ["DuckDuckGo", "Baidu", "Bing"] - will try in this order after primary engine fails.
-#fallback_engines = ["DuckDuckGo", "Baidu", "Bing"]
-# Seconds to wait before retrying all engines again when they all fail due to rate limits. Default is 60.
-#retry_delay = 60
-# Maximum number of times to retry all engines when all fail. Default is 3.
-#max_retries = 3
-# Language code for search results. Options: "en" (English), "zh" (Chinese), etc.
-#lang = "en"
-# Country code for search results. Options: "us" (United States), "cn" (China), etc.
-#country = "us"
-
-
-## Sandbox configuration
-#[sandbox]
-#use_sandbox = false
-#image = "python:3.12-slim"
-#work_dir = "/workspace"
-#memory_limit = "1g"  # 512m
-#cpu_limit = 2.0
-#timeout = 300
-#network_enabled = true
-
-# MCP (Model Context Protocol) configuration
 [mcp]
 server_reference = "app.mcp.server" # default server module reference
 
@@ -391,12 +344,46 @@ api_version = ""
 # 接管已登录的真实 Chrome，与采集/订单/活动三条管线同一个前提。
 
 [publish]
-# 图片 AI 编辑（去中文/去水印/描述图英化）用的 Packy gpt-image-2 密钥。
+# ---- 出图通道（图片 AI 编辑 + 文生图，app/publish/images.py）-------------------
+# 两家供应商，协议都是 OpenAI 兼容的 /images/edits 与 /images/generations，切换只换
+# base/model/key。刻意不做「失败自动切另一家」：那会把 key 配错、模型名写错这类确定性
+# 错误伪装成偶发抖动，真因埋进两家的重试日志里。要换家就改这里。
+#   zzlye  api.zzlye.xyz   gpt-image-2.5-flare  ← 默认
+#   packy  cf.api.fan      gpt-image-2.5-flare  ← 旧通道，走 Clash 代理，节点挂了
+#                                                 整批出图全灭（rc=35）
+image_provider = "zzlye"
+# 选填：覆盖上面通道的默认域名/模型（中转换域名、或想试同家别的模型时用，不必改代码）。
+# 2026-09-20 同源图实测（清晰度越大越锐利，只在 compress 后的 q80 JPEG 成品间可比；
+# 单价取自 zzlye 的 /api/pricing，按次固定计费）：
+#   zzlye gpt-image-2.5-flare       $0.03  清晰度 17.1  1.57MP 要放大 1.66x  ← 默认
+#   zzlye gpt-image-2               $0.03  清晰度  6.4  同价画质垫底，别用
+#   zzlye gpt-image-2.5-flare-4k    $0.12  清晰度 23.6  原生 4.39MP 免放大
+#   zzlye gpt-image-2.5-flare-满血  $0.25  清晰度 17.4  贵 8 倍几乎无提升
+#   packy gpt-image-2.5-flare         --   清晰度 15.3  按尺寸计费，见下方封顶
+# 成本优先故默认取 $0.03 基础档；要画质临时换 4k 就改这里，不必改代码。
+# zzlye 还有 sunburst 系列与 nano-banana-2 / seedream-5-pro 等，未实测。
+#image_base_url = "https://api.zzlye.xyz/v1"
+#image_model = "gpt-image-2.5-flare-4k"
+
+# 出图请求的像素上限：超过就等比压下来，缺口由本地 compress 等比放大补回（服装红线
+# 1340x1785 本来就靠它兜）。0 表示不封顶。留空用各通道的实测默认：
+#   zzlye  不封顶 —— 用 billing/usage 实测【按次固定计费】，1024² 与 2048² 增量都是 3，
+#          压尺寸一分钱不省，只会让 compress 放大倍数更高、织标小字更糊
+#   packy  封 1050000（~1MP）—— 实测【按尺寸计费】，1024² 增量 2.94、2048² 增量 10.42。
+#          实测同一张源图未封顶 6.62、封顶后 2.19，省约 3 倍，compress 放大 2.07x 仍过闸门
+# 【别指望线性省】Packy 计费波动很大：同一请求（768x1024）连发两次增量 5.452 与 2.010，
+# 差 2.7 倍，它后端随机分流到多个计价不同的上游。封顶能稳定避开大档，但小尺寸区间的
+# 波动盖过尺寸差异。
+#image_max_pixels = 1050000
+
+# zzlye 出图密钥（image_provider = "zzlye" 时读这个）
+zzlye_api_key = ""
+# Packy 出图密钥（image_provider = "packy" 时读这个）。
 # 【与 [llm.publish].api_key 是两个不同分组的 key，不能混用】2026-08-20 实测：
 # 生图 key 所在分组只有 gpt-image-2，[llm.publish] 那个分组只有 grok-4.5/4.6。
 # 拿 grok 的 key 调 gpt-image-2 会得 503「分组下模型无可用渠道」，反之同理。
 # 与 [collect_image].api_key 通常可填同一个（都是 gpt-image-2）。
-# 留空则纯本地几何合规化仍可用（fit34 / square / compress 不需要密钥），
+# 当前通道的 key 留空则纯本地几何合规化仍可用（fit34 / square / compress 不需要密钥），
 # 只有 AI 编辑会报错提示来配。
 packy_api_key = ""
 # 店小秘账号级常量：图片直传图床时回调要带的 fullCid。抓包 /api/cos/cosDxmCallBack.json

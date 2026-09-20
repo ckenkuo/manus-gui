@@ -9,13 +9,16 @@
   - 素材图/SKC 图通用：不小于 1340×1785（2026-08-18 实测拦截）
   - SKC 颜色图宽高比必须 3:4，素材图仍 1:1（2026-08-19 实测提示「服装类图片宽高比例需要3:4」）
 
-【AI 编辑】edit_image / generate_image —— 走 Packy gpt-image-2，用于中文图英化、
+【AI 编辑】edit_image / generate_image —— 走 OpenAI 兼容的出图中转（默认 zzlye 的
+gpt-image-2.5-flare，可切回 Packy 的 gpt-image-2，见 PROVIDERS），用于中文图英化、
 去水印。原脚本把 API key 硬编码进源码兜底，这里改成读 [publish] 配置段（见
-resolve_packy_key），没配就直接报错让用户去配，不留内置密钥。
+resolve_image_key），没配就直接报错让用户去配，不留内置密钥。
 
 必须保留 curl.exe 子进程的理由（别顺手改成 httpx/requests）：Packy 的 Cloudflare
 按 TLS 指纹拦截 urllib/requests，返回 403 error 1010（2026-08-14 实测）。这不是加请求头
 能绕的，只有系统 curl 的指纹能过。同理不要加文档示例里的 Host 头，加了反而 403。
+换通道也继续走 curl：指纹策略对不拦截的中转无害，而两条路径共用一份重试/超时逻辑，
+比按通道分叉少一半出错面。
 
 /images/edits 的请求形状是实测锁死的（2026-08-26），改前先读 _edits_post_with_retry
 上方那段注释：只能 multipart 传 image 文件，不能传 input_fidelity，报错里让你改用
@@ -86,9 +89,62 @@ def check_desc_size(w, h, size_bytes=None) -> dict:
     return {"ok": not reasons, "reasons": reasons}
 
 
-# ---- AI 编辑（Packy gpt-image-2）------------------------------------------
-API_BASE = "https://cf.api.fan/v1"
-MODEL = "gpt-image-2"
+# ---- AI 编辑（出图供应商，默认 zzlye gpt-image-2.5-flare）------------------
+# 【为什么要两家供应商、而不是只留一家】原先只有 Packy（cf.api.fan）一条链路，它挂在
+# Clash 代理后面、节点一挂整批出图就全灭（见 [[image-api-needs-proxy]]），且后端随机
+# 分流到不接 multipart 的坏渠道（见下方 _BAD_CHANNEL_CODE）。2026-09-20 起接入 zzlye
+# 中转的 gpt-image-2.5-flare 作为默认通道，Packy 留着可随时切回——两家协议形状一致
+# （都是 OpenAI 兼容的 /images/edits 与 /images/generations），故只需换 base/model/key，
+# 上面那套坏渠道重试、审核拒绝判定、curl 指纹策略全部原样复用。
+#
+# 【为什么不做「失败自动切另一家」】项目默认不写 fallback：自动切家会把「key 配错」
+# 「模型名写错」这类确定性错误伪装成偶发抖动，真因埋在两家的重试日志里，排查成本远高于
+# 直接报错让人改配置。要换家就改 config.toml 的 [publish].image_provider。
+# 【模型为什么定基础档 flare：计价是「按次固定价」，压尺寸省不了钱，只能靠选档省】
+# 2026-09-20 从 zzlye 的 /api/pricing 读到 quota_type=1（按次计费）、model_price 是
+# 每次调用的固定美元价，与请求尺寸【无关】。所以「请求小尺寸来省钱」这条路不存在——
+# 压尺寸只会白降画质、一分钱不省。真正的成本杠杆只有选哪个档：
+#   gpt-image-2.5-flare       $0.03  清晰度 17.1  ← 取它（性价比 570）
+#   gpt-image-2               $0.03  清晰度  6.4  同价但画质垫底，没理由用
+#   gpt-image-2.5-flare-4k    $0.12  清晰度 23.6  贵 4 倍只换 +38%（性价比 197）
+#   gpt-image-2.5-flare-满血  $0.25  清晰度 17.4  贵 8 倍几乎无提升（性价比 70）
+# 用户 2026-09-20 明确成本优先，故默认取 $0.03 的基础档。要画质临时换档改 image_model
+# 即可，不必改代码。
+#
+# 【基础档有 ~157 万像素预算，达标靠本地等比放大补】基础档无论请求什么尺寸，都只按
+# 请求的比例输出、边长压到 157 万像素内（请求 2448x1792 得 1465x1074）。而服装红线
+# 1340x1785 要 239 万像素，缺口由收尾 compress 的 _fit_min_size 等比放大补足
+# （实测放大 1.66x），这条链路本来就有、不必新增代码。代价是织标/小字会比 4k 档糊一档
+# （清晰度 17.1 vs 23.6），这是换 4 倍成本差的自觉取舍。
+#
+# 【为什么 Packy 那家也取 flare】它没有 4k/满血变体，flare 是它上面画质最好的档
+# （清晰度 15.3，原生出 4.39MP 免放大），而原先的 gpt-image-2 只有 6.4。
+# 【max_pixels：只给按尺寸计费的通道封顶，按次计费的不封】2026-09-20 用 billing/usage
+# 端点逐次实测每调用的用量增量：
+#   zzlye  1024x1024 -> 3      2048x2048 -> 3        按次固定，压尺寸一分钱不省
+#   packy  1024x1024 -> 2.94   2048x2048 -> 10.42    按尺寸，大档贵 3.5 倍
+# 故 Packy 封到 ~1MP（够 compress 等比放大补到服装红线），zzlye 不封（封了只会让
+# compress 的放大倍数更高、织标小字更糊，却省不到钱）。None = 不封顶。
+#
+# 【Packy 的计费波动很大，别把封顶当成精确省钱】同一请求（768x1024）连发两次增量是
+# 5.452 与 2.010，差 2.7 倍——这家后端随机分流到多个上游（同 _BAD_CHANNEL_CODE 那段
+# 实测的分流机制），不同上游计价不同。封顶能稳定避开 2048² 那档的 10.42，但小尺寸区间
+# 的波动盖过尺寸差异，别指望线性省。
+PROVIDERS = {
+    # 默认通道：zzlye 中转。按次计费，不封尺寸
+    "zzlye": {"base": "https://api.zzlye.xyz/v1", "model": "gpt-image-2.5-flare",
+              "key_field": "zzlye_api_key", "max_pixels": None},
+    # 旧通道：Packy。同样挂着 2.5-flare（无 4k/满血变体），key 沿用既有
+    # [publish].packy_api_key，不用改配置就能切回。按尺寸计费，封 ~1MP
+    "packy": {"base": "https://cf.api.fan/v1", "model": "gpt-image-2.5-flare",
+              "key_field": "packy_api_key", "max_pixels": 1_050_000},
+}
+DEFAULT_PROVIDER = "zzlye"
+
+# 兼容旧引用：模块级常量保留，值取默认通道。函数内部一律走 _provider() 取实时值，
+# 这两个只给「想知道默认通道是什么」的地方读（如日志、测试）。
+API_BASE = PROVIDERS[DEFAULT_PROVIDER]["base"]
+MODEL = PROVIDERS[DEFAULT_PROVIDER]["model"]
 
 # 【必须显式点出中文标点】只说「中文文字」时模型会把汉字译干净、却把中日韩标点原样留下
 # （2026-08-26 实测：一张图译成了 `『Dino Back Strap Overalls and Top Set』`，
@@ -156,20 +212,11 @@ SIZE_MIN_PIXELS = 655360
 SIZE_MAX_PIXELS = 8294400
 
 
-def resolve_packy_key() -> str:
-    """取 Packy 图像编辑 key：只读 config.toml 的 [publish].packy_api_key。
+def _publish_conf() -> dict:
+    """读 config.toml 的 [publish] 段。
 
-    原脚本在源码里内置了一个兜底 key，这里刻意不留：密钥进版本库是安全问题，
-    且那个 key 迟早失效、届时报错信息会指向 API 而不是「你没配密钥」，更难排查。
-
-    【2026-08-20 起不再读环境变量 PACKY_API_KEY】两处维护同一个 key 时，环境变量
-    优先级更高会静默盖掉配置值——看配置文件是新 key、实际生效的是旧 key，排查时
-    完全看不出来。唯一来源就是配置文件。
-
-    注意这个 key 与 [llm.publish].api_key 是【两个不同分组】的 key，不能混用
-    （2026-08-20 实测）：图像编辑走 sora 分组（只有 gpt-image-2），文本与视觉理解
-    走 grok 分组（只有 grok-4.5/4.6）。拿 grok 的 key 调 gpt-image-2 会得到 503
-    「分组 grok-sale 下模型 gpt-image-2 无可用渠道」，反之同理。
+    每次调用都读盘、不做进程级缓存：改配置（换通道、换 key）不必重启，与
+    image_extract._conf 的取向一致；一个几 KB 的 toml 相比一次出图请求可以忽略。
     """
     try:
         import tomllib
@@ -180,16 +227,80 @@ def resolve_packy_key() -> str:
             if not p.exists():
                 continue
             with open(p, "rb") as f:
-                data = tomllib.load(f)
-            key = (data.get("publish") or {}).get("packy_api_key") or ""
-            if key:
-                return key
+                return (tomllib.load(f).get("publish") or {})
     except Exception as e:
-        logger.warning(f"读取 [publish].packy_api_key 失败：{e}")
+        logger.warning(f"读取 [publish] 配置失败：{e}")
+    return {}
+
+
+def _provider() -> dict:
+    """解析当前出图通道，返回 {"name", "base", "model", "key"}。
+
+    通道名取 [publish].image_provider，缺省 DEFAULT_PROVIDER（zzlye）；base/model 可被
+    同段的 image_base_url / image_model 覆盖（中转站换域名、或要试别的模型时不用改代码）。
+
+    【为什么配错通道名要报错、不悄悄退回默认】拼错 "zzly" 时若静默走默认通道，出图照常
+    成功、账单却记在另一家，人完全看不出配置没生效。这是确定性的人为错误，当场报出来
+    最省事——与 resolve_packy_key 不留内置兜底 key 的取向同源。
+    """
+    conf = _publish_conf()
+    # 【优先级：页面 prefs > config.toml > 代码默认】页面上选了通道却不生效会让人完全
+    # 摸不着头脑，故 prefs 的非空值盖住配置文件（同这个函数拒绝静默退回默认通道的理由）。
+    # 延迟 import：preferences 是纯文件读写、不依赖本模块，但顶层互 import 会成环。
+    pref_provider = pref_model = ""
+    try:
+        from app.publish import preferences
+        pref_provider = preferences.get_image_provider()
+        pref_model = preferences.get_image_model()
+    except Exception as e:
+        # best-effort：prefs 读不到就按「没选过」处理，配置文件那条路仍能出图
+        logger.warning(f"读取出图通道偏好失败（按跟随配置文件处理）：{e}")
+    name = (pref_provider or conf.get("image_provider") or DEFAULT_PROVIDER).strip()
+    if name not in PROVIDERS:
+        src = "发布页所选" if pref_provider else "[publish].image_provider"
+        raise RuntimeError(
+            f"{src}的出图通道 {name!r} 未知，可选：{sorted(PROVIDERS)}")
+    spec = PROVIDERS[name]
+    # max_pixels 可被 [publish].image_max_pixels 覆盖（0 或负数表示不封顶）
+    cap = conf.get("image_max_pixels", spec.get("max_pixels"))
+    if cap is not None and int(cap) <= 0:
+        cap = None
+    return {
+        "name": name,
+        "base": (conf.get("image_base_url") or spec["base"]).rstrip("/"),
+        "model": pref_model or conf.get("image_model") or spec["model"],
+        "key": conf.get(spec["key_field"]) or "",
+        "max_pixels": int(cap) if cap is not None else None,
+    }
+
+
+def resolve_image_key() -> str:
+    """取当前通道的出图 key：只读 config.toml 的 [publish] 段对应字段。
+
+    原脚本在源码里内置了一个兜底 key，这里刻意不留：密钥进版本库是安全问题，
+    且那个 key 迟早失效、届时报错信息会指向 API 而不是「你没配密钥」，更难排查。
+
+    【2026-08-20 起不再读环境变量 PACKY_API_KEY】两处维护同一个 key 时，环境变量
+    优先级更高会静默盖掉配置值——看配置文件是新 key、实际生效的是旧 key，排查时
+    完全看不出来。唯一来源就是配置文件。
+
+    注意出图 key 与 [llm.publish].api_key 是【两个不同分组】的 key，不能混用
+    （2026-08-20 在 Packy 上实测）：图像编辑走生图分组（只有 gpt-image 系列），文本与
+    视觉理解走 grok 分组（只有 grok-4.5/4.6）。拿 grok 的 key 调生图模型会得到 503
+    「分组 grok-sale 下模型 gpt-image-2 无可用渠道」，反之同理。
+    """
+    p = _provider()
+    if p["key"]:
+        return p["key"]
     raise RuntimeError(
-        "缺少 Packy 图像编辑 key：在 config/config.toml 的 [publish] 段配 "
-        "packy_api_key（须是能访问 gpt-image-2 的分组，与 [llm.publish].api_key 不同）"
+        f"缺少出图 key：在 config/config.toml 的 [publish] 段配 "
+        f"{PROVIDERS[p['name']]['key_field']}（当前通道 {p['name']}，模型 {p['model']}；"
+        "须是能访问该生图模型的分组，与 [llm.publish].api_key 不同）"
     )
+
+
+# 旧名保留：外部调用点与记忆/文档里都叫 resolve_packy_key，改名会误伤已有引用。
+resolve_packy_key = resolve_image_key
 
 
 # ---- 纯本地几何处理（无网络、无密钥、可离线单测）---------------------------
@@ -578,8 +689,51 @@ def pick_size_for_file(image_path: str, no_downscale: bool = False,
     if gate_aware:
         gs = _gate_size(*wh)
         if gs:
-            return gs
-    return pick_size(*wh, no_downscale=no_downscale)
+            return _cap_size(gs)
+    return _cap_size(pick_size(*wh, no_downscale=no_downscale))
+
+
+def _cap_size(size: str) -> str:
+    """把出图尺寸按当前通道的像素上限等比压下来（不封顶的通道原样返回）。
+
+    【为什么封在这里】pick_size_for_file 是 edit_image 唯一的尺寸来源，在它的出口统一
+    封顶就覆盖了所有调用阶段，不必逐个阶段改。缺口由收尾 compress 的 _fit_min_size
+    等比放大补回（服装红线那条本来就靠它兜，见 compress docstring）。
+
+    【为什么压比例而不是换档位】档位表 ALLOWED_SIZES 只有 8 个固定比例，硬套会改变
+    原图比例、把描述长图压变形（_gate_size 保持原比例正是为此）。等比压缩只动边长、
+    不动比例。
+
+    压完仍要守服务端那四条约束（16 的倍数、比例、长边、像素下限）。【像素下限不能破】
+    SIZE_MIN_PIXELS=655360 是服务端硬约束，压到它以下请求会被打回；故上限低于下限时
+    以下限为准——宁可多花一点，也不能发出必然失败的请求。
+    """
+    prov = _provider()
+    cap = prov.get("max_pixels")
+    if not cap:
+        return size
+    try:
+        w, h = (int(x) for x in size.lower().split("x"))
+    except Exception:
+        return size
+    if w * h <= cap:
+        return size
+    # 目标像素取 cap 与服务端像素下限的较大者，理由见 docstring
+    target = max(cap, SIZE_MIN_PIXELS)
+    sc = (target / (w * h)) ** 0.5
+    cw = max(SIZE_MULTIPLE, int(round(w * sc) // SIZE_MULTIPLE) * SIZE_MULTIPLE)
+    ch = max(SIZE_MULTIPLE, int(round(h * sc) // SIZE_MULTIPLE) * SIZE_MULTIPLE)
+    # 向下取整到 16 的倍数可能跌破像素下限，逐步抬回去（按长边抬，保持比例偏移最小）
+    while cw * ch < SIZE_MIN_PIXELS:
+        if cw >= ch:
+            cw += SIZE_MULTIPLE
+        else:
+            ch += SIZE_MULTIPLE
+    if cw / ch > SIZE_MAX_RATIO or ch / cw > SIZE_MAX_RATIO:
+        return size            # 压完比例越界（极窄长图），原样发出更稳
+    logger.info(f"出图尺寸按 {prov['name']} 的像素上限压缩：{size} -> {cw}x{ch}"
+                f"（{w * h / 1e6:.2f}MP -> {cw * ch / 1e6:.2f}MP）")
+    return f"{cw}x{ch}"
 
 
 # ---- AI 编辑（Packy gpt-image-2，必须走 curl.exe）--------------------------
@@ -671,7 +825,7 @@ def _multipart_post(url: str, fields: dict, files: dict, timeout: int = 280) -> 
     fields 里的长文本/中文（如 prompt）写临时文件用 `-F name=<file` 读入：
     直接拼进命令行会被 Windows 的编码转换弄坏中文（原脚本实测踩过）。
     """
-    args = [url, "-H", f"Authorization: Bearer {resolve_packy_key()}", "-H", "Accept: */*"]
+    args = [url, "-H", f"Authorization: Bearer {resolve_image_key()}", "-H", "Accept: */*"]
     tmps: list = []
     try:
         for name, value in fields.items():
@@ -703,7 +857,7 @@ def _json_post(url: str, payload: dict, timeout: int = 280) -> dict:
         json.dump(payload, tmp, ensure_ascii=False)
         tmp.close()
         return _curl_json(
-            [url, "-H", f"Authorization: Bearer {resolve_packy_key()}",
+            [url, "-H", f"Authorization: Bearer {resolve_image_key()}",
              "-H", "Content-Type: application/json", "-H", "Accept: */*",
              "--data-binary", f"@{tmp.name}"], timeout
         )
@@ -832,7 +986,7 @@ def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = 280,
     last_resp = None
     for attempt in range(1, tries + 1):
         try:
-            resp = _multipart_post(f"{API_BASE}/images/edits", fields,
+            resp = _multipart_post(f"{_provider()['base']}/images/edits", fields,
                                    {"image": image_path}, timeout=timeout)
         except TransientNetError as e:
             if attempt >= tries:
@@ -877,7 +1031,7 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
         raise FileNotFoundError(image_path)
     out_path = out_path or os.path.splitext(image_path)[0] + "-edited.png"
     fields = {
-        "model": MODEL,
+        "model": _provider()["model"],
         "prompt": prompt or DEFAULT_CLEAN_PROMPT,
         # 描述图不过服装闸门：按原图比例挑档即可，不必为「够 1340x1785」而放大出图
         "size": size or pick_size_for_file(image_path, no_downscale=no_downscale,
@@ -902,8 +1056,9 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
 def generate_image(prompt: str, out_path: str, size: str = "1024x1024",
                    quality: str = "low", do_compress: bool = True) -> dict:
     """文生图（描述区营销图增补用）。"""
-    resp = _json_post(f"{API_BASE}/images/generations", {
-        "model": MODEL, "prompt": prompt, "size": size, "quality": quality, "n": 1,
+    prov = _provider()
+    resp = _json_post(f"{prov['base']}/images/generations", {
+        "model": prov["model"], "prompt": prompt, "size": size, "quality": quality, "n": 1,
     })
     saved = _save_result(resp, out_path)
     if do_compress:

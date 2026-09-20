@@ -46,6 +46,53 @@ def _stale_main_comp(row: dict, main_comp: Optional[dict]) -> bool:
     return abs(attributes_composition._comp_percent_total(row) - 100) > 1e-6
 
 
+# 「无里料/无内衬」的选项文本判据：里料开关字段（里料纹理等）选中它时，平台会把
+# 里衬成分、里料克重这些依赖行整行从 DOM 里【删掉】，不是留空。
+_LINING_OFF_KEYS = ("无里料", "无内衬")
+
+
+def _drop_lining_dependents(valid: list, rejected: list) -> None:
+    """本批把里料开关设成「无里料/无内衬」时，剔掉同批里衬/里料依赖行的 change。
+
+    【为什么会同时出现这两类互斥的 change】模型一边按规则 6 把里料纹理纠正成
+    「无里料/无内衬」（源商品没有单独里衬），一边按规则 4「必填项必须填全」给当时页面
+    上还在的里衬成分、里料克重填了值——这两条规则各自都对，冲突只在它们凑到一批里。
+
+    【不剔的后果】写入顺序是下面那句按 label 码点序的 sort，纯属碰运气：里料克重 <
+    里料纹理 < 里衬成分，于是纹理那一步的联动先把里衬成分整行删掉，轮到写它时行已
+    不存在。set_attr 不看 _open_attr_dropdown 的 row-not-found、照样往下点选，
+    _js_own_panel 取不到行返回 null，报 no-visible-dropdown；4 次尝试 + 原值重试 +
+    整组重试全数失败（一次都不会成功，与「下拉渲染慢」那类可救回的失败不同），最后
+    落进 comp_failed 报人工「成分字段写入失败需人工核对：里衬成分」。而表单其实是
+    自洽的——无里衬、压根不需要里衬成分——阶段④两道收尾闸都判绿、商品一路发布成功
+    （2026-09-20 商品 682542618799 实测，那单就只多报了这一条假失败）。
+    靠调排序治不了：写的是必然要消失的行，早写晚写都白写，还要白花一轮下拉开合。
+
+    判据故意窄：只认 value 里带「无里料/无内衬」的那一条 change 作开关，受影响的行
+    限定 label 含「里衬」或「里料」且不是开关自己。剔掉的进 rejected 留痕，不静默丢。
+    """
+    off = next((str(c.get("label") or "") for c in valid
+                if any(k in str(c.get("value") or "") for k in _LINING_OFF_KEYS)), None)
+    if not off:
+        return
+    drop_ids = {id(c) for c in valid
+                if c.get("label") != off
+                and any(k in str(c.get("label") or "")
+                        for k in ("里衬", "里料"))}
+    if not drop_ids:
+        return
+    gone = sorted({str(c.get("label")) for c in valid if id(c) in drop_ids})
+    for c in valid:
+        if id(c) in drop_ids:
+            rejected.append({**c, "rejectReason":
+                             f"「{off}」已设为无里料/无内衬，"
+                             "该行随联动从页面消失，不写"})
+    valid[:] = [c for c in valid if id(c) not in drop_ids]
+    logger.info(f"「{off}」设为无里料/无内衬，"
+                f"同批 {len(gone)} 个里衬/里料依赖行随联动消失，"
+                f"不写入：{'、'.join(gone)}")
+
+
 def _validate_attr_changes(changes: list, attrs: list,
                            main_comp: Optional[dict] = None) -> tuple:
     """对 LLM 的修改清单做二次校验，返回 (valid, rejected)。
@@ -211,6 +258,9 @@ def _validate_attr_changes(changes: list, attrs: list,
                 "label": label,
                 "rejectReason": f"成分合计 {total}%<100% 且 options 无可用填充纤维"})
             valid = [v for v in valid if v["label"] != label]
+
+    # 里料开关关掉时，同批里衬/里料依赖行随联动消失，写它们只会造出假失败
+    _drop_lining_dependents(valid, rejected)
 
     # 同字段多行按 row 升序：先覆盖第 1 行再加新行，否则加行时行号对不上
     valid.sort(key=lambda c: (c["label"], c.get("row") or 1))

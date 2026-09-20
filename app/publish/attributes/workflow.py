@@ -437,6 +437,23 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 商品 908737332112 的 117% 就是这么穿过整个阶段④ 的。判据与两条来路见
     # attributes_form._comp_total_problems。
     result["badCompTotals"] = attributes_form._comp_total_problems(attrs3)
+    # compFailed 按页面现况核对：写入期间被联动删掉（或联动隐藏）的行不算失败。
+    # 【为什么必须在这里核】comp_failed 是在 _apply_attr_changes 里逐项写入时记下的，
+    # 那一刻只知道「这行没写上」，不知道它接下来还在不在表单上。里料纹理改成
+    # 「无里料/无内衬」会把里衬成分整行从 DOM 删掉，排在它之后写入的里衬成分必然失败
+    # （no-visible-dropdown，重试与整组重试也全失败），可表单其实是自洽的——无里衬、
+    # 压根不需要这一行。2026-09-20 商品 682542618799 就只多报了这一条假失败：两道收尾
+    # 闸都判绿、商品一路发布成功，却弹了「成分字段写入失败需人工核对：里衬成分」。
+    # 上游 validation._drop_lining_dependents 已经不写这类互斥行了，这里是第二道：
+    # 判据落在「页面现在还有没有这一行」，对任何联动删行都成立，不绑里衬这一种。
+    if result.get("compFailed"):
+        live = {a["label"] for a in attrs3 if a.get("visible") is not False}
+        kept = [lbl for lbl in result["compFailed"] if lbl in live]
+        vanished = [lbl for lbl in result["compFailed"] if lbl not in live]
+        if vanished:
+            logger.info(f"成分写入失败的 {len(vanished)} 行已随联动从表单消失，"
+                        f"不报人工：{'、'.join(vanished)}")
+        result["compFailed"] = kept
     parked = await attributes_dropdowns._park_ghost_dropdowns(session)
     result["parkedGhosts"] = parked.get("parked", 0)
     return result

@@ -68,3 +68,45 @@ def set_image_concurrency(n) -> int:
         raise ValueError(f"生图并发数需在 1~{IMAGE_CONCURRENCY_MAX} 之间，收到 {n}")
     save_prefs({"imageConcurrency": n})
     return n
+
+
+def get_image_provider() -> str:
+    """出图通道（页面可切）：读用户在发布页选的通道，没选过返回空串表示「跟随配置文件」。
+
+    【为什么 prefs 优先于 config.toml】页面上选了通道却不生效会让人完全摸不着头脑
+    （同 images._provider 拒绝静默退回默认通道的理由）。故这里返回的非空值由
+    images._provider 覆盖配置文件；没选过（空串）才落回 [publish].image_provider。
+
+    返回值不在这里校验合法性：通道清单是 images.PROVIDERS 的事，preferences 不该
+    反向依赖它（会形成 import 环）。非法值由 images._provider 那道闸门报错。
+    """
+    v = load_prefs().get("imageProvider")
+    return str(v).strip() if v else ""
+
+
+def set_image_provider(name) -> str:
+    """设出图通道并落盘，返回实际写入值。传空串/None 表示清除、回到跟随配置文件。
+
+    合法性同样不在这里判（理由见 get_image_provider）：调用方 app.py 已按
+    images.PROVIDERS 校验过，这里只负责存。
+    """
+    name = "" if name is None else str(name).strip()
+    save_prefs({"imageProvider": name})
+    return name
+
+
+def get_image_model() -> str:
+    """出图模型覆盖（页面可切）：空串表示用该通道的默认模型。
+
+    与通道分开存：同一通道下换档（flare / 4k / 满血）是最常用的成本-画质调节，
+    而换通道是少数情况（旧链路兜底）。两者混成一个字段会让「换档要连通道一起选」。
+    """
+    v = load_prefs().get("imageModel")
+    return str(v).strip() if v else ""
+
+
+def set_image_model(name) -> str:
+    """设出图模型覆盖并落盘。传空串/None 表示清除、用通道默认模型。"""
+    name = "" if name is None else str(name).strip()
+    save_prefs({"imageModel": name})
+    return name

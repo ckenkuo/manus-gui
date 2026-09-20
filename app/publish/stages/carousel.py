@@ -227,18 +227,32 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
     # 【先展开候选列表】池子超过约 21 格时页面把后面的折叠掉、格子压根不渲染（真站实测
     # 21 -> 36），不展开就只能看见前 21 张候选——尺码表/产品介绍图若排在后面，永远
     # 补勾不到，而补勾正是本阶段的职责之一。
+    #
+    # 【没有这一区就先退出，别去展开】展开那步按「查看更多」文案全局找按钮，本类目
+    # 没有轮播区时它找的就只能是别处的折叠入口（实测服装类该页 view-more 为 0，点不到
+    # 东西，但这依赖于页面别处恰好没有折叠），且展开本身也无意义。故先判「有没有这一区」。
     st = await carousel_state(session)
+    if st.get("supported") is False:
+        # 【本类目没有产品轮播图区】2026-09-20 实测服装类（682542618799 男童牛仔夹克、
+        # 1011826279690 男童牛仔衬衫）：产品信息栏里只有「产品素材图」1 格，没有轮播图
+        # 那一区——首屏 Vue 短暂渲染过 18 格，类目一确定就把整个表单项移除，0.6s 起
+        # 恒为零且不再回来。这与玩具类（184807703147300533，18 格稳定在）是两种类目形态，
+        # 不是渲染慢，故判 skipped 而不是 fail：页面上没有这一区，本阶段无事可做，
+        # 也不存在「发布被拒轮播图尺寸」的风险（取向同 ⑦ 的「本类目无 SKC 颜色图位」）。
+        await emit({"type": "log", "stage": "carousel",
+                    "message": "本类目没有产品轮播图区（只有产品素材图），跳过"})
+        return {"status": "skipped", "note": "本类目无产品轮播图区"}
+    if st.get("supported") is None:
+        # 证据不足（产品信息栏都没渲染完/页面改版）：不当成「不支持」静默跳过，如实报
+        # 出来。静默跳过的下场就是首跑那单——发布时才被拒，回头还得从日志里反推。
+        return {"status": "fail",
+                "note": f"读不到产品轮播图区（{st.get('err') or '零个图格'}），"
+                        "无法核对尺寸"}
     ex = await expand_carousel_pool(session)
     if ex.get("expanded"):
         await emit({"type": "log", "stage": "carousel",
                     "message": "候选列表有折叠，已展开，按全部候选判定"})
         st = await carousel_state(session)
-    if st.get("supported") is None:
-        # 证据不足（区块没渲染完/页面改版）：不当成「不支持」静默跳过，如实报出来。
-        # 静默跳过的下场就是这次那单——发布时才被拒，回头还得从日志里反推。
-        return {"status": "fail",
-                "note": f"读不到产品轮播图区（{st.get('err') or '零个图格'}），"
-                        "无法核对尺寸"}
 
     items = st.get("items") or []
     picked = [it for it in items if it.get("checked")]

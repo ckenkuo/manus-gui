@@ -282,6 +282,35 @@
               >确定性管道</label
             >
           </div>
+          <!-- 白底提取：每商品一次生图（采集的主要变动成本），只影响以图搜的 recall。
+               故做成可一键关掉 + 可换档位，不必去改 config.toml。域名与密钥仍只在配置
+               文件里改（那是环境凭证，不该从页面写）。 -->
+          <div class="form-check form-switch ms-1">
+            <input class="form-check-input" type="checkbox" id="switchWhiteBg" />
+            <label
+              class="form-check-label small"
+              for="switchWhiteBg"
+              title="关：直接拿 Temu 原图去 1688 搜（营销拼图 recall 差）。开：先用生图模型重绘成白底单品图当查询图，每商品多一次生图费用。判同款一律用原图，与本开关无关"
+              >白底提取</label
+            >
+          </div>
+          <div class="input-group input-group-sm" style="width: 230px">
+            <span class="input-group-text">出图模型</span>
+            <input
+              id="inputWhiteBgModel"
+              class="form-control"
+              list="whiteBgModelList"
+              placeholder="跟随配置"
+              title="留空用 config.toml 的 [collect_image].model。白底图只当搜索查询图，尺寸/清晰度要求远低于发布管线，选便宜档即可"
+            />
+            <datalist id="whiteBgModelList">
+              <option value="gpt-image-2.5-flare"></option>
+              <option value="gpt-image-2.5-flare-4k"></option>
+              <option value="gpt-image-2.5-sunburst"></option>
+              <option value="gpt-image-2"></option>
+            </datalist>
+          </div>
+          <span id="whiteBgHint" class="text-muted small"></span>
           <button id="btnStart" class="btn btn-primary btn-sm">
             <span
               id="startSpinner"
@@ -809,6 +838,47 @@
       $("switchAuto1688").addEventListener("change", (e) => {
         $("pipelineWrap").classList.toggle("d-none", !e.target.checked);
       });
+
+      // 白底提取设置：值存后端 prefs（不是 localStorage）——CLI 跑批（batch_collect.py）
+      // 要读同一个值，存浏览器里 CLI 就看不到。改完立即保存，长期生效。
+      async function loadWhiteBg() {
+        try {
+          const r = await fetch("/collect/image_settings");
+          const d = await r.json();
+          $("switchWhiteBg").checked = !!d.enabled;
+          $("inputWhiteBgModel").value = d.model || "";
+          $("inputWhiteBgModel").placeholder = `跟随配置（${d.modelActive || ""}）`;
+          $("whiteBgHint").textContent = !d.hasKey
+            ? "未配密钥，白底提取将跳过（退回原图搜索）"
+            : d.enabled
+              ? `生效：${d.modelActive}`
+              : "已关闭，直接用原图搜索";
+        } catch (e) {
+          $("whiteBgHint").textContent = "（设置读取失败）";
+        }
+      }
+      async function saveWhiteBg() {
+        try {
+          const r = await fetch("/collect/image_settings", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              enabled: $("switchWhiteBg").checked,
+              model: $("inputWhiteBgModel").value.trim(),
+            }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          showToast("白底提取设置已保存",
+                    d.enabled ? `模型 ${d.modelActive}` : "已关闭", "success");
+        } catch (e) {
+          showToast("保存失败", String(e), "danger");
+        }
+        loadWhiteBg(); // 一律以后端状态重绘（同发布页那两个控件的闭环）
+      }
+      $("switchWhiteBg").addEventListener("change", saveWhiteBg);
+      $("inputWhiteBgModel").addEventListener("change", saveWhiteBg);
+      loadWhiteBg();
 
       $("btnStart").addEventListener("click", startBatch);
       $("btnRefresh").addEventListener("click", refreshWorklist);

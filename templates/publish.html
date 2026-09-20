@@ -868,10 +868,51 @@
                     title="⑤b 图片清理与 ⑬ 描述图英化的并发出图数，默认 30。链路好时调高能把生图墙压到接近单张耗时；网络拥堵时反而会互相挤占带宽集体超时，此时调小。改完立即保存，长期生效"
                   />
                 </div>
-                <div class="col-12 col-md-9">
+                <!-- 出图通道与模型：与并发数同一行（都是出图的运行期旋钮）。
+                     通道少、模型多，故通道用 select、模型用带 datalist 的输入框——
+                     中转站随时上新模型（zzlye 现有 15 个），写死下拉会让新模型没法试。 -->
+                <div class="col-6 col-md-3">
+                  <label
+                    class="form-label small text-muted mb-1"
+                    for="selImgProvider"
+                    >出图通道</label
+                  >
+                  <select
+                    id="selImgProvider"
+                    class="form-select form-select-sm"
+                    title="⑤b 图片清理、⑬ 描述图英化与文生图走哪家中转。留空=跟随 config.toml。改完立即保存，长期生效"
+                  ></select>
+                </div>
+                <div class="col-6 col-md-3">
+                  <label
+                    class="form-label small text-muted mb-1"
+                    for="inputImgModel"
+                    >出图模型</label
+                  >
+                  <input
+                    id="inputImgModel"
+                    class="form-control form-control-sm"
+                    list="imgModelList"
+                    placeholder="跟随通道默认"
+                    title="留空用该通道的默认模型。zzlye 实测：flare $0.03（清晰度17.1）、flare-4k $0.12（23.6）、flare-满血 $0.25（17.4）。按次固定计费，成本差只看选哪档"
+                  />
+                  <datalist id="imgModelList">
+                    <option value="gpt-image-2.5-flare"></option>
+                    <option value="gpt-image-2.5-flare-4k"></option>
+                    <option value="gpt-image-2.5-flare-满血"></option>
+                    <option value="gpt-image-2.5-sunburst"></option>
+                    <option value="gpt-image-2.5-sunburst-4k"></option>
+                    <option value="gpt-image-2"></option>
+                    <option value="gpt-image-2-4k"></option>
+                  </datalist>
+                </div>
+                <div class="col-12 col-md-3">
                   <div class="small text-muted">
-                    默认 30。出网链路（VPN）不稳时调小，稳定时可调高；上限 64。
+                    并发默认 30，链路不稳时调小；上限 64。
                     <span id="imgConcHint" class="ms-1"></span>
+                  </div>
+                  <div class="small text-muted mt-1">
+                    <span id="imgProviderHint"></span>
                   </div>
                 </div>
               </div>
@@ -1286,10 +1327,63 @@
             d.imageConcurrency === d.imageConcurrencyDefault
               ? "（当前为默认值）"
               : `（已自定义，默认 ${d.imageConcurrencyDefault}）`;
+          renderImgProvider(d);
         } catch (e) {
           $("imgConcHint").textContent = "（读取失败，将按默认 30 运行）";
         }
       }
+
+      // 出图通道下拉：第一项是「跟随配置文件」（value 空串），未配 key 的通道禁选——
+      // 切过去只会让整批出图全线失败，而报错指向 API 而不是「你没配 key」。
+      function renderImgProvider(d) {
+        const sel = $("selImgProvider");
+        sel.innerHTML = "";
+        const opt0 = document.createElement("option");
+        opt0.value = "";
+        opt0.textContent = `跟随配置文件（${d.imageProviderActive || "?"}）`;
+        sel.appendChild(opt0);
+        (d.imageProviders || []).forEach((p) => {
+          const o = document.createElement("option");
+          o.value = p.id;
+          o.textContent = p.available ? p.id : `${p.id}（未配密钥）`;
+          o.disabled = !p.available;
+          sel.appendChild(o);
+        });
+        sel.value = d.imageProvider || "";
+        $("inputImgModel").value = d.imageModel || "";
+        $("inputImgModel").placeholder = `跟随通道默认（${d.imageModelActive || ""}）`;
+        // 生效值单独提示：通道/模型任一项留空时，光看控件看不出实际在用什么
+        const cap = (d.imageProviders || []).find(
+          (p) => p.id === d.imageProviderActive
+        );
+        $("imgProviderHint").textContent =
+          `实际生效：${d.imageProviderActive} / ${d.imageModelActive}` +
+          (cap && cap.maxPixels ? `（按尺寸计费，出图封顶 ${(cap.maxPixels / 1e6).toFixed(2)}MP）` : "");
+      }
+
+      // 通道与模型一起提交：模型是「该通道下的档位」，分两次 POST 会在中间态出现
+      // 「新通道 + 旧通道的模型名」这种必然 503 的组合。
+      async function saveImgProvider() {
+        try {
+          const r = await fetch("/publish/settings/image_provider", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              provider: $("selImgProvider").value,
+              model: $("inputImgModel").value.trim(),
+            }),
+          });
+          const d = await r.json();
+          if (!r.ok) throw new Error(d.detail || r.status);
+          showToast("出图通道已保存",
+                    `${d.imageProviderActive} / ${d.imageModelActive}`, "success");
+        } catch (e) {
+          showToast("保存失败", String(e), "danger");
+        }
+        loadImgConc(); // 同闭环：一律以后端状态重绘
+      }
+      $("selImgProvider").addEventListener("change", saveImgProvider);
+      $("inputImgModel").addEventListener("change", saveImgProvider);
       $("inputImgConc").addEventListener("change", async () => {
         const n = parseInt($("inputImgConc").value, 10);
         if (!n) {

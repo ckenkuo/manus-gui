@@ -44,33 +44,46 @@ CAROUSEL_MIN_SIDE = 800
 # 在页面上认出「产品轮播图」那个 .img-list（三段 JS 共用，仿 variant_dom._JS_DIM_COLS
 # 的注入做法）。
 #
-# 【为什么不按「产品轮播图」标签文字定位】2026-09-13 真站实测（编辑页
-# id=184807703147300533）：页面上含「产品轮播图」四个字的元素有 33 个，而其中最深的
-# 那些【全是素材图区的说明文字】——素材图区原文就写着「素材图将自动获取产品轮播图/
-# 颜色图的第一张图片」。没有任何一个节点的 textContent 恰好等于「产品轮播图」，
-# 故按标签文字找叶子节点恒空（阶段⑤c 首跑就是这么报「读不到产品轮播图区」的）；
-# 而放宽成 includes 又会命中素材图那一区，等于把两区搞混。
+# 【判据取「表单项标签恰好是『产品轮播图』」】同一页有 2 个 .img-list（轮播图区、
+# 素材图区），要认对必须有个与两区都不共享的锚点。
 #
-# 【判据取「格子里有没有 checkbox」】同一页有 2 个 .img-list：轮播图区 18 格、
-# 每格都有 input.ant-checkbox-input（多选语义）；素材图区 1 格、没有 checkbox
-# （整个商品一张，不需要选）。这是两区唯一稳定的结构差异，且与 hash 类名无关。
-# 多个候选时取格子最多的那个：轮播图候选池通常十几张，不会比别处少。
+# 2026-09-13 曾记「没有任何节点的 textContent 恰好等于『产品轮播图』，故按标签文字定位
+# 恒空」——那条结论的范围搞错了：页面上含这四个字的元素确有 33 个（最深的那些全是素材图
+# 区的说明文字，原文「素材图将自动获取产品轮播图/颜色图的第一张图片」），但把选择范围
+# 限定在 .ant-form-item-label 上就唯一了。2026-09-20 实测三种形态下
+# `txt(label) === '产品轮播图'` 都恰好命中那一栏的标签，素材图区的说明文字不带这个类。
+#
+# 【为什么不再按「格子里有没有 checkbox」认】那是原先的判据，它在已上架商品上失效：
+#   184807703152448649（草稿，玩具）   15 格、15 个 checkbox、已选 5 张
+#   184807703147300533（已上架，玩具） 5 格、【0 个 checkbox】、格子带 checked-in-box 类
+#   682542618799 等（服装）            稳态没有这一区
+# 已上架商品不允许改选用图，页面就不渲染 checkbox，于是认区判据落空、报 no-carousel-list。
+# 2026-09-20 回归时正是被这单挡下来的（它本该判 supported=True）。
+#
+# 【原先那条回退分支为什么也不能留】它在主判据落空时改筛「有 .img-size 且有 img」的列表，
+# 而素材图区恰好满足、且它就 1 格，于是 items 非空、supported 误判成 True：
+# 2026-09-20 批（682542618799、1011826279690）两单就栽在这里——该格没有 checkbox 故
+# checked 恒 false、picked 空、adds 空、target 空，最后报出一句方向完全错的
+# 「轮播图区没有可选用的图片，需人工补图」，而真因是服装类压根没有这一区。
+# 两单下载到的唯一候选 pool-00.jpg 与 main-01.jpg 的 md5 逐字节相同，可反证认错了区。
+# 改按标签认区后，这两种情形各自落到正确的结论上，不需要任何回退。
 _JS_PICK_CAROUSEL_LIST = r"""
   function pickCarouselList() {
-    const lists = Array.from(document.querySelectorAll('.img-list'));
-    let cands = lists.filter(L => {
-      const items = Array.from(L.querySelectorAll('.single-image'));
-      if (!items.length) return false;
-      return items.some(el => !!el.querySelector('input.ant-checkbox-input'));
-    });
-    if (!cands.length) {
-      cands = lists.filter(L => Array.from(L.querySelectorAll('.single-image')).some(el =>
-        !!el.querySelector('.img-size') && !!el.querySelector('img')));
+    const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
+    const label = Array.from(document.querySelectorAll('.ant-form-item-label'))
+      .find(el => txt(el) === '产品轮播图');
+    if (!label) return null;
+    // 从标签向上找到这一栏的表单项容器，再在【本栏内】取 .img-list，
+    // 免得越界拿到素材图区那一个（同 _JS_CAROUSEL_BTN_POS 的上溯做法）。
+    let sec = label;
+    for (let k = 0; k < 8 && sec; k++) {
+      const p = sec.parentElement;
+      if (!p) break;
+      sec = p;
+      const found = sec.querySelector('.img-list');
+      if (found) return found;
     }
-    if (!cands.length) return null;
-    cands.sort((a, b) => b.querySelectorAll('.single-image').length
-                       - a.querySelectorAll('.single-image').length);
-    return cands[0];
+    return null;
   }
 """
 
@@ -138,8 +151,15 @@ async def expand_carousel_pool(session: BrowserSession) -> dict:
 _JS_CAROUSEL_STATE = r"""(() => {
   const txt = el => ((el || {}).textContent || '').replace(/\s+/g, ' ').trim();
   __PICK__
+  // 【两个标签位与图格在同一次快照里返回】轮播项被移除的瞬间若夹在两次 eval 之间，
+  // 「有没有这一区」与「区里几格」就会自相矛盾（见 carousel_state 里那段竞态取证）。
+  // hasCarouselLabel 判本类目有没有这一区，hasMaterialLabel 判产品信息栏渲染到位没有。
+  const labels = Array.from(document.querySelectorAll('.ant-form-item-label'))
+    .map(el => txt(el));
+  const flags = {hasCarouselLabel: labels.some(t => t === '产品轮播图'),
+                 hasMaterialLabel: labels.some(t => t === '产品素材图')};
   const list = pickCarouselList();
-  if (!list) return JSON.stringify({err: 'no-carousel-list'});
+  if (!list) return JSON.stringify({err: 'no-carousel-list', ...flags});
   const MIN = __MIN__;
   const items = [];
   Array.from(list.querySelectorAll('.single-image')).forEach((el, i) => {
@@ -161,47 +181,177 @@ _JS_CAROUSEL_STATE = r"""(() => {
   return JSON.stringify({items: items,
                          picked: items.filter(it => it.checked).length,
                          total: items.length,
-                         badPicked: items.filter(it => it.bad).length});
+                         badPicked: items.filter(it => it.bad).length,
+                         ...flags});
 })()"""
+
+
+# 在页面上装一个 MutationObserver，记下「DOM 最后一次变动距今多久」。
+#
+# 【为什么监听整个 body 而不是只监听那一栏】要等的恰恰是「那一栏被整项移除」这件事，
+# 移除发生在它的祖先上；只观察该栏自身，节点一被摘走就再也收不到通知。而 body 级监听
+# 会不会被页面别处的动静（客服组件、余额刷新、图片懒加载）搅得永不静止，是实测过的：
+# 2026-09-20 三个编辑页各连读十几秒，变动次数在开头几百毫秒内就跑完并冻住
+# （草稿服装 225 次、草稿玩具 90 次、已上架玩具 0 次），此后 quiet 单调涨到 13s+，
+# 没有任何后台组件在持续扰动。故 body 级监听是安全的，也是唯一能覆盖整项移除的范围。
+_JS_INSTALL_DOM_WATCH = r"""(() => {
+  // 重复装载要先断开旧的：同一页面会被多个阶段反复读，累积 observer 纯属浪费。
+  if (window.__dxmCarouselWatch && window.__dxmCarouselWatch.obs) {
+    window.__dxmCarouselWatch.obs.disconnect();
+  }
+  const st = {last: performance.now(), count: 0};
+  const obs = new MutationObserver(list => {
+    st.last = performance.now();
+    st.count += list.length;
+  });
+  obs.observe(document.body, {childList: true, subtree: true});
+  st.obs = obs;
+  window.__dxmCarouselWatch = st;
+  return JSON.stringify({ok: true});
+})()"""
+
+# 读「距最后一次 DOM 变动过了多少毫秒」。装载失败/被页面导航清掉时返回 -1，
+# 由调用方当作「无从判断静止」处理。
+_JS_READ_DOM_QUIET = r"""(() => {
+  const st = window.__dxmCarouselWatch;
+  return JSON.stringify({quietMs: st ? Math.round(performance.now() - st.last) : -1,
+                         muts: st ? st.count : -1});
+})()"""
+
+# DOM 静止多久算「一拍渲染结束」。
+#
+# 【这个数不足以单独定论，页面会有假静止】2026-09-20 实测 184807703152448759：
+#   0.00s  muts=0    carousel=True  cells=22
+#   0.22~0.33s       quiet 涨到 275ms、变动停在 11 次   <= 假静止，此时轮播项还在
+#   0.44s  muts=13   变动重启
+#   0.70s  muts=237  carousel=False cells=1             <= 整项移除完成
+# 275ms 的假静止与这里的 300ms 只差一点，管线里就真的误收过（读到 21 格判 True，
+# 阶段展开候选后重读已消失，落回「没有可选用的图片」那句误报）。
+# 把阈值往大调只是把赌注换个数字，故改为「静止 + 读数连续两轮一致」两条并用：
+# 假静止期间读数恒 True、移除后恒 False，两者不会同时满足（见 _read_until_settled）。
+_DOM_QUIET_MS = 300
+
+
+async def _read_until_settled(session: BrowserSession, js: str,
+                              timeout: float = 20.0) -> dict:
+    """读轮播图区快照，等页面按类目重建完产品信息栏（DOM 不再变动）后再交出结果。
+
+    【为什么不能收敛在某个标志出现上】页面挂载分两拍，而两拍都自称「渲染好了」：
+    2026-09-20 实测服装类编辑页（184807703152448761），按 0.12s 一次连读——
+      0.00~0.40s  hasCarouselLabel=True、hasMaterialLabel=True、18 格、已选 5 张
+      0.59s 起    hasCarouselLabel=False、no-carousel-list，此后 20s 恒定不变
+    即 Vue 先按通用模板把「产品轮播图」整项连图格一起渲染出来，再按类目把整项移除
+    （触发源是 popTemuCategory/attributeList.json 返回，CDP 时间轴对齐所得：0.35s
+    响应、0.56s 移除）。第一拍里【任何单点标志都已经是 True】：素材图标签在、轮播
+    标签也在、图格也有，故先后试过的三种收敛条件（图格出现 / 素材图标签出现 / 轮播
+    标签出现）全都在首次探测就通过，拿到的都是这个瞬态。据它跑下去的代价是实打实的：
+    15:21 那次照着抢到的 18 格跑完 74s 备料上传，回头复核时该区已消失，卡在
+    「选图前读不到轮播图区」。
+
+    【为什么判据是「DOM 静止」而不是任何时长】这里先后试过两版都不成立：
+      ① 「读数连续 0.6s 不变」——0.6s 是照本机翻转时刻取的余量，网慢时第二拍来得更晚，
+         0.6s 会在翻转前先收敛，退化成抢瞬态；
+      ② 「等 attributeList.json 响应 + 再稳 0.45s」——接口锚点本身可靠，但那 0.45s 仍是
+         估值（实测响应到重建约 0.2s），极端卡顿下不够，且页面已加载过时压根等不到响应。
+    改成等 MutationObserver 静止后，不再有任何预设时长跟网速挂钩：网慢只是让变动来得晚，
+    而每次变动都把 quiet 计时归零，判定自动跟着推后。_DOM_QUIET_MS 衡量的是页面内两次
+    渲染之间的间隔，与网速无关（取证见该常量上方）。
+
+    【静止一条还不够，要叠加「读数连续两轮一致」】页面存在假静止：184807703152448759
+    在 0.22~0.33s 有一段 275ms 的变动空档（轮播项还在），与 _DOM_QUIET_MS 只差一点，
+    管线里就真误收过。而假静止期间读数恒 True、移除完成后恒 False，故要求「本轮静止
+    且本轮读数与上一轮相同」——两条同时满足才是真稳态，不必再去猜一个更大的阈值。
+
+    【读数与静止在同一轮里取】两者分开读会重新引入竞态：静止确认与快照之间若又发生一次
+    重建，交出的就是重建前的读数。故每轮先读 quiet、再读快照，只在这一轮确认静止时返回
+    当轮快照。
+
+    【等不到静止不抛】按 best-effort 交出最后一次读数，由调用方按 supported 三态判断
+    （辅助路径坏了不中断主流程，同本项目其它 best-effort 的取向）。
+    """
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    try:
+        await session.eval_json(_JS_INSTALL_DOM_WATCH)
+    except Exception as e:
+        # 装不上就退回单次读取：此时无从判断静止，硬等只是白耗 20s。
+        logger.warning(f"DOM 变动监听装载失败，按单次读取判定轮播图区：{e}")
+        return await session.eval_json(js)
+    st = await session.eval_json(js)
+    while loop.time() < deadline:
+        quiet = await session.eval_json(_JS_READ_DOM_QUIET)
+        prev, st = st, await session.eval_json(js)
+        ms = quiet.get("quietMs")
+        if (isinstance(ms, (int, float)) and ms >= _DOM_QUIET_MS
+                and bool(st.get("hasCarouselLabel")) == bool(prev.get("hasCarouselLabel"))
+                and (st.get("total") or 0) == (prev.get("total") or 0)):
+            return st
+        if ms == -1:
+            # 监听被页面导航清掉了（本函数没导航，但上层可能刚跳过来）：重装一次再等。
+            logger.info("DOM 变动监听已失效，重新装载")
+            await session.eval_json(_JS_INSTALL_DOM_WATCH)
+        await asyncio.sleep(0.12)
+    logger.warning(f"DOM {timeout:.0f}s 内未静止，按最后一次读数判定轮播图区")
+    return st
 
 
 async def carousel_state(session: BrowserSession) -> dict:
     """读产品轮播图区现状。返回 {"items": [...], "picked": N, "supported": bool|None}。
 
-    supported=None：区块没找到或零格时证据不足，别当「不支持」，让真失败暴露
+    supported=False：产品信息栏已渲染完（「产品素材图」标签已出现）却没有轮播图区，
+    即本类目没有这一区（服装类如此），由阶段判 skipped。
+    supported=None：连产品信息栏都没渲染出来，证据不足，别当「不支持」，让真失败暴露
     （同 sku_preview_state 的取向）。
 
     【必须先等图格渲染，不能 open_edit 一回来就读】2026-09-13 实测：open_edit 的
     加载判据是「skuDataInfo 区块出现」，那是页面靠后的变种信息区；而轮播图在靠前的
     产品信息区，图格由 Vue 另行渲染，此刻往往一个都还没挂上。表现为阶段⑤c 在 0.3s
     内返回 no-carousel-list，而人在页面上看得清清楚楚（同一个 carousel_state 手动
-    sleep 3 秒后读就完全正常）。判据取「带 checkbox 的图格出现」，与 pickCarouselList
-    的定位判据同一口径。
+    sleep 3 秒后读就完全正常）。
 
-    【上限 8s 对真站偏紧，2026-09-12~13 夜间批实测后抬到 20s】那批 3 个不同商品
-    （rowid-184807703147300533、1078663432052、908737332112）都在 8s 内没等到图格，
-    如实报了「读不到产品轮播图区」——8s 原是照着 inspect 那两处 2.0s 放宽来的估值，
-    不是量出来的。轮播图这一格与那些表单项不同：十几张缩略图要走 CDN，页面又是
+    【但「等某个标志出现」这类收敛条件一律不成立，会抢到瞬态】页面挂载分两拍，第一拍
+    里每个标志都已经是 True。取证与做法见 _read_until_settled 的 docstring，判据换成
+    「DOM 不再变动」。
+
+    【上限 20s：2026-09-12~13 夜间批实测抬上来的】那批 3 个不同商品
+    （rowid-184807703147300533、1078663432052、908737332112）都在原先的 8s 内没等到
+    图格，如实报了「读不到产品轮播图区」——8s 原是照着 inspect 那两处 2.0s 放宽来的
+    估值，不是量出来的。轮播图这一格与那些表单项不同：十几张缩略图要走 CDN，页面又是
     open_edit 刚回来最忙的时刻，慢起来远超 8s。
-    抬上限只推迟【失败】的判定时刻，不推迟成功：_poll_until 一就绪就返回，页面正常时
-    这里照旧是零点几秒，20s 只有真读不到时才付满——而那种情形下本阶段的结论是
-    「发布必被拒尺寸、要人工换图」，多等十几秒远比误报划算。
+    抬上限只推迟【失败】的判定时刻，不推迟成功：DOM 一静止就返回，页面正常时这里是
+    零点几秒，20s 只有真读不到时才付满——而那种情形下本阶段的结论是「发布必被拒尺寸、
+    要人工换图」，多等十几秒远比误报划算。
     """
-    await common._poll_until(
-        lambda: session.eval_json(r"""(() => {
-            const n = Array.from(document.querySelectorAll('.img-list .single-image'))
-              .filter(el => !!el.querySelector('input.ant-checkbox-input')).length;
-            return JSON.stringify({n: n});
-        })()"""),
-        lambda d: d.get("n", 0) > 0,
-        timeout=20.0)
-    st = await session.eval_json(
-        _JS_CAROUSEL_STATE.replace("__MIN__", J(CAROUSEL_MIN_SIDE))
-                          .replace("__PICK__", _JS_PICK_CAROUSEL_LIST))
-    if st.get("err"):
+    # 【「有没有这一区」与「区里几格」必须在同一次 eval 里读】分两次读就有竞态：轮播项
+    # 被移除的瞬间夹在两次 eval 之间，结论就自相矛盾。15:25 那次收敛读到 cells 0、详读
+    # 却拿到 18 格（照着瞬态又跑了一轮 74s 备料）；15:28 那次收敛时轮播标签还在、详读时
+    # 已消失，于是报 no-carousel-list（该判「本类目没有这一区」）。两次都是同一个竞态的
+    # 两个方向。故把标签判定塞进 _JS_CAROUSEL_STATE 一起返回，一次快照定全部结论。
+    js = (_JS_CAROUSEL_STATE.replace("__MIN__", J(CAROUSEL_MIN_SIDE))
+                            .replace("__PICK__", _JS_PICK_CAROUSEL_LIST))
+    st = await _read_until_settled(session, js)
+    # 【服装类压根没有产品轮播图区，要判「不支持」而不是「读不到」】2026-09-20 批
+    # （682542618799 男童牛仔夹克、1011826279690 男童牛仔衬衫）取证：按 0.15s 一次连读
+    # 20s，0.0~0.2s 读到 [{label:产品轮播图, cells:18, boxes:18}, {label:产品素材图,
+    # cells:1}]，0.4s 起【只剩产品素材图那一项】——轮播图连 .ant-form-item-label 都不在了
+    # （URL 未变、skuDataInfo 仍在、body 反而变长，故不是重载），此后 20s 无恢复。
+    # 玩具类（184807703147300533）那种 18 格稳定在的商品与此并存，故不是版本改版，
+    # 而是两种类目形态：服装类的图位只有素材图 + SKC 颜色图 + SKU 预览图。
+    #
+    # 判据取「产品轮播图标签在不在」——比数图格可靠：该标签在稳态下要么在、要么整项没有，
+    # 不像图格那样会被填充后清空（那几毫秒的残留列表正是上面那个竞态的来源）。
+    if not st.get("hasCarouselLabel"):
+        logger.info(f"本类目没有产品轮播图区（只有产品素材图），"
+                    f"图格 {st.get('total') or 0} 个")
+        return {"supported": False, **st, "items": [], "picked": 0, "total": 0,
+                "err": "no-carousel-section"}
+    # 标签在、却读不到图格：那是真的证据不足（渲染未完/页面改版），如实报失败交人工。
+    # 与上面「没有这一区」分开，取向同 sku_preview_state 的 no-preview-column
+    # 与 skc_image_support。
+    if st.get("err") or not (st.get("items") or []):
         return {"supported": None, **st}
-    if not (st.get("items") or []):
-        return {"supported": None, **st}
+    logger.info(f"轮播图区现状：候选 {st.get('total')} 格、已选用 {st.get('picked')} 张"
+                f"（其中尺寸不合规 {st.get('badPicked')} 张）")
     return {"supported": True, **st}
 
 

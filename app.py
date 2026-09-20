@@ -469,6 +469,40 @@ async def collect_worklist(
     return JSONResponse(content=status)
 
 
+@app.get("/collect/image_settings")
+async def collect_image_settings():
+    """白底提取（图搜查询图预处理）的设置，供采集页初始化控件。
+
+    modelActive 单独回传：model 留空表示跟随 config.toml，光看控件看不出实际在用什么。
+    """
+    from app.collect import image_extract
+    conf = image_extract._conf()
+    return {"enabled": image_extract.get_enabled(),
+            "model": image_extract.get_model(),
+            "modelActive": (image_extract.get_model() or conf.get("model")
+                            or image_extract._DEFAULT_MODEL),
+            "baseUrl": conf.get("base_url") or image_extract._DEFAULT_BASE_URL,
+            "hasKey": bool(image_extract._resolve_api_keys())}
+
+
+@app.post("/collect/image_settings")
+async def collect_image_settings_save(
+    enabled: Optional[bool] = Body(None, embed=True),
+    model: Optional[str] = Body(None, embed=True),
+):
+    """存白底提取的开关与模型。两个参数都可单独传（不传的那项保持原值）。
+
+    模型名不校验合法性（中转站随时上新，写死白名单会让新模型没法试）；域名与密钥仍只
+    在 config.toml 里改——那是环境凭证，不该从页面写。
+    """
+    from app.collect import image_extract
+    if enabled is not None:
+        image_extract.set_enabled(enabled)
+    if model is not None:
+        image_extract.set_model(model)
+    return await collect_image_settings()
+
+
 @app.post("/collect/enumerate")
 async def collect_enumerate(status: str = Body("", embed=True),
                             region: str = Body("", embed=True)):
@@ -880,6 +914,7 @@ from app.publish import llm as publish_llm
 from app.publish import cache as publish_cache
 from app.publish import shops as publish_shops
 from app.publish import alert as publish_alert
+from app.publish import preferences as publish_prefs
 from app.error_report import report
 from app.publish.pipeline import resolve_warehouse
 
@@ -991,10 +1026,68 @@ async def publish_llm_stage_switch(stage: str = Body(..., embed=True),
 
 @app.get("/publish/settings")
 async def publish_settings():
-    """发布管线的运行参数（目前只有生图并发数），供发布页初始化输入框。"""
+    """发布管线的运行参数（生图并发数、出图通道与模型），供发布页初始化控件。
+
+    imageProviders 一起返回而不另开接口：前端渲染通道下拉时要同时知道有哪些通道、
+    每个通道的默认模型和是否配了 key，分两个接口只会让它自己去对齐（同
+    publish_llm_list 把 stages 一起返回的理由）。
+    """
+    from app.publish import images as publish_images
+    provs = []
+    for name, spec in publish_images.PROVIDERS.items():
+        # 有没有配 key 决定这一项能不能选：切到没 key 的通道只会让整批出图全线失败
+        try:
+            conf = publish_images._publish_conf()
+            has_key = bool(conf.get(spec["key_field"]))
+        except Exception:
+            has_key = False
+        provs.append({"id": name, "model": spec["model"],
+                      "keyField": spec["key_field"], "available": has_key,
+                      "maxPixels": spec.get("max_pixels")})
+    cur = publish_images._provider()
     return {"imageConcurrency": publish_service.get_image_concurrency(),
             "imageConcurrencyMax": publish_service.IMAGE_CONCURRENCY_MAX,
-            "imageConcurrencyDefault": publish_service.IMAGE_CONCURRENCY_DEFAULT}
+            "imageConcurrencyDefault": publish_service.IMAGE_CONCURRENCY_DEFAULT,
+            "imageProviders": provs,
+            "imageProvider": publish_prefs.get_image_provider(),
+            "imageModel": publish_prefs.get_image_model(),
+            "imageProviderActive": cur["name"],
+            "imageModelActive": cur["model"]}
+
+
+@app.post("/publish/settings/image_provider")
+async def publish_image_provider_switch(
+    provider: Optional[str] = Body(None, embed=True),
+    model: Optional[str] = Body(None, embed=True),
+):
+    """切换出图通道/模型。两者都传空表示回到跟随 config.toml。
+
+    拒切未配 key 的通道（照 publish_llm_switch 的做法）：切了只会让整批出图全线失败，
+    而失败信息指向 API 而不是「你没配 key」，更难排查。
+
+    模型名【不校验】是否在该通道的清单里：中转站随时会上新模型（zzlye 现有 15 个），
+    写死白名单会让新模型没法试。填错的代价是服务端报「无可用渠道」，够清楚了。
+    """
+    from app.publish import images as publish_images
+    name = (provider or "").strip()
+    if name:
+        if name not in publish_images.PROVIDERS:
+            raise HTTPException(
+                400, f"未知出图通道：{name}，可选 {sorted(publish_images.PROVIDERS)}")
+        spec = publish_images.PROVIDERS[name]
+        try:
+            has_key = bool(publish_images._publish_conf().get(spec["key_field"]))
+        except Exception:
+            has_key = False
+        if not has_key:
+            raise HTTPException(
+                400, f"通道 {name} 未配置密钥：请先在 config/config.toml 的 [publish] 段"
+                     f"填上 {spec['key_field']} 再切换")
+    publish_prefs.set_image_provider(name)
+    publish_prefs.set_image_model((model or "").strip())
+    cur = publish_images._provider()
+    return {"ok": True, "imageProvider": name, "imageModel": (model or "").strip(),
+            "imageProviderActive": cur["name"], "imageModelActive": cur["model"]}
 
 
 @app.post("/publish/settings")
