@@ -5,7 +5,7 @@ import json
 import os
 import shutil
 from app.logger import logger
-from app.publish import images, preferences, state, vision
+from app.publish import claims, images, preferences, state, vision
 from app.publish.browser import BrowserSession
 from app.publish.media.skc import SKC_ROW_MIN_IMAGES
 from app.publish.stages import (
@@ -40,9 +40,17 @@ def _fail_message(r: dict) -> str:
 
     出图失败里再分「出网链路异常」和「接口/本地报错」：前者重发就可能好，后者
     重跑多少次都是同一个错（判据是 images.TransientNetError，见 _CURL_TRANSIENT_RC）。
+
+    内容审核拒绝（kind="blocked"）单列一类：它既不是链路问题也不是产物不合格，
+    重跑无用、换图也无从下手（拒的是这张图本身），处置是「这张图不参与后续选图」，
+    已由本阶段自动做掉，故文案讲清「已自动排除、不用处理」。判据是
+    images.ModerationBlocked，见那边的实测取证。
     """
     why = r.get("why") or ""
     kind = r.get("kind")
+    if kind == "blocked":
+        return (f"{r['file']} 被出图服务的内容审核拒收、无法英化（重跑与换提示词都无效），"
+                f"已把它标为不可用并排除出后续选图，其余图照常发布，不用处理。{why}")
     if kind == "edit":
         s = ("出网链路异常、重试后仍不通，请检查网络/代理后重跑本步"
              if r.get("transient") else "出图接口或本地报错，请按报错处理后重跑本步")
@@ -50,6 +58,13 @@ def _fail_message(r: dict) -> str:
     if kind == "qc_error":
         return (f"{r['file']} 清理后的质检环节报错、没能判定产物是否合规："
                 f"原图未被改动、不必换图，请查看报错后重跑本步。{why}")
+    # 夸大宣传单独一句：这类图往往一个汉字都没有（纯英文的 BEST-SELLER 角标），
+    # 讲成「该图带中文/水印」会让用户对着一张全英文的图找中文（同本函数开头
+    # 「文案必须与事实相符」的取向）。处置也不同：换图或换一张没有营销角标的同款图。
+    if r.get("marketingClaim"):
+        return (f"{r['file']} 英化质检未通过、仍是原图：图上的夸大宣传文案"
+                f"（BEST-SELLER、热卖、爆款这类角标或标语）没能抹除干净，"
+                f"平台按虚假宣传处罚，请人工换一张无营销标语的图后续跑：{why}")
     return (f"{r['file']} 英化质检未通过、仍是原图，"
             f"该图带中文/水印不能发布，请人工换图后续跑：{why}")
 
@@ -98,6 +113,10 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         path = os.path.join(main_dir, filename)
         if not os.path.isfile(path) or entry.get("clean") or entry.get("duplicate"):
             continue
+        # 上一轮已被审核拒收的图不再送：重跑必然同样被拒（见 images.ModerationBlocked），
+        # 白等一发还会把这张图重新报一次人工确认。
+        if entry.get("unusable"):
+            continue
         # 【尺码表图走专用提示词，并在末发豁免「全抹掉」】2026-09-17 修。
         # plan_clean 的 _SKIP_KINDS 只在【它自己的候选池】里排除了尺码表，本段补充
         # 循环是按 chinese 标注直接追加的，带中文的尺码表照样会走进来（_one 的
@@ -110,9 +129,14 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         items.append({
             "file": filename,
             "path": path,
+            # 非尺码表那条也要带上营销标语的处置口径：这段是按 chinese 标注追加的补充
+            # 循环，原先只说「中文译成英文 + 移除水印」，纯英文的 BEST-SELLER 角标两头
+            # 都不沾、被原样留下（SIZECHART_TRANSLATE_PROMPT 那条已由
+            # DEFAULT_TRANSLATE_PROMPT 带上，不必重复）。
             "prompt": (images.SIZECHART_TRANSLATE_PROMPT if is_sizechart else
                        "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、"
-                       "构图和颜色；同时移除水印、店铺名和第三方 logo。"),
+                       "构图和颜色；同时移除水印、店铺名和第三方 logo。"
+                       + claims.CLAIM_REMOVE_RULE),
             "sizechart": is_sizechart,
             "note": "轮播图中文复核",
         })
@@ -148,7 +172,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         """
         async with sem:
             dst = os.path.join(outdir, os.path.splitext(item["file"])[0] + "-clean.png")
-            last_why, cjk_left = "", False
+            last_why, cjk_left, claim_left = "", False, False
             attempt, tries = 0, stages_description_images.DESC_QC_TRIES
             while attempt < tries:
                 attempt += 1
@@ -160,13 +184,19 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                     # 故「是不是末发」要拿当前的 tries 判，不能用固定常量。
                     # 尺码表图豁免末发的「全抹掉」（理由见本函数 docstring 末段）
                     prompt += stages_cleaning_rules._retry_hint(
-                        last_why, cjk_left,
+                        last_why, cjk_left, claim=claim_left,
                         last_chance=attempt == tries and not item.get("sizechart"))
                 try:
                     # 素材图是轮播首图，糊了最伤转化，故这一路不降采样出图（见 pick_size 注释）
                     ed = await asyncio.to_thread(
                         images.edit_image, item["path"], prompt=prompt,
                         out_path=dst, no_downscale=True, timeout=CLEAN_TIMEOUT)
+                except images.ModerationBlocked as e:
+                    # 【内容审核拒绝：永久性失败，别再烧后面几发】同一张图连发都是同一个
+                    # 拒绝（见 images.ModerationBlocked 的实测），重烧只是白花时间。
+                    # kind 单列 blocked，让调用方把它标成不可用图而不是判整阶段失败。
+                    return {"file": item["file"], "ok": False, "kind": "blocked",
+                            "why": str(e)[:120]}
                 except Exception as e:
                     # 【失败要带类型，供 _fail_message 分类】这一步栽了说明图压根
                     # 没被处理过，与「质检判定不合格」是两回事，上报文案不能共用。
@@ -184,26 +214,51 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                     return {"file": item["file"], "ok": True, "path": ed["output"]}
                 last_why = f"质检未过：{qc.get('issues') or ''}"
                 cjk_left = bool(qc.get("residualChinese"))
+                claim_left = bool(qc.get("marketingClaim"))
                 # 同 _prepare_desc_image：中文残留与生图乱码都算「这发没弄好」，多烧
                 # 有救。main-04 那次两发全是 garbled，只给 2 发正好白放弃。
-                if cjk_left or qc.get("garbled"):
+                # marketingClaim 同样抬发数（理由见 _prepare_desc_image 那处注释）：
+                # 这一路的图是 ⑥⑦ 的选图来源，退回原图等于把一张带营销标语的图
+                # 以脏图身份放回打分池。
+                if cjk_left or qc.get("garbled") or qc.get("marketingClaim"):
                     tries = max(tries, stages_description_images.DESC_QC_TRIES_TEXT)
                 if attempt < tries:
+                    # 脏法要进日志：加码话术按它分支（见 _retry_hint），不带就无法从
+                    # 「烧了 4 发还没过」反推当时喂的是哪套加码
+                    flags = "，".join(f for f, v in (("残留中文", cjk_left),
+                                                    ("夸大宣传", claim_left)) if v)
                     logger.info(f"{item['file']} 清理质检未过（{attempt}/{tries}"
-                                f"{'，残留中文' if cjk_left else ''}），"
+                                f"{'，' + flags if flags else ''}），"
                                 f"重烧一发：{(qc.get('issues') or '')[:60]}")
             return {"file": item["file"], "ok": False, "kind": "qc",
-                    "why": last_why[:120]}
+                    "why": last_why[:120], "marketingClaim": claim_left}
 
     logger.info(f"图片清理：{len(items)} 张待处理（并发 {conc}）")
     results = await asyncio.gather(*(_one(it) for it in items))
 
     notes = info.get("complianceNotes") or {}
     by_name = {e.get("file"): e for e in (notes.get("files") or []) if isinstance(e, dict)}
-    ok_files, fail_files = [], []
+    ok_files, fail_files, blocked_files = [], [], []
     for r in results:
         if not r.get("ok"):
-            fail_files.append(r["file"])
+            # 【审核拒收的图不算「未完成」，标成不可用后绕开它】它与其余失败的处置相反：
+            # 那几类是「条件弄好再来一次」，这一类重跑必然同样被拒（见
+            # images.ModerationBlocked）。原先它落进 fail_files 判整阶段 fail，而这张图
+            # 每次重跑都被上面那段「轮播图中文复核」补充循环重新送进来，商品就永久卡在
+            # ⑤b——2026-09-18 1051951604789 的 main-03.jpg 就是这么卡住的（那单另有
+            # 10 张干净图，plan_clean 本身早判了「无需清理」）。
+            if r.get("kind") == "blocked":
+                blocked_files.append(r["file"])
+                entry = by_name.get(r["file"])
+                if entry is not None:
+                    # unusable 是硬排除标记：带中文/水印还留着（如实），但所有会把图挂到
+                    # 页面上的选图路径都要跳过它，理由与判据见 vision.is_unusable。
+                    entry.update({"unusable": True, "unusableReason": "moderation",
+                                  "note": "出图服务内容审核拒收，无法英化，已排除"})
+                logger.warning(f"{r['file']} 被出图服务内容审核拒收，标为不可用并排除出选图："
+                               f"{r.get('why')}")
+            else:
+                fail_files.append(r["file"])
             await emit({"type": "manual_check", "stage": "clean_images",
                         "message": _fail_message(r)})
             continue
@@ -214,8 +269,10 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         shutil.copy(r["path"], os.path.join(ctx["workdir"], r["file"]))
         e = by_name.get(r["file"])
         if e is not None:
+            # claim 必须跟着一起清零：它是 is_dirty 的判据之一，留着 True 会让 ⑥⑦
+            # 继续把这张【已清干净且质检通过】的图当脏图排除，表现是「清了也白清」。
             e.update({"clean": True, "chinese": False, "watermark": False, "logo": False,
-                      "cleaned": True, "note": "AI 清理后质检通过"})
+                      "claim": False, "cleaned": True, "note": "AI 清理后质检通过"})
     if by_name:
         notes["files"] = [by_name[k] for k in sorted(by_name)]
         notes["cleanFiles"] = sorted(k for k, v in by_name.items() if v.get("clean"))
@@ -223,12 +280,16 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         _save_info(ctx["info_path"], info)
 
     note = f"清理 {len(ok_files)}/{len(items)} 张"
+    if blocked_files:
+        # 审核拒收的单独说，且【不进 fail】：本步对它的处置（标不可用、排除出选图）
+        # 已经做完了，阶段结论就是 ok。讲成「未完成」会让用户去重跑一件重跑不好的事。
+        note += f"（{len(blocked_files)} 张被审核拒收已排除：{'、'.join(blocked_files)}）"
     if fail_files:
         # 「未完成」而不是「未通过」：出图失败/质检报错的那几张压根没走到判定，
         # 说成「未通过」会把「没做成」讲成「做出来不合格」
         note += f"（未完成：{'、'.join(fail_files)}）"
         return {"status": "fail", "note": note[:300]}
-    return {"status": "ok", "note": note}
+    return {"status": "ok", "note": note[:300]}
 
 
 async def _st_clean_images(ctx: dict, session: BrowserSession, emit) -> dict:

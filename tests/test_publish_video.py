@@ -260,6 +260,97 @@ def test_normalize_转码后回读校验(tmp_path):
     assert match_ratio(r["outMeta"]["ratio"]) == r["ratioName"]
 
 
+def test_normalize_已合规时也给outMeta(tmp_path):
+    """outMeta 恒为【最终产物】的元数据，skip 下就是源文件自己。
+
+    2026-09-18 三单实测：这一支原先不返回 outMeta，阶段收尾无条件读它，于是结论打成
+    `720×720（1.0）→ None×None（1:1），NoneMB`——视频其实是传成功的，纯文案错。
+    契约补在库侧（而非让调用方兜底）是为了让「action 是 skip 还是 crop」留在本函数
+    内部，调用方不必为拼一句话去分辨它。
+    """
+    src = _make(str(tmp_path / "已合规.mp4"), 1080, 1080)
+    r = normalize_video(src, str(tmp_path / "out.mp4"))
+    assert r["action"] == "skip"
+    out = r["outMeta"]
+    assert (out["w"], out["h"]) == (1080, 1080)
+    assert out["sizeMB"] > 0, "note 里要打体积，这个字段不能缺"
+    assert r["trimmed"] is False
+
+
+# ---- 下载重试（不出网：把 _run 换成假 curl）---------------------------------
+# 【为什么用假 curl 而不是真下载】要覆盖的是「哪些退出码值得重试、重试几次」这套
+# 决策，真网络既造不出稳定的 rc=28、也会让单测依赖外网。故只替 _run。
+
+def _fake_run(codes, calls, tmp_path):
+    """造一个按 codes 依次返回退出码的假 _run；成功那次顺手写出文件。"""
+    import subprocess as sp
+
+    def run(args, timeout=600):
+        calls.append(args)
+        rc = codes[min(len(calls) - 1, len(codes) - 1)]
+        if rc == 0:
+            out = args[args.index("-o") + 1]
+            with open(out, "wb") as f:
+                f.write(b"x" * 2048)
+        return sp.CompletedProcess(args, rc, b"", b"curl: (%d) boom" % rc)
+
+    return run
+
+
+def test_download_瞬时故障重试后成功(tmp_path, monkeypatch):
+    """rc=28 是超时，属瞬时故障。2026-09-18 那单就是一次 rc=28 直接丢掉整个视频，
+    而项目其它下载路径（主图、出图）早有重试，视频是同一类网络操作。"""
+    from app.publish import video as videolib
+
+    calls = []
+    monkeypatch.setattr(videolib, "_run", _fake_run([28, 28, 0], calls, tmp_path))
+    # download_video 里是函数内 import time，故直接替 time 模块的 sleep
+    monkeypatch.setattr(__import__("time"), "sleep", lambda s: None)
+    r = videolib.download_video("https://cdn/a.mp4", str(tmp_path / "a.mp4"))
+    assert r["status"] == "ok"
+    assert len(calls) == 3, "前两次瞬时故障应重试"
+
+
+def test_download_源站没有的错不重试(tmp_path, monkeypatch):
+    """-f 下 HTTP 403/404 是 rc=22：源站就没有这个视频，重试多少次都一样，
+    白等还把真因埋进一串重试噪音里。"""
+    from app.publish import video as videolib
+
+    calls = []
+    monkeypatch.setattr(videolib, "_run", _fake_run([22], calls, tmp_path))
+    r = videolib.download_video("https://cdn/gone.mp4", str(tmp_path / "a.mp4"))
+    assert r["status"] == "error"
+    assert len(calls) == 1, "确定性失败不该重试"
+    assert "rc=22" in r["err"]
+
+
+def test_download_重试用尽仍失败时如实报错(tmp_path, monkeypatch):
+    from app.publish import video as videolib
+
+    calls = []
+    monkeypatch.setattr(videolib, "_run", _fake_run([28], calls, tmp_path))
+    monkeypatch.setattr(__import__("time"), "sleep", lambda s: None)
+    r = videolib.download_video("https://cdn/a.mp4", str(tmp_path / "a.mp4"))
+    assert r["status"] == "error"
+    assert len(calls) == videolib.DOWNLOAD_RETRIES
+    assert "rc=28" in r["err"]
+
+
+def test_download_显式直连不走代理(tmp_path, monkeypatch):
+    """阿里 CDN 必须直连：2026-09-18 实测 caiyuanbao.alicdn.com 直连通（1.25s），
+    走 Clash 7890 是 rc=7 连不上。这与出图链路刚好相反（那条必须走代理，见
+    image-api-needs-proxy）。为出图设的全局代理环境变量会被 curl 默认吃掉，
+    不显式 --noproxy 就会让整批视频静默失败。"""
+    from app.publish import video as videolib
+
+    calls = []
+    monkeypatch.setattr(videolib, "_run", _fake_run([0], calls, tmp_path))
+    videolib.download_video("https://cdn/a.mp4", str(tmp_path / "a.mp4"))
+    args = calls[0]
+    assert "--noproxy" in args and args[args.index("--noproxy") + 1] == "*"
+    assert "--connect-timeout" in args, "连不上要快速失败去重试，不该占满整个预算"
+
+
 def test_常量与平台规则一致():
     """规则值写错会让闸门形同虚设，故把平台原文的数值钉在测试里。"""
     assert set(ALLOWED_RATIOS) == {"1:1", "3:4", "16:9"}

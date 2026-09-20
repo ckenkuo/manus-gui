@@ -54,7 +54,7 @@ from app.publish.media.skc import (
 from app.publish.media.video import delete_video, read_video_url, set_video
 from app.publish.navigation import live_state, open_edit
 from app.publish.packaging import estimate_pack
-from app.publish.persistence import publish_now
+from app.publish.persistence import is_online_product, publish_now
 from app.publish.preferences import (
     IMAGE_CONCURRENCY_DEFAULT as IMAGE_CONCURRENCY_DEFAULT,
     IMAGE_CONCURRENCY_MAX as IMAGE_CONCURRENCY_MAX,
@@ -523,6 +523,32 @@ async def _run_product(
     # 故补开不丢 auto_cat 的成果；会丢的只是未保存的表单修改，
     # 而那随上一个浏览器进程早就没了。
     run_ids = [sid for i, (sid, _) in enumerate(stages) if _should_run(i, sid)]
+
+    if ctx.get("rowid") and run_ids:
+        try:
+            if await is_online_product(session, str(ctx["rowid"])):
+                state["status"] = "ok"
+                state["rowid"] = ctx["rowid"]
+                state["failed_stage"] = ""
+                state["published_online"] = True
+                state["online_note"] = "商品已发布，跳过编辑与重复处理"
+                publish_state.save_state(state)
+                note = state["online_note"]
+                await emit({"type": "log", "level": "info", "message": note})
+                return {"status": "ok", "rowid": ctx.get("rowid"),
+                        "already_published": True, "failed_stage": "", "note": note,
+                        "elapsed_s": round(time.monotonic() - t0, 1)}
+            state.pop("published_online", None)
+            state.pop("online_note", None)
+        except Exception as error:
+            note = f"发布状态预检失败，未编辑商品：{error}"
+            state["status"] = "fail"
+            state["failed_stage"] = "precheck"
+            publish_state.save_state(state)
+            return {"status": "fail", "rowid": ctx.get("rowid"),
+                    "failed_stage": "precheck", "note": note,
+                    "elapsed_s": round(time.monotonic() - t0, 1)}
+
     opened_edit = False
     if (ctx.get("rowid")
             and any(s in _EDIT_PAGE_STAGES for s in run_ids)

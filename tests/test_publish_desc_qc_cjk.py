@@ -18,6 +18,86 @@ import pytest
 from app.publish import service, vision
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [
+    {"issues": "Cute 属情绪夸大类"},
+    {"issues": "Super Cute!属情绪夸大"},
+    {"issues": "Cute 属情绪夸大类", "marketingClaimTexts": []},
+    {"issues": "普通审美形容词", "marketingClaimTexts": ["Cute", "Super Cute!", "Lovely"]},
+])
+async def test_style_only_model_rejection_cannot_block(monkeypatch, evidence):
+    async def fake_model(*args, **kwargs):
+        return {"residualChinese": False, "garbled": False, "watermark": False,
+                "brokenSubject": False, "marketingClaim": True, **evidence}
+
+    monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
+    result = await vision.check_cleaned("cute.jpg")
+    assert result["clean"] is True
+    assert result["marketingClaim"] is False
+    assert result["issues"] == ""
+    assert result["nonBlockingIssues"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", ["residualChinese", "garbled", "watermark", "brokenSubject"])
+async def test_style_override_preserves_other_image_failures(monkeypatch, problem):
+    async def fake_model(*args, **kwargs):
+        return {"residualChinese": False, "garbled": False, "watermark": False,
+                "brokenSubject": False, "marketingClaim": True,
+                "issues": "Cute 属情绪夸大类", problem: True}
+
+    monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
+    result = await vision.check_cleaned("mixed.jpg")
+    assert result["clean"] is False
+    assert result["marketingClaim"] is False
+    assert result["issues"] and "Cute" not in result["issues"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", [
+    {"issues": "Cute与Best Seller营销宣称"},
+    {"issues": "Cute 属情绪夸大类；High-Quality品质夸大"},
+    {"issues": "Cute及销量宣称", "marketingClaimTexts": ["Cute", "Best Seller"]},
+    {"issues": "Guaranteed承诺", "marketingClaimTexts": ["Cute"]},
+    {"issues": "Cute 属情绪夸大类", "marketingClaimTexts": "Cute"},
+    {"issues": "未明确识别文案", "marketingClaimTexts": []},
+])
+async def test_mixed_or_unknown_claims_are_not_style_override(monkeypatch, evidence):
+    async def fake_model(*args, **kwargs):
+        return {"residualChinese": False, "garbled": False, "watermark": False,
+                "brokenSubject": False, "marketingClaim": True, **evidence}
+
+    monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
+    result = await vision.check_cleaned("mixed.jpg")
+    assert result["clean"] is False
+    assert result["marketingClaim"] is True
+    assert not result["nonBlockingIssues"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("problem", [None, "marketingClaim", "watermark", "residualChinese", "garbled"])
+async def test_style_boundary_shared_by_generation_and_qc_without_blanket_bypass(monkeypatch, problem):
+    from app.publish import claims, images
+
+    async def fake_model(prompt, *args, **kwargs):
+        assert claims._IMAGE_STYLE_BOUNDARY in prompt
+        assert "实际可见的完整宣称" in prompt
+        response = {field: field == problem for field in (
+            "residualChinese", "garbled", "watermark", "brokenSubject", "marketingClaim")}
+        response["issues"] = "Cute旁还有Best Seller" if problem == "marketingClaim" else ""
+        return response
+
+    assert claims._IMAGE_STYLE_BOUNDARY in images.DEFAULT_TRANSLATE_PROMPT
+    assert claims._IMAGE_STYLE_BOUNDARY in images.SIZECHART_TRANSLATE_PROMPT
+    monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
+
+    result = await vision.check_cleaned("cute-glider.jpg")
+
+    assert result["clean"] is (problem is None)
+    if problem:
+        assert result[problem] is True
+
+
 @pytest.fixture(autouse=True)
 def _no_sleep(monkeypatch):
     """质检重试路径本身不 sleep，但 _prepare_desc_image 会过 to_thread，直接放行。"""
@@ -36,7 +116,8 @@ async def test_衣服实物logo和图案不算质检失败(monkeypatch):
         assert "刺绣" in prompt and "印花" in prompt
         assert "不算问题" in prompt
         return {"residualChinese": False, "garbled": False,
-                "brokenSubject": False, "issues": ""}
+                "brokenSubject": False, "watermark": False,
+                "marketingClaim": False, "issues": ""}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
     assert r["clean"] is True and r["residualChinese"] is False
@@ -47,7 +128,8 @@ async def test_残留中文单独回一个字段(monkeypatch):
     """residualChinese 决定重试发数，不能只混在 issues 文字里。"""
     async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": True, "garbled": False,
-                "brokenSubject": False, "issues": "底部仍有中文说明"}
+                "brokenSubject": False, "watermark": False,
+                "marketingClaim": False, "issues": "底部仍有中文说明"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
     assert r["clean"] is False and r["residualChinese"] is True
@@ -61,7 +143,8 @@ async def test_乱码要透出garbled字段(monkeypatch):
     """
     async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": False, "garbled": True,
-                "brokenSubject": False, "issues": "拼音残留"}
+                "brokenSubject": False, "watermark": False,
+                "marketingClaim": False, "issues": "拼音残留"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
     assert r["clean"] is False
@@ -74,7 +157,8 @@ async def test_破坏主体算不过但两个文字字段都是False(monkeypatch
     """brokenSubject 只给 2 发，故它不能让任何文字类字段变 True。"""
     async def _fake(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": False, "garbled": False,
-                "brokenSubject": True, "issues": "袖子被抹掉"}
+                "brokenSubject": True, "watermark": False,
+                "marketingClaim": False, "issues": "袖子被抹掉"}
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
     assert r["clean"] is False
@@ -89,6 +173,43 @@ async def test_模型只回旧的clean字段时不误判为干净(monkeypatch):
     monkeypatch.setattr(vision, "ask_json_with_images", _fake)
     r = await vision.check_cleaned("x.jpg")
     assert r["clean"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("issues", ["底部含1688店铺水印链接", ""])
+async def test_英文网址水印独立拦截(monkeypatch, issues):
+    async def fake_model(prompt, images, **kwargs):
+        assert "纯英文、数字" in prompt and "半透明" in prompt
+        return {"residualChinese": False, "garbled": False,
+                "brokenSubject": False, "watermark": True,
+                "marketingClaim": False, "clean": True, "issues": issues}
+
+    monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
+    result = await vision.check_cleaned("x.jpg")
+    assert result["status"] == "ok"
+    assert result["clean"] is False
+    assert result["watermark"] is True
+    assert result["residualChinese"] is False and result["garbled"] is False
+    assert "水印" in result["issues"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response", [
+    {"residualChinese": False, "garbled": False, "brokenSubject": False,
+     "marketingClaim": False, "issues": "底部含1688店铺水印链接"},
+    {"clean": True},
+    *[{"residualChinese": False, "garbled": False, "brokenSubject": False,
+       "marketingClaim": False, "watermark": value}
+      for value in (None, "false", "true", 0, 1)],
+])
+async def test_水印未明确检查不能放行(monkeypatch, response):
+    async def fake_model(*args, **kwargs):
+        return response
+
+    monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
+    result = await vision.check_cleaned("x.jpg")
+    assert result["status"] == "error"
+    assert result["clean"] is False
 
 
 # ---- 描述图英化的重试发数 -------------------------------------------------------
@@ -144,7 +265,8 @@ def _desc_stub_real_qc(tmp_path, monkeypatch, model_replies, calls):
     async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
         calls["qc"] = calls.get("qc", 0) + 1
         return seq.pop(0) if seq else {"residualChinese": False, "garbled": True,
-                                       "brokenSubject": False, "issues": "还是不行"}
+                                       "brokenSubject": False, "watermark": False,
+                                       "marketingClaim": False, "issues": "还是不行"}
 
     monkeypatch.setattr(service.extract, "_download_image", fake_download)
     monkeypatch.setattr(service.images, "edit_image", fake_edit)
@@ -323,9 +445,9 @@ async def test_端到端_乱码走真实质检也给到四发(tmp_path, monkeypa
     """
     calls = {}
     bad = {"residualChinese": False, "garbled": True, "brokenSubject": False,
-           "issues": "英文为无意义拼写"}
+           "watermark": False, "marketingClaim": False, "issues": "英文为无意义拼写"}
     ok = {"residualChinese": False, "garbled": False, "brokenSubject": False,
-          "issues": ""}
+          "watermark": False, "marketingClaim": False, "issues": ""}
     _desc_stub_real_qc(tmp_path, monkeypatch, [bad, bad, bad, ok], calls)
 
     got = await service._prepare_desc_image(
@@ -339,7 +461,7 @@ async def test_端到端_乱码走真实质检也给到四发(tmp_path, monkeypa
 async def test_端到端_破坏主体走真实质检仍只两发(tmp_path, monkeypatch):
     calls = {}
     bad = {"residualChinese": False, "garbled": False, "brokenSubject": True,
-           "issues": "袖子被抹掉"}
+           "watermark": False, "marketingClaim": False, "issues": "袖子被抹掉"}
     _desc_stub_real_qc(tmp_path, monkeypatch, [bad] * 4, calls)
 
     got = await service._prepare_desc_image(
@@ -347,6 +469,23 @@ async def test_端到端_破坏主体走真实质检仍只两发(tmp_path, monke
 
     assert got["ok"] is False
     assert calls["qc"] == 2 == service.DESC_QC_TRIES
+
+
+@pytest.mark.asyncio
+async def test_端到端_水印未去除不能复用产物(tmp_path, monkeypatch):
+    calls = {}
+    bad = {"residualChinese": False, "garbled": False, "brokenSubject": False,
+           "watermark": True, "marketingClaim": False, "issues": "底部含1688店铺水印链接"}
+    _desc_stub_real_qc(tmp_path, monkeypatch, [bad] * service.DESC_QC_TRIES, calls)
+
+    result = await service._prepare_desc_image(
+        str(tmp_path), {"pos": 1, "url": "https://cdn/a.jpg"})
+
+    assert result["ok"] is False
+    assert calls["qc"] == service.DESC_QC_TRIES
+    assert "水印" in calls["prompts"][1]
+    _, edited_path = service._desc_cache_paths(str(tmp_path), "https://cdn/a.jpg")
+    assert not os.path.exists(edited_path)
 
 
 # ---- ⑤b 与 ⑬ 共用同一套发数/话术（回归钉子）--------------------------------------
@@ -376,9 +515,9 @@ async def test_5b乱码走真实质检也给到四发(tmp_path, monkeypatch):
         return {"status": "ok", "output": out_path}
 
     bad = {"residualChinese": False, "garbled": True, "brokenSubject": False,
-           "issues": "英文为无意义拼写"}
+           "watermark": False, "marketingClaim": False, "issues": "英文为无意义拼写"}
     ok = {"residualChinese": False, "garbled": False, "brokenSubject": False,
-          "issues": ""}
+          "watermark": False, "marketingClaim": False, "issues": ""}
     seq = [bad, bad, bad, ok]
 
     async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
@@ -426,7 +565,7 @@ async def test_5b质检未过绝不顶替原图(tmp_path, monkeypatch):
 
     async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
         return {"residualChinese": False, "garbled": True, "brokenSubject": False,
-                "issues": "oOaLanTanAt"}
+                "watermark": False, "issues": "oOaLanTanAt"}
 
     monkeypatch.setattr(service.images, "edit_image", fake_edit)
     monkeypatch.setattr(vision, "ask_json_with_images", fake_model)
@@ -451,3 +590,114 @@ async def test_5b质检未过绝不顶替原图(tmp_path, monkeypatch):
     # 这一档（产物确实带中文）才是真该人工换图的失败，文案要与出图失败区分开
     mc = [e for e in events if e["type"] == "manual_check"]
     assert mc and "请人工换图" in mc[0]["message"]
+
+
+# ---- ⑤b 内容审核拒收：标不可用绕开，不判 fail、不无限重跑 --------------------
+# 2026-09-18 1051951604789 实况：main-03.jpg 被出图服务审核硬拒（见
+# images.ModerationBlocked 的取证），原先落进 fail_files 判整阶段 fail，而这张图每次
+# 重跑都被「轮播图中文复核」补充循环重新送进来，商品永久卡在 ⑤b——那单另有 10 张干净
+# 图、plan_clean 本身早判了「无需清理」。
+
+def _blocked_stub(tmp_path, monkeypatch, files: list) -> str:
+    """造一个待清理的 workdir + product-info.json，edit_image 一律抛审核拒绝。"""
+    for e in files:
+        (tmp_path / e["file"]).write_bytes(b"\xff\xd8\xff\xe0jpeg")
+    info_path = tmp_path / "product-info.json"
+    info_path.write_text(json.dumps({"complianceNotes": {"files": files}}),
+                         encoding="utf-8")
+
+    def fake_edit(path, prompt=None, out_path=None, **kw):
+        raise service.images.ModerationBlocked("内容审核拒绝了这张图")
+
+    monkeypatch.setattr(service.images, "edit_image", fake_edit)
+    return str(info_path)
+
+
+@pytest.mark.asyncio
+async def test_5b审核拒收不判fail而是标不可用(tmp_path, monkeypatch):
+    """判 fail 会让整单停在 ⑤b，而这件事重跑一万次都是同一个结果。"""
+    info_path = _blocked_stub(tmp_path, monkeypatch, [
+        {"file": "main-01.jpg", "clean": False, "chinese": True}])
+    events = []
+
+    async def _emit(e):
+        events.append(e)
+
+    r = await service._clean_main_images(
+        {"info_path": info_path, "workdir": str(tmp_path)}, _emit)
+
+    assert r["status"] == "ok", r
+    assert "审核拒收" in r["note"], r["note"]
+    after = json.loads(open(info_path, encoding="utf-8").read())
+    n = after["complianceNotes"]["files"][0]
+    assert n["unusable"] is True and n["unusableReason"] == "moderation", n
+    # 原图不能被顶替（它压根没有产物），中文标注也要如实留着
+    assert n["chinese"] is True and not n.get("clean"), n
+
+
+@pytest.mark.asyncio
+async def test_5b审核拒收只发一次不烧完重试发数(tmp_path, monkeypatch):
+    """永久性失败，多烧几发只是白花时间——与「质检未过多烧」的取向刻意相反。"""
+    calls = []
+
+    for e in [{"file": "main-01.jpg", "clean": False, "chinese": True}]:
+        (tmp_path / e["file"]).write_bytes(b"\xff\xd8\xff\xe0jpeg")
+    info_path = tmp_path / "product-info.json"
+    info_path.write_text(json.dumps({"complianceNotes": {"files": [
+        {"file": "main-01.jpg", "clean": False, "chinese": True}]}}),
+        encoding="utf-8")
+
+    def fake_edit(path, prompt=None, out_path=None, **kw):
+        calls.append(1)
+        raise service.images.ModerationBlocked("内容审核拒绝")
+
+    monkeypatch.setattr(service.images, "edit_image", fake_edit)
+
+    async def _emit(e):
+        pass
+
+    await service._clean_main_images(
+        {"info_path": str(info_path), "workdir": str(tmp_path)}, _emit)
+    assert len(calls) == 1, f"审核拒收不该重烧，实际发了 {len(calls)} 次"
+
+
+@pytest.mark.asyncio
+async def test_5b重跑不再送已标不可用的图(tmp_path, monkeypatch):
+    """【死循环的钉子】补充循环按 chinese 追加，不跳过 unusable 就每轮都撞同一张图。"""
+    info_path = _blocked_stub(tmp_path, monkeypatch, [
+        {"file": "main-01.jpg", "clean": True},
+        {"file": "main-02.jpg", "clean": True},
+        {"file": "main-03.jpg", "clean": True},
+        {"file": "main-04.jpg", "clean": False, "chinese": True},
+    ])
+    events = []
+
+    async def _emit(e):
+        events.append(e)
+
+    ctx = {"info_path": info_path, "workdir": str(tmp_path)}
+    first = await service._clean_main_images(ctx, _emit)
+    assert first["status"] == "ok" and "审核拒收" in first["note"], first
+
+    events.clear()
+    second = await service._clean_main_images(ctx, _emit)
+    assert second["status"] == "skipped", second
+    assert not events, f"重跑又报了一次人工确认：{events}"
+
+
+@pytest.mark.asyncio
+async def test_5b审核拒收的提醒不叫用户换图(tmp_path, monkeypatch):
+    """拒的是这张图本身，人工换图无从下手；处置已由本阶段自动做完（排除出选图）。"""
+    info_path = _blocked_stub(tmp_path, monkeypatch, [
+        {"file": "main-01.jpg", "clean": False, "chinese": True}])
+    events = []
+
+    async def _emit(e):
+        events.append(e)
+
+    await service._clean_main_images(
+        {"info_path": info_path, "workdir": str(tmp_path)}, _emit)
+    msgs = [e["message"] for e in events if e["type"] == "manual_check"]
+    assert msgs, events
+    assert "请人工换图" not in msgs[0] and "重跑本步" not in msgs[0], msgs[0]
+    assert "已排除" in msgs[0] or "排除" in msgs[0], msgs[0]

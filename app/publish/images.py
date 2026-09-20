@@ -30,6 +30,7 @@ import time
 from typing import Optional
 
 from app.logger import logger
+from app.publish import claims
 
 # ---- 尺寸硬规则（发布校验实测，勿凭记忆改）--------------------------------
 # Temu 服装类图片最小尺寸（2026-08-18 发布校验实测拦截规则）
@@ -100,6 +101,11 @@ _NO_CJK_PUNCT = (
 DEFAULT_CLEAN_PROMPT = (
     "移除图片中所有中文文字、水印和 logo，" + _NO_CJK_PUNCT + "，"
     "保持商品主体、配色和构图完全不变，被遮挡处按周围内容自然补全。"
+    # 这条走「全部移除」，营销标语本来就在移除范围内；显式点一句是为了让
+    # 【纯英文】的营销角标（BEST-SELLER 这类）也确定被清掉——上一句只说了「中文文字」，
+    # 模型会把英文角标当成不该动的内容留下。
+    "图上纯英文的夸大宣传角标与标语（BEST-SELLER、Hot Sale、Top Quality、Must Have 等）"
+    "同样要抹除干净；商品实物上的印花、刺绣、织标原样保留。"
 )
 # 【翻译优先，与 DEFAULT_CLEAN_PROMPT 的「移除中文」刻意相反】描述图英化与主图清理
 # 走这条：商品介绍、说明类中文文字要翻译成英文原位保留，不能当待清理文字抹掉——
@@ -113,6 +119,11 @@ DEFAULT_TRANSLATE_PROMPT = (
     "都翻译保留、不要删除；"
     "仅水印、店铺名、拍摄者账号文字、他人品牌 logo 这类非商品信息直接移除，"
     + _NO_CJK_PUNCT + "，商品主体、配色、图案和构图完全不变，被移除处按周围内容自然补全。"
+    # 【营销标语是「翻译保留」的例外，必须显式排除】上面的主轴是「商品介绍类文字都
+    # 翻译保留」，不单独点出来，模型就规规矩矩把 BEST-SELLER / 爆款 原位译成英文留在图上，
+    # 而 check_cleaned 的 marketingClaim 那关必然判不过，发数烧完退回原图（白花几发生图、
+    # 还在描述区留下 1688 外链）。故这条口径与 claims.CLAIM_REMOVE_RULE 同源、同一份措辞。
+    + claims.CLAIM_REMOVE_RULE
 )
 
 # 尺码表图/尺寸图专用的英化提示词：在 DEFAULT_TRANSLATE_PROMPT 的基础上，额外要求把
@@ -593,6 +604,41 @@ class TransientNetError(RuntimeError):
     """
 
 
+class ModerationBlocked(RuntimeError):
+    """出图服务的内容审核拒收这张图，【永久性】失败，重跑一万次都是同一个结果。
+
+    2026-09-18 实测（1051951604789 的 main-03.jpg，一张摊在笔记本键盘前的章鱼毛绒
+    玩具合影）：同一张图同一个 key 连发 4 次，4 次全返
+    `code=moderation_blocked / type=packy_image_generation_user_error`；再换极简英文
+    提示词（Remove the watermark text.）、重新编码去掉 EXIF、把带水印的底部裁掉，
+    仍然全被拒；而同商品 main-01 同参数一发即中。也就是说触发点在【图片内容】本身，
+    与提示词、文件元信息、水印区域都无关，误判也没有申诉入口。
+
+    【为什么必须与其它三类失败分开】现有三类的处置都是「弄好条件再来一次」：
+    TransientNetError 恢复链路后重跑、坏渠道换渠道重发、质检不合格人工换图。而这一类
+    的正确处置是【放弃这张图、绕开它继续跑】——它既不是链路问题（重跑无用），也不是
+    产物不合格（压根没有产物），更不该让用户去换一张本来能用的图。混进
+    「响应中没有图片」那句笼统 RuntimeError 里，⑤b 会判整阶段 fail，而这张图每次
+    重跑都被同一段补充循环重新送进来，商品就永久卡在 ⑤b（那单的实况）。
+
+    【为什么不重试】同上，判据与 _BAD_CHANNEL_CODE 那段的取向一致：确定性失败原样
+    抛出，白等几分钟还把真因埋成一串重试噪音（见 [[publish-vision-400-no-retry]]）。
+    """
+
+
+# 内容审核拒绝的错误签名（2026-09-18 实测，见 ModerationBlocked 的取证）。
+# 判 code 而不是判文案：message 里带 request id、会变也会被截断。
+_MODERATION_CODES = frozenset({"moderation_blocked", "content_policy_violation"})
+
+
+def _is_moderation_blocked(resp_json: dict) -> bool:
+    """判响应是否为「内容审核拒收这张图」——这是永久性失败，不能重试也不该判换图。"""
+    err = (resp_json or {}).get("error")
+    if not isinstance(err, dict):
+        return False
+    return str(err.get("code") or "") in _MODERATION_CODES
+
+
 def _curl_json(args: list, timeout: int = 280) -> dict:
     """用 curl.exe 发请求并把 stdout 解析为 JSON。出错时抛带响应体的异常。
 
@@ -709,6 +755,13 @@ def _save_result(resp_json: dict, out_path: str) -> str:
         with open(out_path, "wb") as f:
             f.write(base64.b64decode(data["b64_json"]))
         return out_path
+    # 内容审核拒绝要单独抛类型：它与「响应结构没有图」是两件事，处置完全相反
+    # （见 ModerationBlocked）。混成一句「响应中没有图片」会让调用方去重跑，而重跑
+    # 必然撞同一个拒绝。
+    if _is_moderation_blocked(resp_json):
+        err = resp_json.get("error") or {}
+        raise ModerationBlocked(
+            f"出图服务的内容审核拒绝了这张图（{err.get('code')}）：{str(err.get('message'))[:150]}")
     raise RuntimeError(f"响应中没有图片: {json.dumps(resp_json, ensure_ascii=False)[:300]}")
 
 
@@ -771,6 +824,10 @@ def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = 280,
 
     抖动重试到最后一次仍失败时把异常抛出去（而不是返回坏响应），交由上层
     best-effort 兜住——⑤b 清理与⑬ 备料都会把单张失败降级成「保留原图」。
+
+    【内容审核拒绝走原样返回、不在这里重试】它是永久性失败（见 ModerationBlocked
+    的实测：同图连发 4 次全被拒），重试只是把 4 次拒绝叠成一串日志。响应原样返回给
+    _save_result，由它抛 ModerationBlocked 让调用方按「放弃这张图」处置。
     """
     last_resp = None
     for attempt in range(1, tries + 1):

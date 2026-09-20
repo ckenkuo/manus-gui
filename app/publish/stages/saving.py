@@ -75,6 +75,12 @@ async def _st_publish(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": "ok",
                 "note": f"已发布：{'；'.join(r.get('messages') or []) or '已离开编辑页'}"[:200]}
 
+    if st == "not-ready":
+        reason = r.get("reason") or "编辑页尚未回填完整，未点击发布"
+        await emit({"type": "manual_check", "stage": "publish",
+                    "message": f"{reason}；草稿已保存，页面就绪后可续跑"})
+        return {"status": "fail", "note": reason[:200]}
+
     if st == "validation-error":
         red = "、".join(s["name"] for s in (r.get("redSections") or []))
         await emit({"type": "manual_check", "stage": "publish",

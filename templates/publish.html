@@ -3478,8 +3478,10 @@
               "text-success"
             );
           } else {
+            const failureState = data.failed_stage === "publish"
+              ? "发布未确认完成（草稿已保存）" : "未落库";
             logLine(
-              `❌ [${data.offer}] 未落库：${STAGE_NAME[data.failed_stage] || data.failed_stage || ""} ${data.note || ""}`,
+              `❌ [${data.offer}] ${failureState}：${STAGE_NAME[data.failed_stage] || data.failed_stage || ""} ${data.note || ""}`,
               "text-danger"
             );
           }

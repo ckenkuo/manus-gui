@@ -19,7 +19,7 @@ from typing import Literal, Optional
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.logger import logger
-from app.publish import images
+from app.publish import claims, images
 from app.publish.llm import (
     NonEmptyStr,
     ask_json,
@@ -138,17 +138,23 @@ class DescAuditItem(BaseModel):
 
     【pos 必须是真整数】同 DescAction 的坑：收到字符串 "1" 时复核结论对不上
     真实 pos，含中文的图就继续漏在网上。
+
+    【marketingClaim 给默认值而不是必填】它只用来分类上报与日志（这一条是因为中文
+    还是因为夸大宣传），漏答不影响处置——改判生图英化这件事两种脏法都一样做。
+    声明成必填等于为一个只进日志的字段把整批复核判失败（同 DescPlan 那边
+    「只声明答错了会静默出错的字段」的取向）。
     """
 
     model_config = ConfigDict(strict=True)
 
     pos: int
     sizeTable: bool = False
+    marketingClaim: bool = False
     what: str = ""
 
 
 class DescAudit(BaseModel):
-    """阶段⑬ keep 复核（专查中文，只列脏的）。"""
+    """阶段⑬ keep 复核（查中文与夸大宣传，只列脏的）。"""
 
     model_config = ConfigDict(strict=True)
 
@@ -213,25 +219,56 @@ def _listing(paths: list) -> str:
 
 
 def is_dirty(n: dict) -> bool:
-    """这条标注是否仍带中文/水印/他人 logo（⑤b 清理成功的会被回写成三项全 False）。
+    """这条标注是否仍带中文/水印/他人 logo/夸大宣传（⑤b 清理成功的会被回写成全 False）。
 
-    【标注不全时算合规】三项都没标、也没有 clean 时返回 False：不能因为模型漏标就
+    【标注不全时算合规】几项都没标、也没有 clean 时返回 False：不能因为模型漏标就
     把图丢掉，那会静默排除一张本来能用的图——与 images.ahash「算不出就别当重复」
     同取向。判据放模块级是因为 service._pad_row_images 补图时要用同一口径，
     两处口径不一致就会出现「选图排除了、补图又补回来」。
+
+    【claim 与前三项同级】它是阶段① 新标的「叠加文案层有夸大宣传」。原先这一项不存在，
+    于是一张纯英文的 BEST-SELLER 角标图三项全 False、clean=true，⑤b 不清它、⑥ 直接
+    把它选作素材图（也就是轮播首图）——而 ⑥⑦ 这条路【不跑 check_cleaned】，标注就是
+    它们唯一的判据，漏在这里等于漏到真店。
     """
-    return bool(n.get("chinese") or n.get("watermark") or n.get("logo"))
+    return bool(n.get("chinese") or n.get("watermark") or n.get("logo")
+                or n.get("claim"))
+
+
+def is_unusable(n: dict) -> bool:
+    """这张图【永久不可用】，任何要挂到页面上的选图路径都必须排除它。
+
+    目前唯一的来源是 ⑤b：出图服务的内容审核拒收了这张图，它既清不干净、也不能原样
+    发（带中文/水印是 Temu 硬红线），于是 ⑤b 把它标 unusable=True（见
+    stages.cleaning 与 images.ModerationBlocked 的实测取证）。
+
+    【与 is_dirty 的区别是「能不能救」】is_dirty 是软排除：脏图凑不够行下限时会被
+    放回，因为它还能靠 ⑤b 清理救回来。unusable 是硬排除：这张图不存在能用的路径，
+    放回它只会把一张带中文的图发上真店，而这正是整套清理机制要防的事。故三级兜底
+    一级都不放回它——宁可让那一行少一张图（⑦ 有复制主图凑数的兜底），也不发它。
+
+    【为什么单开一个字段而不是复用 duplicate 或 kind】duplicate 的语义是「同一画面
+    已有别的文件」，第一级兜底会把它放回；kind ∈ _SKIP_KINDS 说的是「这是尺码表/
+    工厂图这类非商品图」，与「图没问题但上游不给处理」是两件事。借用任何一个都会让
+    日后读代码的人查错方向（同 _norm_color「不做同义词映射」的取向：宁可多一个准确
+    的字段，也不要一个含义被撑大的字段）。
+    """
+    return bool(n.get("unusable"))
 
 
 def _dirty_score(n: dict) -> tuple:
-    """脏图排序键（越小越优）：中文 > 水印 > logo > 重复。
+    """脏图排序键（越小越优）：中文 > 夸大宣传 > 水印 > logo > 重复。
 
     只在「一张干净图都没有」时用。原先兜底只排除 duplicate、其余按编号取第一张，
     2026-08-22 实测踩坑：某商品 6 张全脏，first 恰好是带中文店名水印的 main-01，
     等于在一堆脏图里挑了最脏的当轮播首图（中文是 Temu 最硬的红线，水印次之）。
+
+    【claim 排第二，在水印之前】夸大宣传是实罚项（平台按虚假宣传处理），而水印/logo
+    多是审核打回重传；两害相权，宁可兜底选一张带水印的也不选一张写着 BEST-SELLER 的。
     """
-    return (bool(n.get("chinese")), bool(n.get("watermark")),
-            bool(n.get("logo")), bool(n.get("duplicate")))
+    return (bool(n.get("chinese")), bool(n.get("claim")),
+            bool(n.get("watermark")), bool(n.get("logo")),
+            bool(n.get("duplicate")))
 
 
 def _norm_color(s: str) -> str:
@@ -425,6 +462,12 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
                          "都翻译保留、不要删除；"
                          "仅水印、店铺名、拍摄者账号文字、他人品牌 logo 这类非商品信息直接移除；"
                          "中文标点（『』「」、，。！？等）也必须一并去掉或换成英文标点")
+        # 【夸大宣传要独立成条，且与「翻译保留」相反】上一条的主轴是商品介绍类文字都
+        # 翻译保留，营销标语若不单独排除，模型就把 BEST-SELLER 原位译成英文留在图上，
+        # 而 check_cleaned 的 marketingClaim 那关必然判不过（同 images.DEFAULT_TRANSLATE_PROMPT
+        # 末尾那条的理由）。纯英文的角标也在此列——上一条只管中文，管不到它。
+        if n.get("claim"):
+            parts.append(claims.CLAIM_REMOVE_RULE.rstrip("。"))
         parts.append("商品主体、配色、图案和构图完全不变，被移除处按周围内容自然补全")
         cands.append((_dirty_score(n),
                       {"file": name, "path": p, "prompt": "，".join(parts) + "。",
@@ -554,16 +597,23 @@ async def pick_material(info: dict, workdir: str) -> dict:
     by_name = {os.path.basename(p): p for p in mains}
     notes = _notes_by_file(info)
     if notes:
-        for p in mains:  # 按编号序取第一张干净图
+        # 【永久不可用的图先摘掉】素材图就是轮播首图，挂一张审核拒收、清不干净的图上去
+        # 等于把带中文的图放在最显眼的位置（见 is_unusable）。全摘完就退回原池子——
+        # 一张都不剩时下面的兜底还得选出一张来，那时由 uncertain 交人工。
+        usable = [p for p in mains
+                  if not is_unusable(notes.get(os.path.basename(p)) or {})]
+        pool = usable or mains
+        for p in pool:  # 按编号序取第一张干净图
             n = notes.get(os.path.basename(p))
             if n and n.get("clean"):
                 return {"status": "ok", "image": p, "source": "notes", "uncertain": False,
                         "reason": f"complianceNotes 标注干净（{(n.get('note') or '无中文/水印/logo')[:20]}）"}
         # 没有干净图：按脏度打分取最不脏的一张兜底，标 uncertain 交人工
         # （不能只排除 duplicate 就取首张，见 _dirty_score 注释里的实测踩坑）
-        cand = min(mains, key=lambda p: _dirty_score(notes.get(os.path.basename(p)) or {}))
+        cand = min(pool, key=lambda p: _dirty_score(notes.get(os.path.basename(p)) or {}))
         n = notes.get(os.path.basename(cand)) or {}
         flags = "、".join(k for k, v in (("含中文", n.get("chinese")),
+                                        ("有夸大宣传", n.get("claim")),
                                         ("有水印", n.get("watermark")),
                                         ("有logo", n.get("logo"))) if v)
         return {"status": "ok", "image": cand, "source": "notes-fallback", "uncertain": True,
@@ -577,8 +627,11 @@ async def pick_material(info: dict, workdir: str) -> dict:
 
 请挑出最适合做 Temu 产品素材图的一张：
 - 无任何中文文字、水印、他人品牌 logo；
+- 无夸大宣传或绝对化宣称的叠加文案（BEST-SELLER、Best Seller、Hot Sale、Top Quality、
+  Premium、Must Have、Amazing、Guaranteed、热卖、爆款、销量第一这类，纯英文的也算），
+  商品实物上的印花/刺绣/织标不算；
 - 画面就是商品本身（白底/干净背景优先），主体完整；
-- 模特实拍图可以，但不能带中文海报文案。
+- 模特实拍图可以，但不能带中文海报文案或营销标语。
 
 只输出 JSON：{{"image": "<文件名>", "reason": "<20字内>", "uncertain": true/false}}
 一张都不合格时也选相对最好的一张，并把 uncertain 置 true。"""
@@ -658,9 +711,16 @@ async def plan_skc(info: dict, workdir: str,
           那是用一个确定的坏换另一个确定的坏。只有一张可用图都没有时才轮到它们。
         每一级都打 warning 说清放回了什么——静默是这套兜底最坏的性质
         （2026-08-24 追查 SKC 行出现两张重复图，就是被静默的 `return out or paths` 坑的）。
+
+        【unusable 图三级兜底一级都不放回】它是审核拒收、永久清不干净的图（见
+        is_unusable）。三级兜底放回的都是「还有救或还算商品图」的，而放回一张确定带
+        中文的图只会让阶段⑮ 发布被打回。这一行宁可少一张，由 _st_skc 的「复制主图
+        凑数」兜底。
         """
         if not notes:
             return paths
+        # 先整体摘掉永久不可用的图，后面三级兜底就都从这个池子里降级，不会把它放回来
+        paths = [p for p in paths if not is_unusable(_note(p))]
 
         def _base_ok(p: str) -> bool:
             return (not _note(p).get("duplicate")
@@ -1030,11 +1090,15 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
                     rep = {"pos": p, "url": valid_pos[p]["url"]}
                     replace.append(rep)
                     rep_by_pos[p] = rep
-                # 有中文就必须走生图英化：纯放大不动画面，中文会原样带出去
+                # 有中文或夸大宣传就必须走生图英化：纯放大不动画面，两类都会原样带出去
                 rep.pop("needsUpscale", None)
                 if d.get("sizeTable"):
                     rep["sizechart"] = True
-                rep["reason"] = ("复核发现中文：" + (d.get("what") or ""))[:60]
+                # reason 要说清是哪一类：它进 manual_check 与阶段说明给用户看，
+                # 把「BEST-SELLER 角标」讲成「复核发现中文」会让人去找根本不存在的中文
+                # （同 stages.cleaning._fail_message「文案必须与事实相符」的取向）。
+                why = "复核发现夸大宣传：" if d.get("marketingClaim") else "复核发现中文："
+                rep["reason"] = (why + (d.get("what") or ""))[:60]
             replace.sort(key=lambda r: r["pos"])
 
     out = {"status": "ok", "delete": sorted(set(delete)),
@@ -1049,7 +1113,13 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
 
 async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
                             info: Optional[dict] = None) -> dict:
-    """对「将按原画面发布」的描述图专查中文，返回 {pos: {"sizeTable", "what"}}（只含脏的）。
+    """对「将按原画面发布」的描述图查中文与夸大宣传，返回 {pos: {...}}（只含脏的）。
+
+    【为什么夸大宣传也要在这一遍查】这批图的共同点是【原画面原样上架】，全链路没有
+    任何环节再看一眼它们的内容（见 plan_desc docstring 末段）。原先这一遍只问中文，
+    于是纯英文的营销海报（BEST-SELLER 角标、Hot Sale 横幅）在每一道闸都判「干净」：
+    阶段① 只标 chinese/watermark/logo，check_cleaned 当时也不查宣称，这里又只问中文。
+    判据与 check_cleaned 同源（claims.IMAGE_CLAIM_RULE），改口径只改 claims 一处。
 
     与初判分两遍的原因（单任务小批量比几十张混审可靠）见 plan_desc docstring 末段。
     传图复用初判已解析好的 data URL（ref_by_pos），不重复下载。
@@ -1068,15 +1138,20 @@ async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
 下面是同一商品描述区里的 {len(chunk)} 张图，序号是 pos：
 {listing}
 
-它们初判为「干净的商品图」，将【原样】发布到 Temu 海外站。你的唯一任务：复核
-每张图上是否存在任何【中文字符或中文标点】——标题大字、小字说明、表格文字、
-水印、吊牌/标签上的字都算；英文、数字、符号不算。
+它们初判为「干净的商品图」，将【原样】发布到 Temu 海外站。请复核每张图两件事：
+
+1. 是否存在任何【中文字符或中文标点】——标题大字、小字说明、表格文字、水印、
+   吊牌/标签上的字都算；英文、数字、符号不算。
+2. {claims.IMAGE_CLAIM_RULE}
 
 只输出 JSON：{{"dirty": [{{"pos": 1, "sizeTable": true/false,
-"what": "<10 字内说清中文在哪，如「模特信息卡全文」「左上角海报标题」>"}}]}}
-dirty 只列【有中文】的图（pos 必须从 {chunk} 里取），全部干净就返回空数组。
+"marketingClaim": true/false,
+"what": "<10 字内说清问题在哪，如「模特信息卡全文」「右上角BEST-SELLER角标」>"}}]}}
+dirty 只列【有中文或有夸大宣传文案】的图（pos 必须从 {chunk} 里取），
+两项都干净才不列，全部干净就返回空数组。
+marketingClaim 标出这一条是不是因为夸大宣传（只有中文问题时填 false）。
 sizeTable 表示该图是不是尺码表/尺寸示意图。
-拿不准一律算有中文——漏掉的代价是它原样发上真店。"""
+拿不准一律算脏——漏掉的代价是它原样发上真店。"""
         data = await ask_json_with_images(
             prompt, [ref_by_pos[p] for p in chunk], what="阶段⑬keep图中文复核",
             system=_SYS, stage="desc", result_model=DescAudit)
@@ -1087,14 +1162,16 @@ sizeTable 表示该图是不是尺码表/尺寸示意图。
             if p not in chunk or p in dirty:
                 continue
             dirty[p] = {"sizeTable": bool(v.get("sizeTable")),
+                        "marketingClaim": bool(v.get("marketingClaim")),
                         "what": (v.get("what") or "")[:20]}
 
     await asyncio.gather(*(_one(c) for c in
                            (audit_pos[i:i + _DESC_AUDIT_CHUNK]
                             for i in range(0, len(audit_pos), _DESC_AUDIT_CHUNK))))
     if dirty:
-        logger.warning(f"阶段⑬中文复核：{len(dirty)} 张初判保留的图发现中文，"
-                       f"改判生图英化：pos {sorted(dirty)}")
+        n_claim = sum(1 for d in dirty.values() if d.get("marketingClaim"))
+        logger.warning(f"阶段⑬合规复核：{len(dirty)} 张初判保留的图发现中文或夸大宣传"
+                       f"（其中夸大宣传 {n_claim} 张），改判生图英化：pos {sorted(dirty)}")
     return dirty
 
 
@@ -1155,9 +1232,10 @@ plan 必须覆盖上面每一个模块。"""
 
 
 async def check_cleaned(image_path: str) -> dict:
-    """AI 英化后的质检：残留中文/拼音/乱码或破坏主体都算不过。
+    """AI 英化后的质检：残留中文/拼音/乱码/水印/夸大宣传或破坏主体都算不过。
 
-    返回 {"status": "ok", "clean": bool, "issues": str, "residualChinese": bool}。
+    返回 status、clean、issues、residualChinese、garbled、watermark、marketingClaim。
+    五项检查必须明确返回布尔结论才能放行；旧版只回 clean 的响应仅接受拒绝结论。
     实测生图会残留拼音、误译品类（pipeline.desc_replace 注释），只看「中文没了」
     会把带乱码文案的图挂上去，故替换前必须过这道。
 
@@ -1171,13 +1249,28 @@ async def check_cleaned(image_path: str) -> dict:
     真实的绣标与装饰字母——人工选品阶段已经筛掉了不能用的款，实物的一部分不是「待
     清理的文字层」。误报的后果不是保守而是更糟：退回原图 = 中文外链图留在描述区，
     既过不了 1340×1785 闸门、也过不了合规。故这里把判据收窄到【叠加在图上的文案层】。
+
+    【marketingClaim 是第五项，与中文同级】原先五项里没有夸大宣传这一条，于是一张
+    纯英文的 BEST-SELLER 角标图在全链路每一道闸都判「干净」：阶段① 只标
+    chinese/watermark/logo，本函数只查中文与乱码，⑬ 的 keep 复核也只查中文——它就
+    径直发上真店，而销量与排名宣称正是平台罚得最实的一类。判据文案取
+    claims.IMAGE_CLAIM_RULE（与出图提示词同源，见那边说明）。
+
+    【它与 residualChinese 一样单独回一个字段】调用方靠字段决定重试发数，而这一类
+    与中文同属「重烧一发常常就过」：CLAIM_REMOVE_RULE 要求的是抹除而不是译写，
+    是比翻译容易得多的任务，故并入抬高发数的那一档（见 DESC_QC_TRIES_TEXT）。
     """
     prompt = """请对这张商品图片做英化质检（可能是原图，也可能已将中文文案改成英文）：
 
 只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）：
 - residualChinese：是否还残留任何中文字符或中文标点（『』「」、，。！？；：《》等）；
 - garbled：是否有拼音、乱码、断词、无意义字母串（正常英文单词不算）；
-- brokenSubject：是否有明显修图痕迹破坏了商品主体（糊掉、变形、缺块）。
+- watermark：是否残留后期叠加的水印、店铺名、拍摄者账号、网址或联系方式。
+  纯英文、数字或正常可读的网址同样算水印，不需要含中文或乱码。
+  特别检查四角、边缘和底部的浅色、白色、半透明小字，例如 shop…1688.com。
+  正常的英文商品说明不算水印。发现水印必须将 watermark 设为 true，不能只写在 issues；
+- brokenSubject：是否有明显修图痕迹破坏了商品主体（糊掉、变形、缺块）；
+- """ + claims.IMAGE_CLAIM_RULE + """
 
 【以下一律不算问题，不要报】：
 - 商品实物本身的印花、刺绣、织标、袖标、胸标、图案上的字母或品牌标识
@@ -1185,33 +1278,74 @@ async def check_cleaned(image_path: str) -> dict:
 - 图片本身的构图、留白、配色。
 
 只输出 JSON：{"residualChinese": true/false, "garbled": true/false,
-"brokenSubject": true/false, "issues": "<20字内，没有问题留空>"}"""
-    # 【这一处刻意不传 schema】本判断点是【双形状契约】：新形状三个布尔，老形状只回
-    # 一个 clean，下面那段兼容代码是特意留的（模型偶尔仍按老约定答）。把新形状列成
-    # 必答，等于把一个已经能正确读懂的回答判成错、重问三次再抛——而它是逐张图调用
-    # 的（一个商品十几张），代价按张放大。形状风险在这里已由下面的兼容分支接住，
-    # 不需要靠重试解决。
+"watermark": true/false, "brokenSubject": true/false,
+"marketingClaim": true/false, "marketingClaimTexts": ["实际可见的宣称词或短语"],
+"issues": "<具体问题，没有问题留空>"}
+五个布尔字段必须全部填写。marketingClaimTexts 必须列全判为宣称的原文，
+没有宣称时返回空数组；不得只写其中一个词而漏掉其他宣称。"""
     data = await ask_json_with_images(prompt, [image_path], what="英化质检", system=_SYS,
                                       stage="clean_images")
-    fields = ("residualChinese", "garbled", "brokenSubject")
-    if not (all(isinstance(data.get(field), bool) for field in fields)
-            or (not any(field in data for field in fields)
-                and isinstance(data.get("clean"), bool))):
-        return {"status": "error", "clean": False, "issues": "英化质检响应不完整",
-                "residualChinese": False, "garbled": False}
+    fields = ("residualChinese", "garbled", "watermark", "brokenSubject",
+              "marketingClaim")
+    if not all(isinstance(data.get(field), bool) for field in fields):
+        return {"status": "error", "clean": False,
+                "issues": (data.get("issues") or "英化质检响应不完整")[:80],
+                "residualChinese": False, "garbled": False, "watermark": None,
+                "marketingClaim": False}
     cjk = bool(data.get("residualChinese"))
     garbled = bool(data.get("garbled"))
-    bad = cjk or garbled or bool(data.get("brokenSubject"))
-    # 【兼容只回 clean 的旧形状】提示词换过好几版，模型偶尔仍按老约定只回一个
-    # clean 布尔（老提示词的字段）。此时以它为准，免得把「模型说不干净」读成干净——
-    # 三个新字段缺失时 bad 恒 False，那才是真的危险。
-    if "clean" in data and not any(
-            k in data for k in ("residualChinese", "garbled", "brokenSubject")):
-        bad = not bool(data.get("clean"))
-    # 【residualChinese 与 garbled 都要透出去】service 侧靠这两个字段决定重试发数
-    # （见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
+    watermark = bool(data.get("watermark"))
+    claim = bool(data.get("marketingClaim"))
+    non_blocking = []
+    if claim and claims.is_style_only_image_claim(
+            data.get("issues"), data.get("marketingClaimTexts")):
+        non_blocking.append(data.get("issues") or "普通风格描述无需修改")
+        claim = False
+        logger.info(f"图片质检普通风格描述不阻断：{non_blocking[0]}")
+    bad = cjk or garbled or watermark or claim or bool(data.get("brokenSubject"))
+    issues = data.get("issues") or ("残留水印、店铺名或网址" if watermark else "")
+    if non_blocking:
+        issues = "、".join(reason for present, reason in (
+            (cjk, "残留中文"), (garbled, "乱码或拼写错误"),
+            (watermark, "残留水印、店铺名或网址"),
+            (data.get("brokenSubject"), "商品主体破坏")) if present)
+    # issues 留空而 marketingClaim 为真时要自己补一句：调用方把 issues 原样报给用户，
+    # 空串会让提醒变成「质检未过：」这种看不出原因的话（同 watermark 那句的理由）。
+    if not issues and claim:
+        issues = "图上有夸大宣传/绝对化宣称文案"
+    # 【residualChinese / garbled / marketingClaim 都要透出去】service 侧靠这些字段决定
+    # 重试发数（见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
     # 的 `qc.get("garbled")` 恒为 None，加长重试对乱码那一路形同虚设——而 ⑤b main-04
-    # 两发恰好全是 garbled，正是要救的那种。
+    # 两发恰好全是 garbled，正是要救的那种；marketingClaim 从一开始就按这个教训透出。
     return {"status": "ok", "clean": not bad,
-            "issues": (data.get("issues") or "")[:80],
-            "residualChinese": cjk, "garbled": garbled}
+            "issues": issues[:80],
+            "residualChinese": cjk, "garbled": garbled, "watermark": watermark,
+            "marketingClaim": claim, "nonBlockingIssues": non_blocking}
+
+
+async def check_cleaned_twice(image_path: str) -> dict:
+    """英化质检问两次：两次都明确判干净才放行，任一次判坏或无结论都不放行。
+
+    【为什么是两次】check_cleaned 的判定不可复现：2026-09-18 商品 1049857947880 取证，
+    同一批图、同一提示词两次结论相反（第 36 张那次判坏、复测回 clean；第 34 张那次判好、
+    复测却抓出残留的方块字）。抖动是双向的，而两种错的代价不对称——误报只是白拦一张
+    好图（人工一看就放行），漏报是带中文/水印的图【发上真店】（Temu 硬红线，后面没有
+    第二道闸）。故取严：宁可多问一次，不可漏一张。
+
+    【status=error 同样算不过】那是没读到结论（响应不完整），未知在这条红线上不能当安全。
+
+    【调用方在用它做「放行」决策】⑤c 判「已选用的轮播图能不能原样留着」、⑦b 判
+    「预览图能不能原样留着」，都是「说干净就上架」的意思，故共用这一份。原先它只长在
+    ⑤c 里，两处各写一份的话，一处收紧另一处没跟上就白收紧了。
+    """
+    try:
+        for _ in range(2):
+            result = await check_cleaned(image_path)
+            if result.get("status") == "error" or not isinstance(result.get("clean"), bool):
+                return {**result, "status": "error", "clean": False,
+                        "issues": result.get("issues") or "无法取得完整质检结论"}
+            if result["clean"] is False:
+                return result
+        return result
+    except Exception as error:
+        return {"status": "error", "clean": False, "issues": str(error)}

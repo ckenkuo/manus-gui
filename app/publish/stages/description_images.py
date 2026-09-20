@@ -287,7 +287,7 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
     #     连带撞 1340×1785 闸门、在描述区留下 1688 外链（2026-08-26 那批日志末尾
     #     「仍有外链图未转存」+「三张破线」就是三张图退回原图的后果，不是独立故障）。
     #   - 其它 issues（修图痕迹之类）→ DESC_QC_TRIES 发，多烧是同样结果。
-    last_issues, cjk_left = "", False
+    last_issues, cjk_left, claim_left = "", False, False
     attempt, tries = 0, DESC_QC_TRIES
     while attempt < tries:
         attempt += 1
@@ -307,7 +307,7 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
             # last_chance 段。尺码表图抹掉文字就只剩一张空网格、买家按它选码，等于废图，
             # 故这类图末发仍走原来的加码，宁可退回原图交人工。
             prompt = base + stages_cleaning_rules._retry_hint(
-                last_issues, cjk_left,
+                last_issues, cjk_left, claim=claim_left,
                 last_chance=attempt == tries and not rep.get("sizechart"))
         try:
             # desc_mode：按描述图口径出图与收尾，不套服装 1340x1785 闸门
@@ -323,21 +323,29 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 「已通过的缓存」复用——en_path 就是缓存键，见 _desc_cache_paths
         last_issues = qc.get("issues") or ""
         cjk_left = bool(qc.get("residualChinese"))
+        claim_left = bool(qc.get("marketingClaim"))
         # 文字层没清干净（中文残留 or 生图吐了乱码）都给到 DESC_QC_TRIES_TEXT 发，
         # 理由见该常量注释。发数在循环里抬而不是一开始就取大值：只有确实是这两类才
         # 多烧，brokenSubject 照旧 2 发。
-        if cjk_left or qc.get("garbled"):
+        # marketingClaim 一并进这一档：CLAIM_REMOVE_RULE 要求的是【抹除】而不是译写，
+        # 比翻译容易得多（不必读懂、不必排版），多烧一发命中率明显高；而它漏过去的代价
+        # 与中文同级（平台按虚假宣传实罚），不该只给 2 发就退回原图。
+        if cjk_left or qc.get("garbled") or qc.get("marketingClaim"):
             tries = max(tries, DESC_QC_TRIES_TEXT)
         try:
             os.remove(ed["output"])
         except OSError:
             pass
         if attempt < tries:
+            # 脏法要标出来：加码话术按它分支（见 _retry_hint），日志不带就无法从
+            # 「烧了 4 发还没过」反推当时喂的是哪套加码
+            flags = "，".join(f for f, v in (("残留中文", cjk_left),
+                                            ("夸大宣传", claim_left)) if v)
             logger.info(f"描述图英化质检未过（{attempt}/{tries}"
-                        f"{'，残留中文' if cjk_left else ''}），重烧一发："
+                        f"{'，' + flags if flags else ''}），重烧一发："
                         f"{last_issues[:60]}")
     return {"ok": False, "why": f"英化质检未过：{last_issues}"[:150],
-            "residualChinese": cjk_left}
+            "residualChinese": cjk_left, "marketingClaim": claim_left}
 
 
 async def _prewarm_desc_images(workdir: str, replace_plan: list, emit) -> dict:

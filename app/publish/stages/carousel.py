@@ -25,6 +25,7 @@ from app.publish.upload import upload_many
 # 单张生图超时（实测一张约 35s），与 ⑤b 的 CLEAN_TIMEOUT 同值：同一种「curl 生图」
 # 调用、同一类图，没有理由在这里另定一套。
 EN_TIMEOUT = 90
+EN_QC_TRIES = 3
 
 
 # ---- 候选池 → 本地文件 -------------------------------------------------------
@@ -85,25 +86,54 @@ def _en_cache_path(workdir: str, url: str) -> str:
 
 
 async def _english_one(local_path: str, url: str, workdir: str,
-                       sizechart: bool = False) -> dict:
-    """只生图一次；产物替换到页面后再质检，缓存也必须经过页面复检。"""
+                       sizechart: bool = False, initial_qc: dict = None) -> dict:
+    """缓存与新产物均先双检，带具体失败原因最多生图三次，再交页面复检。"""
     out = _en_cache_path(workdir, url)
     os.makedirs(os.path.dirname(out), exist_ok=True)
+    last_qc = initial_qc or {}
     if os.path.exists(out) and os.path.getsize(out) > 0:
         sz = images.image_size(out)
-        if sz and sz[0] == sz[1] and min(sz) >= CAROUSEL_MIN_SIDE:
-            return {"ok": True, "path": out, "how": "cached"}
-        logger.warning(f"轮播图英化产物尺寸已不合规（{sz}），当缓存未命中重做")
-    prompt = (images.SIZECHART_TRANSLATE_PROMPT if sizechart
-              else images.DEFAULT_TRANSLATE_PROMPT)
-    prompt += " 将完整内容排入1:1画布，保留全部尺码、数值、单位和商品介绍，不裁掉信息。"
-    try:
-        ed = await asyncio.to_thread(
-            images.edit_image, local_path, prompt=prompt, out_path=out,
-            size="2048x2048", timeout=EN_TIMEOUT)
-    except Exception as e:
-        return {"ok": False, "why": f"英化失败：{e}"[:150]}
-    return {"ok": True, "path": ed["output"], "how": "edited"}
+        if (sz and sz[0] == sz[1] and min(sz) >= CAROUSEL_MIN_SIDE
+                and os.path.getsize(out) <= CAROUSEL_MAX_BYTES):
+            last_qc = await vision.check_cleaned_twice(out)
+            if last_qc.get("clean") is True:
+                return {"ok": True, "path": out, "how": "cached"}
+        os.remove(out)
+        logger.warning(f"轮播图缓存未通过复核，已作废：{url}；{last_qc.get('issues') or sz}")
+        if last_qc.get("status") == "error":
+            return {"ok": False, "why": f"缓存质检失败：{last_qc.get('issues')}"[:150]}
+    base = (images.SIZECHART_TRANSLATE_PROMPT if sizechart
+            else images.DEFAULT_TRANSLATE_PROMPT)
+    base += " 将完整内容排入1:1画布，保留客观商品介绍及尺码、数值和单位，不裁掉信息。"
+    for attempt in range(EN_QC_TRIES):
+        prompt = base
+        if last_qc.get("issues"):
+            prompt += (
+                f" 本张图质检指出：{str(last_qc['issues'])[:200]}。请逐项修正，"
+                "纯英文文案也必须修正：拼写错误改成正确英文，中文说明翻译成英文；"
+                "夸大宣传、情绪标语、水印直接抹除，不要翻译或换一个同义标语。"
+                "这些修正优先于保留原文案，但商品实物及客观参数、使用说明必须保留。")
+        try:
+            edited = await asyncio.to_thread(
+                images.edit_image, local_path, prompt=prompt, out_path=out,
+                size="2048x2048", timeout=EN_TIMEOUT)
+            prepared = _to_carousel_size(edited["output"], out, preserve_info=True)
+            if not prepared:
+                raise RuntimeError("生图产物尺寸/体积处理失败")
+            last_qc = await vision.check_cleaned_twice(prepared)
+        except Exception as error:
+            if os.path.exists(out):
+                os.remove(out)
+            return {"ok": False, "why": f"英化失败：{error}"[:150]}
+        if last_qc.get("clean") is True:
+            return {"ok": True, "path": prepared, "how": "edited"}
+        if os.path.exists(out):
+            os.remove(out)
+        logger.warning(f"轮播图上传前质检未通过（{attempt + 1}/{EN_QC_TRIES}）："
+                       f"{last_qc.get('issues') or '无结论'}")
+        if last_qc.get("status") == "error":
+            break
+    return {"ok": False, "why": f"英化质检未过：{last_qc.get('issues') or '无结论'}"[:150]}
 
 
 def _to_carousel_size(path: str, out_path: str, preserve_info: bool = False) -> str:
@@ -183,7 +213,7 @@ def _kind_of(entry: dict, verdict: dict) -> str:
 # ---- 阶段主体 ---------------------------------------------------------------
 
 async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
-    """补勾关键信息图，逐张英化质检；一次生图替换后复检，失败停止发布交人工。
+    """补勾关键信息图，上传前带反馈修图并双检，页面复检失败停止发布交人工。
     """
     # 【等图格渲染这件事只在 carousel_state 里做，本阶段不再补等重读】
     # 首跑（2026-09-12~13 夜间批）这里原本是「supported 为 None 就 sleep 2 秒再读一次」，
@@ -258,8 +288,12 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
     adds = wanted[:add_max]
     incomplete = [f"第 {it['i'] + 1} 张候选图未完成识别" for it in cands
                   if it["i"] not in pool or pool[it["i"]]["file"] not in verdicts]
-    incomplete.extend(f"第 {it['i'] + 1} 张信息图超出轮播上限，需人工安排"
-                      for it, _ in wanted[add_max:])
+    # 【放不下的信息图单独一类，不能混进 unknown】它不是「读不出结论」——结论读得很
+    # 清楚（是信息图、价值几分），只是选用位已被占满、本阶段无位可补。混进 unknown 的
+    # 代价：上报讲成「N 张读不出结论」，用户照这条只会去查图片/模型，而真正该做的是
+    # 「取消一张次要图腾个位」；1040482047185 与 1005064778878 两单的「2 张读不出结论」
+    # 全是这么来的（日志里 28/28、9/9 张都有结论）。
+    overflow = [f"第 {it['i'] + 1} 张" for it, _ in wanted[add_max:]]
 
     target = [{"i": it["i"], "add": False} for it in picked] + \
              [{"i": it["i"], "add": True} for it, _ in adds]
@@ -280,7 +314,7 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
             continue
         verdict = verdicts.get(entry["file"]) or {}
         try:
-            qc = await vision.check_cleaned(entry["path"])
+            qc = await vision.check_cleaned_twice(entry["path"])
         except Exception as exc:
             unknown.append(f"{tag}英化质检异常：{exc}")
             continue
@@ -314,7 +348,8 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"轮播图 {tag} 英化质检未通过"
                                    f"（{qc.get('issues') or ''}），"
                                    "生图英化后替换"})
-            en = await _english_one(path, entry["url"], ctx["workdir"], sizechart)
+            en = await _english_one(path, entry["url"], ctx["workdir"], sizechart,
+                                    initial_qc=qc)
             if not en.get("ok"):
                 logger.warning(f"轮播图 {tag} {en.get('why')}")
                 await emit({"type": "manual_check", "stage": "carousel",
@@ -342,17 +377,29 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
                                f"（{'、'.join(unknown[:6])}），"
                                "未通过处理，暂停发布并交人工核对"})
 
+    if overflow:
+        await emit({"type": "log", "level": "info", "stage": "carousel",
+                    "message": f"按 {CAROUSEL_MAX_PICKED} 张选用上限，计划补勾 {len(adds)} 张信息图；"
+                               f"另有 {len(overflow)} 张候选信息图因选用位已满未纳入本轮"
+                               f"（{'、'.join(overflow[:6])}），"
+                               "不影响已选图片的合规判定"})
+
     if failed_adds:
         await emit({"type": "manual_check", "stage": "carousel",
                     "message": f"{len(failed_adds)} 张信息图处理失败、未补勾"
                                f"（{'、'.join(failed_adds[:4])}），需人工补图"})
 
     if not ready:
+        # 【选用位满导致的 overflow 不阻断】选用图本身全部合格、数量也合规，页面这就是
+        # 一个可发布状态；能补的信息图补不进去只是「没能更好」，不是「不能发」。把它算进
+        # fail 等于让一单本可落库的商品停在人工队列里（这正是 1040482047185 那单的处境）。
         status = "fail" if (failed_kept or failed_adds or unknown
                             or not CAROUSEL_MIN_PICKED <= len(picked) <= CAROUSEL_MAX_PICKED) else "ok"
         note = f"轮播图已选 {len(picked)} 张"
         if unknown:
             note += f"；{len(unknown)} 张读不出结论"
+        if overflow:
+            note += f"；{len(overflow)} 张信息图因选用位已满未补勾"
         if failed_kept:
             note = (f"{len(failed_kept)} 张已选轮播图未通过处理"
                     f"（{'、'.join(failed_kept[:4])}），原图仍在选用中，"
@@ -365,7 +412,8 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
         return {"status": status, "note": note[:200]}
 
     # ---- 直传图床：串行保序，与 ⑦ 同一理由（空间弹窗按入库时间排序）----
-    up = await upload_many(session, [r["path"] for r in ready])
+    up = await upload_many(session, [r["path"] for r in ready],
+                           min_w=CAROUSEL_MIN_SIDE, min_h=CAROUSEL_MIN_SIDE)
     uploaded = up.get("uploaded") or []
     if not uploaded:
         await emit({"type": "manual_check", "stage": "carousel",
@@ -389,81 +437,126 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
     if not ready:
         return {"status": "fail", "note": "轮播图产物直传全失败，保持原图"}
 
-    # ---- 把新图选进轮播图候选列表 ----
-    opened = await open_carousel_space(session)
-    if opened.get("err") or not opened.get("opened"):
-        await emit({"type": "manual_check", "stage": "carousel",
-                    "message": "打不开轮播图「选择图片」弹窗，不合规图仍是原图"
-                               "（发布会被拦，请人工换图）"})
-        return {"status": "fail",
-                "note": f"打开选图弹窗失败[{opened.get('stage') or '?'}]："
-                        f"{opened.get('err') or ''}"[:200]}
-
-    picked_res = await media_space._pick_many_from_space(
-        session, [r["fileId"] for r in ready])
-    if picked_res.get("err"):
-        # 弹窗可能还开着挡住后续操作，尽力关掉（best-effort，失败不影响错误返回）
-        await media_space._close_space_modal(session)
-        await emit({"type": "manual_check", "stage": "carousel",
-                    "message": "在图片空间里选不中新传的轮播图，不合规图仍是原图"
-                               "（发布会被拦，请人工换图）"})
-        return {"status": "fail",
-                "note": f"空间选图失败[{picked_res.get('stage') or '?'}]："
-                        f"{picked_res.get('err') or ''}"[:200]}
-
-    # ---- 插完重读一次：新图进了列表，旧下标全部作废 ----
-    st2 = await carousel_state(session)
-    items2 = st2.get("items") or []
-    if not items2:
-        return {"status": "fail",
-                "note": f"选图后读不到轮播图区（{st2.get('err') or '零个图格'}），"
-                        "无法核对替换结果"}
-
-    # 新图按 fileId 文件名在列表里认（同 _pick_from_space：弹窗与列表的 URL 前缀
-    # 不同但文件名一致）。认不到就不能瞎勾——宁可保留原图报人工。
-    ok_tags, added = [], []
+    # ---- 分批把新图选进候选列表：每轮只插「还剩几个选用位」那么多张 ----
+    # 【为什么不能一次全插】2026-09-17 真站实测（1005064778878）：空间弹窗点「确定」后
+    # 新图【自动进入选用态】，而「最多选用 10 张」平台在插入那一刻就卡死——已选 5 张时
+    # 一次插 9 张，页面弹「最大支持10张图片,上传成功5张!」，多出的 4 张【连候选列表都
+    # 没进】，本阶段按 fileId 认不到，只能逐张报「未补勾」（那单 4 张信息图就是这么丢
+    # 的，而日志里只留下一句 toast）。
+    # 【为什么不改成「先把要替换的旧图全取消、再一次性插」】那样选用数会先掉一大截
+    # （4 张替换让它从 5 掉到 1），插入或认图任一步失败，页面就停在「选用数低于下限
+    # 3 张」，比原先「旧图还在、只是不合规」更糟。分批则让选用数始终在满位附近小幅
+    # 动：插满位 -> 取消刚被顶替的旧图 -> 再插下一批。
+    # 【满位时先取消一张旧图腾位】已选 10 张（上一轮刚补满就是这样）时 room=0，不腾位
+    # 这一批就会被平台整批丢掉；取消一张待替换项的旧图、本轮立刻把新图插回来，选用数
+    # 最多只低一张。
+    ok_tags, added, freed = [], [], {}
     expected_urls = {it["url"] for it in picked}
-    for item in sorted(ready, key=lambda entry: entry["add"]):
+    pending = sorted(ready, key=lambda entry: entry["add"])
+
+    async def _restore(item: dict, items: list) -> None:
+        """把腾位时取消掉的旧图勾回去（新图没进列表或勾不上时），别让选用数白掉一张。"""
+        if item["sourceUrl"] not in freed:
+            return
+        old = next((entry for entry in items
+                    if entry.get("url") == item["oldUrl"]), None)
+        if old is not None and not old.get("checked"):
+            await toggle_carousel(session, old["i"], True)
+        freed.pop(item["sourceUrl"], None)
+
+    while pending:
         current = await carousel_state(session)
         current_items = current.get("items") or []
-        file_id = item["fileId"].rsplit("/", 1)[-1]
-        hit = next((entry for entry in current_items
-                    if file_id in (entry.get("url") or "")), None)
-        old_item = next((entry for entry in current_items
-                         if entry.get("url") == item["oldUrl"] and entry.get("checked")), None)
-        failures = failed_adds if item["add"] else failed_kept
-        if hit is None or (not item["add"] and old_item is None):
-            failures.append(item["tag"])
+        if not current_items:
+            return {"status": "fail",
+                    "note": f"选图前读不到轮播图区（{current.get('err') or '零个图格'}），"
+                            "无法核对替换结果"}
+        room = CAROUSEL_MAX_PICKED - sum(bool(entry.get("checked"))
+                                         for entry in current_items)
+        if room <= 0:
+            waiting = next((entry for entry in pending if not entry["add"]
+                            and entry["sourceUrl"] not in freed), None)
+            if waiting is None:
+                # 位子满了又没有可腾位的替换项：剩下的全是补勾项，如实报出来不硬挤
+                for entry in pending:
+                    (failed_adds if entry["add"] else failed_kept).append(entry["tag"])
+                break
+            old_item = next((entry for entry in current_items
+                             if entry.get("url") == waiting["oldUrl"]
+                             and entry.get("checked")), None)
+            result = ({} if old_item is None
+                      else await toggle_carousel(session, old_item["i"], False))
+            if result.get("stage") != "ok":
+                failed_kept.append(waiting["tag"])
+                pending = [entry for entry in pending if entry is not waiting]
+                continue
+            freed[waiting["sourceUrl"]] = waiting["oldUrl"]
             continue
-        removed = False
-        if not hit.get("checked") and sum(bool(entry.get("checked")) for entry in current_items) >= CAROUSEL_MAX_PICKED:
-            if old_item is None:
+
+        batch, pending = pending[:room], pending[room:]
+        opened = await open_carousel_space(session)
+        if opened.get("err") or not opened.get("opened"):
+            await emit({"type": "manual_check", "stage": "carousel",
+                        "message": "打不开轮播图「选择图片」弹窗，这一批图没能替换/补勾"
+                                   "（发布会被拦，请人工核对勾选）"})
+            return {"status": "fail",
+                    "note": f"打开选图弹窗失败[{opened.get('stage') or '?'}]："
+                            f"{opened.get('err') or ''}"[:200]}
+
+        picked_res = await media_space._pick_many_from_space(
+            session, [entry["fileId"] for entry in batch])
+        if picked_res.get("err"):
+            # 弹窗可能还开着挡住后续操作，尽力关掉（best-effort，失败不影响错误返回）
+            await media_space._close_space_modal(session)
+            await emit({"type": "manual_check", "stage": "carousel",
+                        "message": "在图片空间里选不中新传的轮播图，这一批图没能替换/补勾"
+                                   "（发布会被拦，请人工核对勾选）"})
+            return {"status": "fail",
+                    "note": f"空间选图失败[{picked_res.get('stage') or '?'}]："
+                            f"{picked_res.get('err') or ''}"[:200]}
+
+        # ---- 插完重读一次：新图进了列表，旧下标全部作废 ----
+        # 新图按 fileId 文件名在列表里认（同 _pick_from_space：弹窗与列表的 URL 前缀
+        # 不同但文件名一致）。认不到就不能瞎勾——宁可保留原图报人工。
+        for item in batch:
+            current = await carousel_state(session)
+            current_items = current.get("items") or []
+            file_id = item["fileId"].rsplit("/", 1)[-1]
+            hit = next((entry for entry in current_items
+                        if file_id in (entry.get("url") or "")), None)
+            old_item = next((entry for entry in current_items
+                             if entry.get("url") == item["oldUrl"]
+                             and entry.get("checked")), None)
+            failures = failed_adds if item["add"] else failed_kept
+            # 腾过位的替换项，它的旧图【本来就已取消】，不能再按「旧图还在选用中」判失败
+            spared = item["sourceUrl"] in freed
+            if hit is None or (not item["add"] and old_item is None and not spared):
+                await _restore(item, current_items)
                 failures.append(item["tag"])
                 continue
-            result = await toggle_carousel(session, old_item["i"], False)
-            if result.get("stage") != "ok":
-                failures.append(item["tag"])
-                continue
-            removed = True
-        if not hit.get("checked"):
-            result = await toggle_carousel(session, hit["i"], True)
-            if result.get("stage") != "ok":
-                if removed:
-                    await toggle_carousel(session, old_item["i"], True)
-                failures.append(item["tag"])
-                continue
-        added.append((item, hit))
-        if old_item is not None and not removed:
-            result = await toggle_carousel(session, old_item["i"], False)
-            if result.get("stage") != "ok":
-                failures.append(item["tag"])
-                continue
-        expected_urls.discard(item["oldUrl"])
-        expected_urls.add(hit["url"])
-        replacements = {source: hit["url"] if destination == item["sourceUrl"] else destination
-                        for source, destination in replacements.items()}
-        replacements[item["sourceUrl"]] = hit["url"]
-        ok_tags.append(item["tag"])
+            if not hit.get("checked"):
+                if sum(bool(entry.get("checked"))
+                       for entry in current_items) >= CAROUSEL_MAX_PICKED:
+                    await _restore(item, current_items)
+                    failures.append(item["tag"])
+                    continue
+                result = await toggle_carousel(session, hit["i"], True)
+                if result.get("stage") != "ok":
+                    await _restore(item, current_items)
+                    failures.append(item["tag"])
+                    continue
+            added.append((item, hit))
+            if old_item is not None:
+                result = await toggle_carousel(session, old_item["i"], False)
+                if result.get("stage") != "ok":
+                    failures.append(item["tag"])
+                    continue
+            expected_urls.discard(item["oldUrl"])
+            expected_urls.add(hit["url"])
+            replacements = {source: hit["url"] if destination == item["sourceUrl"] else destination
+                            for source, destination in replacements.items()}
+            replacements[item["sourceUrl"]] = hit["url"]
+            ok_tags.append(item["tag"])
 
     # ---- 收尾复核：勾选数与残留不合规图 ----
     st3 = await carousel_state(session)
@@ -482,11 +575,40 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
         try:
             downloaded = await asyncio.to_thread(extract._download_image, item["url"], path)
             qc = await vision.check_cleaned(path) if downloaded else {}
+            # 【问两次，任一次判坏就算坏——只有两次都说好才放行】
+            # check_cleaned 对水印/单字符乱码的判定不可复现：2026-09-18 商品
+            # 1049857947880 取证，同一批 final 图、同一提示词，两次结论相反——
+            # 第 36 张那次判坏、复测回 clean（画面确实干净、全英文 2048²），
+            # 而第 34 张那次判好、复测却抓出「Citizens后出现缺字乱码方块」
+            # （原图确实残留一个方块字 `Citizens囚`，它就这么被放行到了选用中）。
+            #
+            # 【为什么取严的那一侧】抖动是双向的，一次判定既会误报也会漏报，而两种
+            # 错的代价不对称：误报的后果是整单停摆交人工（白拦一个本可落库的商品，
+            # 但图是好的、人工一看就放行）；漏报的后果是带中文/水印的图【发上真店】，
+            # 那是 Temu 的硬红线，且没有第二道闸会再拦它。宁可多拦几单，不可漏一张。
+            # 这与 ⑤b「带中文的图不能一路发上真店」、vision 模块头「拿不准一律交人工，
+            # 不硬猜——选错图会上真店」同一取向。
+            # 代价：每张选用图多一次质检调用（约 2 秒），且误报停摆会变多。
+            #
+            # status=error（响应不完整）同样算「没通过」：那是没读到结论，而未知在
+            # 这条红线上不能当安全。
+            if downloaded and qc.get("clean") is True and qc.get("status") != "error":
+                again = await vision.check_cleaned(path)
+                if again.get("clean") is not True or again.get("status") == "error":
+                    logger.warning(f"轮播图第 {item['i'] + 1} 张复检首次判合格、"
+                                   f"复问判不合格（{again.get('issues') or '无结论'}），"
+                                   "按不合格拦下（判定抖动，取严的一侧）")
+                    qc = again
         except Exception as exc:
             qc = {"issues": str(exc)}
         if qc.get("clean") is not True or qc.get("status") == "error":
             tag = f"第 {item['i'] + 1} 张"
             failed_kept.append(tag)
+            for source_url, destination_url in replacements.items():
+                if destination_url == item.get("url"):
+                    cached = _en_cache_path(ctx["workdir"], source_url)
+                    if os.path.exists(cached):
+                        os.remove(cached)
             await emit({"type": "manual_check", "stage": "carousel",
                         "message": f"轮播图 {tag} 替换后英化复检未通过，停止自动处理并交人工："
                                    f"{qc.get('issues') or '无法取得质检结论'}"})
@@ -506,15 +628,18 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
 
     n_add = sum(1 for r, _ in added if r["add"] and r["tag"] in ok_tags)
     note = (f"替换 {len(ok_tags) - n_add} 张、补勾信息图 {n_add} 张"
-            f"（现选用 {len(picked3)} 张，残留不合规 {len(bad3)} 张）")
+            f"（现选用 {len(picked3)} 张，尺寸不合规 {len(bad3)} 张）")
     if unknown:
         note += f"；{len(unknown)} 张读不出结论"
     if failed_kept:
         note += f"；{len(failed_kept)} 张未换成合规图：{'、'.join(failed_kept[:4])}"
     if failed_adds:
         note += f"；{len(failed_adds)} 张信息图未补勾"
+    if overflow:
+        note += f"；{len(overflow)} 张信息图因选用位已满未补勾"
     if failed_up:
         note += f"；{len(failed_up)} 张上传失败"
+    # overflow 不进 blocked，理由同上面 not ready 那支：页面状态本身是可发布的
     blocked = (failed_kept or failed_adds or failed_up or unknown or bad3
                or st3.get("supported") is not True
                or not CAROUSEL_MIN_PICKED <= len(picked3) <= CAROUSEL_MAX_PICKED)

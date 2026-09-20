@@ -113,5 +113,8 @@ async def test_subjective_claim_exhausted_retries():
     r = await generate_titles(info)
     assert r["status"] == "error"
     assert "title-generation-failed" in r["reason"]
-    # 错误信息里应该提到「含主观营销用语」
-    assert "主观营销" in str(r.get("err", ""))
+    # 错误信息里要点出是哪一类、以及【撞的是哪个词】：判据已并到 claims 共用词表，
+    # 拒因文案随之从「含主观营销用语」改成「含夸大宣传用语 [命中词]」，带词是为了
+    # 让重试提示词能把具体的词喂回模型（见 titles._claim_reject）。
+    err = str(r.get("err", ""))
+    assert "夸大宣传" in err and "Must Have" in err

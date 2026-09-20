@@ -365,6 +365,15 @@ _JS_LIVE_STATE = r"""(async () => {
         .map(x => (x.title || x.textContent || '').trim());
     }
   }
+  // 【仓库判据必须与 save 的 _warehouse_ready 同口径】只看下拉选中值不够：
+  // 库存列没生成时 ⑪ 的成果等于没落到表上，而 save 那道前置校验两个条件都要（选中值
+  // + 库存列表头含仓库名）。两处口径不一致会死锁——续跑判定看下拉有值就不排 ⑪，
+  // save 又要求「请重跑 ⑪」，重跑多少次都是同一个结果（2026-09-18 商品
+  // 1005064778878 实测：全部阶段报「此前已完成，续跑跳过」，save 却卡在仓库校验）。
+  const stockHeaders = Array.from(
+      document.querySelectorAll('#skuDataInfo table thead th'))
+    .map(header => (header.textContent || '').replace(/\s+/g, ''))
+    .filter(text => text.includes('库存'));
 
   // ⑨ 尺码表：控件文本仍是「添加尺码表」说明没加。
   // 套装商品有两张表（label「尺码表」「尺码表2」），按 label 取而不是靠
@@ -544,6 +553,7 @@ _JS_LIVE_STATE = r"""(async () => {
     skuCodeBad: skuCodeBad,
     skuVariantMissing: skuVariantMissing,
     warehouseSelected: warehouseSelected,
+    stockHeaders: stockHeaders,
     sizechartAdded: !!scText && !scText.includes('添加尺码表'),
     // 第二张表：null 表示该类目没有这一栏；false 表示有栏但没填（套装商品必须填，
     // 否则平台打回「套装尺码模板数量不合法」）

@@ -271,3 +271,54 @@ def test_pick_size_for_file可关掉闸门档(tmp_path):
     p = tmp_path / "a.jpg"
     Image.new("RGB", (790, 684), "white").save(p)
     assert images.pick_size_for_file(str(p), gate_aware=False) in images.ALLOWED_SIZES
+
+
+# ---- 内容审核拒绝：永久性失败，不重试、不判换图 ------------------------------
+# 2026-09-18 实测取证见 images.ModerationBlocked：1051951604789 的 main-03.jpg 连发
+# 4 次全被拒，换极简提示词/重编码/裁掉水印带都不救，同商品别的图一发即中。
+
+# 审核拒绝的真实响应（原样抄回，message 里的 request id 已抹）
+MODERATION_RESP = {
+    "error": {
+        "message": ("Your request was rejected by the safety system. If you believe "
+                    "this is an error, contact us at ***.***.com and include the "
+                    "request ID req_8e47dbefc52f403c8a18aed5c3fedee1."),
+        "type": "packy_image_generation_user_error",
+        "param": "",
+        "code": "moderation_blocked",
+    }
+}
+
+
+def test_审核拒绝抛专用异常而不是笼统的响应中没有图片(monkeypatch, 假图, tmp_path):
+    """混进「响应中没有图片」会让调用方去重跑，而重跑必然撞同一个拒绝。"""
+    calls = []
+    _stub(monkeypatch, [MODERATION_RESP], calls)
+    with pytest.raises(images.ModerationBlocked):
+        images.edit_image(假图, out_path=str(tmp_path / "o.png"), do_compress=False)
+
+
+def test_审核拒绝不重试(monkeypatch, 假图, tmp_path):
+    """永久性失败，重试只是把 4 次拒绝叠成一串日志、白等几分钟。"""
+    calls = []
+    _stub(monkeypatch, [MODERATION_RESP], calls)
+    with pytest.raises(images.ModerationBlocked):
+        images.edit_image(假图, out_path=str(tmp_path / "o.png"), do_compress=False)
+    assert len(calls) == 1, f"审核拒绝不该重试，实际发了 {len(calls)} 次"
+
+
+def test_审核拒绝判据只认code不认文案():
+    """message 里带 request id、会变也会被截断，判据必须是 code。"""
+    assert images._is_moderation_blocked(MODERATION_RESP)
+    assert not images._is_moderation_blocked(BAD_CHANNEL_RESP)
+    assert not images._is_moderation_blocked(FIDELITY_RESP)
+    assert not images._is_moderation_blocked(OK_RESP)
+    # 别把「文案里出现 safety」的其它错也当审核拒绝
+    assert not images._is_moderation_blocked(
+        {"error": {"code": "server_error", "message": "safety system unavailable"}})
+
+
+def test_审核拒绝与坏渠道是两类不能互认():
+    """两者处置相反：坏渠道要换渠道重发，审核拒绝要放弃这张图。"""
+    assert not images._is_bad_channel(MODERATION_RESP)
+    assert not images._is_moderation_blocked(BAD_CHANNEL_RESP)

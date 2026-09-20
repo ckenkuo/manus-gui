@@ -38,8 +38,33 @@ _JS_OPEN_CAT_MODAL = r"""(() => {
   const btn = Array.from(sec.querySelectorAll('button, a'))
     .find(b => (b.textContent||'').trim() === '选择分类');
   if (!btn) return JSON.stringify({opened: false, reason: 'button-not-found'});
+  if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+    return JSON.stringify({opened: false, reason: 'button-disabled'});
+  }
   btn.click();
   return JSON.stringify({opened: true});
+})()"""
+
+
+_JS_CATEGORY_FORM_READY = r"""(() => {
+  const sec = document.getElementById('productBasicInfo');
+  if (!sec) return JSON.stringify({ready: false, why: 'no-section'});
+  const row = Array.from(sec.querySelectorAll('.ant-form-item')).find(el => {
+    const label = el.querySelector('.ant-form-item-label label');
+    const text = label ? (label.getAttribute('title') || label.textContent || '') : '';
+    return /^(商家账号|店铺账号)$/.test(text.replace(/[*\s]/g, ''));
+  });
+  const value = row && row.querySelector('.ant-select-selection-item');
+  const shop = value ? (value.textContent || '').trim() : '';
+  const btn = Array.from(sec.querySelectorAll('button, a'))
+    .find(b => (b.textContent || '').trim() === '选择分类');
+  if (!row) return JSON.stringify({ready: false, why: 'no-shop-row'});
+  if (!shop) return JSON.stringify({ready: false, why: 'shop-empty'});
+  if (!btn) return JSON.stringify({ready: false, why: 'button-not-found'});
+  if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') {
+    return JSON.stringify({ready: false, why: 'button-disabled'});
+  }
+  return JSON.stringify({ready: true, shop: shop.slice(0, 40)});
 })()"""
 
 
@@ -374,8 +399,8 @@ async def _lookup_cat_ids(session: BrowserSession, rowid: str, path: list) -> li
     商品会继续按草稿已保存的旧类目查选项，本次修的问题原样重现。
 
     走的是与逐级遍历同一套接口（候选与弹窗列实测同源，见 category_api），故反查结果
-    可以直接当权威值。best-effort：取不到店铺 id、或某一级名字对不上（类目树变了）
-    就返回 []，调用方退回原有行为，绝不让这条补齐路径把阶段搞挂。
+    可以直接当权威值。取不到店铺 id、或某一级名字对不上（类目树变了）时返回 []；
+    接口请求失败则抛异常，防止把失败误当成没有子类目。
     """
     shop_id = await category_api.fetch_shop_id(session, rowid)
     if not shop_id or not path:
@@ -643,9 +668,8 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
                    info: Optional[dict] = None) -> dict:
     """阶段③：逐级选定产品类目到叶子，确认后留在页面（不刷新，状态交后续阶段）。
 
-    走 UI 树而非类目 API（理由见上方注释块）：打开弹窗读第 0 列 → 前瞻各候选的子类目 →
-    LLM 选 → 点列 0 → 读新出现的列 → …… 直到某级点完不再出现新列（= 到叶子），
-    然后点「选择」确认并回读校验。
+    从类目 API 读取逐级候选，LLM 选择后点对应弹窗列，直到接口明确标记叶子类目，
+    然后点「选择」确认并回读校验。请求失败、非叶子没有候选或回读不符均抛异常。
 
     use_cache=True（默认）时先试两条快路径，都不中才落回下面这条完整遍历，一行逻辑
     都不跳：
@@ -679,33 +703,8 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
     if clues:
         logger.info(f"类目判断线索：{clues}")
     await navigation.open_edit(session, rowid)
-    # 等页面自己的数据加载完（原固定 sleep(2)）。
-    #
-    # 【判据必须是「商家账号已回填」，不是按钮渲染出来】2026-09-03 踩坑取证：
-    # open_edit 只等到 skuDataInfo 出现就返回，而页面随后还在异步回填自身数据
-    # （店铺/站点/类目等）。我先试过两个更弱的判据，都会 0~几十 ms 就返回：
-    #   - 只判 productBasicInfo 存在  → 点击落空，报「选择类目弹窗未就绪」
-    #   - 判「选择分类」按钮可见      → 按钮早就在了，点开弹窗时平台弹
-    #                                  「错误：请选择店铺!」并拒开弹窗
-    # 原 sleep(2) 真正兜住的是这段【数据回填】，不是 DOM 挂载。故判据取商家账号
-    # 那一行有值——它正是平台校验的前置项，有值即说明页面数据到位。
-    # 上限 8s：数据回填比 DOM 慢，2s 只是经验值而非上界；提前满足就立刻返回，
-    # 故放宽上限不会让正常情况变慢。
     filled = await common._poll_until(
-        lambda: session.eval_json(r"""(() => {
-            const sec = document.getElementById('productBasicInfo');
-            if (!sec) return JSON.stringify({ready: false, why: 'no-section'});
-            const row = Array.from(sec.querySelectorAll('.ant-form-item'))
-              .find(el => {
-                const l = el.querySelector('.ant-form-item-label label');
-                const t = l ? (l.getAttribute('title') || l.textContent || '') : '';
-                return t.replace(/[*\s]/g, '').includes('商家账号');
-              });
-            if (!row) return JSON.stringify({ready: false, why: 'no-shop-row'});
-            const sel = row.querySelector('.ant-select-selection-item');
-            const v = sel ? (sel.textContent || '').trim() : '';
-            return JSON.stringify({ready: !!v, value: v.slice(0, 40)});
-        })()"""),
+        lambda: session.eval_json(_JS_CATEGORY_FORM_READY),
         lambda d: d.get("ready"),
         timeout=8.0)
     if not filled.get("ready"):
@@ -722,20 +721,19 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
             })()""")
         except Exception:
             logger.warning("等商家账号回填超时后 dump 表单字段失败")
-        # 【不抛】这一步只是等待，判不出来就按原样继续——下方打开弹窗本身会报错，
-        # 那条路径的诊断信息（含平台 toast）比在这里抛更有用。
         logger.warning(f"等商家账号回填超时（{filled.get('why') or filled}），"
                        f"实际表单字段：{(labels or {}).get('labels')}，"
-                       "仍继续尝试打开类目弹窗")
-    await session.kill_stuck_modals()  # 上一轮残留的遮罩会挡住「选择分类」按钮
-
-    r = await session.eval_json(_JS_OPEN_CAT_MODAL)
-    if not r.get("opened"):
-        raise RuntimeError(f"打开选择类目弹窗失败: {r}")
+                       "停止编辑")
+        raise RuntimeError(f"类目表单未就绪：{filled.get('why') or filled}")
+    await session.kill_stuck_modals()
+    result = await session.eval_json(_JS_OPEN_CAT_MODAL)
+    if not result.get("opened"):
+        raise RuntimeError(f"打开选择类目弹窗失败: {result}")
     cols = await session.wait_for(
-        _JS_CAT_COLUMNS, lambda d: d.get("ready") and d.get("n", 0) > 0, timeout=15)
-    if not cols.get("ready"):
-        raise RuntimeError("选择类目弹窗未就绪")
+        _JS_CAT_COLUMNS, lambda data: data.get("ready") and data.get("n", 0) > 0,
+        timeout=15)
+    if not cols.get("ready") or cols.get("n", 0) <= 0:
+        raise RuntimeError(f"选择类目弹窗未就绪: {cols}")
 
     # 两条快路径：先判草稿默认类目，再判历史路径清单。都不中/不适用就落回下方原有
     # 逐级遍历（不需清场，理由见 _try_cached_category 的 docstring）
@@ -758,7 +756,9 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
     for level in range(max_levels):
         rows = await category_api.fetch_children(session, shop_id, parent_id)
         if not rows:
-            break
+            raise RuntimeError(
+                f"类目候选为空，尚未到达叶子类目（父级 {parent_id or '一级'}，"
+                f"路径：{' > '.join(path) or '未选择'}）")
         options = [r["catName"] for r in rows]
         children = None
         if lookahead and len(options) > 1:
@@ -808,13 +808,10 @@ async def auto_cat(session: BrowserSession, rowid: str, title: str,
             timeout=2.0)
     snippet = await read_current_category(session)
     # 回读校验：叶子类目名必须出现在基本信息区，否则确认没生效
-    if leaf and snippet and leaf not in snippet:
-        logger.warning(f"类目回读未见「{leaf}」，实际显示：{snippet[:120]}")
-    # 走通的路径记进缓存，下一个同类商品就能走快路径。
-    # 【只在回读真见到叶子名时才记】上面那行回读不符目前只 warning 不失败，把没生效
-    # 的路径记下来会永久污染缓存（缓存按既定决策不设过期），下游又没有任何环节能
-    # 发现它是错的。
-    if use_cache and path and leaf and snippet and leaf in snippet:
+    if not (leaf and snippet and leaf in snippet):
+        raise RuntimeError(
+            f"类目确认未生效：回读未见「{leaf}」，实际显示：{(snippet or '空')[:120]}")
+    if use_cache:
         cache.remember_category(path, title, [s.get("catId") for s in trace])
     return {"status": "ok", "path": " > ".join(path), "pathList": list(path),
             "leaf": leaf, "levels": len(path), "source": "walk",

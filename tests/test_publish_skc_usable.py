@@ -88,3 +88,69 @@ async def test_单色分支不发视觉请求(tmp_path, monkeypatch):
     r = await vision.plan_skc(_info(["图色"], [
         {"file": "main-01.jpg", "clean": True, "kind": "平铺"}]), d)
     assert r["status"] == "ok" and len(r["rows"]) == 1
+
+
+# ---- unusable（审核拒收）是硬排除，三级兜底一级都不放回 ----------------------
+# 判据与理由见 vision.is_unusable：脏图还能靠 ⑤b 清理救回来，故凑不够行下限时放回；
+# 审核拒收的图不存在能用的路径，放回它就是把带中文的图发上真店。
+
+@pytest.mark.asyncio
+async def test_审核拒收的图不进候选(tmp_path):
+    """它带中文且清不干净，挂上去发布必被打回。"""
+    d = _mk(tmp_path, ["main-01.jpg", "main-02.jpg"])
+    info = _info(["图色"], [
+        {"file": "main-01.jpg", "clean": True, "kind": "平铺"},
+        {"file": "main-02.jpg", "chinese": True, "unusable": True},
+    ])
+    r = await vision.plan_skc(info, d)
+    picked = [os.path.basename(p) for p in r["rows"][0]["images"]]
+    assert picked == ["main-01.jpg"], picked
+
+
+@pytest.mark.asyncio
+async def test_凑不够行下限也不放回审核拒收的图(tmp_path):
+    """脏图这一级按张数降级会放回，unusable 不在降级池子里——宁可这行少一张，
+    由 _st_skc 复制主图凑数，也不发一张确定带中文的图。"""
+    d = _mk(tmp_path, ["main-01.jpg", "main-02.jpg", "main-03.jpg"])
+    info = _info(["图色"], [
+        {"file": "main-01.jpg", "clean": True},
+        {"file": "main-02.jpg", "chinese": True, "unusable": True},
+        {"file": "main-03.jpg", "chinese": True, "unusable": True},
+    ])
+    r = await vision.plan_skc(info, d)
+    picked = [os.path.basename(p) for p in r["rows"][0]["images"]]
+    assert picked == ["main-01.jpg"], f"unusable 图被放回来凑数了：{picked}"
+    assert not r["dirtyUsed"], r["dirtyUsed"]
+
+
+@pytest.mark.asyncio
+async def test_全是审核拒收图时不靠兜底把它们放回(tmp_path):
+    """连一张可用图都没有时，两级兜底放回的是重复图/非商品图，不该把 unusable 放回。"""
+    d = _mk(tmp_path, ["main-01.jpg", "main-02.jpg"])
+    info = _info(["图色"], [
+        {"file": "main-01.jpg", "chinese": True, "unusable": True},
+        {"file": "main-02.jpg", "chinese": True, "unusable": True},
+    ])
+    r = await vision.plan_skc(info, d)
+    assert not (r["rows"][0]["images"] if r["rows"] else []), r["rows"]
+
+
+@pytest.mark.asyncio
+async def test_素材图不选审核拒收的图(tmp_path):
+    """素材图就是轮播首图，挂一张清不干净的图上去最伤。"""
+    d = _mk(tmp_path, ["main-01.jpg", "main-02.jpg"])
+    info = _info(["图色"], [
+        {"file": "main-01.jpg", "chinese": True, "unusable": True},
+        {"file": "main-02.jpg", "clean": True},
+    ])
+    r = await vision.pick_material(info, d)
+    assert os.path.basename(r["image"]) == "main-02.jpg", r
+
+
+@pytest.mark.asyncio
+async def test_只剩审核拒收图时素材图仍给出一张并标uncertain(tmp_path):
+    """全摘完就没得选了，此时不能返回 error 让阶段炸掉——交人工确认。"""
+    d = _mk(tmp_path, ["main-01.jpg"])
+    info = _info(["图色"], [{"file": "main-01.jpg", "chinese": True, "unusable": True}])
+    r = await vision.pick_material(info, d)
+    assert r["status"] == "ok" and r["uncertain"], r

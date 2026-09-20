@@ -288,17 +288,22 @@ async def _curl_put(put_url: str, file_path: str, sign: str, ctype: str,
 
 
 async def upload_many(session: BrowserSession, paths: list,
-                      full_cid: Optional[str] = None) -> dict:
+                      full_cid: Optional[str] = None,
+                      min_w: Optional[int] = None,
+                      min_h: Optional[int] = None) -> dict:
     """按给定顺序逐张直传，返回 {"uploaded": [...], "failed": [...]}。
 
     刻意【串行】而不并发：阶段⑦ 依赖上传顺序决定行内图片顺序（颜色专属图命名
     01.jpg 就自然落在首位、免拖拽，见 todo 阶段⑦）。并发会打乱登记入库的先后，
     空间弹窗按入库时间排序，顺序一乱就得回去拖图。
+    min_w/min_h 透传用途对应的尺寸下限；省略时保留服装默认闸门。
     """
     cid = full_cid or resolve_full_cid()
     uploaded, failed = [], []
+    limits = {key: value for key, value in (("min_w", min_w), ("min_h", min_h))
+              if value is not None}
     for p in paths:
-        res = await upload_image(session, p, full_cid=cid)
+        res = await upload_image(session, p, full_cid=cid, **limits)
         if res.get("status") == "ok":
             uploaded.append(res)
         else:

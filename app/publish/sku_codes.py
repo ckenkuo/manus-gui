@@ -264,7 +264,11 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     todo = [(c, "颜色") for c in colors if has_cjk(c) and not drop_color] + \
            [(s, "尺码") for s in sizes if has_cjk(s) and not drop_size]
 
-    mapping = {w: sku_token(w) for w in colors + sizes if not has_cjk(w)}
+    # 【只把保留维度的词放进 mapping】被丢掉的那一维压根不参与拼装（见上一步的
+    # 「维度取舍」），把它的词也收进来，下面那道 untranslated 闸就会替一个用不到的
+    # 值判整个阶段失败。
+    kept = ([] if drop_color else colors) + ([] if drop_size else sizes)
+    mapping = {w: sku_token(w) for w in kept if not has_cjk(w)}
     if todo:
         sem = asyncio.Semaphore(SKU_CODE_CONCURRENCY)
         logger.info(f"SKU 货号：{len(todo)} 个中文词待翻译（并发 {SKU_CODE_CONCURRENCY}）")
@@ -272,7 +276,13 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
         for term, token in pairs:
             mapping[term] = token
 
-    # 译完仍为空或仍含非 ASCII 的词：拼进货号必然过不了平台校验，直接失败
+    # 译完仍为空或仍含非 ASCII 的词：拼进货号必然过不了平台校验，直接失败。
+    #
+    # 【为什么闸只看保留维度】2026-09-18 商品 1040482047185（9 个颜色 × 尺码列只有
+    # 一个「/」）栽在这里：`/` 是纯符号，`has_cjk` 判它是 ASCII 于是不送翻译，
+    # 直接以 sku_token('/') == '' 进了 mapping，被这道闸当成「译不出的词」——可
+    # 上一步的维度取舍早已 drop_size=True，那个 `/` 根本不会出现在任何货号里。
+    # 卖家在尺码列填 `/`（表示「无尺码」）是常见写法，不该让整单发不出去。
     untranslated = sorted(w for w, t in mapping.items() if not t or has_cjk(t))
     if untranslated:
         return {"status": "error",

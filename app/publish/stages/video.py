@@ -92,15 +92,27 @@ async def _st_video(ctx: dict, session: BrowserSession, emit) -> dict:
     # 3) 直传 + 用「网络上传」把地址填回表单
     r = await set_video(session, norm["output"])
     if r.get("status") != "ok":
+        # 【失败文案要按环节说、别一律讲成「裁切成功」】没裁过的（已合规转存）说成
+        # 「裁切成功但回填失败」是语义错误，人照着这句去查裁切根本没有产物。
+        # 判据取 norm 的 action，不 parse 文案（见 [[publish-stage-fail-message-by-stage]]）。
+        did = "已合规（未裁切）" if norm.get("action") == "skip" else "裁切成功"
         await emit({"type": "manual_check", "stage": "video",
-                    "message": f"视频已裁好但没能填回表单[{r.get('stage')}]，"
+                    "message": f"视频{did}但没能填回表单[{r.get('stage')}]，"
                                f"页面上仍是原视频（发布可能被打回）：{str(r)[:150]}"})
         return {"status": "ok",
-                "note": f"裁切成功但回填失败[{r.get('stage')}]，视频原样保留"}
+                "note": f"{did}但回填失败[{r.get('stage')}]，视频原样保留"}
 
-    out = norm.get("outMeta") or {}
+    # 【note 分两种说法，因为这两支干的事不同】已合规那支没有新产物、尺寸前后一样，
+    # 打成「720×720 → 720×720」等于让人怀疑白转了一遍；它的成果是【地址换到店小秘
+    # 图床】（源在 goods-vod.kwcdn.com 时店小秘拉不动，见上面那段取证），文案就该说
+    # 这件事。真裁过的才用「前 → 后」的对比。
+    out = norm.get("outMeta") or meta
     dur = f"，截断到 {out.get('duration')}s" if norm.get("trimmed") else ""
-    return {"status": "ok",
-            "note": (f"{meta.get('w')}×{meta.get('h')}（{meta.get('ratio')}）→ "
-                     f"{out.get('w')}×{out.get('h')}（{norm.get('ratioName')}）"
-                     f"{dur}，{out.get('sizeMB')}MB")[:200]}
+    if norm.get("action") == "skip":
+        note = (f"已合规（{out.get('w')}×{out.get('h')} {norm.get('ratioName')}，"
+                f"{out.get('sizeMB')}MB），未裁切，已转存到店小秘图床")
+    else:
+        note = (f"{meta.get('w')}×{meta.get('h')}（{meta.get('ratio')}）→ "
+                f"{out.get('w')}×{out.get('h')}（{norm.get('ratioName')}）"
+                f"{dur}，{out.get('sizeMB')}MB")
+    return {"status": "ok", "note": note[:200]}

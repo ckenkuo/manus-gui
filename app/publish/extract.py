@@ -1191,12 +1191,21 @@ _VISION_PROMPT_DETAIL = """请完成五件事，合并成一个 JSON 返回：
    - 如果按款式区分，款式名尽量与「源商品颜色」对齐，但不强制——图里怎么写就怎么记录；
    - 图里压根没有成分标签时返回 {}，【不要按商品照片猜材质】。
 
-5. complianceNotes —— 逐张标注合规风险（Temu 不接受中文/水印/他人 logo）：
+5. complianceNotes —— 逐张标注合规风险（Temu 不接受中文/水印/他人 logo/夸大宣传）：
    "files"：[{"file": "<文件名>", "chinese": true/false, "watermark": true/false,
-   "logo": true/false, "kind": "<模特实拍|平铺|细节|尺码表|洗水标|吊牌|中文海报|工厂图|其它>",
+   "logo": true/false, "claim": true/false,
+   "kind": "<模特实拍|平铺|细节|尺码表|洗水标|吊牌|中文海报|工厂图|其它>",
    "clean": true/false, "note": "<10字内>"}]
-   clean=true 的判据：无任何中文文字、无水印、无他人品牌 logo，且画面就是商品本身
-   （阶段⑥ 挑素材图、阶段⑪ 删描述图直接读这个字段）。
+   claim 标【叠加的文案层里有没有夸大宣传或绝对化宣称】：销量与排名类
+   （BEST-SELLER、Best Seller、热卖、爆款、销量第一、TOP1、#1）、最高级类
+   （Best、Perfect、Top Quality、Premium、Luxury、最好、完美、顶级）、必备类
+   （Must Have、Essential、必备、神器）、情绪夸大类（Amazing、Incredible、震撼）、
+   无从核实的保证（Guaranteed、100% Satisfaction）都算，【纯英文的也算】。
+   客观描述不算（材质成分、尺寸数值、件数、功能说明、使用方法），品类名里的词不算
+   （Tank Top、Essential Oil 这类搭配中的 Top/Essential 是品类词）；商品实物上的
+   印花、刺绣、织标、吊牌字样一律不算，哪怕印的正是这些词。
+   clean=true 的判据：无任何中文文字、无水印、无他人品牌 logo、无夸大宣传文案，
+   且画面就是商品本身（阶段⑥ 挑素材图、阶段⑪ 删描述图直接读这个字段）。
 
 6. duplicates —— 【同一画面】的重复图（画面内容完全一样，只是尺寸/裁切/压缩不同）：
    [[重复文件名, 首见文件名], ...]，首见文件是这一组里编号最前、画面最完整的那张。

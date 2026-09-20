@@ -105,16 +105,29 @@ def _stale_form_stages(live: dict) -> list:
             stale += ["variant", "stock"]
         # ⑪ 仓库单独判：下拉没选（保存失败后页面刷新清空）要重跑 stock 补仓库。
         # warehouseSelected 为 None 表示读不到仓库块（交阶段自己判），空数组才是真没选。
+        #
+        # 【库存列也要判，口径必须与 save 的 _warehouse_ready 一致】那道前置校验要求
+        # 两件事：下拉有选中值【且】库存列表头含仓库名。这里原先只看下拉，于是
+        # 「下拉有值、库存列没生成」的页面会死锁：续跑判定不排 ⑪，save 又回
+        # 「请重跑 ⑪ 库存SKU」，重跑多少轮都是同一结果（2026-09-18 商品
+        # 1005064778878 实测，全部阶段「此前已完成，续跑跳过」而 save 卡在仓库校验）。
+        # 判据取「有仓库块但没有任何库存列」——stockHeaders 读不到时按未知处理，
+        # 不硬判（同 warehouseSelected 为 None 的取向）。
         wh = live.get("warehouseSelected")
-        if wh is not None and not wh:
+        headers = live.get("stockHeaders")
+        if wh is not None and (not wh or (headers is not None and not headers)):
             stale.append("stock")
     # ⑦b SKU 预览图：【与 skuRowCount 那个分支平级，不放进 else】——它读的是变种
     # 【信息】表第一列，与 ⑥⑦ 看的 attrImg*（变种【属性】区）是两处不同的图，
     # 两处正交（2026-08-30 玩具类那单就是 ⑦ 合理跳过、⑦b 从未跑过而被平台拒）。
     # 也不该挂在 skuRowCount 非空的前提下：变种表 0 行时预览图列同样不存在，
     # 那种情况由 previewBad 自己为 0 兜住，不必再套一层分支。
-    # previewCount 为 0 时不判 stale：那说明该类目没有这一列，交阶段自己 skipped。
-    if live.get("previewBad"):
+    # 【只要这一列存在就进重跑集，细判交给阶段自己】2026-09-19 起 ⑦b 还会英化
+    # 【几何本来就合格】的预览图（那批同样是源站原图、同样可能带中文），这类成果被页面
+    # 重载冲掉时回到的是尺寸本来就没问题的源图，previewBad 恒 0 判不出来——与下面
+    # ⑤c 那段是同一个道理，判据也从 previewBad 改成 previewCount。
+    # previewCount 为 0 仍不判 stale：那说明该类目压根没有这一列，交阶段自己 skipped。
+    if live.get("previewCount"):
         stale.append("sku_preview")
     # ⑤c 产品轮播图：与 attrImg*（变种属性区）、preview*（变种信息表）平级的第四处
     # 图位，且是 ⑥ 素材图的上游（页面原文「素材图将自动获取产品轮播图/颜色图的第一张

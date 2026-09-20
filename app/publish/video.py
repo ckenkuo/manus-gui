@@ -303,20 +303,77 @@ def crop_box(w: int, h: int, target: float) -> tuple:
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36")
 
+# curl 退出码里属于「链路瞬时故障」的那些，重发一次很可能就过，值得重试。
+# 这份集合与 images._CURL_TRANSIENT_RC 同源（那边是出图链路用的），刻意各留一份而不
+# 互相 import：本模块的取向是「无网络密钥依赖、可离线单测」，拉 images 进来会把出图
+# 的配置与密钥读取一并拖进这条纯几何处理的链路。
+# 6 DNS 解析失败 / 7 连不上 / 16 HTTP2 帧错 / 18 传输被截断 / 28 超时 /
+# 35 TLS 握手失败 / 52 服务端没回内容 / 55 发送失败 / 56 接收失败（连接重置）。
+# 【为什么必须按码白名单，不能「非 0 就重试」】curl 的确定性失败也给非 0：
+# 22 是 -f 下的 HTTP 错误码（源站 403/404，视频被商家删了就是这个）、3 URL 格式错、
+# 23 写本地文件失败（磁盘满/路径不可写）——重试多少次都是同样的错，白等还把真因
+# 埋进一串重试噪音里（同 [[publish-vision-400-no-retry]] 的取向）。
+_CURL_TRANSIENT_RC = frozenset({6, 7, 16, 18, 28, 35, 52, 55, 56})
+# 下载重试次数与退避基数（第 n 次失败后睡 n × 基数）。
+# 【为什么退避而不是立刻重发】与出图链路同一判断（见 images.EDIT_TRANSIENT_BACKOFF）：
+# 抖动往往是链路一小段时间的劣化（CDN 拥塞），立刻重发很可能撞上同一段劣化。
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_BACKOFF = 3
+# 单次传输时限。【刻意从 300s 缩到 120s 再配重试】原来单发 300s 的形态下，一次
+# rc=28 超时要干等 300s 才认输、还不重试；而 2026-09-18 那单实测是 42.6s 就连不上
+# （rc=28）。单次收紧 + 3 次重试，最坏 6 分钟量级且对瞬时故障真正有效，比单发长等
+# 强。商品视频实测在几 MB 量级（那三单 2.53MB），120s 对正常链路绰绰有余。
+DOWNLOAD_TIMEOUT = 120
+# 连接阶段单独设时限：连不上要快速失败去重试，不该占满整个 --max-time 预算
+# （慢速传输仍由 --max-time 兜着）。
+DOWNLOAD_CONNECT_TIMEOUT = 15
 
-def download_video(url: str, out_path: str, timeout: int = 300) -> dict:
+
+def download_video(url: str, out_path: str, timeout: int = DOWNLOAD_TIMEOUT,
+                   retries: int = DOWNLOAD_RETRIES) -> dict:
     """下载视频到本地，返回 {"status", "path", "sizeMB", "err"}。
 
     -L 跟 302（淘宝 CDN 必跳），-f 让 HTTP 错误码变成非零退出码（否则 curl 会把
     错误页当成文件写下来，后面 ffmpeg 才报「不是视频」，错误信息指不到根因）。
+
+    【为什么要重试】2026-09-18 跑批实测：`下载失败 rc=28: curl: (28) Failed to
+    connect to caiyuanbao.alicdn.com port 443 after 42649 ms`，超时属瞬时故障，而
+    原来这里单发一次、非零立即返回 error，一次抖动就丢掉整个视频（后果是带着竖屏
+    视频去发布，走完 15 个阶段才被平台打回）。项目其它下载路径早有这层防护——主图走
+    extract._download_image（浏览器头 + 指数退避 + 404 不重试），出图走
+    _edits_post_with_retry——视频是同一类网络操作，这里按同样形状补齐。
+
+    【只重试瞬时故障】判据是 curl 退出码白名单 _CURL_TRANSIENT_RC，源站 403/404
+    （-f 下是 rc=22）这类「源站就没有」不重试。
+
+    【链路必须直连，不能走代理】2026-09-18 实测：`caiyuanbao.alicdn.com` 直连正常
+    （TLS 通、1.25s 回 403，403 只是根路径无资源），而走 Clash 的 7890 端口是
+    rc=7 连不上。这与出图链路刚好相反（那条必须走代理，见
+    [[image-api-needs-proxy]]）——阿里 CDN 是国内站，代理绕出国反而断。故显式
+    --noproxy：机器上现在没设 proxy 环境变量，但一旦设了（为出图链路设的全局代理
+    就会这样），curl 会默认吃掉它把视频下载也带上代理，于是整批视频静默失败。
     """
+    import time
+
     os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
-    p = _run(["curl.exe", "-sSL", "-f", "--max-time", str(timeout),
-              "-H", f"User-Agent: {_UA}",
-              "-o", out_path, url], timeout=timeout + 30)
-    if p.returncode != 0:
+    last_err = ""
+    for attempt in range(1, max(1, retries) + 1):
+        p = _run(["curl.exe", "-sSL", "-f",
+                  "--noproxy", "*",
+                  "--connect-timeout", str(DOWNLOAD_CONNECT_TIMEOUT),
+                  "--max-time", str(timeout),
+                  "-H", f"User-Agent: {_UA}",
+                  "-o", out_path, url], timeout=timeout + 30)
+        if p.returncode == 0:
+            break
         err = (p.stderr or b"").decode("utf-8", "replace")[:200]
-        return {"status": "error", "path": out_path, "err": f"下载失败 rc={p.returncode}: {err}"}
+        last_err = f"下载失败 rc={p.returncode}: {err}"
+        if p.returncode not in _CURL_TRANSIENT_RC or attempt >= max(1, retries):
+            return {"status": "error", "path": out_path, "err": last_err}
+        wait = DOWNLOAD_BACKOFF * attempt
+        logger.warning(f"视频下载链路抖动（{attempt}/{retries}），{wait}s 后重试："
+                       f"rc={p.returncode} {url[:80]}")
+        time.sleep(wait)
     if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
         return {"status": "error", "path": out_path, "err": "下载得到空文件"}
     size_mb = os.path.getsize(out_path) / (1024 * 1024)
@@ -349,8 +406,13 @@ def normalize_video(path: str, out_path: Optional[str] = None,
     need_trim = bool(max_seconds) and meta.get("duration", 0) > max_seconds
     if chk["ok"] and not need_trim:
         logger.info(f"视频已合规（{meta['w']}×{meta['h']} {chk['ratioName']}），跳过转码")
+        # 【outMeta 恒为「最终产物」的元数据，skip 下就是源文件自己】原先这一支不给
+        # outMeta，调用方无条件读它就拿到一片 None——2026-09-18 三单的阶段结论都打成
+        # `720×720（1.0）→ None×None（1:1），NoneMB`（视频其实传成功了，纯文案错）。
+        # 补在这里而不是让阶段侧兜底，是为了让返回契约自洽：action 是 skip 还是 crop
+        # 属于本函数的内部决策，调用方不该为了拼一句话去分辨它。
         return {"status": "ok", "action": "skip", "output": path, "meta": meta,
-                "ratioName": chk["ratioName"]}
+                "outMeta": meta, "ratioName": chk["ratioName"], "trimmed": False}
 
     name = target_ratio or pick_target_ratio(meta.get("ratio"))
     if name not in ALLOWED_RATIOS:

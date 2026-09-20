@@ -120,9 +120,13 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
         return notes.get(os.path.basename(path)) or {}
 
     have = set(picked)
+    # unusable（审核拒收、永久清不干净）与 duplicate 一样在候选阶段就排掉：口径必须
+    # 与 plan_skc._usable 一致，否则会出现「选图排除了、补图又补回来」（同 is_dirty
+    # 那段注释的理由）。这一类连「凑不够就放回」都不适用，见 vision.is_unusable。
     cands = [p for p in vision._main_files(workdir)
              if p not in have
              and not _note(p).get("duplicate")
+             and not vision.is_unusable(_note(p))
              and (_note(p).get("kind") or "") not in vision._SKIP_KINDS]
 
     def _key(p: str) -> tuple:

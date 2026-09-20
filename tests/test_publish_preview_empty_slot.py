@@ -41,10 +41,12 @@ class _FakeSession:
 
 
 async def _run(rows, monkeypatch, *, has_trigger=True, session=None,
-               rows_after=None):
+               rows_after=None, workdir="."):
     """把 sku_preview_state 换成给定的行状态，跑 _st_sku_preview 取结论。
 
     rows_after 给了就作为「反选后重读」那一次的返回（模拟变种表重建的结果）。
+    workdir 默认 "."（沿用原有用例），语言关那几个用例传 tmp_path：它们会真的建
+    sku-preview 备料目录，不该把工作目录写进仓库根。
     """
     seq = [rows] + ([rows_after] if rows_after is not None else [])
 
@@ -59,7 +61,7 @@ async def _run(rows, monkeypatch, *, has_trigger=True, session=None,
     async def emit(ev):
         events.append(ev)
 
-    ctx = {"workdir": "."}
+    ctx = {"workdir": workdir}
     res = await service._st_sku_preview(
         ctx, session or _FakeSession(rows_after=rows_after or []), emit)
     return res, events
@@ -101,13 +103,103 @@ async def test_反选不掉时仍判fail并提示人工(monkeypatch):
     assert any(e.get("type") == "manual_check" for e in events)
 
 
+# ---- 语言关：几何合格不等于可以原样发布（2026-09-19 起）---------------------
+# 取证：编辑页 id=184807703152217257 的 6 行预览图都是同一张 alicdn 源图，
+# 1440×1440 方图 → 几何全合格，于是本阶段 0.0s 返回「均已满足」、一次英化都不做，
+# 而那张图上「萌龙弹射飞机」和 shop…1688.com 水印俱全。预览图在买家页选规格时直接
+# 可见、中文是 Temu 硬红线，故现在【几何合格的行也要过语言关】：判干净才放行。
+
+def _write_jpeg(path):
+    """写一张真图：square_image 要真读文件，桩不能只写空文件。"""
+    import os
+    from PIL import Image
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    Image.new("RGB", (1200, 900), (255, 255, 255)).save(path, quality=80)
+    return True
+
+
+def _stub_download(monkeypatch):
+    patch_publish(monkeypatch, "extract", "_download_image",
+                  lambda url, dst: _write_jpeg(dst))
+
+
 @pytest.mark.asyncio
-async def test_全部合规仍判skipped(monkeypatch):
-    rows = [{"i": 0, "color": "白色", "url": "http://x/1.jpg",
-             "w": 1785, "h": 1785, "empty": False, "bad": False}]
-    res, _ = await _run(rows, monkeypatch)
-    assert res["status"] == "skipped"
-    assert "均已满足" in res["note"]
+async def test_合规且画面干净的行原样不动(monkeypatch, tmp_path):
+    """判干净就完全不碰它：省一次上传与替换，画面本来就没变。"""
+    rows = [{"i": 0, "color": "白色", "url": "http://x/1.jpg", "w": 1785, "h": 1785,
+             "empty": False, "bad": False, "hasTrigger": True}]
+    replaced = []
+    _stub_download(monkeypatch)
+    async def fake_check(path):
+        return {"status": "ok", "clean": True, "issues": ""}
+
+    async def fake_replace(*a, **k):
+        replaced.append(a)
+        return {"status": "ok"}
+
+    patch_publish(monkeypatch, "vision", "check_cleaned_twice", fake_check)
+    patch_publish(monkeypatch, "stages.preview", "sku_preview_replace_row", fake_replace)
+    res, _ = await _run(rows, monkeypatch, workdir=str(tmp_path))
+    assert replaced == [], "画面干净的行不该换图"
+    assert res["status"] == "ok"
+    assert "本已干净" in res["note"]
+
+
+@pytest.mark.asyncio
+async def test_合规但带中文的行逐行替换(monkeypatch, tmp_path):
+    """同一张源图被多行共用时只【英化】一次，但组内每一行都要各自替换。
+
+    2026-09-19 实况取证（1051894953703 首跑）：只换「载体」那行的话，其余行仍指向
+    alicdn 源图——该类目每行都各挂各的图引用、各有换图入口，不会跟着主行变。
+    没有入口的继承行不单独换（它跟着主行变，见 bad_inherited）。
+    """
+    rows = [{"i": 0, "color": "白色", "url": "http://x/1.jpg", "w": 1785, "h": 1785,
+             "empty": False, "bad": False, "hasTrigger": True},
+            {"i": 1, "color": "黑色", "url": "http://x/1.jpg", "w": 1785, "h": 1785,
+             "empty": False, "bad": False, "hasTrigger": True},
+            {"i": 2, "color": "红色", "url": "http://x/1.jpg", "w": 1785, "h": 1785,
+             "empty": False, "bad": False, "hasTrigger": False, "hasFillSlot": False}]
+    downloaded, rows_replaced = [], []
+    _stub_download(monkeypatch)
+    patch_publish(monkeypatch, "extract", "_download_image",
+                  lambda url, dst: (downloaded.append(url), _write_jpeg(dst))[1])
+    async def fake_check(path):
+        return {"status": "ok", "clean": False, "issues": "残留中文水印「萌龙弹射飞机」"}
+
+    seen_issues = []
+
+    async def fake_clean(path, prep, issues=""):
+        # 英化产物另存一张真图，交给 square_image 读
+        seen_issues.append(issues)
+        out = path.replace("-raw", "-clean")
+        _write_jpeg(out)
+        return out
+
+    async def fake_replace(session, idx, path, *a, **k):
+        rows_replaced.append(idx)
+        return {"status": "ok"}
+
+    patch_publish(monkeypatch, "vision", "check_cleaned_twice", fake_check)
+    patch_publish(monkeypatch, "stages.preview", "_clean_downloaded_preview", fake_clean)
+    patch_publish(monkeypatch, "stages.preview", "sku_preview_replace_row", fake_replace)
+    res, _ = await _run(rows, monkeypatch, workdir=str(tmp_path))
+    assert downloaded == ["http://x/1.jpg"], "同 URL 的多行只该下载/英化一次"
+    assert rows_replaced == [0, 1], "有换图入口的行都要各自替换；继承行不单独换"
+    # 已拿到的质检结论要喂进英化提示词（同 ⑤c 的带反馈修图，省一发白烧的生图）
+    assert seen_issues and "萌龙弹射飞机" in seen_issues[0]
+    assert res["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_合规但判不了脏时如实判fail(monkeypatch, tmp_path):
+    """判不了脏＝不知道有没有中文，未知不能当安全（同 ⑤c 的 unknown 处置）。"""
+    rows = [{"i": 0, "color": "白色", "url": "http://x/1.jpg", "w": 1785, "h": 1785,
+             "empty": False, "bad": False, "hasTrigger": True}]
+    patch_publish(monkeypatch, "extract", "_download_image",
+                  lambda url, dst: False)
+    res, events = await _run(rows, monkeypatch, workdir=str(tmp_path))
+    assert res["status"] == "fail"
+    assert any("没能判定是否含中文" in (e.get("message") or "") for e in events)
 
 
 @pytest.mark.asyncio
@@ -118,3 +210,41 @@ async def test_尺寸持续未知应等待后阻止保存(monkeypatch):
     res, events = await _run(rows, monkeypatch)
     assert res["status"] == "fail"
     assert any("读不到尺寸" in (e.get("message") or "") for e in events)
+
+
+# ---- 空位补图的第 3 条兜底要跳过审核拒收的图 ---------------------------------
+# 这一条兜底刻意不看 clean/chinese（取的是已过 ⑤b 清理的本地主图，空图位是平台硬拒，
+# 挂同款任意一张也比空着好）。unusable 是唯一例外：那张图 ⑤b 压根没能清干净，
+# 挂上去就是把带中文的图发上真店（见 vision.is_unusable）。
+
+def _mk_mains(tmp_path, names):
+    for n in names:
+        (tmp_path / n).write_bytes(b"\xff\xd8\xff\xe0jpeg")
+    return str(tmp_path)
+
+
+def test_兜底取本地主图时跳过审核拒收的那张(tmp_path):
+    from app.publish.stages import preview as stages_preview
+
+    wd = _mk_mains(tmp_path, ["main-01.jpg", "main-02.jpg"])
+    rows = [{"i": 0, "color": "红", "url": "", "empty": True},
+            {"i": 1, "color": "蓝", "url": "https://cdn/b.jpg", "empty": False}]
+    notes = {"main-01.jpg": {"file": "main-01.jpg", "chinese": True, "unusable": True},
+             "main-02.jpg": {"file": "main-02.jpg", "clean": True}}
+    got = stages_preview._pick_fill_source(
+        rows[0], rows, {}, wd, str(tmp_path / "prep"), notes)
+    import os
+    assert os.path.basename(got) == "main-02.jpg", got
+
+
+def test_没有标注时兜底行为不变(tmp_path):
+    """notes 传空要保持原来的「字典序第一张」，别因为这次改动收紧了兜底。"""
+    from app.publish.stages import preview as stages_preview
+
+    wd = _mk_mains(tmp_path, ["main-01.jpg", "main-02.jpg"])
+    rows = [{"i": 0, "color": "红", "url": "", "empty": True},
+            {"i": 1, "color": "蓝", "url": "https://cdn/b.jpg", "empty": False}]
+    got = stages_preview._pick_fill_source(
+        rows[0], rows, {}, wd, str(tmp_path / "prep"))
+    import os
+    assert os.path.basename(got) == "main-01.jpg", got

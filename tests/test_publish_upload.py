@@ -68,6 +68,29 @@ def curl_spy(monkeypatch):
     return seen
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("side,carousel_limits,accepted", [
+    (799, True, False), (800, True, True), (1000, True, True), (1000, False, False),
+])
+async def test_upload_many_uses_requested_size_gate(tmp_path, curl_spy, side, carousel_limits, accepted):
+    source = _img(str(tmp_path / "carousel.jpg"), side, side)
+    session = FakeSession(
+        {"sign": "SIGN", "url": "https://cos.example.com/upload", "fileId": "/cid/carousel.jpg"},
+        {"code": 0},
+    )
+    limits = {"min_w": 800, "min_h": 800} if carousel_limits else {}
+
+    result = await up.upload_many(session, [source], full_cid="cid", **limits)
+
+    assert result["okCount"] == int(accepted)
+    if accepted:
+        assert curl_spy["path"] == source
+    else:
+        assert result["failed"][0]["stage"] == "size-check"
+        assert not session.calls
+        assert not curl_spy
+
+
 def test_三步顺序与最终URL(tmp_path, curl_spy):
     """成功路径：getSign → PUT → callback，最终 URL = 图床前缀 + fileId。"""
     src = _img(str(tmp_path / "01.jpg"))

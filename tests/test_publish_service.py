@@ -10,6 +10,7 @@ from publish_patching import patch_publish
 import json
 import os
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -25,10 +26,12 @@ def _isolate_state(tmp_path, monkeypatch):
     """状态文件和 prefs 重定向到临时目录，不污染真实 workspace/。"""
     patch_publish(monkeypatch, "service", "STATE_DIR", str(tmp_path / "publish-state"))
     patch_publish(monkeypatch, "service", "PREFS_PATH", str(tmp_path / "publish_prefs.json"))
+    monkeypatch.setattr(service, "is_online_product", AsyncMock(return_value=False))
 
 
 def _fake_stages(monkeypatch, calls: list, fail_at: str = "", raise_at: str = ""):
     """把 15 个阶段全换成假函数，按调用顺序记录到 calls。"""
+    monkeypatch.setattr(service.stages_prewarm, "_start_prewarm", lambda *args: None)
     for sid, _ in service.STAGES:
         async def fake(ctx, session, emit, _sid=sid):
             calls.append(_sid)
@@ -154,6 +157,53 @@ async def test_续跑跳过已完成阶段(tmp_path, monkeypatch):
     assert calls[0] == "auto_cat" and calls[-2:] == ["save", "publish"]
     skipped = [e for e in events if e["type"] == "stage_done" and e["status"] == "skipped"]
     assert {e["stage"] for e in skipped} == {"extract", "claim"}
+
+
+@pytest.mark.asyncio
+async def test_在线商品续跑在打开编辑页前直接跳过(tmp_path, monkeypatch):
+    """发布成功但断点未收口时，在线状态应阻止重复编辑。"""
+    calls = []
+    _fake_stages(monkeypatch, calls)
+
+    async def _online(session, rowid):
+        calls.append(("online", rowid))
+        return True
+
+    patch_publish(monkeypatch, "service", "is_online_product", _online)
+    task = {"rowid": "777", "info_path": "x.json"}
+    r = await service.publish_one(None, task, "Pawly", on_progress=_collect([]))
+
+    assert r["status"] == "ok"
+    assert calls == [("online", "777")]
+    assert service.load_state("rowid-777")["published_online"] is True
+    calls.clear()
+    r = await service.publish_one(None, task, "Pawly", from_stage="attrs")
+    assert r["already_published"] is True
+    assert calls == [("online", "777")]
+
+
+@pytest.mark.asyncio
+async def test_offline_product_rechecks_previous_online_marker(monkeypatch):
+    calls = []
+    _fake_stages(monkeypatch, calls)
+    state = service.load_state("rowid-779")
+    state["published_online"] = True
+    service.save_state(state)
+    result = await service.publish_one(None, {"rowid": "779", "info_path": "x.json"}, "Pawly")
+    assert result["status"] == "ok"
+    assert "attrs" in calls
+    assert not service.load_state("rowid-779").get("published_online")
+
+
+@pytest.mark.asyncio
+async def test_online_precheck_failure_does_not_edit(monkeypatch):
+    calls = []
+    _fake_stages(monkeypatch, calls)
+    monkeypatch.setattr(service, "is_online_product", AsyncMock(side_effect=RuntimeError("unavailable")))
+    result = await service.publish_one(None, {"rowid": "778", "info_path": "x.json"}, "Pawly")
+    assert result["status"] == "fail"
+    assert result["failed_stage"] == "precheck"
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -722,7 +772,9 @@ async def test_实况显示表单还在时不重复重跑(tmp_path, monkeypatch)
     # ⑤c carousel 同理无条件进重跑集：它的成果（替换/补勾上去的图床图）丢没丢，
     # 实况里没有一个稳定信号（「本就没做过」与「做过又丢了」都表现为轮播区全是源站
     # 外链），故也由阶段自己判——它开头有幂等短路（已选图里出现图床图即跳过）。
-    assert calls == ["open_edit", "carousel", "video", "save"]
+    # ⑦b sku_preview 同理（2026-09-19 起它还会英化几何本来就合格的预览图，那批成果
+    # 丢了 previewBad 照样是 0），判据是「预览图列存在」，见 _stale_form_stages。
+    assert calls == ["open_edit", "carousel", "sku_preview", "video", "save"]
 
 
 @pytest.mark.asyncio
@@ -743,8 +795,8 @@ async def test_尺码勾选丢了连带重跑尺码表变种库存(tmp_path, mon
                               "Pawly", on_progress=_collect(events))
 
     assert [c for c in calls if c != "open_edit"] == [
-        "carousel", "fix_sizes", "sizechart", "sku_code", "variant", "stock",
-        "video", "save"]
+        "carousel", "sku_preview", "fix_sizes", "sizechart", "sku_code", "variant",
+        "stock", "video", "save"]
     assert "titles" not in calls and "skc" not in calls
 
 
@@ -996,7 +1048,7 @@ async def test_货号是中文时单独重跑货号阶段(tmp_path, monkeypatch)
                               "Pawly", on_progress=_collect(events))
 
     assert [c for c in calls if c != "open_edit"] == [
-        "carousel", "sku_code", "video", "save"]
+        "carousel", "sku_preview", "sku_code", "video", "save"]
     # 贵阶段（图片/属性）不该被连带
     assert "skc" not in calls and "clean_images" not in calls
 
@@ -1235,6 +1287,26 @@ def test_stale判定_类目有效时不重跑类目():
     stale = service._stale_form_stages(live)
     assert "auto_cat" not in stale and "attrs" not in stale
     assert "titles" in stale and "fix_sizes" in stale
+
+
+def test_stale判定_仓库有值但库存列没生成也要重跑库存():
+    """2026-09-18 商品 1005064778878 死锁取证：下拉选着「飞特COL仓库」、库存列却没
+    生成。续跑判定原先只看 warehouseSelected 非空就不排 ⑪，而 save 的
+    _warehouse_ready 两个条件都要（选中值 + 库存列表头含仓库名），于是每个阶段都报
+    「此前已完成，续跑跳过」，save 又回「请重跑 ⑪ 库存SKU」——重跑多少轮都一样。
+    两处判据必须同口径。"""
+    live = {"rendered": True, "titleFilled": True, "titleHasCjk": False,
+            "skuRowCount": 8, "skuFilledRows": 8, "sizechartAdded": True,
+            "attrImgCount": 6, "shippingSet": True, "descImgCount": 9,
+            "descForeignCount": 0, "skuCodeCount": 8, "skuCodeBad": 0,
+            "warehouseSelected": ["飞特COL仓库"], "stockHeaders": []}
+    assert "stock" in service._stale_form_stages(live)
+    # 库存列在 = ⑪ 的成果确实还在，不该白重跑
+    ok = {**live, "stockHeaders": ["飞特COL仓库库存"]}
+    assert "stock" not in service._stale_form_stages(ok)
+    # 读不到表头时按未知处理，不硬判（同 warehouseSelected 为 None 的取向）
+    unknown = {**live, "stockHeaders": None}
+    assert "stock" not in service._stale_form_stages(unknown)
 
 
 def test_stale判定_标题含中文时重跑标题():

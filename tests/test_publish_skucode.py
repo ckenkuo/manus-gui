@@ -187,6 +187,36 @@ async def test_要丢的维度不进翻译(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_要丢的维度是纯符号时不判失败(monkeypatch):
+    """2026-09-18 商品 1040482047185（9 色 × 尺码列只有一个「/」）栽在这里：
+    `/` 是 ASCII，has_cjk 判它不含中文于是不送翻译，直接以 sku_token('/') == ''
+    进 mapping，被 untranslated 那道闸当成「译不出的词」，整个阶段报
+    「这些词未能译成合法货号 token：['/']」。可尺码维早已 drop_size=True，那个
+    `/` 根本不进任何货号。卖家用 `/` 表示「无尺码」是常见写法，不该整单发不出去。"""
+    rows = [{"i": 0, "color": "粉猪", "size": "/", "cur": ""},
+            {"i": 1, "color": "腊肠", "size": "/", "cur": ""}]
+    patch_publish(monkeypatch, "pipeline", "_translate_term",
+                  _fake_translate({"粉猪": "PinkPig", "腊肠": "Dachshund"}))
+    r = await pipeline.fix_sku_codes(_FakeSession(rows))
+    assert r["status"] == "ok"
+    assert r["codes"] == ["PinkPig", "Dachshund"]
+    assert r["dropped"] == ["尺码"]
+
+
+@pytest.mark.asyncio
+async def test_保留维度里的纯符号词仍判失败(monkeypatch):
+    """反向钉住：闸只对【保留维度】放宽。两维都有多值时 `/` 会真的进货号，
+    拼出来的 `-80` 过不了平台校验，那种情况必须照旧失败。"""
+    rows = [{"i": 0, "color": "/", "size": "80", "cur": ""},
+            {"i": 1, "color": "粉猪", "size": "90", "cur": ""}]
+    patch_publish(monkeypatch, "pipeline", "_translate_term",
+                  _fake_translate({"粉猪": "PinkPig"}))
+    r = await pipeline.fix_sku_codes(_FakeSession(rows))
+    assert r["status"] == "error"
+    assert "/" in r["reason"]
+
+
+@pytest.mark.asyncio
 async def test_颜色列全部行同值时丢掉颜色(monkeypatch):
     """单色多码：颜色恒定，留着只会让每行都背同一个色名，丢掉后货号就是尺码。"""
     rows = [{"i": 0, "color": "粉红色", "size": "80", "cur": ""},

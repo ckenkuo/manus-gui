@@ -4,24 +4,15 @@ import asyncio
 import json
 import re
 from app.logger import logger
+from app.publish import claims
 from app.publish.browser import BrowserSession, J
 from typing import Optional
 
 
-# 「修饰词 + Top(s)」是服装品类词（Tank Top 工字背心 / Crop Top 露脐上衣），不是
-# Temu 禁的「顶级/第一」宣称。_has_subjective_claim 的 \btop\b 不区分这两种用法，
-# 2026-09-11 实测女童背心（1041397908049）两轮 6 个候选全因 "Tank Top"/"Summer Top"
-# 被拦死（title-generation-failed）。故查禁词前先把这些已知搭配整体摘掉。
-# 【名单之外仍按禁词拦】营销用法的 "Top" 在名词前（Top Quality）或独立出现
-# （Our Top Pick 的 Our 不在名单），都不受这个掩码影响，闸门没有变松。
-_TOP_GARMENT_RE = re.compile(
-    r"\b(?:tank|crop|tube|halter|bandeau|camisole?|bikini|vest|peplum|corset|"
-    r"bralette|bra|polo|knit(?:ted)?|ribbed|smocked|ruffled?|lace|mesh|denim|"
-    r"satin|silk(?:y)?|cotton|linen|wool(?:en)?|fleece|thermal|seamless|"
-    r"sleeveless|short[- ]sleeve|long[- ]sleeve|spaghetti[- ]strap|backless|"
-    r"strapless|padded|sports?|yoga|swim|lounge|sleep|maternity|nursing|"
-    r"basic|casual|summer|winter|plus[- ]size)\s+tops?\b",
-    re.I)
+# 夸大宣传词表与品类词掩码已搬到 app/publish/claims.py：那套判据图片链路（英化提示词、
+# 英化质检、keep 图复核）也要用，各留一份必然漂移。此处只保留标题侧的调用。
+# _TOP_GARMENT_RE 原先只掩服装类的「修饰词 + Top」，搬过去后并入 claims._TOP_NOUN_RE，
+# 顺带补上 Table Top / Counter Top 这类部件名。
 
 
 def _js_fill_by_label(label: str, value: str) -> str:
@@ -125,6 +116,38 @@ def _strip_dated(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+# 标题年龄硬闸的判据（2026-09-19 用户要求「标题不填年龄」）。拦的是**具体年龄数值/
+# 月龄**，不是人群词：kids / children / baby / toddler 是搜索大词，提示词第 4 条本就
+# 要求写人群场景；平台上的适用年龄有属性字段与尺码表（阶段⑥⑧）负责，标题再写一遍
+# 只会多一处与实际适用年龄对不上的地方。
+_AGE_RE = (
+    r"\bage[sd]?\s*\d",                                    # Age 3+ / Ages 3-6
+    r"\b\d+\s*(?:[-–~]|to)\s*\d+\s*"                       # 3-6 Years / 0-12M / 2-4T
+    r"(?:years?|yrs?|y|months?|mos?|m|t)\b",
+    r"\b\d+\s*(?:years?|yrs?)\s*(?:old|and up|plus)\b",     # 3 Years Old / 3 Years and up
+    r"\bfor\s+\d+\s*(?:\+|and\s+up\b)",                     # for 3+ / for 3 and up
+    r"\b\d+\s*months?\b",                                   # 6 Months
+    r"\b\d+\s*t\b",                                         # 2T / 3T（童装码）
+    r"\d+\s*[-–~至到]\s*\d+\s*岁",                           # 3-6岁
+    r"\d+\s*岁",                                            # 3岁 / 1岁半
+    r"\d+\s*个月",                                          # 6个月 / 0-12个月
+    r"\d+\s*月龄",                                          # 12月龄
+)
+
+
+def _has_age(text: str) -> bool:
+    """标题里出现具体年龄数值/月龄就返回 True（判不合格）。
+
+    【为什么裸 "3 Years" 不拦】电子产品/家居标题常把保修写成 "1 Year Warranty"，
+    按「数字 + Years」一刀切会误伤；标题里真正会出现的年龄写法是范围（3-6 Years）、
+    "3 Years Old"、"Age 3+"、"for 3+"，这几类都已覆盖。误伤的代价不只是拒一个候选——
+    两次生成都撞上就会整个阶段失败。月份那类按年计价的保修少，故 "6 Months" 直接拦。
+    【为什么 "2T/3T" 要拦】童装码本身就是年龄码，与「3-6 Years」等价。
+    """
+    t = str(text or "")
+    return any(re.search(p, t, re.I) for p in _AGE_RE)
+
+
 # 明显不是品牌的词：1688 的「品牌」属性经常被卖家填成品类/功能描述（实测
 # offer 971877978455 填的是「无功能保暖」），源标题开头也常是「儿童秋冬季…」这类
 # 品类词。这些一旦进了品牌违禁词表，任何正常重写的中文标题都会被判「含品牌词」，
@@ -171,6 +194,8 @@ async def generate_titles(info: dict) -> dict:
       - 中文标题重写（不照抄源标题），突出卖点，≤60 字
       - 品牌红线：属性里的品牌值（过滤掉「无功能保暖」这类描述性假品牌）
         + 源标题开头的英文商标 token，见 _brand_words
+      - 年龄红线：不出现具体年龄数值/月龄（3-6 Years、2T、3-6岁、6个月），
+        人群词（kids/儿童/男童）可写，见 _has_age
       - 多候选兜底：一次生成 3 个英文标题，按推荐序取第一个合规的
     生成失败时最多重试一次（喂上次不合格的原因）；两次都不合格才报错。
 
@@ -232,28 +257,18 @@ async def generate_titles(info: dict) -> dict:
         )
         return any(re.search(p, text, re.I) for p in pats)
 
-    def _has_subjective_claim(text: str) -> bool:
-        """主观营销用语硬闸——Temu 明确禁止的绝对化/主观化表述。
+    def _claim_reject(text: str) -> Optional[str]:
+        """夸大宣传硬闸：命中返回带具体词的拒因，合规返回 None。
 
-        平台禁用词类型：最高级（Best/Perfect）、必备类（Must Have）、
-        第一类（#1/Top/Leading）、完美类（Perfect/Flawless）等。
-        中文同样拦截「好物/神器/必备/最好/第一/完美」等。
+        判据走 claims.has_marketing_claim（全管线共用词表）。原先这里内联一份
+        只覆盖最高级/必备/第一三类的词表，销量与排名类（BEST-SELLER、Hot Sale、
+        爆款、销量第一）压根不在其中——那正是平台罚得最实的一类。
+
+        【拒因要带上命中的词】两次生成都不合格时只报「含主观营销用语」，日志里看不出
+        撞的是哪个词，重试提示词也没法把它喂回模型（同本函数外层 last_reasons 的取向）。
         """
-        # 先摘掉「Tank Top / Crop Top」这类服装品类词里的 top（理由见
-        # _TOP_GARMENT_RE 的注释），再查禁词
-        text = _TOP_GARMENT_RE.sub(" ", text)
-        # 英文主观营销词
-        en_pats = (
-            r"\b(best|perfect|flawless|ultimate|ideal)\b",
-            r"\b(must[\s-]?have|essential|necessary)\b",
-            r"\b(top|leading|premier|superior|unbeatable)\b",
-            r"\b(number[\s-]?one|#\s*1|no\.?\s*1)\b",
-            r"\b(amazing|incredible|unbelievable|revolutionary)\b",
-        )
-        # 中文主观营销词
-        zh_pats = r"(好物|神器|必备|最好|第一|完美|极致|顶级|首选|王牌)"
-        return (any(re.search(p, text, re.I) for p in en_pats)
-                or bool(re.search(zh_pats, text)))
+        hits = claims.hit_words(text)
+        return f"含夸大宣传用语 {hits[:4]}" if hits else None
 
     def _en_reject(en: str) -> Optional[str]:
         """英文标题不合格的具体原因；合格返回 None。
@@ -275,11 +290,11 @@ async def generate_titles(info: dict) -> dict:
             return f"含品牌词 {forbidden}"
         if _has_year(en):
             return "含年份或时效词"
+        if _has_age(en):
+            return "含年龄数值（适用年龄由属性字段声明，标题只写人群词）"
         if _has_price_claim(en):
             return "含价格/优惠宣称"
-        if _has_subjective_claim(en):
-            return "含主观营销用语"
-        return None
+        return _claim_reject(en)
 
     def _zh_reject(zh: str) -> Optional[str]:
         """中文标题不合格的具体原因；合格返回 None。"""
@@ -291,12 +306,12 @@ async def generate_titles(info: dict) -> dict:
             return f"含品牌词 {forbidden}"
         if _has_year(zh) or re.search(r"新款|新品|上新", zh):
             return "含年份或新款等时效词"
+        if _has_age(zh):
+            return "含年龄数值（适用年龄由属性字段声明，标题只写人群词）"
         if _has_price_claim(zh) or re.search(
-                r"包邮|免邮|特价|清仓|折扣|秒杀|亏本|甩卖", zh):
+                r"包邮|免邮|特价|清仓|折扣|秒杀|亏本|甩卖|超值|白菜价", zh):
             return "含价格/优惠宣称"
-        if _has_subjective_claim(zh):
-            return "含主观营销用语"
-        return None
+        return _claim_reject(zh)
 
     # 【候选数 3 不是 10】2026-08-24 耗时实测：原先要 10 个候选、每个还带 logic 字段，
     # 推理模型为 10 个候选各推演一遍，一次烧掉 15896 completion token / 2 分 13 秒——
@@ -318,11 +333,23 @@ async def generate_titles(info: dict) -> dict:
         "   Temu/拼多多等推荐型平台采用「强卖点+核心词+属性词+适用对象」，紧凑直白，前 30-40 个字符\n"
         "   放核心词和最大卖点。当前来源平台为：" + platform + "。\n"
         "7. 拒绝关键词堆砌：使用自然语序、空格和连字符，标题必须读起来像商品名称。\n"
-        "8. 只描述客观事实，禁止夸大或无法验证的词：Best、Perfect、Must Have、Top、#1、Amazing、\n"
-        "   Incredible、最高级、全网第一、最好、必买等；禁止价格、折扣、包邮、清仓等承诺。\n"
+        "8. 只描述客观事实，禁止夸大或无法验证的词，以下几类一个都不许出现：\n"
+        "   - 销量/排名：Best Seller、BEST-SELLER、Hot Sale、Top Rated、#1、Trending、\n"
+        "     Viral、1000+ Sold、爆款、热卖、畅销、销量第一；\n"
+        "   - 最高级/绝对化：Best、Perfect、Top Quality、Premium、Luxury、Ultimate、\n"
+        "     Unbeatable、最好、最佳、完美、顶级、极致、独一无二、全网第一；\n"
+        "   - 必备/必买：Must Have、Essential、必备、必买、神器、好物；\n"
+        "   - 情绪夸大与保证：Amazing、Incredible、Stunning、Guaranteed、100% Satisfaction、\n"
+        "     震撼、逆天、保证效果；\n"
+        "   禁止价格、折扣、包邮、清仓等承诺。品类名里的词不受此限（Tank Top、Essential Oil\n"
+        "   这类搭配中的 Top/Essential 是品类词，可以正常使用）。\n"
         "9. 禁止年份及短期时效词（2025/2026/25/26、New Arrival、Latest、This Year、新款、新品、上新）；\n"
         "   Winter/Fall 等真实季节属性可以保留。禁止 Emoji、商标蹭词和特殊符号。\n"
         "10. 英文标题只允许 ASCII 字母、数字、空格和连字符，长度严格 40-70 个字符（含空格）。\n"
+        "11. 禁止出现任何年龄数值或月龄（Age 3+、Ages 3-6、3-6 Years、2-4T、6 Months、2T、\n"
+        "   3-6岁、6个月等）：适用年龄由平台属性字段声明，标题写了只会与实际适用年龄对不上。\n"
+        "   人群词 kids / children / baby / toddler / 儿童 / 男童 可以正常写，但不要带岁数；\n"
+        "   需要凑长度时用材质、功能、场景、规格补，不要用年龄。\n"
         "标题结构公式（推荐按商品类型选用）：\n"
         "A 基础型：[核心品类] + [关键属性] + [材质/功能] + [适用场景/人群]\n"
         "   示例：Adjustable Pet Harness for Small Dogs, Breathable Mesh, Daily Walking\n"
@@ -336,7 +363,8 @@ async def generate_titles(info: dict) -> dict:
         f"源标题前几个字符也可能是品牌词，一律剔除）。\n"
         "中文标题要求：去掉品牌名，不得照抄源标题——重新组织关键词和语序，突出本商品实际卖点\n"
         "（从源参数/图片理解中提炼，如材质/套装件数/风格/季节/装饰元素等），通顺简洁≤60字；\n"
-        "同样严禁年份和「新款/新品/上新」这类时效词（季节词可留）。\n"
+        "同样严禁年份和「新款/新品/上新」这类时效词（季节词可留），也严禁年龄数值/月龄\n"
+        "（如 3-6岁、6个月），人群词（儿童/男童/宝宝）可保留但不带岁数。\n"
         # 不要 logic 字段：它只进日志不进表单，却让模型为每个候选多写一段推演
         "只输出 JSON：{\"candidates\": [{\"enTitle\": \"...\"}...共3个],\n"
         "\"recommend\": <0-2 的序号，选最贴合商品且合规的>, \"title\": \"<重写后的中文标题>\"}\n\n"

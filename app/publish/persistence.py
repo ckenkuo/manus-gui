@@ -12,6 +12,27 @@ from app.publish.browser import (
 )
 
 
+_PUBLISH_READY_TIMEOUT = 40.0
+
+_JS_PUBLISH_READY = r"""(() => {
+  const url = new URL(location.href);
+  const rowid = url.pathname === '/web/popTemu/edit' ? url.searchParams.get('id') : '';
+  const checked = Array.from(document.querySelectorAll(
+    '#skuAttrsInfo label.d-checkbox input[type="checkbox"]:checked'));
+  const table = Array.from(document.querySelectorAll('#skuDataInfo table')).find(candidate =>
+    Array.from(candidate.querySelectorAll('thead th')).some(header =>
+      (header.textContent || '').includes('SKU货号')));
+  const codes = table ? Array.from(table.querySelectorAll('tbody input[name="variationSku"]')) : [];
+  const filledCodes = codes.filter(input => (input.value || '').trim()).length;
+  const publishEnabled = Array.from(document.querySelectorAll('button')).some(button =>
+    button.offsetHeight > 0 && !button.disabled && (button.textContent || '').trim() === '发布');
+  return {ready: !!rowid && publishEnabled && checked.length > 0 && codes.length > 0 &&
+      filledCodes === codes.length,
+    rowid, url: location.href, checkedOptions: checked.length,
+    skuRowCount: codes.length, filledCodes, publishEnabled};
+})()"""
+
+
 # ---- 阶段⑮ 立即发布 --------------------------------------------------------
 # 【这里是全管线唯一不可逆的一步】原 skill 与本模块此前刻意不实现发布入口（真实商家
 # 账号、发布后要下架才能改）。2026-08-24 按用户明确要求补上：⑭ save 落库之后点顶部
@@ -107,7 +128,7 @@ _JS_OPEN_PUBLISH_DROPDOWN = r"""(async () => {
 
 
 # hover 展开 + 点「立即发布」，一个 evaluate 里做完（见本节顶部：菜单跨 evaluate 会收起）。
-_JS_CLICK_PUBLISH_NOW = r"""(async () => {
+_JS_CLICK_PUBLISH_NOW = r"""(async (expectedRowid = '') => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const btns = Array.from(document.querySelectorAll('button'))
     .filter(b => b.offsetHeight > 0 && (b.textContent || '').trim() === '发布')
@@ -164,6 +185,11 @@ _JS_CLICK_PUBLISH_NOW = r"""(async () => {
     return JSON.stringify({clicked: false, reason: 'publish-now-item-zero-height'});
   }
   // 菜单还开着的这一刻直接点，中间不回 Python
+  const readiness = __PUBLISH_READY__;
+  if (expectedRowid && readiness.rowid !== expectedRowid) return JSON.stringify({clicked: false,
+    reason: 'publish-product-mismatch', readiness});
+  if (!readiness.ready) return JSON.stringify({clicked: false,
+    reason: 'publish-form-not-ready', readiness});
   item.click();
   await sleep(1500);
   return JSON.stringify({clicked: true,
@@ -172,7 +198,7 @@ _JS_CLICK_PUBLISH_NOW = r"""(async () => {
            w: Math.round(rect.width), h: Math.round(rect.height)},
     // 菜单收起是「点中了」的旁证（ant 的菜单项点击后会关闭浮层）
     menuGone: !liveMenu()});
-})()"""
+})""".replace("__PUBLISH_READY__", _JS_PUBLISH_READY)
 
 
 # 「立即发布」后平台可能再弹一次二次确认（.ant-modal）。按钮文案未经实测，故兜
@@ -303,6 +329,24 @@ async def _publish_landed(session: BrowserSession, rowid: str) -> dict:
         await session.fix_hidden_tab()
 
 
+async def is_online_product(session: BrowserSession, rowid: str) -> bool:
+    """按商品 ID 读取服务端在线状态，不导航或修改表单。"""
+    if not rowid:
+        return False
+    data = await session.eval_json(r"""(async () => {
+      const response = await fetch('/api/popTemuProduct/edit.json?id=' +
+        encodeURIComponent(__ROWID__), {credentials: 'include'});
+      if (!response.ok) return {error: 'HTTP ' + response.status};
+      const body = await response.json();
+      if (body.code !== 0) return {error: body.msg || 'product-query-failed'};
+      const product = (body.data || {}).product || {};
+      return {rowid: product.idStr, state: product.dxmState};
+    })()""".replace("__ROWID__", J(str(rowid))))
+    if data.get("rowid") != str(rowid) or not data.get("state"):
+        raise RuntimeError(f"无法确认商品 {rowid} 的发布状态：{data}")
+    return data["state"] == "online"
+
+
 async def publish_now(session: BrowserSession, rowid: str = "",
                       confirm: bool = False) -> dict:
     """阶段⑮：点顶部「发布」→「立即发布」，把已落库的草稿真正上架。
@@ -313,6 +357,9 @@ async def publish_now(session: BrowserSession, rowid: str = "",
     前提：⑭ save 必须已成功。发布走与保存同一套前端校验，草稿没落库就点发布只会
     重复卡在同一批校验错误上。
 
+    保存确认框的「继续编辑」会重载页面；发布按钮先于变种数据出现，必须等待
+    变种选择与 SKU 货号回填，再重装被重载清掉的提示监听，并在点击前再次检查。
+
     判据：
       成功 = 无 .ant-form-item-explain-error，且【列表取证】通过——草稿箱里没了
              或在线产品列表里有它（见 _publish_landed；成功 toast 抓不到、页面也
@@ -322,6 +369,24 @@ async def publish_now(session: BrowserSession, rowid: str = "",
     if not confirm:
         return {"status": "refused", "reason": "发布不可逆，必须显式传 confirm=True"}
 
+    await session.fix_hidden_tab()
+    readiness = await session.wait_for(
+        _JS_PUBLISH_READY,
+        lambda data: data.get("ready") or bool(
+            rowid and data.get("rowid") and data["rowid"] != str(rowid)),
+        timeout=_PUBLISH_READY_TIMEOUT, interval=0.5)
+    if rowid and readiness.get("rowid") and readiness["rowid"] != str(rowid):
+        return {"status": "not-ready", "reason": "当前编辑页商品与待发布商品不一致，未点击发布",
+                "readiness": readiness}
+    if not readiness.get("ready"):
+        return {"status": "not-ready",
+                "reason": f"编辑页尚未回填完整，未点击发布（已选变种 {readiness.get('checkedOptions', 0)}，"
+                          f"SKU 行 {readiness.get('skuRowCount', 0)}，"
+                          f"已填货号 {readiness.get('filledCodes', 0)}）",
+                "readiness": readiness}
+    await session.install_toast_watch()
+    logger.info(f"发布前编辑页已就绪：{readiness}")
+
     # 遗留遮罩会把点击全部吞掉（保存确认框的老坑），发布前先清一次
     await session.kill_stuck_modals()
 
@@ -329,7 +394,7 @@ async def publish_now(session: BrowserSession, rowid: str = "",
     # 见 _JS_CLICK_PUBLISH_NOW 上方注释）。整段重试 3 轮：hover 偶发不触发。
     clicked = {}
     for attempt in (1, 2, 3):
-        clicked = await session.eval_json(_JS_CLICK_PUBLISH_NOW)
+        clicked = await session.eval_json(_JS_CLICK_PUBLISH_NOW, arg=str(rowid or ""))
         if clicked.get("clicked"):
             break
         logger.warning(f"第 {attempt} 次展开/点击「立即发布」未成功：{clicked}")

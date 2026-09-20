@@ -2,6 +2,7 @@
 
 import asyncio
 
+from app.logger import logger
 from app.publish import common
 from app.publish.browser import BrowserSession, J
 from app.publish.media import space as media_space
@@ -337,29 +338,56 @@ async def open_carousel_space(session: BrowserSession) -> dict:
     三步：JS 定坐标 → CDP 真实鼠标点击展开菜单 → JS 点「空间图片」。
     为什么必须这么拆（那个按钮吞 JS click 与 Playwright click），见
     _JS_CAROUSEL_BTN_POS 上方的实测记录。
+
+    【no-dropdown 要重瞄一次，不能一次点不开就判死】坐标是「JS 读一次 → Python 另发
+    一次 CDP 点击」得来的，两次往返之间只要 Vue 重渲染或页面滚一下，坐标就打在别的
+    元素上——菜单实例压根不会创建，回来就是 no-dropdown（同 _JS_PICK_WAREHOUSE 上方
+    记的那个「先读坐标再点」的坑）。2026-09-18 商品 1005064778878 实测栽在这里：⑤c
+    刚把 9 张产物直传完、页面正好重渲染过，第一次点必落空。
+    重瞄比放宽判据对：判据（菜单里同时有「空间图片」与「引用采集图片」）一个字都没动，
+    只是把「读坐标→点」这对动作整体再做一遍。
     """
-    pos = await session.eval_json(
-        _JS_CAROUSEL_BTN_POS.replace("__PICK__", _JS_PICK_CAROUSEL_LIST))
-    if pos.get("err"):
-        return {"stage": "locate", **pos}
+    last: dict = {}
+    for attempt in range(3):
+        pos = await session.eval_json(
+            _JS_CAROUSEL_BTN_POS.replace("__PICK__", _JS_PICK_CAROUSEL_LIST))
+        if pos.get("err"):
+            last = {"stage": "locate", **pos}
+            await asyncio.sleep(0.8)
+            continue
 
-    # CDP 真实鼠标事件：先移过去再按下抬起。三个事件缺一不可——只发 pressed/released
-    # 而不先 mouseMoved 时，实测有概率不展开（hover 态没建立）。
-    for params in ({"type": "mouseMoved", "x": pos["x"], "y": pos["y"]},
-                   {"type": "mousePressed", "x": pos["x"], "y": pos["y"],
-                    "button": "left", "clickCount": 1},
-                   {"type": "mouseReleased", "x": pos["x"], "y": pos["y"],
-                    "button": "left", "clickCount": 1}):
-        r = await session.cdp("Input.dispatchMouseEvent", params)
-        if not r.get("ok"):
-            return {"stage": "click", "err": f"CDP 点击失败: {r.get('err')}"}
-        await asyncio.sleep(0.3)
-    await asyncio.sleep(0.9)
+        # CDP 真实鼠标事件：先移过去再按下抬起。三个事件缺一不可——只发 pressed/released
+        # 而不先 mouseMoved 时，实测有概率不展开（hover 态没建立）。
+        failed = None
+        for params in ({"type": "mouseMoved", "x": pos["x"], "y": pos["y"]},
+                       {"type": "mousePressed", "x": pos["x"], "y": pos["y"],
+                        "button": "left", "clickCount": 1},
+                       {"type": "mouseReleased", "x": pos["x"], "y": pos["y"],
+                        "button": "left", "clickCount": 1}):
+            r = await session.cdp("Input.dispatchMouseEvent", params)
+            if not r.get("ok"):
+                failed = {"stage": "click", "err": f"CDP 点击失败: {r.get('err')}"}
+                break
+            await asyncio.sleep(0.3)
+        if failed:
+            return failed
+        await asyncio.sleep(0.9)
 
-    return await session.eval_json(
-        _JS_PICK_CAROUSEL_MENU.replace("__WANT__", J(CAROUSEL_MENU_WANT))
-                              .replace("__FEAT__", J(CAROUSEL_MENU_FEATURE))
-                              .replace("__TITLE__", J(media_space.SPACE_MODAL_TITLE)))
+        r = await session.eval_json(
+            _JS_PICK_CAROUSEL_MENU.replace("__WANT__", J(CAROUSEL_MENU_WANT))
+                                  .replace("__FEAT__", J(CAROUSEL_MENU_FEATURE))
+                                  .replace("__TITLE__", J(media_space.SPACE_MODAL_TITLE)))
+        if r.get("opened"):
+            if attempt:
+                logger.info(f"轮播图选图弹窗第 {attempt + 1} 次重瞄后打开")
+            return r
+        if r.get("stage") == "open" and not r.get("err"):
+            r = {**r, "err": "图片空间弹窗在 6 秒内未出现"}
+        last = r
+        if r.get("err") != "no-dropdown" and r.get("stage") != "open":
+            return r
+        await asyncio.sleep(1.0)
+    return last
 
 
 async def toggle_carousel(session: BrowserSession, idx: int, want: bool) -> dict:

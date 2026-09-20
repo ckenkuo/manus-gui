@@ -88,9 +88,6 @@ async def fetch(session: BrowserSession, url: str,
     if not r.get("ok"):
         raise RuntimeError(f"导航失败: {r}")
 
-    # 【2026-09-03 额外等待数据注入】navigate() 已改用 "load" 事件，但 1688 的
-    # window.context 数据可能在 load 之后才异步注入。这里额外等待 2 秒，给数据注入
-    # 脚本足够的执行时间。best-effort：如果 2 秒还不够，wait_for 会继续轮询 40 秒。
     await asyncio.sleep(2.0)
 
     # 反爬闸门放在等数据【之前】：被拦时 window.context 压根不存在，先干等 40s 再

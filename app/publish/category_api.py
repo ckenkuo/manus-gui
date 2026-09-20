@@ -16,6 +16,8 @@
          → 该级候选 [{catId, catName, isLeaf, isHidden, catLevel, ...}]
 """
 
+import asyncio
+
 from app.logger import logger
 from app.publish.browser import BrowserSession, fill_js
 
@@ -91,18 +93,24 @@ async def fetch_children(session: BrowserSession, shop_id: str,
                          parent_id: str = "") -> list:
     """取某一级类目的候选，返回 [{"catId", "catName", "isLeaf", "isHidden"}]。
 
-    parent_id 为空串即取一级类目。取不到时返回空列表（调用方据此收尾）。
+    parent_id 为空串即取一级类目。请求失败最多尝试三次，仍失败则抛异常；
+    只有请求成功且没有候选时返回空列表。
     【不过滤 isHidden】实测一级候选与弹窗那一列逐项一致（含顺序），多一层过滤反而
     会与 UI 对不上；真点到隐藏项会在点击那一步如实报错，不会静默选错。
     """
     if not shop_id:
-        return []
-    data = await session.eval_json(
-        fill_js(_JS_CATEGORY_LEVEL, SHOPID=str(shop_id)), arg=str(parent_id or ""))
-    if not data.get("ok"):
-        logger.warning(f"取类目候选失败（父级 {parent_id or '一级'}）："
-                       f"{data.get('msg') or data.get('err') or data.get('status')}")
-        return []
+        raise RuntimeError("取类目候选失败：缺少店铺 id（shopId）")
+    for attempt in range(3):
+        data = await session.eval_json(
+            fill_js(_JS_CATEGORY_LEVEL, SHOPID=str(shop_id)), arg=str(parent_id or ""))
+        if data.get("ok"):
+            break
+        reason = data.get("msg") or data.get("err") or data.get("status") or "未知错误"
+        message = f"取类目候选失败（父级 {parent_id or '一级'}）：{reason}"
+        if attempt == 2:
+            raise RuntimeError(f"{message}（已尝试 3 次）")
+        logger.warning(f"{message}，准备第 {attempt + 2}/3 次尝试")
+        await asyncio.sleep(attempt + 1)
     rows = [r for r in (data.get("rows") or []) if r.get("catName")]
     logger.info(f"类目候选（父级 {parent_id or '一级'}）：{len(rows)} 个")
     return rows

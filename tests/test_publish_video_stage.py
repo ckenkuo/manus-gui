@@ -169,6 +169,35 @@ async def test_转码失败不拖垮商品(monkeypatch, _ctx):
     assert [e for e in events if e["type"] == "manual_check"]
 
 
+_SKIP_NORM = {"status": "ok", "action": "skip", "output": "a.mp4",
+              "meta": {"w": 720, "h": 720, "ratio": 1.0, "sizeMB": 2.53},
+              "outMeta": {"w": 720, "h": 720, "ratio": 1.0, "sizeMB": 2.53},
+              "ratioName": "1:1", "trimmed": False}
+
+
+@pytest.mark.asyncio
+async def test_已合规但源在Temu图床时转存且note不打None(monkeypatch, _ctx):
+    """2026-09-18 三单的实况：note 打成 `720×720（1.0）→ None×None（1:1），NoneMB`。
+
+    根因是 normalize_video 的 skip 分支不返回 outMeta（已在库侧补齐），而这条路径
+    很常走——Temu 源视频挂 goods-vod.kwcdn.com，店小秘拉不动，比例虽合规也要转存。
+    另外「已合规」这支不该打「前 → 后」的对比：尺寸前后一样，打成
+    `720×720 → 720×720` 等于让人怀疑白转了一遍，它的成果是【地址换到店小秘图床】。
+    """
+    _patch(monkeypatch,
+           cur={"status": "ok",
+                "videoUrl": "https://goods-vod.kwcdn.com/a.mp4"},
+           norm=_SKIP_NORM)
+    events, emit = _emit_collector()
+    r = await service._st_video(_ctx, _FakeSession(), emit)
+    assert r["status"] == "ok"
+    assert "None" not in r["note"], f"note 里不该出现 None：{r['note']}"
+    assert "720×720" in r["note"] and "2.53MB" in r["note"]
+    assert "→" not in r["note"], "没裁过就别打前后对比，尺寸一样看着像白转了"
+    assert "转存" in r["note"], "这一支的成果是把地址换到店小秘图床，文案要说这件事"
+    assert not events
+
+
 @pytest.mark.asyncio
 async def test_回填失败不拖垮商品(monkeypatch, _ctx):
     """裁好了但没填进表单：页面上仍是原视频，要说清楚这一点。"""
@@ -179,8 +208,26 @@ async def test_回填失败不拖垮商品(monkeypatch, _ctx):
     r = await service._st_video(_ctx, _FakeSession(), emit)
     assert r["status"] == "ok"
     assert "回填失败" in r["note"]
+    assert "裁切成功" in r["note"]
     msgs = [e["message"] for e in events if e["type"] == "manual_check"]
     assert msgs and "仍是原视频" in msgs[0]
+
+
+@pytest.mark.asyncio
+async def test_已合规转存时回填失败别说成裁切成功(monkeypatch, _ctx):
+    """按环节说话：这一支压根没裁过，说「裁切成功但回填失败」会让人去查一个
+    不存在的产物（见记忆 publish-stage-fail-message-by-stage）。"""
+    _patch(monkeypatch,
+           cur={"status": "ok", "videoUrl": "https://goods-vod.kwcdn.com/a.mp4"},
+           norm=_SKIP_NORM,
+           setv={"status": "error", "stage": "upload", "detail": {}})
+    events, emit = _emit_collector()
+    r = await service._st_video(_ctx, _FakeSession(), emit)
+    assert r["status"] == "ok"
+    assert "裁切成功" not in r["note"], f"没裁过不能说裁切成功：{r['note']}"
+    assert "未裁切" in r["note"] and "回填失败" in r["note"]
+    msgs = [e["message"] for e in events if e["type"] == "manual_check"]
+    assert msgs and "裁切成功" not in msgs[0]
 
 
 # ---- 阶段注册与续跑 ---------------------------------------------------------
