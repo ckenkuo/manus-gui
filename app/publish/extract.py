@@ -488,7 +488,9 @@ def check_material_image(main_entries: list) -> dict:
     result = {"sourceFile": first["file"], "w": w, "h": h}
     if not w or not h:
         return {**result, "needsProcessing": None, "reason": "尺寸读取失败，需人工看图确认"}
-    square = abs(w / h - 1) < 0.01
+    # 方图判严格相等，不留比例容差：平台按像素严格比 1:1，1206x1204 这种差 2px 的图
+    # 照样被拒（2026-09-19 商品 1081125452313，取证见 media/preview.py 那处注释）。
+    square = w == h
     big_enough = w >= 800 and h >= 800
     if square and big_enough:
         return {**result, "needsProcessing": False,

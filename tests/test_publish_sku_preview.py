@@ -66,7 +66,7 @@ class _StateSession:
 def _row(i, color, w, h, url="https://cbu01.alicdn.com/x.jpg"):
     """按 JS 侧那套判据算出 bad，模拟真实返回（JS 已算好 bad，Python 侧只读）。"""
     known = w > 0 and h > 0
-    square = known and abs(w / h - 1) < 0.01
+    square = known and w == h
     bad = known and (not square or w < P.PREVIEW_MIN_SIDE or h < P.PREVIEW_MIN_SIDE)
     return {"i": i, "color": color, "url": url, "w": w, "h": h, "bad": bad}
 
@@ -135,6 +135,14 @@ def test_大图但非方形判bad():
     assert _row(0, "某色", 1600, 1200)["bad"] is True
 
 
+def test_只差两px的近方图也判bad():
+    """2026-09-19 商品 1081125452313：1206x1204 差 2px，比例容差 0.00166 曾放它过去，
+    平台照样拒「错误：变种预览图必须为1:1尺寸」。方图判据必须严格 w == h——那单因此
+    整行一次没碰（note 写「0 行预览图已处理」），错误一路延后到发布才暴露。"""
+    assert _row(0, "可爱甜玉米抱枕", 1206, 1204)["bad"] is True
+    assert _row(1, "某色", 1206, 1206)["bad"] is False
+
+
 def test_状态脚本带行级换图入口():
     """坏行要能分流「有 trigger 能换图」与「无 trigger 继承图」——后者
     sku_preview_replace_row 报「该行没有预览图 trigger」，service 据此不判 fail
@@ -187,9 +195,15 @@ def test_预览图破线进重跑集():
     assert "sku_preview" in stale
 
 
-def test_预览图全达标不进重跑集():
+def test_预览图列存在就进重跑集():
+    """⑦b 与 ⑤c 同口径：成果丢没丢实况里没有稳定信号。
+
+    2026-09-19 起 ⑦b 还会英化【几何本来就合格】的预览图（那批同样是源站原图、同样
+    可能带中文），而这类成果被页面重载冲掉后回到的仍是尺寸没问题的源图，previewBad
+    恒 0 判不出来——故判据从 previewBad 改成 previewCount。
+    """
     stale = S._stale_form_stages(_live(previewBad=0))
-    assert "sku_preview" not in stale
+    assert "sku_preview" in stale
 
 
 def test_无预览图列不进重跑集():
@@ -207,9 +221,15 @@ def test_预览图破线不连带重跑skc():
     assert "sku_preview" in stale and "skc" not in stale
 
 
-def test_skc破线不连带重跑预览图():
+def test_skc破线只牵连自己那一侧():
+    """两处正交：变种属性区的图（⑦）与变种信息表的预览图（⑦b）各判各的。
+
+    ⑦b 恒在重跑集里（判据是 previewCount，见上一条），这里钉的是 skc 那一侧：
+    只因 attrImgBad 破线而入集，不因为别的图位。
+    """
     stale = S._stale_form_stages(_live(attrImgBad=2, previewBad=0))
-    assert "skc" in stale and "sku_preview" not in stale
+    assert "skc" in stale
+    assert "sku_preview" in stale
 
 
 def test_类目失效时全量重跑含预览图():

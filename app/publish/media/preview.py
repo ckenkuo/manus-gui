@@ -124,7 +124,14 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
     const h = empty ? 0 : (im.naturalHeight || 0);
     // 未知尺寸(w/h=0)不判 bad：图没加载完不等于不合格
     const known = w > 0 && h > 0;
-    const square = known && Math.abs(w / h - 1) < 0.01;
+    // 【方图必须严格 w === h，不能留比例容差】2026-09-19 商品 1081125452313 取证：
+    // 变种表那行预览图 1206x1204，只差 2px，原判据 abs(w/h-1)<0.01 算出 0.00166 < 0.01
+    // 判成合规 → bad=False，语言关又判「画面本已干净」，于是本阶段一次都没碰它
+    // （note 写的是「0 行预览图已处理」），发布被平台拒「错误：变种预览图必须为1:1尺寸」。
+    // 那条容差是从 video.RATIO_TOLERANCE 抄来的，而那边的成因是【视频编码后实际像素
+    // 会差一两个】、平台按三档比例归类；图片这边平台是按像素严格比的，差 2px 就拒。
+    // 判据与 ⑤c 轮播图（media/carousel.py 的 w === h）自此同口径。
+    const square = known && w === h;
     rows.push({i: i, color: iColor >= 0 ? txt(tds[iColor]) : '',
                url: empty ? '' : src,
                w: w, h: h, empty: empty,
@@ -479,8 +486,9 @@ async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
     # 【成功判据是回读到的 src 含新 fileId】只看「src 变了」不够：挂错行时本行 src
     # 同样可能变（原脚本的素材图误替换事故正是这么发生的，见 set_material 的注释）
     width, height = after.get("w") or 0, after.get("h") or 0
+    # 回读校验与 _JS_SKU_PREVIEW_STATE 的 bad 同口径：方图判严格相等，理由见那处注释
     ok = (fid in (after.get("src") or "") and min(width, height) >= PREVIEW_MIN_SIDE
-          and abs(width / height - 1) < 0.01)
+          and width == height)
     if not ok:
         logger.error(f"预览图第 {row_idx + 1} 行替换后回读不含新 fileId："
                      f"before={(opened.get('srcBefore') or '')[-50:]} "

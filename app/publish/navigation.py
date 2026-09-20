@@ -433,7 +433,9 @@ _JS_LIVE_STATE = r"""(async () => {
   // ⑦b SKU 预览图：变种【信息】表第一列，与上面 attrImg* 那组（变种【属性】区）
   // 是两处不同的图，续跑必须分开判——2026-08-30 玩具类那单正是 ⑦ 合理跳过、
   // ⑦b 从未跑过而被平台拒（见「阶段⑦b SKU 预览图」段落的取证）。
-  // 判据与 sku_preview_state 一致：非 1:1 或短边 < __PREVMIN__ 即 bad；
+  // 判据与 sku_preview_state 一致：非 1:1 或短边 < __PREVMIN__ 即 bad；方图判【严格
+  // w !== h】而不是比例容差——1206x1204 这种差 2px 的图平台照样拒（2026-09-19 商品
+  // 1081125452313，取证见 media/preview.py 那处注释），容差会让续跑也判不出这一列 stale。
   // 尺寸未知（naturalWidth=0，图没加载完）不计入 bad——未知不等于不合格。
   const prevTable = (document.getElementById('skuDataInfo') || document)
     .querySelector('table');
@@ -450,7 +452,7 @@ _JS_LIVE_STATE = r"""(async () => {
       if (!im) return;
       previewCount++;
       const w = im.naturalWidth || 0, h = im.naturalHeight || 0;
-      if (w && h && (Math.abs(w / h - 1) >= 0.01 || w < __PREVMIN__ || h < __PREVMIN__)) {
+      if (w && h && (w !== h || w < __PREVMIN__ || h < __PREVMIN__)) {
         previewBad++;
       }
     });

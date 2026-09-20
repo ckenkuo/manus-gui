@@ -341,13 +341,26 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                                        f"（发布会被拦，请人工换图）"})
                 fail_rows.append(tag)
                 continue
-            cleaned = await _clean_downloaded_preview(raw, prep)
-            if not cleaned:
-                fail_rows.append(tag)
-                await emit({"type": "manual_check", "stage": "sku_preview",
-                            "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"})
-                continue
-            raw = cleaned
+            # 【先质检再决定要不要出图】几何不合规不等于画面脏：2026-09-19 判据从
+            # 「比例容差」改成严格 w==h 之后，「画面本来干净、只差几 px 不方」的图开始
+            # 进这条通道（商品 1081125452313 那张 1206x1204 即此）。无条件走
+            # _clean_downloaded_preview 等于为纯几何问题白烧一次出图——出图依赖代理、
+            # 有内容审核，失败反而把本来只需 PIL 裁方就能修好的行拖成 fail。
+            # 判干净就只做 square_image（画面一个像素不改，同下面语言关「判干净就完全
+            # 不碰」的取向）；判脏或判不出结论才英化——后者与原行为一致。
+            qc = await vision.check_cleaned_twice(raw)
+            if qc.get("clean") is True:
+                logger.info(f"预览图 {tag} 画面已干净（{r['w']}x{r['h']} 仅几何不合规），"
+                            "只做 1:1 合规化、不动画面")
+            else:
+                cleaned = await _clean_downloaded_preview(
+                    raw, prep, issues=qc.get("issues") or "")
+                if not cleaned:
+                    fail_rows.append(tag)
+                    await emit({"type": "manual_check", "stage": "sku_preview",
+                                "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"})
+                    continue
+                raw = cleaned
             sq = images.square_image(raw, out_path=out)
         except Exception as e:
             # 下载或合规化失败：该行保持原样（原图还挂着，不会变空）
