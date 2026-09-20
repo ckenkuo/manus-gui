@@ -2,7 +2,7 @@
 
 
 def _retry_hint(issues: str, cjk: bool, last_chance: bool = False,
-                claim: bool = False) -> str:
+                claim: bool = False, banned: bool = False) -> str:
     """质检未过后重烧时追加的提示词（⑤b 与 ⑬ 共用）。
 
     【为什么必须加码而不是原样重发】原样重发只是赌生图的随机性；把「上一发到底哪里
@@ -42,6 +42,22 @@ def _retry_hint(issues: str, cjk: bool, last_chance: bool = False,
                        "抹除处按周围画面自然补全，最终图上不留任何后期添加的文字。"
                        "商品实物本身的印花、刺绣、织标要原样保留，"
                        "商品主体、配色、图案和构图完全不变。")
+    # 【banned 排在 claim 之前】两样都有时先说禁词：禁词是「整句连同它说明的信息一起
+    # 抹掉」，比 claim 那句「抹标语、留客观介绍」更严，先说不会漏掉 claim 要做的事，
+    # 反过来则会让模型以为「客观介绍照旧保留」而把「PP棉填充」这类当介绍留下来
+    # （同 claim 优先于 cjk 的理由）。
+    if banned:
+        return head + ("图上仍有平台禁词，分两种处置："
+                       "①「安抚」类用途描述（安抚、安抚玩偶、Soothing、Soother、"
+                       "Comforter）【不要翻译、不要保留】，连同所在整句文案与它的底色块"
+                       "一起抹除干净、按周围画面自然补全；"
+                       "②「PP棉」类填充物俗称（PP棉、pp棉、聚丙烯棉、PP Cotton）不要照译，"
+                       "改写成规范材质名 Polyester Fiber——填充物是买家关心的材质信息，"
+                       "不要整段删掉。"
+                       "Comfort（舒适）不是禁词，「聚酯纤维」「Polyester Fiber」"
+                       "是规范材质名，都不必动。"
+                       "商品实物本身的印花、刺绣、织标原样保留；"
+                       "材质、尺寸、件数这类不含上述词的客观介绍照旧翻译保留。")
     if claim:
         return head + ("图上仍有夸大宣传或绝对化宣称的文案（BEST-SELLER、Best Seller、"
                        "Hot Sale、Top Quality、Premium、Must Have、Amazing、Guaranteed、"

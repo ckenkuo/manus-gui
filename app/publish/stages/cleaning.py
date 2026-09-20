@@ -136,7 +136,8 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
             "prompt": (images.SIZECHART_TRANSLATE_PROMPT if is_sizechart else
                        "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、"
                        "构图和颜色；同时移除水印、店铺名和第三方 logo。"
-                       + claims.CLAIM_REMOVE_RULE),
+                       + claims.CLAIM_REMOVE_RULE
+                       + claims.BANNED_REMOVE_RULE),
             "sizechart": is_sizechart,
             "note": "轮播图中文复核",
         })
@@ -173,6 +174,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         async with sem:
             dst = os.path.join(outdir, os.path.splitext(item["file"])[0] + "-clean.png")
             last_why, cjk_left, claim_left = "", False, False
+            banned_left = False
             attempt, tries = 0, stages_description_images.DESC_QC_TRIES
             while attempt < tries:
                 attempt += 1
@@ -184,7 +186,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                     # 故「是不是末发」要拿当前的 tries 判，不能用固定常量。
                     # 尺码表图豁免末发的「全抹掉」（理由见本函数 docstring 末段）
                     prompt += stages_cleaning_rules._retry_hint(
-                        last_why, cjk_left, claim=claim_left,
+                        last_why, cjk_left, claim=claim_left, banned=banned_left,
                         last_chance=attempt == tries and not item.get("sizechart"))
                 try:
                     # 素材图是轮播首图，糊了最伤转化，故这一路不降采样出图（见 pick_size 注释）
@@ -215,23 +217,29 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                 last_why = f"质检未过：{qc.get('issues') or ''}"
                 cjk_left = bool(qc.get("residualChinese"))
                 claim_left = bool(qc.get("marketingClaim"))
+                banned_left = bool(qc.get("bannedTerm"))
                 # 同 _prepare_desc_image：中文残留与生图乱码都算「这发没弄好」，多烧
                 # 有救。main-04 那次两发全是 garbled，只给 2 发正好白放弃。
                 # marketingClaim 同样抬发数（理由见 _prepare_desc_image 那处注释）：
                 # 这一路的图是 ⑥⑦ 的选图来源，退回原图等于把一张带营销标语的图
                 # 以脏图身份放回打分池。
-                if cjk_left or qc.get("garbled") or qc.get("marketingClaim"):
+                # 禁词与中文/乱码/夸大同属「重烧一发常常就过」（抹除比译写容易），
+                # 故一并抬高发数，理由见 vision.check_cleaned 对 marketingClaim 那段。
+                if (cjk_left or qc.get("garbled") or qc.get("marketingClaim")
+                        or banned_left):
                     tries = max(tries, stages_description_images.DESC_QC_TRIES_TEXT)
                 if attempt < tries:
                     # 脏法要进日志：加码话术按它分支（见 _retry_hint），不带就无法从
                     # 「烧了 4 发还没过」反推当时喂的是哪套加码
                     flags = "，".join(f for f, v in (("残留中文", cjk_left),
-                                                    ("夸大宣传", claim_left)) if v)
+                                                    ("夸大宣传", claim_left),
+                                                    ("平台禁词", banned_left)) if v)
                     logger.info(f"{item['file']} 清理质检未过（{attempt}/{tries}"
                                 f"{'，' + flags if flags else ''}），"
                                 f"重烧一发：{(qc.get('issues') or '')[:60]}")
             return {"file": item["file"], "ok": False, "kind": "qc",
-                    "why": last_why[:120], "marketingClaim": claim_left}
+                    "why": last_why[:120], "marketingClaim": claim_left,
+                    "bannedTerm": banned_left}
 
     logger.info(f"图片清理：{len(items)} 张待处理（并发 {conc}）")
     results = await asyncio.gather(*(_one(it) for it in items))

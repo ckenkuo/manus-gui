@@ -206,3 +206,99 @@ CLAIM_REMOVE_RULE = (
     "按周围画面自然补全；商品实物上的印花、刺绣、织标要原样保留。"
     + _IMAGE_STYLE_BOUNDARY
 )
+
+
+# ---- 平台禁词：与夸大宣传无关的另一类硬红线 ------------------------------------
+#
+# 【为什么不并进 _EN_CLAIM_PATS / _ZH_CLAIM_PAT】那两套是「夸大宣传」判据，命中后的
+# 处置口径是「抹掉标语、保留商品信息」；这一套是用户 2026-09-20 定案的禁词，性质完全
+# 不同——睡眠类词说的是商品用途，不是宣称，却一样不许出现在买家可见的商品信息里。
+# 混进同一个函数会让日志分不清「拦的是宣称还是禁词」，两类的重试话术也不一样。
+#
+# 【必须独立成函数、跑在原文上，不能复用 has_marketing_claim】那个函数先过
+# _TOP_NOUN_RE / _CATEGORY_MASK_RE 两道掩码，掩码会把「修饰词 + Top」「essential oil」
+# 这类搭配整段摘掉，落在里头的禁词就跟着逃了。故 has_banned_term 一律对【未经掩码的
+# 原文】做匹配。
+#
+# 【拦什么：安抚 / PP棉，中英文两侧都拦】2026-09-20 用户定案。睡眠类词（sleep/nap/
+# bedtime 这些）曾一度进过这份词表，后按用户口径撤掉——它们与品类高度重合
+# （睡衣/睡袋/Sleepwear 是正当品类），拦了得不偿失。现在只拦这两类：
+#   - 「安抚」类用途描述：安抚玩偶/安抚巾/Soothing/Comforter 这类说法；
+#   - 「PP棉」填充物俗称：要写填充物就用规范材质名（聚酯纤维 / Polyester Fiber）。
+# 两侧都拦是因为它们不像睡眠词那样有正当品类用法：中文侧「安抚」「PP棉」本身就是该换掉
+# 的写法，英文侧 Soothing / PP Cotton 同理。
+#
+# 【为什么 Comforter 要拦而 Comfort 不拦】Comforter 在美式英语里是「被子/棉被」，也是
+# 「安抚物」的常见译法，两义都指向要换掉的表达；而 Comfort（舒适）是正当的客观描述，
+# 也是本项目给「安抚玩偶」的推荐替代译法（Comfort Plush Toy），拦了就没有出路了。
+#
+# 【PP棉的写法要覆盖变体】源标题里实测有「PP棉」「pp棉」「PP 棉」「聚丙烯棉」四种写法，
+# 英文侧还有 PP Cotton / PPCotton（货号里连写）。故中文用 [Pp][Pp]\s*棉 容忍空格，
+# 英文用 pp[\s-]?cotton 容忍空格与连字符。
+# 【不拦「聚丙烯纤维/丙纶」「聚酯纤维」】那是平台 options 里的规范写法、也是 PP 棉的
+# 化学名，属性行要靠它们顶替 pp棉（见 attributes.validation._dodge_banned_option），
+# 一并拦掉会让「填充物成分」这类必填行无值可选、整个商品卡在保存。
+_BANNED_EN_PAT = (
+    r"\bsoothing\b|\bsoother\b|\bcomforters?\b"
+    r"|\bpp[\s-]?cotton\b|\bpolypropylene\s+cotton\b"
+)
+
+# 中文侧：与英文同源的红线，用户明确要求「无论源头中文还是英文都不能过」。
+_BANNED_ZH_PAT = r"安抚|[Pp][Pp]\s*棉|聚丙烯棉"
+
+_BANNED_EN_RE = re.compile(_BANNED_EN_PAT, re.I)
+_BANNED_ZH_RE = re.compile(_BANNED_ZH_PAT)
+
+
+def has_banned_term(text: str) -> bool:
+    """这段文字是否含平台禁词（安抚 / PP棉，中英文两侧同一套口径）。
+
+    与 has_marketing_claim 刻意分开：判据不同、处置不同、日志要能分清（见上方说明）。
+    【不过掩码】直接对原文匹配，理由见 _BANNED_EN_PAT 上方那段。
+    """
+    s = str(text or "")
+    if not s:
+        return False
+    return bool(_BANNED_EN_RE.search(s) or _BANNED_ZH_RE.search(s))
+
+
+def banned_hits(text: str) -> list:
+    """命中的禁词（去重、保序），只用于报错文案与日志。
+
+    【为什么要它】同 hit_words：拒因不带上具体词，两次生成都不合格时日志只能报
+    「含禁词」，既看不出撞的是哪个，重试提示词也没法把它喂回模型。
+    """
+    s = str(text or "")
+    out = []
+    for r in (_BANNED_EN_RE, _BANNED_ZH_RE):
+        for m in r.finditer(s):
+            w = m.group(0).strip()
+            if w and w.lower() not in {x.lower() for x in out}:
+                out.append(w)
+    return out
+
+
+# 给模型看的提示词片段。与 CLAIM_REMOVE_RULE 并列而不是合并：那条讲的是「夸大宣传
+# 抹掉」，这条讲的是「这些词连同它说明的信息一起不要出现」，两件事模型要分开听懂。
+# 【PP棉这类填充物说明要「换写法」而不是整段抹掉】它与睡眠词的处置不同：填充物是买家
+# 关心的材质信息（也是 Temu 属性里的必填项），整段抹掉就丢了有效信息。故这里要求改写成
+# 规范材质名。「安抚」不同——它是用途宣称、没有必须保留的信息量，直接抹掉即可。
+BANNED_REMOVE_RULE = (
+    "图上若有「安抚」类用途描述（安抚、安抚玩偶、Soothing、Comforter 这类），"
+    "【不要翻译、不要保留】，连同背景一起抹除干净、按周围画面自然补全。"
+    "图上若有「PP棉」「pp棉」「聚丙烯棉」「PP Cotton」这类填充物俗称，"
+    "不要照译，改写成规范材质名 Polyester Fiber（或 Polyester Fiber Filled）——"
+    "填充物是买家关心的材质信息，不要整段删掉。"
+    "商品实物上的印花、刺绣、织标要原样保留。"
+)
+
+BANNED_IMAGE_RULE = (
+    "bannedTerm：叠加的文案层里有没有【平台禁词】——"
+    "「安抚」类用途描述（安抚、安抚玩偶、Soothing、Soother、Comforter）、"
+    "以及「PP棉」类填充物俗称（PP棉、pp棉、PP 棉、聚丙烯棉、PP Cotton、"
+    "Polypropylene Cotton）都算。\n"
+    "  规范材质名不算禁词：聚酯纤维、聚丙烯纤维/丙纶、Polyester Fiber、"
+    "Polypropylene Fiber；Comfort（舒适）作为客观描述也不算，只有 Comforter 才算。\n"
+    "  判为 bannedTerm=true 时，bannedTermTexts 必须列全实际可见的原文。\n"
+    "  商品实物本身的印花、刺绣、织标、吊牌上的字样一律不算。"
+)

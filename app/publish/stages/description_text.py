@@ -1,7 +1,7 @@
 """店小秘发布共用能力：stages.description_text。各来源流程由 workflows/ 独立定义。"""
 
 from app.logger import logger
-from app.publish import extract, vision
+from app.publish import claims, extract, vision
 from app.publish.media.description import desc_text_apply, desc_text_delete_all, desc_text_map
 
 
@@ -63,10 +63,35 @@ async def _keep_size_text(session, info_for_desc, emit) -> tuple:
 
     tplan = await vision.translate_size_texts(size_texts, info_for_desc)
     acts = list(tplan.get("plan") or [])
-    translated_idx = {a["idx"] for a in acts}
+    # 【禁词的模块一律删掉，不留中文原文】这是本函数原有取向的唯一例外：下面那条
+    # 「译不成就保留中文原文」的理由是「删掉丢唯一准确来源」，但禁词是硬红线——
+    # 用户 2026-09-20 定案「无论源头中文还是英文都不能过」，中文原文同样不许留在页面上。
+    # 故命中禁词的模块（译文或中文原文任一命中）改判 delete 并发 manual_check：
+    # 尺码信息还有平台尺码表（阶段⑨）那一份，带禁词的文字块留着则是必然的合规问题。
+    src_by_idx = {str(t["idx"]): (t.get("text") or "") for t in size_texts}
+    banned_idx, banned_words = set(), []
+    for a in acts:
+        idx = str(a.get("idx"))
+        for probe in (a.get("text") or "", src_by_idx.get(idx, "")):
+            hits = claims.banned_hits(probe)
+            if hits:
+                banned_idx.add(idx)
+                banned_words.extend(hits)
+                break
+    if banned_idx:
+        acts = [a for a in acts if str(a.get("idx")) not in banned_idx]
+        acts.extend({"idx": i, "text": "", "action": "delete"} for i in banned_idx)
+        uniq_words = list(dict.fromkeys(banned_words))
+        logger.warning(f"描述文字模块含平台禁词 {uniq_words[:6]}，"
+                       f"已删除 {len(banned_idx)} 段（不留中文原文）")
+        await emit({"type": "manual_check", "stage": "desc",
+                    "message": f"{len(banned_idx)} 段尺码文字含平台禁词 "
+                               f"{uniq_words[:4]}，已整段删除（禁词不许留在页面上）。"
+                               f"尺码信息请以平台尺码表为准，必要时人工补一段合规文案"})
+    translated_idx = {a["idx"] for a in acts if a.get("action") == "translate"}
     size_idx = {t["idx"] for t in size_texts}
     for t in texts:
-        if t["idx"] in translated_idx:
+        if t["idx"] in translated_idx or str(t["idx"]) in banned_idx:
             continue
         # 尺码文字但没译成（模型漏判/译文空）：保留中文原文，不删（删掉丢唯一准确来源）
         acts.append({"idx": t["idx"], "text": "",

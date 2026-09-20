@@ -44,6 +44,11 @@ def test_1688_missing_data_diagnostic(context, expected):
 def test_carousel_dom_rejects_near_square(width, height, checked, bad):
     from app.publish.media.carousel import _JS_CAROUSEL_STATE, _JS_PICK_CAROUSEL_LIST
 
+    # 【桩要带「产品轮播图」标签与它的上溯父链】2026-09-20 起 _JS_PICK_CAROUSEL_LIST
+    # 改成「按 .ant-form-item-label 文字认区、再从标签向上找 .img-list」（原先按「格子里
+    # 有没有 checkbox」认，已上架商品不渲染 checkbox 就落空，见那段注释的取证）。
+    # 旧桩只有一个裸 list、没有标签节点，认区必然返回 null → 整个响应是
+    # {"err":"no-carousel-list"}，7 个参数组全报 KeyError: 'items'。
     setup = "const dimensions = " + json.dumps({
         "size": f"{width} X {height}", "checked": checked,
     }) + ";" + r"""
@@ -54,7 +59,17 @@ const item = {
   querySelectorAll: () => [{src: 'https://source.test/picture.jpg'}]
 };
 const list = {querySelectorAll: () => [item]};
-global.document = {querySelectorAll: () => [list]};
+// 表单项容器：标签在它里面，.img-list 也在它里面（真实页面的结构）
+const section = {
+  parentElement: null,
+  querySelector: selector => selector === '.img-list' ? list : null,
+  querySelectorAll: () => []
+};
+const label = {textContent: '产品轮播图', parentElement: section};
+global.document = {
+  querySelectorAll: selector =>
+    selector === '.ant-form-item-label' ? [label] : [list]
+};
 """
     code = _JS_CAROUSEL_STATE.replace("__MIN__", "800").replace("__PICK__", _JS_PICK_CAROUSEL_LIST)
     result = run_js(code, setup)

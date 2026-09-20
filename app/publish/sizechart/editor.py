@@ -3,7 +3,7 @@
 import json
 import math
 from app.logger import logger
-from app.publish import titles, workflows
+from app.publish import claims, titles, workflows
 from app.publish.browser import BrowserSession, J
 from app.publish.sizechart import (
     measurements as sizechart_measurements,
@@ -67,6 +67,15 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     size_ref = info.get("sizeChart") or {}
     # 模板名去年份：源标题惯用「2026新款」，前 10 字硬截取会把年份带进模板名
     clean_title = titles._strip_dated(title)
+    # 【禁词的源标题不截进模板名】模板名是把源标题前 10 字【原样】写进平台持久字段的，
+    # 是全链路唯一一处源中文不经改写就落地的点（其余路径至少过 LLM 改写或 options
+    # 白名单）。源标题带「安抚」「PP棉」时截出来就是带禁词的模板名。模板名对买家没有
+    # 信息价值（只是后台区分多张表的标签），故命中就退回「通用尺码表」，不值得为它再
+    # 跑一轮 LLM 改写。
+    if claims.has_banned_term(clean_title):
+        logger.info(f"源标题含平台禁词 {claims.banned_hits(clean_title)[:3]}，"
+                    f"尺码表模板名改用通用名（不截源标题）")
+        clean_title = ""
     tpl_name = name or ((clean_title[:10] + "尺码表") if clean_title else "通用尺码表")
     # 两张表的模板名必须不同：同名模板平台会当成同一个，第二张覆盖第一张而不是新增
     if which and not name:

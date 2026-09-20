@@ -180,6 +180,9 @@ DEFAULT_TRANSLATE_PROMPT = (
     # 而 check_cleaned 的 marketingClaim 那关必然判不过，发数烧完退回原图（白花几发生图、
     # 还在描述区留下 1688 外链）。故这条口径与 claims.CLAIM_REMOVE_RULE 同源、同一份措辞。
     + claims.CLAIM_REMOVE_RULE
+    # 禁词与夸大宣传同属「不翻译、直接抹掉」的一档，理由同上一条：主轴是「商品介绍类
+    # 文字都翻译保留」，不显式排除就会被原位译成英文留在图上，质检那关必然判不过。
+    + claims.BANNED_REMOVE_RULE
 )
 
 # 尺码表图/尺寸图专用的英化提示词：在 DEFAULT_TRANSLATE_PROMPT 的基础上，额外要求把

@@ -2,6 +2,7 @@
 
 import re
 from app.logger import logger
+from app.publish import claims
 from app.publish.attributes import composition as attributes_composition
 from typing import Optional
 
@@ -93,6 +94,45 @@ def _drop_lining_dependents(valid: list, rejected: list) -> None:
                 f"不写入：{'、'.join(gone)}")
 
 
+# 平台 options 里本身就带禁词的值（实测「填充物成分」必填行的选项里就有 pp棉，见
+# workspace/publish-cache/attrs 的 猫窝/狗床/小动物吊床 三个类目），按优先级给出同义的
+# 合规替代。都是同一种材料的不同写法：PP 棉的化学名就是聚丙烯，平台自己也把
+# 「聚丙烯纤维/丙纶」「聚酯纤维」列在同一个下拉里。
+#
+# 【为什么是替换而不是拒绝】这些行是 required=true，拒掉就无值可填、整个商品卡在保存
+# （规则 4 明写「必填项必须填全」）。而禁词又是硬红线，照填即违规。两边都不能让步时
+# 唯一的出路是选一个【语义相同且不含禁词】的选项——这不是折中，填的仍是同一种材料。
+_BANNED_OPTION_ALIAS = {
+    "pp棉": ("聚丙烯纤维/丙纶", "聚酯纤维", "涤纶", "棉"),
+}
+
+
+def _dodge_banned_option(value: str, options: list) -> tuple:
+    """value 命中禁词时换一个同义的合规 option，返回 (新值, 换了什么的说明)。
+
+    换不动（options 里没有任何合规替代）就原样返回并给出说明，交调用方按拒绝处理：
+    那种情况说明这个类目的该字段全是禁词选项，只能交人工，不能自己编一个不在 options
+    里的值——编出来的值点不中，白跑一趟还留幽灵浮层（同本模块第 2 道闸的理由）。
+    """
+    v = str(value or "")
+    if not claims.has_banned_term(v):
+        return v, ""
+    for key, alts in _BANNED_OPTION_ALIAS.items():
+        if key.lower() not in v.lower():
+            continue
+        for alt in alts:
+            if alt in (options or []) and not claims.has_banned_term(alt):
+                return alt, f"原值「{v}」含平台禁词，换用同义选项「{alt}」"
+    # 没有预设别名时退一步：options 里任何不含禁词的值都好过带禁词的值——但只在
+    # 该行确实没有别的出路时才这么做，故这里不挑「语义最近」，由人工在 note 里复核。
+    clean = [o for o in (options or [])
+             if isinstance(o, str) and o and not claims.has_banned_term(o)]
+    if clean:
+        return clean[0], (f"原值「{v}」含平台禁词，无预设同义项，"
+                          f"暂取首个合规选项「{clean[0]}」待人工复核")
+    return v, f"原值「{v}」含平台禁词，且该行 options 无任何合规替代"
+
+
 def _validate_attr_changes(changes: list, attrs: list,
                            main_comp: Optional[dict] = None) -> tuple:
     """对 LLM 的修改清单做二次校验，返回 (valid, rejected)。
@@ -163,11 +203,25 @@ def _validate_attr_changes(changes: list, attrs: list,
             # kind 必须显式标透：_apply_attr_changes 靠它把同一 label 的多条归并成
             # 一个目标集合一次性重设，漏标会让它们各自走下拉分支、必然 no-select。
             if c.get("value") in opt_map.get(label, []):
-                valid.append({**c, "kind": "checkbox"})
+                v2, why = _dodge_banned_option(c.get("value"), opt_map.get(label, []))
+                if why and v2 == c.get("value"):
+                    rejected.append({**c, "rejectReason": why})
+                else:
+                    if why:
+                        logger.warning(f"属性「{label}」{why}")
+                    valid.append({**c, "value": v2, "kind": "checkbox"})
             else:
                 rejected.append({**c, "rejectReason": "value 不在 options 内，已拒绝"})
         elif c.get("value") in opt_map.get(label, []):
-            valid.append(c)
+            # 【禁词选项要换成同义合规项】平台自己的 options 里就有 pp棉 这类禁词值，
+            # 而这些行多是必填，拒掉等于卡死保存（见 _dodge_banned_option 的说明）。
+            v2, why = _dodge_banned_option(c.get("value"), opt_map.get(label, []))
+            if why and v2 == c.get("value"):
+                rejected.append({**c, "rejectReason": why})
+            else:
+                if why:
+                    logger.warning(f"属性「{label}」{why}")
+                valid.append({**c, "value": v2})
         else:
             rejected.append({**c, "rejectReason": "value 不在 options 内，已拒绝"})
 

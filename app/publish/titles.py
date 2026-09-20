@@ -270,6 +270,21 @@ async def generate_titles(info: dict) -> dict:
         hits = claims.hit_words(text)
         return f"含夸大宣传用语 {hits[:4]}" if hits else None
 
+    def _banned_reject(text: str) -> Optional[str]:
+        """平台禁词硬闸（安抚 / PP棉）：命中返回带具体词的拒因，合规返回 None。
+
+        判据走 claims.has_banned_term（与图片链路同一份词表，中英文都查）。与
+        _claim_reject 分开是因为两类的修正方向不同：夸大宣传要「删掉这个形容词」，禁词要
+        【换一种说法】（安抚玩偶→Plush Companion Doll、PP棉→聚酯纤维），拒因里必须说出
+        改法，否则模型只会把词删掉、把商品说成别的东西。
+        """
+        hits = claims.banned_hits(text)
+        if not hits:
+            return None
+        return (f"含平台禁词 {hits[:4]}——这类词禁止出现，须换成同义的规范写法"
+                f"（安抚玩偶→Plush Companion Doll/Comfort Plush Toy/毛绒公仔、"
+                f"PP棉→Polyester Fiber/聚酯纤维），不要只删掉词")
+
     def _en_reject(en: str) -> Optional[str]:
         """英文标题不合格的具体原因；合格返回 None。
 
@@ -294,7 +309,7 @@ async def generate_titles(info: dict) -> dict:
             return "含年龄数值（适用年龄由属性字段声明，标题只写人群词）"
         if _has_price_claim(en):
             return "含价格/优惠宣称"
-        return _claim_reject(en)
+        return _claim_reject(en) or _banned_reject(en)
 
     def _zh_reject(zh: str) -> Optional[str]:
         """中文标题不合格的具体原因；合格返回 None。"""
@@ -311,7 +326,9 @@ async def generate_titles(info: dict) -> dict:
         if _has_price_claim(zh) or re.search(
                 r"包邮|免邮|特价|清仓|折扣|秒杀|亏本|甩卖|超值|白菜价", zh):
             return "含价格/优惠宣称"
-        return _claim_reject(zh)
+        # 中文标题同样过禁词闸：「安抚」「PP棉」中英文两侧都拦（与睡眠类词不同，
+        # 它们没有正当的品类用法，换成规范写法即可，不会把品类词拦死）。
+        return _claim_reject(zh) or _banned_reject(zh)
 
     # 【候选数 3 不是 10】2026-08-24 耗时实测：原先要 10 个候选、每个还带 logic 字段，
     # 推理模型为 10 个候选各推演一遍，一次烧掉 15896 completion token / 2 分 13 秒——
@@ -343,6 +360,22 @@ async def generate_titles(info: dict) -> dict:
         "     震撼、逆天、保证效果；\n"
         "   禁止价格、折扣、包邮、清仓等承诺。品类名里的词不受此限（Tank Top、Essential Oil\n"
         "   这类搭配中的 Top/Essential 是品类词，可以正常使用）。\n"
+        # 【这条必须写进提示词，不能只靠校验层拦】「安抚」「PP棉」常是源标题的核心词
+        # （安抚玩偶、PP棉填充），只加硬闸的话模型两次都会照写、两次都被拒，阶段⑤ 直接
+        # title-generation-failed。故要给【替代写法】而不是只说「不许写」（同规则 11 对
+        # 年龄那条的取向：说清用什么补位，模型才有的可写）。
+        # 【中英文标题都受约束】这两类词没有正当的品类用法，换成规范写法即可，不像睡眠词
+        # 那样会把品类词拦死，故两侧同一口径。
+        "8b. 禁词红线（中文标题与英文标题都不许出现，无论源商品怎么写）：\n"
+        "   - 「安抚」类用途描述：安抚、安抚玩偶、安抚巾、Soothing、Soother、Comforter；\n"
+        "   - 「PP棉」类填充物俗称：PP棉、pp棉、聚丙烯棉、PP Cotton。\n"
+        "   这类词【换说法、不是删掉】——商品该表达的意思要用规范写法写出来：\n"
+        "     安抚玩偶/安抚公仔 → 英文 Plush Companion Doll、Comfort Plush Toy；\n"
+        "                          中文 毛绒公仔、毛绒玩偶、陪伴玩偶；\n"
+        "     PP棉填充 → 英文 Polyester Fiber Filled、Soft Fiber Fill；\n"
+        "                 中文 聚酯纤维填充、纤维棉填充。\n"
+        "   注意 Comfort（舒适）不是禁词，可以正常用，只有 Comforter 才算；\n"
+        "   「聚酯纤维」「聚丙烯纤维/丙纶」是规范材质名，不受本条限制。\n"
         "9. 禁止年份及短期时效词（2025/2026/25/26、New Arrival、Latest、This Year、新款、新品、上新）；\n"
         "   Winter/Fall 等真实季节属性可以保留。禁止 Emoji、商标蹭词和特殊符号。\n"
         "10. 英文标题只允许 ASCII 字母、数字、空格和连字符，长度严格 40-70 个字符（含空格）。\n"

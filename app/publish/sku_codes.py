@@ -3,7 +3,7 @@
 import asyncio
 import re
 from app.logger import logger
-from app.publish import variant_dom
+from app.publish import claims, variant_dom
 from app.publish.browser import BrowserSession, J
 
 
@@ -192,6 +192,11 @@ async def _translate_term(term: str, kind: str, sem: asyncio.Semaphore) -> tuple
         "3. 译文尽量不超过 30 个字符；\n"
         "4. 用电商通行译法：粉红色→Pink、藏青色→Navy、均码→OneSize；\n"
         "5. 只允许英文字母和数字，不要空格、连字符和任何标点（多个单词首字母大写连写）。\n"
+        # 【禁词要换说法而不是删掉】货号要能认款，把整个词删掉会让同批两个款撞成同一个
+        # 货号（重名虽有加序号兜底，但运营看货号就分不出款了）。故给替代译法。
+        "6. 禁词红线：译文里不许出现 Soothing/Soother/Comforter（安抚）与 PPCotton/"
+        "PPCotton 这类 PP棉 写法。遇到这类源词改用同义写法：安抚→Comfort、"
+        "PP棉→PolyFiber。Comfort（舒适）不是禁词，可正常用。\n"
         "示例：\n"
         "  粉红色 → Pink\n"
         "  白砖纹【长5米*宽70厘米】 → WhiteBrick\n"
@@ -287,6 +292,15 @@ async def fix_sku_codes(session: BrowserSession) -> dict:
     if untranslated:
         return {"status": "error",
                 "reason": f"这些词未能译成合法货号 token：{untranslated}"}
+
+    # 【禁词硬闸：提示词是软约束，译文照样会带 Soothing/PPCotton 这类词】货号会出现在订单与
+    # 包裹面单上，禁词同样不许进。这里判失败而不是自己改写：改写要同时保证「同批不撞号」
+    # 与「还能认款」，交上游重跑（换一轮译文）比在这里猜一个替代词稳，且本阶段可续跑。
+    banned_terms = sorted({w for w, t in mapping.items() if claims.has_banned_term(t)})
+    if banned_terms:
+        hits = {w: claims.banned_hits(mapping[w])[:2] for w in banned_terms}
+        return {"status": "error",
+                "reason": f"这些词的货号译文含平台禁词，需重跑本阶段：{hits}"}
 
     # 4) 逐行拼装 + 截断 + 重名加序号
     # 截断要给重名序号留位（最长的序号是 "-" + 行数位数），否则加完序号又越界。

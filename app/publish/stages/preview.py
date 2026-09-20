@@ -73,7 +73,8 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
     # 只说「中文翻译成英文」时，纯英文的 BEST-SELLER 角标既不在翻译范围、也不在移除
     # 范围，模型会原样留下，而 check_cleaned 的 marketingClaim 那关必然判不过。
     prompt = ("将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、构图和颜色；"
-              "移除水印、店铺名和第三方 logo。" + claims.CLAIM_REMOVE_RULE)
+              "移除水印、店铺名和第三方 logo。" + claims.CLAIM_REMOVE_RULE
+              + claims.BANNED_REMOVE_RULE)
     if issues:
         prompt += f" 本张图已知的问题：{str(issues)[:200]}。请一并修正。"
     for _ in range(3):

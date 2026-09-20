@@ -150,11 +150,14 @@ class DescAuditItem(BaseModel):
     pos: int
     sizeTable: bool = False
     marketingClaim: bool = False
+    # 【与 marketingClaim 同样给默认值】理由同上：它也只用于分类上报与日志，漏答不
+    # 影响处置（脏了就改判生图英化，三种脏法一样做），声明成必填只会白判整批失败。
+    bannedTerm: bool = False
     what: str = ""
 
 
 class DescAudit(BaseModel):
-    """阶段⑬ keep 复核（查中文与夸大宣传，只列脏的）。"""
+    """阶段⑬ keep 复核（查中文、夸大宣传与平台禁词，只列脏的）。"""
 
     model_config = ConfigDict(strict=True)
 
@@ -468,6 +471,10 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
         # 末尾那条的理由）。纯英文的角标也在此列——上一条只管中文，管不到它。
         if n.get("claim"):
             parts.append(claims.CLAIM_REMOVE_RULE.rstrip("。"))
+        # 【禁词这条无条件加，不像 claim 那样看标记】阶段① 的 complianceNotes 只标
+        # chinese/watermark/logo/claim，没有 banned 这一项，故没有可依据的逐图标记；
+        # 而禁词的代价是发上去必然违规，漏一张就是一张。多说一句话的成本远小于漏判。
+        parts.append(claims.BANNED_REMOVE_RULE.rstrip("。"))
         parts.append("商品主体、配色、图案和构图完全不变，被移除处按周围内容自然补全")
         cands.append((_dirty_score(n),
                       {"file": name, "path": p, "prompt": "，".join(parts) + "。",
@@ -1113,13 +1120,15 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
 
 async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
                             info: Optional[dict] = None) -> dict:
-    """对「将按原画面发布」的描述图查中文与夸大宣传，返回 {pos: {...}}（只含脏的）。
+    """对「将按原画面发布」的描述图查中文、夸大宣传与平台禁词，返回 {pos: {...}}（只含脏的）。
 
     【为什么夸大宣传也要在这一遍查】这批图的共同点是【原画面原样上架】，全链路没有
     任何环节再看一眼它们的内容（见 plan_desc docstring 末段）。原先这一遍只问中文，
     于是纯英文的营销海报（BEST-SELLER 角标、Hot Sale 横幅）在每一道闸都判「干净」：
     阶段① 只标 chinese/watermark/logo，check_cleaned 当时也不查宣称，这里又只问中文。
     判据与 check_cleaned 同源（claims.IMAGE_CLAIM_RULE），改口径只改 claims 一处。
+    平台禁词（安抚 / PP棉）同理加在这一遍：这批图没有别的环节会再看一眼，
+    漏了就是原样发上真店（判据同源于 claims.BANNED_IMAGE_RULE）。
 
     与初判分两遍的原因（单任务小批量比几十张混审可靠）见 plan_desc docstring 末段。
     传图复用初判已解析好的 data URL（ref_by_pos），不重复下载。
@@ -1143,13 +1152,15 @@ async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
 1. 是否存在任何【中文字符或中文标点】——标题大字、小字说明、表格文字、水印、
    吊牌/标签上的字都算；英文、数字、符号不算。
 2. {claims.IMAGE_CLAIM_RULE}
+3. {claims.BANNED_IMAGE_RULE}
 
 只输出 JSON：{{"dirty": [{{"pos": 1, "sizeTable": true/false,
-"marketingClaim": true/false,
+"marketingClaim": true/false, "bannedTerm": true/false,
 "what": "<10 字内说清问题在哪，如「模特信息卡全文」「右上角BEST-SELLER角标」>"}}]}}
-dirty 只列【有中文或有夸大宣传文案】的图（pos 必须从 {chunk} 里取），
-两项都干净才不列，全部干净就返回空数组。
+dirty 只列【有中文、有夸大宣传文案或有平台禁词】的图（pos 必须从 {chunk} 里取），
+三项都干净才不列，全部干净就返回空数组。
 marketingClaim 标出这一条是不是因为夸大宣传（只有中文问题时填 false）。
+bannedTerm 标出这一条是不是因为平台禁词。
 sizeTable 表示该图是不是尺码表/尺寸示意图。
 拿不准一律算脏——漏掉的代价是它原样发上真店。"""
         data = await ask_json_with_images(
@@ -1163,6 +1174,7 @@ sizeTable 表示该图是不是尺码表/尺寸示意图。
                 continue
             dirty[p] = {"sizeTable": bool(v.get("sizeTable")),
                         "marketingClaim": bool(v.get("marketingClaim")),
+                        "bannedTerm": bool(v.get("bannedTerm")),
                         "what": (v.get("what") or "")[:20]}
 
     await asyncio.gather(*(_one(c) for c in
@@ -1170,8 +1182,10 @@ sizeTable 表示该图是不是尺码表/尺寸示意图。
                             for i in range(0, len(audit_pos), _DESC_AUDIT_CHUNK))))
     if dirty:
         n_claim = sum(1 for d in dirty.values() if d.get("marketingClaim"))
-        logger.warning(f"阶段⑬合规复核：{len(dirty)} 张初判保留的图发现中文或夸大宣传"
-                       f"（其中夸大宣传 {n_claim} 张），改判生图英化：pos {sorted(dirty)}")
+        n_banned = sum(1 for d in dirty.values() if d.get("bannedTerm"))
+        logger.warning(f"阶段⑬合规复核：{len(dirty)} 张初判保留的图发现中文、夸大宣传"
+                       f"或平台禁词（夸大宣传 {n_claim} 张、禁词 {n_banned} 张），"
+                       f"改判生图英化：pos {sorted(dirty)}")
     return dirty
 
 
@@ -1207,6 +1221,9 @@ async def translate_size_texts(texts: list, info: Optional[dict] = None) -> dict
 2. 长度单位 cm 一律换算成英寸 in，数值保留 1 位小数（如 59cm → 23.2in）；只换算长度，
    胸围/腰围等全围仍按全围写、不要当半围；
 3. 只翻译尺码/尺寸相关信息，不要添加价格、折扣、运费、年份等原文没有的内容；
+3b. 译文里不许出现平台禁词：「安抚」类（Soothing、Soother、Comforter）与「PP棉」类
+   （PP Cotton、Polypropylene Cotton）——命中整段会被删掉。原文有这类词时改用规范写法：
+   安抚→Comfort、PP棉→Polyester Fiber。Comfort（舒适）与 Polyester Fiber 不是禁词；
 4. 每个模块译文不超过 500 字符（平台上限），超了就精简次要信息。
 
 只输出 JSON：{{"plan": [{{"idx": "<原样照抄模块 idx>", "text": "<英文译文>"}}]}}
@@ -1271,6 +1288,7 @@ async def check_cleaned(image_path: str) -> dict:
   正常的英文商品说明不算水印。发现水印必须将 watermark 设为 true，不能只写在 issues；
 - brokenSubject：是否有明显修图痕迹破坏了商品主体（糊掉、变形、缺块）；
 - """ + claims.IMAGE_CLAIM_RULE + """
+- """ + claims.BANNED_IMAGE_RULE + """
 
 【以下一律不算问题，不要报】：
 - 商品实物本身的印花、刺绣、织标、袖标、胸标、图案上的字母或品牌标识
@@ -1280,9 +1298,11 @@ async def check_cleaned(image_path: str) -> dict:
 只输出 JSON：{"residualChinese": true/false, "garbled": true/false,
 "watermark": true/false, "brokenSubject": true/false,
 "marketingClaim": true/false, "marketingClaimTexts": ["实际可见的宣称词或短语"],
+"bannedTerm": true/false, "bannedTermTexts": ["实际可见的禁词原文"],
 "issues": "<具体问题，没有问题留空>"}
-五个布尔字段必须全部填写。marketingClaimTexts 必须列全判为宣称的原文，
-没有宣称时返回空数组；不得只写其中一个词而漏掉其他宣称。"""
+六个布尔字段必须全部填写。marketingClaimTexts 必须列全判为宣称的原文，
+没有宣称时返回空数组；不得只写其中一个词而漏掉其他宣称。
+bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原文，没有禁词时返回空数组。"""
     data = await ask_json_with_images(prompt, [image_path], what="英化质检", system=_SYS,
                                       stage="clean_images")
     fields = ("residualChinese", "garbled", "watermark", "brokenSubject",
@@ -1291,28 +1311,48 @@ async def check_cleaned(image_path: str) -> dict:
         return {"status": "error", "clean": False,
                 "issues": (data.get("issues") or "英化质检响应不完整")[:80],
                 "residualChinese": False, "garbled": False, "watermark": None,
-                "marketingClaim": False}
+                "marketingClaim": False, "bannedTerm": False}
     cjk = bool(data.get("residualChinese"))
     garbled = bool(data.get("garbled"))
     watermark = bool(data.get("watermark"))
     claim = bool(data.get("marketingClaim"))
+    # 【bannedTerm 不进上面那道「必须是 bool」的必答清单】那道闸的语义是「模型没给出
+    # 明确结论就不放行」，对五项老字段成立是因为提示词一直要求它们必填。bannedTerm 是
+    # 2026-09-20 新加的，加进 fields 会让任何漏答的响应直接判 error → 整批图退回原图
+    # （带中文的 1688 原图留在描述区，比漏判一次禁词更糟）。故这里按「漏答当没有」处理，
+    # 而用下面的文本兜底补上：禁词是确定性判据，模型给了 texts 就能用词表复核。
+    banned = bool(data.get("bannedTerm"))
+    banned_texts = data.get("bannedTermTexts")
+    # 【文本兜底：模型答 false 但列出了命中禁词的原文时以词表为准】视觉模型对「算不算
+    # 禁词」的判断会抖（同 check_cleaned_twice 记的那种不可复现），而一旦它把原文列出来，
+    # 这件事就退化成确定性文本匹配、不必再信它的布尔。方向是单向的（只从 false 翻成
+    # true、不反过来）：漏判的代价是违规发出去，误判的代价只是多烧一发。
+    if isinstance(banned_texts, list):
+        hits = [w for t in banned_texts if isinstance(t, str)
+                for w in claims.banned_hits(t)]
+        if hits and not banned:
+            banned = True
+            logger.info(f"图片质检 bannedTerm 按原文复核翻为 true：{hits[:4]}")
     non_blocking = []
     if claim and claims.is_style_only_image_claim(
             data.get("issues"), data.get("marketingClaimTexts")):
         non_blocking.append(data.get("issues") or "普通风格描述无需修改")
         claim = False
         logger.info(f"图片质检普通风格描述不阻断：{non_blocking[0]}")
-    bad = cjk or garbled or watermark or claim or bool(data.get("brokenSubject"))
+    bad = (cjk or garbled or watermark or claim or banned
+           or bool(data.get("brokenSubject")))
     issues = data.get("issues") or ("残留水印、店铺名或网址" if watermark else "")
     if non_blocking:
         issues = "、".join(reason for present, reason in (
             (cjk, "残留中文"), (garbled, "乱码或拼写错误"),
-            (watermark, "残留水印、店铺名或网址"),
+            (watermark, "残留水印、店铺名或网址"), (banned, "图上有平台禁词"),
             (data.get("brokenSubject"), "商品主体破坏")) if present)
     # issues 留空而 marketingClaim 为真时要自己补一句：调用方把 issues 原样报给用户，
     # 空串会让提醒变成「质检未过：」这种看不出原因的话（同 watermark 那句的理由）。
     if not issues and claim:
         issues = "图上有夸大宣传/绝对化宣称文案"
+    if not issues and banned:
+        issues = "图上有平台禁词（安抚 / PP棉 这类）"
     # 【residualChinese / garbled / marketingClaim 都要透出去】service 侧靠这些字段决定
     # 重试发数（见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
     # 的 `qc.get("garbled")` 恒为 None，加长重试对乱码那一路形同虚设——而 ⑤b main-04
@@ -1320,7 +1360,8 @@ async def check_cleaned(image_path: str) -> dict:
     return {"status": "ok", "clean": not bad,
             "issues": issues[:80],
             "residualChinese": cjk, "garbled": garbled, "watermark": watermark,
-            "marketingClaim": claim, "nonBlockingIssues": non_blocking}
+            "marketingClaim": claim, "bannedTerm": banned,
+            "nonBlockingIssues": non_blocking}
 
 
 async def check_cleaned_twice(image_path: str) -> dict:
