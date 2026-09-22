@@ -865,14 +865,24 @@ def _json_post(url: str, payload: dict, timeout: int = 280) -> dict:
 
 
 def _save_result(resp_json: dict, out_path: str) -> str:
-    """从响应保存图片（url 或 b64_json），返回保存路径。下载也走 curl（同一拦截策略）。
+    """从响应保存图片（b64_json 优先，其次 url 下载），返回保存路径。
 
-    实测（2026-08-18）：结果 CDN 偶发连接失败，curl -s 会吞错误信息，故用 -sS 且失败
-    重试；超长签名 URL 用 -K 配置文件传，避免 WinError 206（命令行过长）。
+    【为什么 b64_json 优先】zzlye 网关在同一个响应里两个字段都给（2026-09-22
+    实测 generations/edits 均如此），图的字节本来就随响应回来了，再向结果 CDN
+    多发一次下载纯属多余——还引入一个真实的故障点：结果 URL 是裸 IP 站点
+    （161.34.67.174:9090），个别机器的网络到不了它（2026-09-22 笔记本 ⑤b 整批
+    「下载结果图失败」，而 API 调用与计费全部正常）。b64 解码零网络依赖。
+    url 分支保留给只回 url 的响应：下载走 curl（与请求同一 TLS 指纹策略）；
+    结果 CDN 偶发连接失败（2026-08-18 实测），curl -s 会吞错误信息，故用 -sS
+    且失败重试；超长签名 URL 用 -K 配置文件传，避免 WinError 206（命令行过长）。
     """
     import base64
 
     data = (resp_json.get("data") or [{}])[0]
+    if data.get("b64_json"):
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(data["b64_json"]))
+        return out_path
     if data.get("url"):
         url = data["url"]
         last_err = ""
@@ -903,10 +913,6 @@ def _save_result(resp_json: dict, out_path: str) -> str:
             logger.warning(f"结果图下载失败（{attempt + 1}/3）：{last_err}")
             time.sleep(2 * (attempt + 1))
         raise RuntimeError(f"下载结果图失败：{last_err}")
-    if data.get("b64_json"):
-        with open(out_path, "wb") as f:
-            f.write(base64.b64decode(data["b64_json"]))
-        return out_path
     # 内容审核拒绝要单独抛类型：它与「响应结构没有图」是两件事，处置完全相反
     # （见 ModerationBlocked）。混成一句「响应中没有图片」会让调用方去重跑，而重跑
     # 必然撞同一个拒绝。
