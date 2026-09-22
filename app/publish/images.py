@@ -216,21 +216,16 @@ SIZE_MAX_PIXELS = 8294400
 
 
 def _publish_conf() -> dict:
-    """读 config.toml 的 [publish] 段。
+    """读统一配置源的 [publish] 段。
 
-    每次调用都读盘、不做进程级缓存：改配置（换通道、换 key）不必重启，与
-    image_extract._conf 的取向一致；一个几 KB 的 toml 相比一次出图请求可以忽略。
+    统一源（app/config.py 的 get_config_section）配了 [config_store] 走 MySQL
+    配置中心、否则读本地 config.toml，自带 30s TTL——改配置（换通道、换 key）
+    最多晚 30 秒生效、仍不必重启，与 image_extract._conf 的取向一致。
     """
     try:
-        import tomllib
+        from app.config import get_config_section
 
-        from app.config import config_search_dirs
-        for d in config_search_dirs():
-            p = d / "config.toml"
-            if not p.exists():
-                continue
-            with open(p, "rb") as f:
-                return (tomllib.load(f).get("publish") or {})
+        return get_config_section("publish")
     except Exception as e:
         logger.warning(f"读取 [publish] 配置失败：{e}")
     return {}

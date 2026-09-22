@@ -43,28 +43,21 @@ _NOTE_MAX = 300        # 阶段 note 有时是整段异常文本，卡片里截�
 def load_alert_config() -> dict:
     """读 [publish.alert] 段，返回 {"enabled": bool, "webhook": str}。
 
-    只读 config.toml、不回退 config.example.toml：example 里的 webhook 一定是空串
-    （凭证不进版本库），回退过去没有任何意义。读不到/解析失败一律返回禁用态——
-    告警是辅助路径，配置有问题不该让发布跑不起来。
+    webhook 环境变量优先、其次统一配置源（app/config.py 的 get_config_section，
+    配了 [config_store] 走 MySQL 配置中心、否则本地 config.toml）。读不到/解析
+    失败一律返回禁用态——告警是辅助路径，配置有问题不该让发布跑不起来（配置
+    中心挂掉的 ConfigStoreError 同样只吞成「本次不发」）。
     """
     webhook = (os.environ.get(WEBHOOK_ENV) or "").strip()
     enabled = True
     if not webhook:
         try:
-            import tomllib
+            from app.config import get_config_section
 
-            from app.config import config_search_dirs
-            for d in config_search_dirs():
-                p = d / "config.toml"
-                if not p.exists():
-                    continue
-                with open(p, "rb") as f:
-                    data = tomllib.load(f)
-                section = ((data.get("publish") or {}).get("alert") or {})
-                webhook = str(section.get("webhook") or "").strip()
-                if webhook:
-                    enabled = bool(section.get("enabled", True))
-                    break
+            section = get_config_section("publish").get("alert") or {}
+            webhook = str(section.get("webhook") or "").strip()
+            if webhook:
+                enabled = bool(section.get("enabled", True))
         except Exception as e:
             logger.warning(f"读取 [publish.alert] 配置失败，本次不发告警：{e}")
             return {"enabled": False, "webhook": ""}

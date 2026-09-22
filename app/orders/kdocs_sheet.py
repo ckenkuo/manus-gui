@@ -24,7 +24,7 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Collection, Dict, List, Optional, Tuple
 
 from app.logger import logger
 from app.orders import pipeline
@@ -174,6 +174,17 @@ def index_to_col(idx: int) -> str:
         idx, r = divmod(idx - 1, 26)
         s = chr(ord("A") + r) + s
     return s
+
+
+def _clamped_row_span(cell: dict, lo: int, hi: int) -> range:
+    """单元格纵向合并区间 [rowFrom..rowTo] 夹到 [lo..hi]（均为 0-based 闭区间）。
+
+    合并单元格只在锚点（rowFrom）返回值，覆盖行要靠 rowTo 展开；读窗口可能只与合并区
+    相交（如 500 行一批的读批把合并区切开），所以两端都要夹。无 rowTo 视为普通单格。
+    """
+    start = max(lo, int(cell["rowFrom"]))
+    end = min(hi, int(cell.get("rowTo", cell["rowFrom"])))
+    return range(start, end + 1)
 
 
 def force_text_input(value: Any) -> str:
@@ -448,9 +459,7 @@ class KdocsSheet:
             for c in self._get_range(sheet_name, row_from, row_to, ci, ci):
                 text = str(c.get("cellText") or "").strip()
                 if text:
-                    start = max(row_from, int(c["rowFrom"]))
-                    end = min(row_to, int(c.get("rowTo", c["rowFrom"])))
-                    for row in range(start, end + 1):
+                    for row in _clamped_row_span(c, row_from, row_to):
                         values[row] = text
             per_col[col] = values
         rows = sorted({r for v in per_col.values() for r in v})
@@ -472,7 +481,8 @@ class KdocsSheet:
             col_to = _HEADER_SCAN_COLS - 1
         return min(max(col_to, 0), _HEADER_SCAN_COLS - 1)
 
-    def read_rows(self, sheet_name: str, row_from: int, row_to: int
+    def read_rows(self, sheet_name: str, row_from: int, row_to: int,
+                  expand_merged: Optional[Collection[str]] = None,
                   ) -> Dict[int, Dict[str, dict]]:
         """读【任意行区间】→ {1-based 行号: {列字母: {"text","formula","format"}}}。
 
@@ -482,9 +492,17 @@ class KdocsSheet:
         为什么要按行号返回而不是像 read_data_sample 那样返回无名列表：采集管线要按
         【落点附近】学公式，既要知道公式原文、也要知道它原本在第几行，才能把本行引用
         换成占位符而不误伤跨行/绝对引用（见 pipeline._templatize_formula）。
+
+        expand_merged：列字母白名单。命中列的纵向合并单元格按 rowFrom..rowTo（夹到本
+        窗口）把同一个 cell 复制进每个覆盖行——否则合并覆盖行读成空（活动管线的成本表
+        一个 SPU 合并多行货号，不展开会把后续货号读成「SPU 为空」）。只有身份/展示列
+        （SPU/站点/类目）能进白名单；【价格列绝不能进】——价格空 = 该货号行无效、整组
+        不可选，这是活动管线「宁缺毋错」保守语义的来源，静默继承价格可能报错价。
+        默认 None 维持原行为（只落锚点行），现有调用方零影响。
         """
         row_from = max(int(row_from), 1)
         row_to = max(int(row_to), row_from)
+        expand = {str(col).strip().upper() for col in (expand_merged or ())}
         col_to = self._sample_col_to(sheet_name)
         cells = self._get_range(sheet_name, row_from - 1, row_to - 1, 0, col_to)
         by_row: Dict[int, Dict[str, dict]] = {}
@@ -494,13 +512,17 @@ class KdocsSheet:
             cell_format = read_cell_xf(c)
             if not text and not formula and cell_format is None:
                 continue
-            by_row.setdefault(int(c["rowFrom"]) + 1, {})[
-                index_to_col(int(c["colFrom"]))
-            ] = {
+            col = index_to_col(int(c["colFrom"]))
+            payload = {
                 "text": text,
                 "formula": formula,
                 "format": cell_format,
             }
+            if col in expand:
+                for row in _clamped_row_span(c, row_from - 1, row_to - 1):
+                    by_row.setdefault(row + 1, {})[col] = payload
+            else:
+                by_row.setdefault(int(c["rowFrom"]) + 1, {})[col] = payload
         return by_row
 
     def read_data_sample(self, sheet_name: str, header_row: int, max_rows: int = 10

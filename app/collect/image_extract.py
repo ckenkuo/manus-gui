@@ -133,23 +133,18 @@ def set_enabled(on) -> bool:
 
 
 def _conf() -> dict:
-    """读 config.toml 的 [collect_image] 段。
+    """读统一配置源的 [collect_image] 段。
 
-    每次调用都读盘而不做进程级缓存：白底提取是每商品一次的低频调用，读一个几 KB 的
-    toml 相比一次生图请求可以忽略；换来的好处是改配置不必重启，与 resolve_packy_key
-    的取向一致。读失败按 best-effort 吞掉（返回空 dict）——本模块任何失败都退回原图、
-    不阻断采集，这里不该是唯一的例外。
+    统一源（app/config.py 的 get_config_section）配了 [config_store] 走 MySQL
+    配置中心、否则读本地 config.toml，自带 30s TTL——改配置最多晚 30 秒生效、
+    仍不必重启，与 resolve_packy_key 的取向一致。读失败按 best-effort 吞掉
+    （返回空 dict）——本模块任何失败都退回原图、不阻断采集，这里不该是唯一的
+    例外（配置中心挂掉的 ConfigStoreError 同样吞掉走原图）。
     """
     try:
-        import tomllib
+        from app.config import get_config_section
 
-        from app.config import config_search_dirs
-        for d in config_search_dirs():
-            p = d / "config.toml"
-            if not p.exists():
-                continue
-            with open(p, "rb") as f:
-                return (tomllib.load(f).get("collect_image") or {})
+        return get_config_section("collect_image")
     except Exception as e:
         logger.warning(f"读取 [collect_image] 配置失败：{e}")
     return {}

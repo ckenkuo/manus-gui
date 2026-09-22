@@ -1,3 +1,43 @@
+# =====================================================================================
+# 配置来源说明（2026-09-22 配置中心改造）
+#
+# 本项目的配置有两个来源，运行时按「本机有没有配置中心连接」二选一：
+#
+# 1) 文件模式（默认）：全部配置读本文件，与历来行为一致。冻结版/单机的标准用法。
+# 2) 配置中心模式：本机 config.toml 配了 [config_store] 段，【或】已配好
+#    [error_report] 段的连接参数（host/database 非空）——后者在各机部署时本就
+#    配好了，会自动复用、零额外配置。此模式下除自举连接外，全部配置改从共享
+#    MySQL 读取：多台机器共用一套代码时，改配置只在一台机器改完
+#    `python -m app.config_sync push` 推送，其余机器 30 秒内自动生效（走 Config
+#    单例的 llm/browser 等段仍需重启进程，与改文件时代口径相同）。
+#    本机 config.toml 里自举连接以外的段【一律不生效】，不必保留；
+#    `push --trim` 可自动把本文件精简为仅连接段。
+#    注意：该模式下 MySQL 连不上应用会直接报错退出（拿不到配置宁可不跑），
+#    没有「退回本地旧文件」的兜底；应急可设环境变量 MANUS_CONFIG_SOURCE=file
+#    强制文件模式启动。
+#
+# 常用命令（在任一已有连接参数的机器上）：
+#   python -m app.config_sync push [--trim]   把本机 config.toml 整份推送到配置中心
+#   python -m app.config_sync pull [--write]  查看/写回配置中心里的当前配置
+#   python -m app.config_sync diff            比较本机文件与配置中心的差异
+#
+# 环境变量 MANUS_CONFIG_SOURCE 可强制模式：file（测试/应急用）或 db（排障用）。
+# =====================================================================================
+
+# ---- 配置中心连接段（自举信息，唯一始终从本地文件读的配置）--------------------------
+# 【多数机器不用配本段】[error_report] 已配好的机器会自动复用它的连接参数进配置
+# 中心模式。只有「配置想放到另一个 MySQL/另一个库」时才需要显式配本段覆盖。
+# 表自动 CREATE TABLE IF NOT EXISTS，整份配置文本存一行（name='global'），
+# 表名默认 app_config（与 error_report 的 pipeline_errors 互不干扰）。
+# 权限要求：SELECT + INSERT + UPDATE（error_report 的只写账号不够）。
+# [config_store]
+# host = ""
+# port = 3306
+# user = ""
+# password = ""
+# database = ""
+# table = "app_config"
+
 # Global LLM configuration
 [llm]
 model = "claude-3-7-sonnet-20250219"       # The LLM model to use

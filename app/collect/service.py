@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 
 from app.agent.manus import Manus
 from app.cloud_docs import remember as remember_cloud_doc
-from app.config import PROJECT_ROOT, config, config_search_dirs
+from app.config import PROJECT_ROOT, config, config_search_dirs, get_config_section
 from app.error_report import attach
 from app.logger import logger
 
@@ -93,25 +93,29 @@ def is_cloud_link(value: str) -> bool:
 
 
 def load_collect_config() -> dict:
-    """读 [collect] 段：config.toml 优先，**该段缺失时退到 config.example.toml**。
+    """读统一配置源的 [collect] 段；**该段缺失时退到 config.example.toml**。
 
-    与 load_orders_config 同一回退策略：现网 config.toml 未必有 [collect] 段，
-    随仓库分发的 example 充当默认值（占位空值），用户在 config.toml 写了就完全覆盖。
-    解析失败只告警返回 {}，由调用方按「无云端目标」走本地路径。
+    与 load_orders_config 同一回退策略：统一源（app/config.py 的
+    get_config_section，配了 [config_store] 走 MySQL 配置中心、否则本地
+    config.toml）里未必有 [collect] 段，随仓库分发的 example 充当默认值
+    （占位空值），统一源里写了就完全覆盖。example 解析失败只告警返回 {}，
+    由调用方按「无云端目标」走本地路径。
     """
+    section = get_config_section("collect")
+    if section:
+        return section
     # 目录维度也要遍历：冻结后 example 只存在于随包只读侧（_internal/config）。
     for cfg_dir in config_search_dirs():
-        for name in ("config.toml", "config.example.toml"):
-            p = cfg_dir / name
-            if not p.exists():
-                continue
-            try:
-                with p.open("rb") as f:
-                    section = tomllib.load(f).get("collect") or {}
-                if section:
-                    return section
-            except Exception as e:
-                logger.warning(f"读 {p} 的 [collect] 配置失败：{e}")
+        p = cfg_dir / "config.example.toml"
+        if not p.exists():
+            continue
+        try:
+            with p.open("rb") as f:
+                section = tomllib.load(f).get("collect") or {}
+            if section:
+                return section
+        except Exception as e:
+            logger.warning(f"读 {p} 的 [collect] 配置失败：{e}")
     return {}
 
 

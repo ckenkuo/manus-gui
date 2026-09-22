@@ -1626,20 +1626,19 @@ def open_local_browser(config):
 
 
 def load_config():
+    """读统一配置源的 [server] 段（uvicorn 监听参数）；缺段/缺键退回 localhost:5172。
+
+    统一源（app/config.py 的 get_config_section）配了 [config_store] 走 MySQL
+    配置中心、否则读本地 config.toml；配置中心挂掉时 ConfigStoreError 原样上抛，
+    应用按既定策略直接退出（不拿默认端口起一个没有配置的服务）。
+    """
+    from app.config import get_config_section
+
     try:
-        # 冻结后入口脚本的 __file__ 指向 _internal 里的解包路径，推不出用户实际
-        # 编辑的那份配置；PROJECT_ROOT 在冻结态即 exe 所在目录，开发态即项目根。
-        config_path = PROJECT_ROOT / "config" / "config.toml"
-
-        if not config_path.exists():
+        server = get_config_section("server")
+        if not server:
             return {"host": "localhost", "port": 5172}
-
-        with open(config_path, "rb") as f:
-            config = tomllib.load(f)
-
-        return {"host": config["server"]["host"], "port": config["server"]["port"]}
-    except FileNotFoundError:
-        return {"host": "localhost", "port": 5172}
+        return {"host": server["host"], "port": server["port"]}
     except KeyError as e:
         print(
             f"The configuration file is missing necessary fields: {str(e)}, use default configuration"

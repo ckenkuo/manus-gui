@@ -216,6 +216,58 @@ def test_existing_keys_clip_merged_ranges_to_scan_bounds(monkeypatch):
     assert cli._read_columns("StoreA全球1", ["C"], header_row=2) == [("SPU-1",), ("SPU-1",)]
 
 
+def test_read_rows_expand_merged_only_for_whitelisted_columns(monkeypatch):
+    """read_rows 的 expand_merged 白名单：命中列按合并区间展开，未命中列只落锚点行。
+
+    活动管线成本表一个 SPU 合并多行货号，SPU 列不展开会把后续货号读成「SPU 为空」；
+    价格列（E）即使带合并区间也绝不展开——「价格空=该货号行无效」的保守语义靠这个。
+    """
+    def range_data(payload):
+        return {"rangeData": [
+            # C 列合并格：锚点 1-based 行2，覆盖行2-3（0-based rowFrom=1, rowTo=2）
+            {"rowFrom": 1, "rowTo": 2, "colFrom": 2, "cellText": "2879383652"},
+            # E 列同样合并，但不在白名单
+            {"rowFrom": 1, "rowTo": 2, "colFrom": 4, "cellText": "74.72"},
+            {"rowFrom": 1, "colFrom": 5, "cellText": "45"},
+            {"rowFrom": 2, "colFrom": 5, "cellText": "95"},
+        ]}
+
+    cli = _make(monkeypatch, {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "get_range_data"): range_data,
+    })
+    rows = cli.read_rows("StoreA全球1", 2, 3, expand_merged={"C"})
+    assert rows[2]["C"]["text"] == "2879383652"
+    assert rows[3]["C"]["text"] == "2879383652"  # 白名单列被展开到覆盖行
+    assert "E" not in rows[3]                    # 价格列即使合并也不展开
+    assert rows[3]["F"]["text"] == "95"
+    # 不传 expand_merged：维持旧行为（只落锚点行）
+    plain = cli.read_rows("StoreA全球1", 2, 3)
+    assert "C" not in plain[3]
+
+
+def test_read_rows_expand_merged_clips_anchor_outside_window(monkeypatch):
+    """合并区跨读批边界：锚点在请求窗口上方、覆盖行在窗口内时，覆盖行也要拿到值。
+
+    500 行一批的读批会把长合并区切开。这里钉死「_get_range 返回了与窗口相交但锚点在
+    窗口外的单元格」时 read_rows 的夹取行为；真 API 是否返回此类单元格属已知边界，
+    若不返回后果保守（覆盖行 SPU 读空 → 整组不可选），不会报错价。
+    """
+    def range_data(payload):
+        assert payload["range"]["rowFrom"] == 2  # 0-based，请求的是 1-based 行3
+        return {"rangeData": [
+            {"rowFrom": 1, "rowTo": 4, "colFrom": 2, "cellText": "2879383652"},
+            {"rowFrom": 2, "colFrom": 5, "cellText": "95"},
+        ]}
+
+    cli = _make(monkeypatch, {
+        ("sheet", "get_sheets_info"): SHEETS_INFO,
+        ("sheet", "get_range_data"): range_data,
+    })
+    rows = cli.read_rows("StoreA全球1", 3, 3, expand_merged={"C"})
+    assert rows[3]["C"]["text"] == "2879383652"
+
+
 def test_write_rows_sequence_and_payload(monkeypatch):
     verify = {"rangeData": [{"rowFrom": 2, "colFrom": 2, "cellText": "PO-9"}]}
     routes = {

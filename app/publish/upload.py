@@ -66,7 +66,7 @@ VIDEO_LOCAL_UPLOAD_WARN_MB = 100
 
 
 def resolve_full_cid() -> str:
-    """取账号级 fullCid：环境变量 DXM_FULL_CID > config.toml 的 [publish].full_cid。
+    """取账号级 fullCid：环境变量 DXM_FULL_CID > 统一配置源的 [publish].full_cid。
 
     与 images.resolve_packy_key 同构（同样不留内置兜底值）：原脚本硬编码的
     5153348- 只对那一个账号成立，留着比没有更坏——换账号后上传会「成功」但图片
@@ -76,23 +76,16 @@ def resolve_full_cid() -> str:
     if cid:
         return cid
     try:
-        import tomllib
+        from app.config import get_config_section
 
-        from app.config import config_search_dirs
-        for d in config_search_dirs():
-            p = d / "config.toml"
-            if not p.exists():
-                continue
-            with open(p, "rb") as f:
-                data = tomllib.load(f)
-            cid = (data.get("publish") or {}).get("full_cid") or ""
-            if cid:
-                return cid
+        cid = get_config_section("publish").get("full_cid") or ""
+        if cid:
+            return cid
     except Exception as e:
         logger.warning(f"读取 [publish].full_cid 失败：{e}")
     raise RuntimeError(
         "缺少店小秘 fullCid：设环境变量 DXM_FULL_CID，"
-        "或在 config/config.toml 的 [publish] 段配 full_cid"
+        "或在配置的 [publish] 段配 full_cid"
         "（抓包 /api/cos/cosDxmCallBack.json 的 fullCid 参数可得，形如 5153348-）"
     )
 

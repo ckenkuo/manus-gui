@@ -6,20 +6,26 @@ UI / CLI 共用入口，进度经【结构化回调】抛出——对标 app/col
 和 UI（app.py 的 /activity 接口）都调这里。进度以结构化事件（dict）经 on_progress 抛出，
 UI 直接走 SSE 渲染。
 
-判定逻辑：申报价达到 WPS 在线文档销售底价的活动全部入选，一个 SPU 可报多个活动。
+判定逻辑：一个 SPU 可有多个货号行（合并单元格成本表，各自一套日常价/销售底价）；
+【全部货号】的申报价（各日常价×活动折扣率）都达到各自销售底价的活动才入选——提报页
+勾选是 SPU 级、无法只报部分货号，任一货号穿底价即淘汰整个活动。一个 SPU 可报多个活动。
 商品实时采购，不读取库存、不按库存门槛初筛；平台详情资格检查仍保留。无需 LLM 选活动。
 
 最高优先级安全约束（真实商家账号、操作不可逆）：
 - 默认 dry-run 只生成计划；正式执行需要 dry_run=False 且 live=True。
-- 云端价格无效时中止；无固定折扣活动达底价时 skip_nomatch。
+- 云端价格无效时中止；无全部货号达底价的活动时 skip_nomatch。
 - 报名成功由本次提交、完整前后快照和最新有效报名记录共同确认，历史成功不补作本次成功。
 
 事件契约（on_progress 收到的 dict，均含 "type"）：
     {"type":"batch_start","total":int,"todo":int,"batch":int,"dry_run":bool}
     {"type":"product_start","index":int,"total":int,"spu":str,"name":str}
-    # product_plan：一个 SPU 会发多条（每个达销售底价的活动一条）
-    {"type":"product_plan","spu":str,"activity":str,"daily_price":float,"sale":float,
-                           "cost":float|None,"submit_price":float,"within_floor":bool,
+    # product_plan：一个 SPU 会发多条（每个全部货号达底价的活动一条）；skus 是逐货号
+    # 明细（权威价格），daily_price/sale/submit_price/cost 是单货号兼容字段（多货号置 None）
+    {"type":"product_plan","spu":str,"activity":str,
+                           "skus":[{"label":str,"daily":float,"sale":float,"submit_price":float}],
+                           "sku_count":int,
+                           "daily_price":float|None,"sale":float|None,
+                           "cost":float|None,"submit_price":float|None,"within_floor":bool,
                            "stock":None,"min_stock":int|None,"stock_ok":None,"stock_policy":"on_demand",
                            "selected":bool,"reason":str}
     {"type":"product_done","spu":str,"status":"done"|"skip_nofloor"|"skip_nomatch"|"fail",
@@ -66,7 +72,7 @@ from app.activity import pipeline, source
 from app.activity.reconciliation import assess_registration
 # 复用采集 service 已实测的 CDP 护栏 / 进度回调 / LLM token 清零，避免重复实现。
 from app.collect.service import CDP_URL, _emit, ensure_cdp_alive, reset_pipeline_llms
-from app.config import PROJECT_ROOT, config_search_dirs
+from app.config import PROJECT_ROOT, get_config_section
 from app.error_report import attach
 from app.logger import logger
 
@@ -90,26 +96,18 @@ def _normalize_margin(m) -> Optional[float]:
 
 
 def global_min_margin() -> float:
-    """读 config.toml [activity].min_margin 作全局默认；缺失/损坏兜底 0.15（best-effort）。"""
-    import tomllib
+    """读统一配置源 [activity].min_margin 作全局默认；缺失/损坏兜底 0.15（best-effort）。
 
-    # 目录维度也要遍历：冻结后 example 只存在于随包只读侧（_internal/config）。
-    # 保留原先「只认第一个存在的文件」语义（break），避免 config.toml 显式写了
-    # min_margin 却被 example 的默认值盖掉。
-    for cfg_dir in config_search_dirs():
-        for name in ("config.toml", "config.example.toml"):
-            p = cfg_dir / name
-            if not p.exists():
-                continue
-            try:
-                with p.open("rb") as f:
-                    data = tomllib.load(f)
-                m = _normalize_margin((data.get("activity") or {}).get("min_margin"))
-                if m is not None:
-                    return m
-            except Exception as e:
-                logger.warning(f"读 [activity].min_margin 失败（用兜底 0.15）：{e}")
-            break
+    统一源（app/config.py 的 get_config_section）配了 [config_store] 走 MySQL
+    配置中心、否则读本地 config.toml（文件模式下即原先「第一个存在的文件」那条链，
+    显式写的 min_margin 不会被 example 默认值盖掉）。
+    """
+    try:
+        m = _normalize_margin(get_config_section("activity").get("min_margin"))
+        if m is not None:
+            return m
+    except Exception as e:
+        logger.warning(f"读 [activity].min_margin 失败（用兜底 0.15）：{e}")
     return _FALLBACK_MIN_MARGIN
 
 
@@ -226,10 +224,12 @@ async def _process_one_spu(
     """单 SPU 确定性流程（重构版），返回结果 dict（供上层生成 product_done 事件）。
 
     2026-07-16 用户重定义判定：不再 LLM 选一个活动、不再用毛利率红线，改为【确定性筛选】——
-    遍历活动页全部活动，把「申报价(=日常价×活动折扣率) ≥ 销售底价(WPS 销售价格列)」
-    的活动全部列入报名计划。商品实时采购，库存不参与初筛。每个入选活动发一条
-    product_plan。规划阶段不执行报名或切换流量。
-    保守跳过：日常价或销售底价读不到 → skip_nofloor；无任何活动入选 → skip_nomatch。
+    遍历活动页全部活动，把「全部货号的申报价(=各日常价×活动折扣率)都 ≥ 各自销售底价
+    (WPS 销售价格列)」的活动全部列入报名计划。一个 SPU 可有多个货号行（合并单元格成本表），
+    提报页勾选是 SPU 级、无法只报部分货号，故任一货号穿底价即淘汰整个活动。
+    商品实时采购，库存不参与初筛。每个入选活动发一条 product_plan（带逐货号明细 skus）。
+    规划阶段不执行报名或切换流量。
+    保守跳过：任一货号日常价或销售底价读不到 → skip_nofloor；无任何活动入选 → skip_nomatch。
     """
     spu = entry["spu"]
     # 多商品串行时，每个商品开始前都清一次随机公告遮罩；只在业务弹窗出现前调用。
@@ -241,21 +241,28 @@ async def _process_one_spu(
         "enrolled_activities": [],
     }
 
-    # 1. 读底价：daily(日常价) + sale(销售价=底价，用户手填常量)。成本 purchase 仅展示、不判定。
-    #    daily 或 sale 缺失/公式(=开头)/解析不出 → skip_nofloor（底价读不到，保守跳过）。
+    # 1. 读底价：read_costs 已保证整组货号有效才给价（{spu: {"items": [...]}}），
+    #    每个货号各自一套 日常价/销售底价。成本 purchase 仅展示、不判定。
     row = (cost_map or {}).get(spu)
-    if not row:
+    items_raw = (row or {}).get("items") or []
+    if not items_raw:
         result.update(status="skip_nofloor", note="WPS 文档未找到该 SPU 的有效价格")
         return result
-    daily_price = pipeline._to_number(row.get("daily"))
-    sale_raw = str(row.get("sale", "")).strip()
-    sale = None if (not sale_raw or sale_raw.startswith("=")) else pipeline._to_number(sale_raw)
-    if daily_price is None or sale is None:
-        result.update(status="skip_nofloor",
-                      note=f"日常价或销售底价读不到（日常价={row.get('daily')} 销售价={sale_raw or '空'}）")
-        return result
-    purchase_raw = str(row.get("purchase", "")).strip().lstrip("=")
-    cost = pipeline._to_number(purchase_raw)  # 仅展示，可为 None
+    # 防御性重解析（=开头公式拒判）：source 层已校验过，这里是最后一道，任一货号无效即整组跳过。
+    items = []
+    for item in items_raw:
+        daily = pipeline._to_number(item.get("daily"))
+        sale_raw = str(item.get("sale", "")).strip()
+        sale = None if (not sale_raw or sale_raw.startswith("=")) else pipeline._to_number(sale_raw)
+        if daily is None or sale is None:
+            result.update(status="skip_nofloor",
+                          note=f"货号{item.get('label')}（第{item.get('row_number')}行）"
+                               f"的日常价或销售底价读不到，整组跳过")
+            return result
+        items.append({**item, "daily": daily, "sale": sale})
+    # 成本仅展示：多货号各不相同，n>1 不下发单值（避免把某货号成本当成整个 SPU 的）。
+    cost = pipeline._to_number(str(items[0].get("purchase", "")).strip().lstrip("=")) \
+        if len(items) == 1 else None
 
     # 2. 流量页定位行、读加速态（只读）。dry-run 只记「将关」，绝不点。
     accel_state = await pipeline.read_accel_state(flux_page, spu, search=True) if flux_page else "unknown"
@@ -265,47 +272,68 @@ async def _process_one_spu(
     activities = await pipeline.read_activities(activity_page) if activity_page else []
 
     enrolled = []
+    rejected = []
     for act in activities:
         dr = act.get("discount_rate")
         if dr is None:
             continue  # 无固定折扣（万人团/详见提报列表）阶段1 无法确定性算价，跳过
-        calc = pipeline.compute_submit_price(daily_price, dr, sale)
-        submit_price = calc.get("submit_price")
-        within_floor = bool(calc.get("within_floor"))
-        if not within_floor:
-            continue  # 申报价够不到销售底价，直接淘汰、不发 plan
+        # 逐货号算价：任一货号穿底价即淘汰整个活动（提报是 SPU 级，不能只报部分货号）。
+        calcs = [(it, pipeline.compute_submit_price(it["daily"], dr, it["sale"]))
+                 for it in items]
+        under = [(it, c) for it, c in calcs if not c.get("within_floor")]
+        if under:
+            it, c = under[0]
+            rejected.append(
+                f"活动「{act['name']}」货号{it['label']} 申报价{c.get('submit_price')}<底价{it['sale']}"
+            )
+            continue
+        sku_prices = [{
+            "label": it["label"], "daily": it["daily"], "sale": it["sale"],
+            "submit_price": c["submit_price"],
+        } for it, c in calcs]
+        single = len(sku_prices) == 1
         min_stock = act.get("min_stock")
-        selected = True
-        reason = "申报价达底价；实时采购，不按库存筛选"
         await _emit(on_progress, {
             "type": "product_plan", "spu": spu, "activity": act["name"],
-            "daily_price": daily_price, "sale": sale, "cost": cost,
-            "submit_price": submit_price, "within_floor": within_floor,
+            # 逐货号明细是权威价格；旧单值字段仅单货号时照填、多货号置 None——
+            # 把某一个货号的价格当成「该 SPU 的价」展示会误导核对。
+            "skus": sku_prices, "sku_count": len(sku_prices),
+            "daily_price": sku_prices[0]["daily"] if single else None,
+            "sale": sku_prices[0]["sale"] if single else None,
+            "cost": cost,
+            "submit_price": sku_prices[0]["submit_price"] if single else None,
+            "within_floor": True,
             "stock": None, "min_stock": min_stock, "stock_ok": None,
             "stock_policy": "on_demand",
-            "selected": selected, "reason": reason,
+            "selected": True,
+            "reason": "全部货号申报价达底价；实时采购，不按库存筛选",
         })
-        if selected:
-            enrolled.append({
-                "activity": act["name"], "submit_price": submit_price,
-                # daily_price/discount_rate 仅在超参考价失败时反推「建议核对的日常价」用，
-                # 不参与任何主流程判定（申报价仍是既算好的 submit_price）。
-                "daily_price": daily_price, "discount_rate": dr,
-                "registered_count": act.get("registered_count"),
-                "registered_display": act.get("registered_display"),
-            })
+        enrolled.append({
+            "activity": act["name"], "sku_prices": sku_prices,
+            # submit_price/daily_price 仅是单货号兼容展示字段，执行层一律以 sku_prices 为准。
+            "submit_price": sku_prices[0]["submit_price"] if single else None,
+            "daily_price": sku_prices[0]["daily"] if single else None,
+            "discount_rate": dr,
+            "registered_count": act.get("registered_count"),
+            "registered_display": act.get("registered_display"),
+        })
 
     result["enrolled_activities"] = enrolled
     result["accel_state"] = accel_state  # 供执行遍区分初始 on/off/unknown
     result["accel_will_close"] = accel_will_close  # 初始 on 才需先关
-    result["sale"] = sale  # 销售底价，供执行遍重开加速器时设加速价=底价+1
+    # 逐货号价格（含底价）：执行遍阶段三重开加速器时按各自底价+1 逐行设加速价。
+    result["skus"] = [{
+        "label": it["label"], "daily": it["daily"], "sale": it["sale"],
+        "purchase": it.get("purchase"),
+    } for it in items]
     if enrolled:
-        result["submit_price"] = enrolled[0]["submit_price"]  # 兼容旧单值字段
+        result["submit_price"] = enrolled[0]["submit_price"]  # 兼容旧单值字段（多货号为 None）
 
     # 6. 无任何活动入选 → skip_nomatch。
     if not enrolled:
+        detail = "；".join(rejected[:2]) if rejected else "无固定折扣活动"
         result.update(status="skip_nomatch",
-                      note="无固定折扣活动的申报价达到销售底价")
+                      note=f"没有全部货号都达底价的活动（{detail}）")
         return result
 
     # 7. 计划可行（status=done，携带计划）。真正的变更在【执行遍】(_run_execution_phases) 里按
@@ -427,7 +455,8 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
         for e in r.get("enrolled_activities", []):
             by_activity.setdefault(e["activity"], []).append(
                 {
-                    "spu": r["spu"], "submit_price": e["submit_price"],
+                    "spu": r["spu"], "sku_prices": e["sku_prices"],
+                    "submit_price": e.get("submit_price"),
                     "daily_price": e.get("daily_price"), "discount_rate": e.get("discount_rate"),
                     "registered_count": e.get("registered_count"),
                     "registered_display": e.get("registered_display"),
@@ -452,8 +481,9 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
     # ---- 阶段三：开启流量 ----
     # 初始 on：仅关闭成功后重开；关闭失败/冷却时仍为 on，不重复操作。
     # 初始 off：业务允许先报名再开启，因此报名遍结束后也开启。
-    # 初始 unknown：保守不操作。加速价统一为 Excel 底价+1（前端显示价以加速价为准）。
-    sale_by_spu = {r["spu"]: r.get("sale") for r in plans}
+    # 初始 unknown：保守不操作。加速价逐货号 = 各自 Excel 底价+1（前端显示价以加速价为准，
+    # 各货号底价不同，统一单值会把高底价货号按低价卖——多货号必须逐行设价）。
+    skus_by_spu = {r["spu"]: r.get("skus") for r in plans}
     initially_off = [r["spu"] for r in plans if r.get("accel_state") == "off"]
     if live:
         # 初始 off 属于新增开启动作：只有该 SPU 的全部计划活动都完成提交后才允许开启。
@@ -483,19 +513,24 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
         to_open = list(dict.fromkeys(known_accel))
     for spu in to_open:
         try:
-            sale = sale_by_spu.get(spu)
-            accel_price = round(float(sale) + 1, 2) if sale is not None else None
+            accel_prices = [{
+                "label": s.get("label"), "daily": s.get("daily"), "sale": s.get("sale"),
+                "price": round(float(s["sale"]) + 1, 2),
+            } for s in (skus_by_spu.get(spu) or []) if s.get("sale") is not None] or None
             await _emit(on_progress, {
                 "type": "exec_accel_step", "phase": "open", "step": "checking",
                 "spu": spu, "state": None, "note": "正在按 SPU 查询开启前状态",
             })
-            res = await pipeline.open_accel(flux_page, spu, allow=live, accel_price=accel_price)
+            res = await pipeline.open_accel(flux_page, spu, allow=live, accel_prices=accel_prices)
             ok = res.get("opened", False)
             if ok:
                 summary["reopened"].append(spu)
             await _emit(on_progress, {
                 "type": "exec_reopen", "spu": spu, "ok": ok, "live": live,
-                "accel_price": accel_price,
+                "accel_prices": accel_prices,
+                # 单货号兼容字段（模板展示用）；多货号看 accel_prices 明细。
+                "accel_price": (accel_prices[0]["price"]
+                                if accel_prices and len(accel_prices) == 1 else None),
                 "precheck_state": res.get("precheck_state", res.get("state", "unknown")),
                 "already_on": res.get("precheck_state", res.get("state")) == "on",
                 "note": res.get("note", ""),
@@ -774,9 +809,8 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                         })
 
                     r = await pipeline.enroll_activity(page, it["spu"], act_name,
-                                                       it["submit_price"], allow_submit=False,
+                                                       it["sku_prices"], allow_submit=False,
                                                        on_step=on_step,
-                                                       daily_price=it.get("daily_price"),
                                                        discount_rate=it.get("discount_rate"))
                     if r.get("detail_eligible") is False:
                         ineligible.append(it["spu"])
@@ -792,7 +826,8 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                         # 未填成功：逐条记入 failed（over_ref 标注疑数据不一致），供操作者核对。
                         summary["failed"].append({
                             "spu": it["spu"], "activity": act_name,
-                            "submit_price": it["submit_price"],
+                            "submit_price": it.get("submit_price"),
+                            "sku_count": len(it.get("sku_prices") or []),
                             "ref_price": r.get("ref_price"),
                             "over_ref": bool(r.get("over_ref")),
                             "reason": r.get("note", "填价未成功"),
@@ -806,13 +841,17 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                                               "spu": it["spu"], "ok": r.get("filled", False),
                                               "over_ref": bool(r.get("over_ref")),
                                               "ineligible": r.get("detail_eligible") is False,
+                                              "sku_count": len(it.get("sku_prices") or []),
                                               "ref_price": r.get("ref_price"),
-                                              "submit_price": it["submit_price"], "note": r.get("note", "")})
+                                              "submit_price": it.get("submit_price"),
+                                              "note": r.get("note", "")})
                     if halt:
                         break
                 except Exception as e:
                     summary["failed"].append({"spu": it["spu"], "activity": act_name,
-                                              "submit_price": it["submit_price"], "reason": f"异常：{e}"})
+                                              "submit_price": it.get("submit_price"),
+                                              "sku_count": len(it.get("sku_prices") or []),
+                                              "reason": f"异常：{e}"})
                     await _emit(on_progress, {"type": "exec_fill", "activity": act_name,
                                               "spu": it["spu"], "ok": False, "note": f"异常：{e}"})
                     halt = {"activity": act_name, "spu": it["spu"],

@@ -17,7 +17,8 @@ best-effort：未配置 / 未装 pymysql / 连接失败 / 插入失败一律 log
 绝不中断主流程（同 app/publish/alert.py 的飞书告警取向）。写库用 pymysql 短连接 +
 asyncio.to_thread 下沉线程，不堵事件循环。
 
-配置在 config/config.toml 的 [error_report] 段（gitignored，含密码不进版本库）：
+配置在统一配置源的 [error_report] 段（app/config.py 的 get_config_section：
+本机配了 [config_store] 时读 MySQL 配置中心，否则读本地 config.toml）：
 
     [error_report]
     enabled = false
@@ -38,7 +39,7 @@ import socket
 import traceback as _traceback
 from typing import Awaitable, Callable, Optional, Union
 
-from app.config import config_search_dirs
+from app.config import get_config_section
 from app.logger import logger
 
 # 默认表名；machine 用 hostname，多台 PC 靠它区分。
@@ -103,12 +104,12 @@ _SNAP_INSERT = """INSERT INTO `{table}`
 
 
 def load_config() -> dict:
-    """读 config.toml 的 [error_report] 段，返回连接/开关参数；读不到返回禁用态。
+    """读统一配置源的 [error_report] 段，返回连接/开关参数；读不到返回禁用态。
 
-    只读 config.toml、不回退 config.example.toml（example 里是空占位，读来无意义）。
     best-effort：读不到 / 解析失败一律 enabled=False，绝不影响主流程（照抄
-    app/publish/alert.py 的 load_alert_config）。enabled 默认 false，需显式置 true
-    且 host/database 非空才启用——避免没配好就连公网 MySQL 刷 warning。
+    app/publish/alert.py 的 load_alert_config）——配置中心挂掉抛的
+    ConfigStoreError 同样只吞成「本次不上报」。enabled 默认 false，需显式置
+    true 且 host/database 非空才启用——避免没配好就连公网 MySQL 刷 warning。
     """
     result = {
         "enabled": False, "host": "", "port": 3306, "user": "", "password": "",
@@ -120,16 +121,8 @@ def load_config() -> dict:
         "screenshot_max_kb": 2048, "snapshot_max_kb": 256,
     }
     try:
-        import tomllib
-
-        for d in config_search_dirs():
-            p = d / "config.toml"
-            if not p.exists():
-                continue
-            with open(p, "rb") as f:
-                section = tomllib.load(f).get("error_report") or {}
-            if not section:
-                continue
+        section = get_config_section("error_report")
+        if section:
             result["host"] = str(section.get("host") or "").strip()
             result["port"] = int(section.get("port") or 3306)
             result["user"] = str(section.get("user") or "")
@@ -147,7 +140,6 @@ def load_config() -> dict:
                 bool(section.get("enabled", False))
                 and bool(result["host"]) and bool(result["database"])
             )
-            break
     except Exception as e:
         logger.warning(f"读取 [error_report] 配置失败，本次不上报：{e}")
         result["enabled"] = False

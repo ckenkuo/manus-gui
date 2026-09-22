@@ -34,7 +34,6 @@ import base64
 import json
 import os
 import tempfile
-import tomllib
 from typing import Annotated, Any, Optional
 
 from pydantic import BaseModel, StringConstraints, ValidationError
@@ -78,7 +77,6 @@ LLM_CHOICES = {
 }
 _DEFAULT_CHOICE = "grok"
 _LLM_PREFS_PATH = os.path.join("workspace", "publish_llm.json")
-_CONFIG_TOML_PATH = os.path.join("config", "config.toml")
 
 # ---- 按阶段覆盖模型 -------------------------------------------------------------
 # 【为什么要分阶段而不是一个全局选择】2026-08-24 实测同一批商品的耗时账：属性审核
@@ -194,16 +192,19 @@ def set_stage_choice(stage: str, choice: Optional[str]) -> None:
 
 
 def _section_api_key(config_name: str) -> str:
-    """直接读 config.toml 原文里该段的 api_key。
+    """读统一配置源【原文】里该段的 api_key。
 
     为什么不能看加载后的 config.llm：app/config.py 合并时会【剔除空 api_key 再合并】
     （空串会盖掉 [llm] 默认 key，见 _load_initial_config 注释），于是段里留
     api_key = "" 时，合并结果反而带着 [llm] 默认段的真 key——拿它判可用性会
     误判为「已配置」，切过去就拿别家的 key 打 Kimi 的端点（2026-08-21 实测踩中）。
+    统一源（load_raw_config）保证给的是未合并原文，且顺带修掉了原先相对路径
+    config/config.toml 依赖进程 CWD 的口径问题（2026-09-22 配置中心改造）。
     """
     try:
-        with open(_CONFIG_TOML_PATH, "rb") as f:
-            raw = tomllib.load(f)
+        from app.config import load_raw_config
+
+        raw = load_raw_config()
         return str(raw.get("llm", {}).get(config_name, {}).get("api_key") or "").strip()
     except Exception:
         return ""

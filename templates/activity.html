@@ -582,6 +582,17 @@
           <span class="small text-muted cell-ellipsis d-inline-block align-middle" title="${reason}">${reason}</span>`;
       }
 
+      // 价格列渲染：多货号（skus>1）时单值字段是 null，必须逐货号一行小字，
+      // 否则核对的人看到的全是「–」，无从发现报错价。单货号维持原单值。
+      function priceCell(p, singleKey, skuKey) {
+        if (Array.isArray(p.skus) && p.skus.length > 1) {
+          return p.skus
+            .map((s) => `<div class="text-nowrap">${s.label}: ${fmtNum(s[skuKey])}</div>`)
+            .join("");
+        }
+        return fmtNum(p[singleKey]);
+      }
+
       function renderPlanTable() {
         const body = $("planBody");
         if (!order.length) {
@@ -614,9 +625,9 @@
               <td class="cell-ellipsis" title="${p.activity || ""}">${
               p.activity || '<span class="text-muted">–</span>'
             }</td>
-              <td class="small">${fmtNum(p.daily_price)}</td>
-              <td class="small">${fmtNum(p.sale)}</td>
-              <td class="small fw-semibold">${fmtNum(p.submit_price)}</td>
+              <td class="small">${priceCell(p, "daily_price", "daily")}</td>
+              <td class="small">${priceCell(p, "sale", "sale")}</td>
+              <td class="small fw-semibold">${priceCell(p, "submit_price", "submit_price")}</td>
               <td class="small">${floorCell(p.within_floor)}</td>
               <td class="small">实时采购</td>
               <td class="small">${fmtNum(p.min_stock)}</td>
@@ -675,10 +686,14 @@
           }
           // product_plan 量大（一 SPU 可达数十条），只把「入选」的记进日志，避免刷屏
           if (data.selected) {
+            // 多货号逐货号列出申报价（单值字段为 null，不能只报一个货号的价当 SPU 的价）
+            const multi = Array.isArray(data.skus) && data.skus.length > 1;
+            const priceText = multi
+              ? data.skus.map((s) => `${s.label}=${fmtNum(s.submit_price)}`).join("、") +
+                `（${data.skus.length} 个货号均达底价，实时采购，不按库存筛选）`
+              : `${fmtNum(data.submit_price)}（底价${fmtNum(data.sale)}，实时采购，不按库存筛选）`;
             logLine(
-              `[计划] SPU=${data.spu} 入选活动「${data.activity || ""}」 申报价${fmtNum(
-                data.submit_price
-              )}（底价${fmtNum(data.sale)}，实时采购，不按库存筛选）`
+              `[计划] SPU=${data.spu} 入选活动「${data.activity || ""}」 申报价${priceText}`
             );
           }
           renderPlanTable();

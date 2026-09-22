@@ -72,20 +72,21 @@ def test_choice_文件值非法回落默认(_isolate_llm_prefs):
     assert llm.get_llm_choice() == "grok"
 
 
-def _write_toml(tmp_path, monkeypatch, sections: dict):
-    """sections: config_name -> {api_key: ...}，写成临时 config.toml 并指过去。"""
-    lines = []
-    for name, fields in sections.items():
-        lines.append(f"[llm.{name}]")
-        for k, v in fields.items():
-            lines.append(f'{k} = "{v}"')
-    p = tmp_path / "config.toml"
-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    monkeypatch.setattr(llm, "_CONFIG_TOML_PATH", str(p))
+def _feed_llm_sections(monkeypatch, sections: dict):
+    """sections: config_name -> {api_key: ...}，灌进统一配置源。
+
+    配置中心改造（2026-09-22）后 _section_api_key 不再读文件，而是读
+    app.config.load_raw_config 的【未合并原文】，故测试直接打桩这个入口——
+    语义与原先写临时 config.toml 等价（都是构造 raw dict）。
+    """
+    import app.config as app_config
+
+    raw = {"llm": {name: dict(fields) for name, fields in sections.items()}}
+    monkeypatch.setattr(app_config, "load_raw_config", lambda: raw)
 
 
-def test_list_choices_可用性(_isolate_llm_prefs, tmp_path, monkeypatch):
-    _write_toml(tmp_path, monkeypatch, {
+def test_list_choices_可用性(_isolate_llm_prefs, monkeypatch):
+    _feed_llm_sections(monkeypatch, {
         "publish": {"api_key": "sk-real"},
         "publish-kimi": {"api_key": ""},       # 没填 key
     })
@@ -94,7 +95,7 @@ def test_list_choices_可用性(_isolate_llm_prefs, tmp_path, monkeypatch):
     assert choices["kimi"]["available"] is False
     assert choices["grok"]["active"] is True and choices["kimi"]["active"] is False
     # 段整个缺失也算不可用
-    _write_toml(tmp_path, monkeypatch, {"publish": {"api_key": "sk-real"}})
+    _feed_llm_sections(monkeypatch, {"publish": {"api_key": "sk-real"}})
     choices = {c["id"]: c for c in llm.list_llm_choices()}
     assert choices["kimi"]["available"] is False
 

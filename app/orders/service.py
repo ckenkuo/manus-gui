@@ -32,7 +32,13 @@ from app.collect.service import (
     list_workbooks,
 )
 from app.cloud_docs import remember as remember_cloud_doc
-from app.config import PROJECT_ROOT, config, config_search_dirs, get_output_dir
+from app.config import (
+    PROJECT_ROOT,
+    config,
+    config_search_dirs,
+    get_config_section,
+    get_output_dir,
+)
 from app.error_report import attach
 from app.logger import logger
 from app.orders import pipeline, upload
@@ -185,27 +191,31 @@ class SheetPlan:
 
 
 def load_orders_config() -> dict:
-    """读 [orders] 段：config.toml 优先，**该段缺失时退到 config.example.toml**。
+    """读统一配置源的 [orders] 段；**该段缺失时退到 config.example.toml**。
 
-    为什么这里要「按段」回退，而不是像 activity 那样只读第一个存在的文件：现网
-    config.toml 里根本没有 [orders] 段（用户配置只写了 llm/browser 等），只读它会拿到
-    空配置、整个功能直接中止。而 [orders] 的默认值（登记表路径、sheet_map）没法在代码里
-    兜底——猜错就是写错表。所以让随仓库分发的 example 充当默认值，用户在 config.toml
-    写了 [orders] 就完全覆盖它。解析失败只告警返回 {}，由调用方按缺字段中止。
+    统一源（app/config.py 的 get_config_section）在本机配了 [config_store] 时读
+    MySQL 配置中心、否则读本地 config.toml，对本函数透明。「缺段退 example」的
+    语义保留：现网配置里可能根本没有 [orders] 段（用户配置只写了 llm/browser
+    等），只读它会拿到空配置、整个功能直接中止。而 [orders] 的默认值（登记表
+    路径、sheet_map）没法在代码里兜底——猜错就是写错表。所以让随仓库分发的
+    example 充当默认值，统一源里写了 [orders] 就完全覆盖它。example 解析失败
+    只告警返回 {}，由调用方按缺字段中止。
     """
+    section = get_config_section("orders")
+    if section:
+        return section
     # 目录维度也要遍历：冻结后 example 只存在于随包只读侧（_internal/config）。
     for cfg_dir in config_search_dirs():
-        for name in ("config.toml", "config.example.toml"):
-            p = cfg_dir / name
-            if not p.exists():
-                continue
-            try:
-                with p.open("rb") as f:
-                    section = tomllib.load(f).get("orders") or {}
-                if section:
-                    return section
-            except Exception as e:
-                logger.warning(f"读 {p} 的 [orders] 配置失败：{e}")
+        p = cfg_dir / "config.example.toml"
+        if not p.exists():
+            continue
+        try:
+            with p.open("rb") as f:
+                section = tomllib.load(f).get("orders") or {}
+            if section:
+                return section
+        except Exception as e:
+            logger.warning(f"读 {p} 的 [orders] 配置失败：{e}")
     return {}
 
 

@@ -71,31 +71,25 @@ def resolve_warehouse(site: str = "") -> str:
     【为什么仓库名不能写死「飞特COL仓库」】编辑页仓库下拉的选项集合因站点而异
     （bulkattr 已实测：哥伦比亚站「飞特COL仓库 / 哥伦比亚-新势力」、秘鲁站「飞特PE仓库」、
     美国站「嘉运美东仓库」）。写死一个名字，非该站点的商品在下拉里找不到匹配项，
-    _JS_PICK_WAREHOUSE 报 no-option、整单未落库。故仓库名按站点查 config.toml 的
-    [publish.warehouse_by_site] 映射，站点未配时退回 [publish].warehouse 的全局默认，
-    再没有才用代码内兜底「飞特COL仓库」。
+    _JS_PICK_WAREHOUSE 报 no-option、整单未落库。故仓库名按站点查统一配置源的
+    [publish.warehouse_by_site] 映射（get_config_section，配了 [config_store] 走
+    MySQL 配置中心、否则本地 config.toml），站点未配时退回 [publish].warehouse
+    的全局默认，再没有才用代码内兜底「飞特COL仓库」。
 
     site 取 --site 的站点名（如「美国」）。页面上「美国」与「美国站」两种写法都出现，
     这里归一去掉尾部「站」再查。
     """
     default = "飞特COL仓库"
     try:
-        import tomllib
+        from app.config import get_config_section
 
-        from app.config import config_search_dirs
-        for d in config_search_dirs():
-            p = d / "config.toml"
-            if not p.exists():
-                continue
-            with open(p, "rb") as f:
-                data = tomllib.load(f)
-            pub = data.get("publish") or {}
-            default = str(pub.get("warehouse") or default)
-            by_site = pub.get("warehouse_by_site") or {}
-            if site:
-                key = site[:-1] if site.endswith("站") else site
-                if key in by_site:
-                    return str(by_site[key])
+        pub = get_config_section("publish")
+        default = str(pub.get("warehouse") or default)
+        by_site = pub.get("warehouse_by_site") or {}
+        if site:
+            key = site[:-1] if site.endswith("站") else site
+            if key in by_site:
+                return str(by_site[key])
     except Exception as e:
         logger.warning(f"读取 [publish] 站点仓库映射失败（退回默认）：{e}")
     return default

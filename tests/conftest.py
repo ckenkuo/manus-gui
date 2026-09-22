@@ -19,6 +19,13 @@ cache_stats() 报缓存现状，各阶段跑通还会往里写类目路径与属
 表里混进十几行假记录，跟真故障分不开。开发机通常 enabled=true（见 config.toml），
 所以这条不是可选项。
 """
+import os
+
+# 配置源钉死文件模式：单测不依赖配置中心（MySQL）的可达性，也不被库里的配置
+# 改动带跑（2026-09-22 配置中心改造）。必须在任何 app.* import 之前设置——
+# app.config 的 Config 单例在 import 时就完成首次加载。
+os.environ.setdefault("MANUS_CONFIG_SOURCE", "file")
+
 import pytest
 
 from app import cloud_docs

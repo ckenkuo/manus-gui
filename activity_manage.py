@@ -37,13 +37,26 @@ def _print_progress(event: dict) -> None:
             f"（{(event.get('name') or '')[:20]}）---"
         )
     elif t == "product_plan":
-        logger.info(
-            f"[计划] SPU={event['spu']} 活动「{event.get('activity') or '无'}」 "
-            f"日常价={event.get('daily_price')} 成本={event.get('cost')} "
-            f"申报价={event.get('submit_price')} 红线={event.get('red_line')} "
-            f"守红线={'是' if event.get('within_red_line') else '否'} "
-            f"（{event.get('reason') or ''}）"
-        )
+        # 多货号时单值价格字段为 None，逐货号列出（底价/申报价各一套），避免把某个
+        # 货号的价当成整个 SPU 的价。
+        skus = event.get("skus") or []
+        if len(skus) > 1:
+            per_sku = "；".join(
+                f"{s.get('label')}: 日常价{s.get('daily')} 底价{s.get('sale')} "
+                f"申报价{s.get('submit_price')}" for s in skus
+            )
+            logger.info(
+                f"[计划] SPU={event['spu']} 活动「{event.get('activity') or '无'}」 "
+                f"{len(skus)} 个货号均达底价：{per_sku}（{event.get('reason') or ''}）"
+            )
+        else:
+            logger.info(
+                f"[计划] SPU={event['spu']} 活动「{event.get('activity') or '无'}」 "
+                f"日常价={event.get('daily_price')} 底价={event.get('sale')} "
+                f"成本={event.get('cost')} 申报价={event.get('submit_price')} "
+                f"达底价={'是' if event.get('within_floor') else '否'} "
+                f"（{event.get('reason') or ''}）"
+            )
     elif t == "product_done":
         status = event.get("status")
         if status == "done":

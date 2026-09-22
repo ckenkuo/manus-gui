@@ -1,12 +1,17 @@
+import copy
 import json
 import os
 import sys
 import threading
+import time
 import tomllib
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from pydantic import BaseModel, Field
+
+from app.config_store import ConfigStoreError
+from app import config_store
 
 
 def is_frozen() -> bool:
@@ -155,6 +160,177 @@ def get_output_dir(kind: str = "") -> Path:
         except Exception:
             pass
         return fallback
+
+
+# ---- 统一配置源（本地文件 / MySQL 配置中心）--------------------------------------
+# 为什么有两种模式：多台机器共用一套代码，但 config.toml 含密钥、gitignored 不走
+# git，逐机手改配置漏一台就出过整批卡死事故（2026-09-11 多模态白名单跨机错配）。
+# 本地配了配置中心连接（[config_store] 段，或已配好的 [error_report] 连接参数，
+# 见 read_config_store_section）的机器从共享 MySQL 读同一份配置（一处 push 处处
+# 生效）；两处都没配的（冻结版终端用户、CI）维持读本地文件，行为与引入配置中心
+# 前完全一致。这是确定性的模式开关而不是 fallback：DB 模式下连不上库直接抛
+# ConfigStoreError 退出（2026-09-22 拍板：拿不到配置宁可不跑，拿错/旧配置跑
+# 批次比不跑更糟），绝不静默退回本地旧文件。
+_CONFIG_SOURCE_ENV = "MANUS_CONFIG_SOURCE"  # auto(默认)/file/db；测试用 file 钉死
+_CONFIG_CACHE_TTL = 30.0  # 秒
+# 为什么加 TTL 缓存：散点管线「每次现读、改配置不必重启」是有意设计（见
+# app/publish/images.py 的 _publish_conf 注释），但配置存库后每次现读都是一次
+# 公网 MySQL 往返（出图热路径单个商品几十次调用），故加短 TTL——既保住「不用
+# 重启」的性质（最多晚 30 秒生效），又把 DB 抖动时的连接超时限制在每 30 秒一次。
+_raw_config_cache: Dict[str, object] = {"at": 0.0, "data": None}
+_raw_config_lock = threading.Lock()
+_last_source_tag: Optional[str] = None  # 配置源日志只在来源变化时打，避免每 30s 刷屏
+
+
+def _find_config_path() -> Path:
+    """定位本地配置文件（原 Config._get_config_path 的查找链，提为模块函数复用）。
+
+    查找顺序刻意把「可写侧」排在前面：冻结态下 exe 同级的 config/config.toml
+    才是用户实际编辑的那份；随包分发的只读副本（BUNDLE_ROOT，即 _internal/）
+    只作兜底，保证首次运行还没生成用户配置时也能起得来。
+    开发态两个根指向同一目录，行为与改动前一致。
+    """
+    candidates = [
+        DATA_ROOT / "config" / "config.toml",
+        PROJECT_ROOT / "config" / "config.toml",
+        BUNDLE_ROOT / "config" / "config.toml",
+        PROJECT_ROOT / "config" / "config.example.toml",
+        BUNDLE_ROOT / "config" / "config.example.toml",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    raise FileNotFoundError("No configuration file found in config directory")
+
+
+def read_config_store_section() -> dict:
+    """读配置中心的连接参数（唯一仍从本地文件读的配置）。
+
+    来源优先级：本地 config.toml 的 [config_store] 段 > 同文件 [error_report] 段
+    的连接参数（host/port/user/password/database）。为什么能复用 error_report 的：
+    各机部署时就已配好它（错误集中上报的前提），配置中心与它本就是同一个共享
+    MySQL，再单配一段等于把同一组连接参数维护两遍（2026-09-22 用户定：每台机器
+    本地已有 MySQL 账号密码，启动直接用它去库里取配置，零额外配置）。
+    注意只借连接参数：表名不借（error_report.table 是 pipeline_errors，配置表用
+    默认 app_config），enabled 语义也不借（那是错误上报的开关，与配置中心无关，
+    上报被关掉的机器照样要读配置）。
+    文件缺失/两处都没配全返回 {}；TOML 解析失败原样抛出。
+    """
+    for d in config_search_dirs():
+        p = d / "config.toml"
+        if not p.exists():
+            continue
+        with p.open("rb") as f:
+            data = tomllib.load(f)
+        section = data.get("config_store") or {}
+        if section:
+            return section
+        er = data.get("error_report") or {}
+        if str(er.get("host") or "").strip() and str(er.get("database") or "").strip():
+            return {
+                "host": er.get("host"),
+                "port": er.get("port") or 3306,
+                "user": er.get("user") or "",
+                "password": er.get("password") or "",
+                "database": er.get("database"),
+            }
+        return {}
+    return {}
+
+
+def _resolve_source() -> str:
+    """确定配置来源："db" 或 "file"。规则见上方「统一配置源」说明。"""
+    mode = os.environ.get(_CONFIG_SOURCE_ENV, "auto").strip().lower()
+    if mode == "file":
+        return "file"
+    section = read_config_store_section()
+    configured = bool(
+        str(section.get("host") or "").strip()
+        and str(section.get("database") or "").strip()
+    )
+    if mode == "db" and not configured:
+        raise ConfigStoreError(
+            f"{_CONFIG_SOURCE_ENV}=db 但本地 config.toml 既没有 [config_store] 段，"
+            "[error_report] 的连接参数（host/database）也不全")
+    return "db" if configured else "file"
+
+
+def _log_source(tag: str) -> None:
+    """打一行配置源日志（不含配置内容）；只在来源变化时打，TTL 重读不刷屏。"""
+    global _last_source_tag
+    if tag == _last_source_tag:
+        return
+    _last_source_tag = tag
+    try:
+        # 延迟导入：app.logger 模块级反向依赖本模块的 DATA_ROOT，顶部 import 会循环。
+        from app.logger import logger
+
+        logger.info(f"配置源：{tag}")
+    except Exception:
+        pass  # 日志系统未就绪不挡启动
+
+
+def _load_raw_from_file() -> dict:
+    path = _find_config_path()
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+    _log_source(f"本地文件 {path}")
+    return raw
+
+
+def _load_raw_from_db() -> dict:
+    section = read_config_store_section()
+    text = config_store.fetch(section)
+    try:
+        raw = tomllib.loads(text)
+    except Exception as e:
+        raise ConfigStoreError(
+            f"配置中心里的配置文本解析失败（TOML 语法错误）：{e}。"
+            "用 python -m app.config_sync pull 拉下来检查，修正后 push 回去") from e
+    _log_source(
+        f"MySQL {section.get('host')}/{section.get('database')}"
+        f".{section.get('table') or config_store.DEFAULT_TABLE} (global)"
+    )
+    return raw
+
+
+def load_raw_config() -> dict:
+    """统一配置源：返回【未合并】的配置 raw dict（Config 单例与各管线散点共用）。
+
+    必须是未合并原文：app/publish/llm.py 的 _section_api_key 靠「段里显式留空
+    api_key = 未配置」判可用性，给合并后的 dict 会把 [llm] 默认 key 补进去造成
+    误判。进程内 TTL 缓存（见 _CONFIG_CACHE_TTL），测试/push 后可用
+    invalidate_config_cache() 强制重读。
+    """
+    now = time.monotonic()
+    with _raw_config_lock:
+        cached = _raw_config_cache["data"]
+        if cached is not None and now - float(_raw_config_cache["at"]) < _CONFIG_CACHE_TTL:
+            return cached  # type: ignore[return-value]
+    # 加载不持锁：DB 慢时只是把并发调用变成各自重读一次（幂等），不会因持锁
+    # 串行化把散点调用全堵在 5 秒连接超时上。
+    raw = _load_raw_from_db() if _resolve_source() == "db" else _load_raw_from_file()
+    with _raw_config_lock:
+        _raw_config_cache["at"] = now
+        _raw_config_cache["data"] = raw
+    return raw
+
+
+def invalidate_config_cache() -> None:
+    """清空统一源缓存（测试、config_sync push 后立即生效用）。"""
+    with _raw_config_lock:
+        _raw_config_cache["at"] = 0.0
+        _raw_config_cache["data"] = None
+
+
+def get_config_section(name: str) -> dict:
+    """取统一源的指定段（deepcopy，防调用方改脏缓存）；段缺失/不是表返回 {}。
+
+    各管线原先各自「for d in config_search_dirs(): tomllib.load(...)」现读
+    自己那段，配置中心落地后统一走这里——文件/DB 两种模式对消费方透明。
+    """
+    section = load_raw_config().get(name)
+    return copy.deepcopy(section) if isinstance(section, dict) else {}
 
 
 class LLMSettings(BaseModel):
@@ -389,29 +565,14 @@ class Config:
 
     @staticmethod
     def _get_config_path() -> Path:
-        """定位配置文件。
-
-        查找顺序刻意把「可写侧」排在前面：冻结态下 exe 同级的 config/config.toml
-        才是用户实际编辑的那份；随包分发的只读副本（BUNDLE_ROOT，即 _internal/）
-        只作兜底，保证首次运行还没生成用户配置时也能起得来。
-        开发态两个根指向同一目录，行为与改动前一致。
-        """
-        candidates = [
-            DATA_ROOT / "config" / "config.toml",
-            PROJECT_ROOT / "config" / "config.toml",
-            BUNDLE_ROOT / "config" / "config.toml",
-            PROJECT_ROOT / "config" / "config.example.toml",
-            BUNDLE_ROOT / "config" / "config.example.toml",
-        ]
-        for path in candidates:
-            if path.exists():
-                return path
-        raise FileNotFoundError("No configuration file found in config directory")
+        """定位配置文件。查找链说明见模块函数 _find_config_path（已提为公共实现）。"""
+        return _find_config_path()
 
     def _load_config(self) -> dict:
-        config_path = self._get_config_path()
-        with config_path.open("rb") as f:
-            return tomllib.load(f)
+        # 统一配置源：配了 [config_store] 走 MySQL 配置中心，否则本地文件。
+        # 单例「import 时加载一次、重启生效」的语义不变；DB 连不上时
+        # ConfigStoreError 在此抛出、应用按既定策略直接退出。
+        return load_raw_config()
 
     def _load_initial_config(self):
         raw_config = self._load_config()

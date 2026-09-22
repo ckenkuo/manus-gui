@@ -277,14 +277,25 @@ def test_connect_pages_ignores_existing_tabs_and_opens_owned_tabs(monkeypatch):
 
 def _plan(spu, activities, accel_will_close, sale=46.5, accel_state=None):
     """构造一条规划遍结果（status=done）。activities: [(名, 申报价)]。sale=销售底价（重开
-    加速器时加速价=sale+1）。"""
+    加速器时加速价=sale+1）。单货号：label 固定「默认」，执行层只认 skus/sku_prices 列表。"""
     if accel_state is None:
         accel_state = "on" if accel_will_close else "off"
+    sku = {"label": "默认", "daily": sale, "sale": sale}
     return {
-        "spu": spu, "status": "done", "accel_will_close": accel_will_close, "sale": sale,
+        "spu": spu, "status": "done", "accel_will_close": accel_will_close,
         "accel_state": accel_state,
-        "enrolled_activities": [{"activity": n, "submit_price": p} for n, p in activities],
+        "skus": [{**sku, "purchase": ""}],
+        "enrolled_activities": [
+            {"activity": n, "sku_prices": [{**sku, "submit_price": p}]}
+            for n, p in activities
+        ],
     }
+
+
+def _accel_prices(price, sale=None):
+    """单货号加速价列表（price = 底价+1），对应 service 阶段三构造的 accel_prices。"""
+    sale = price - 1 if sale is None else sale
+    return [{"label": "默认", "daily": sale, "sale": sale, "price": price}]
 
 
 def _patch_log(monkeypatch, pairs=(), complete=True):
@@ -326,9 +337,9 @@ def _run(results, live, monkeypatch, runtime_states=None):
         calls["close"].append((spu, allow))
         return {"state": "on", "closed": allow, "note": "半程" if not allow else "已停止"}
 
-    async def fake_open(page, spu, allow=False, accel_price=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None):
         calls["open"].append((spu, allow))
-        calls.setdefault("open_price", []).append((spu, accel_price))
+        calls.setdefault("open_price", []).append((spu, accel_prices))
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
@@ -336,9 +347,9 @@ def _run(results, live, monkeypatch, runtime_states=None):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
-        calls["fill"].append((page.tag, spu, act, price, allow_submit))
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
+        calls["fill"].append((page.tag, spu, act, sku_prices, allow_submit))
         return {"filled": True, "submitted": False, "note": ""}
 
     async def fake_submit(page, allow=False):
@@ -423,7 +434,7 @@ def test_each_enroll_page_closed_after_activity(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "off", "closed": True, "note": ""}
 
-    async def fake_open(page, spu, allow=False, accel_price=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None):
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
@@ -431,8 +442,8 @@ def test_each_enroll_page_closed_after_activity(monkeypatch):
         opened.append(pg)
         return pg
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         # 报名前该页必须是打开的（未被提前关）
         assert page.closed is False
         return {"filled": True, "submitted": False, "note": ""}
@@ -478,6 +489,140 @@ def test_build_over_ref_note_without_discount_falls_back():
     assert zero["suggested_daily_price"] is None
 
 
+def test_compute_submit_price_rounds_half_up_at_exact_midpoint():
+    """申报价舍入必须是四舍五入（Decimal HALF_UP），不是内置 round 的银行家舍入：
+    精确 x.xx5 中点（188.5×0.25=47.125，二进制可精确表示）银行家舍入舍向偶数少 1 分钱，
+    底价压线的商品会被误判穿底而错杀活动。"""
+    calc = pipeline.compute_submit_price(188.5, 0.25, 47.13)
+    assert calc["submit_price"] == 47.13  # 内置 round() 会给 47.12
+    assert calc["within_floor"] is True
+    # 实机压线案：188.88×0.85=160.548=50cm 底价，须判达底价
+    edge = pipeline.compute_submit_price(188.88, 0.85, 160.548)
+    assert edge["submit_price"] == 160.55 and edge["within_floor"] is True
+
+
+def test_match_enroll_rows_matches_by_daily_multiset():
+    """提报页行按日常价多重集合配对货号：同 daily 的货号申报价必相同，谁是谁无所谓；
+    行数不等、行 daily 读不到、页面 daily 在成本表无剩余名额 → None（调用方 fail-closed）。"""
+    sku_prices = [
+        {"label": "30cm", "daily": 74.72, "submit_price": 47.07},
+        {"label": "40cm", "daily": 188.88, "submit_price": 160.55},
+    ]
+    rows = [  # 页面行序与成本表相反也要配上
+        {"idx": 0, "daily": 188.88, "ref": 200.0},
+        {"idx": 1, "daily": 74.72, "ref": 80.0},
+    ]
+    matched = pipeline.match_enroll_rows(sku_prices, rows)
+    assert matched[0]["label"] == "40cm" and matched[0]["ref"] == 200.0
+    assert matched[1]["label"] == "30cm" and matched[1]["submit_price"] == 47.07
+    assert pipeline.match_enroll_rows(sku_prices, rows[:1]) is None
+    assert pipeline.match_enroll_rows(
+        sku_prices, [{"idx": 0, "daily": None}, {"idx": 1, "daily": 74.72}]) is None
+    assert pipeline.match_enroll_rows(
+        sku_prices, [{"idx": 0, "daily": 99.0}, {"idx": 1, "daily": 74.72}]) is None
+
+
+def test_match_enroll_rows_same_daily_skus_degenerate_correctly():
+    """两个货号日常价相同（申报价也相同）：多重集合各占一个名额，两行都配上且价相同。"""
+    sku_prices = [
+        {"label": "40cm", "daily": 188.88, "submit_price": 160.55},
+        {"label": "50cm", "daily": 188.88, "submit_price": 160.55},
+    ]
+    rows = [{"idx": 0, "daily": 188.88, "ref": None}, {"idx": 1, "daily": 188.88, "ref": None}]
+    matched = pipeline.match_enroll_rows(sku_prices, rows)
+    assert matched is not None and set(matched) == {0, 1}
+    assert all(m["submit_price"] == 160.55 for m in matched.values())
+
+
+def test_match_accel_rows_requires_unique_label_hit():
+    """加速器行只能靠货号 label 在行文本中唯一命中配对（同 daily 不同底价的货号价格键
+    区分不了）；单货号直接对应；「行N」兜底 label、命中 0/2 行、行数不等 → None 中止不开。"""
+    one = [{"label": "默认", "daily": 46.5, "sale": 46.5, "price": 47.5}]
+    assert pipeline.match_accel_rows(one, [{"idx": 0, "text": "任意文本"}]) == {0: one[0]}
+
+    prices = [
+        {"label": "40cm", "daily": 188.88, "sale": 95, "price": 96.0},
+        {"label": "50cm", "daily": 188.88, "sale": 160.55, "price": 161.55},
+    ]
+    rows = [{"idx": 0, "text": "毛绒木偶 40cm 在售"}, {"idx": 1, "text": "毛绒木偶 50cm 在售"}]
+    assert pipeline.match_accel_rows(prices, rows) == {0: prices[0], 1: prices[1]}
+    # 行文本没有货号（label 不上页面）→ None：40/50cm 同日常价不同底价的 fail-closed 场景
+    no_label = [{"idx": 0, "text": "毛绒木偶"}, {"idx": 1, "text": "毛绒木偶"}]
+    assert pipeline.match_accel_rows(prices, no_label) is None
+    # 「行N」兜底 label 不可能上页面 → None
+    fallback = [{"label": "行8", "daily": 80, "sale": 50, "price": 51.0}, prices[0]]
+    assert pipeline.match_accel_rows(fallback, rows) is None
+    # 一个 label 命中两行（前缀撞名）→ None；行数不等 → None
+    dup = [{"idx": 0, "text": "40cm"}, {"idx": 1, "text": "40cm 50cm"}]
+    assert pipeline.match_accel_rows(prices, dup) is None
+    assert pipeline.match_accel_rows(prices, rows[:1]) is None
+
+
+class _FakeAccelDialogPage:
+    """模拟「调整申报价」对话框：evaluate 返回标记行，locator(...).first.fill 记录逐行填价。"""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.filled = {}
+
+    async def evaluate(self, _script, *_args):
+        return self.rows
+
+    def locator(self, selector):
+        idx = int(selector.rsplit('="', 1)[1].rstrip('"]'))
+        page = self
+
+        class _Input:
+            @property
+            def first(self):
+                return self
+
+            async def click(self):
+                return None
+
+            async def fill(self, value):
+                page.filled[idx] = value
+
+        return _Input()
+
+
+def test_set_accel_prices_count_mismatch_and_match_failed_fill_nothing():
+    """行数≠货号数 → count_mismatch；行文本配不上货号 label → match_failed；
+    两者都不填任何价（调用方据此中止不开加速器）。"""
+    prices = [
+        {"label": "40cm", "daily": 188.88, "sale": 95, "price": 96.0},
+        {"label": "50cm", "daily": 188.88, "sale": 160.55, "price": 161.55},
+    ]
+    page = _FakeAccelDialogPage([{"idx": 0, "ref": None, "text": "40cm"}])
+    result = asyncio.run(pipeline._set_accel_prices(page, prices))
+    assert result["match"] == "count_mismatch" and result["rows_filled"] == 0
+    assert page.filled == {}
+
+    page = _FakeAccelDialogPage([
+        {"idx": 0, "ref": None, "text": "毛绒"}, {"idx": 1, "ref": None, "text": "木偶"}])
+    result = asyncio.run(pipeline._set_accel_prices(page, prices))
+    assert result["match"] == "match_failed" and result["rows_filled"] == 0
+    assert page.filled == {}
+
+
+def test_set_accel_prices_fills_per_row_and_skips_over_ref():
+    """匹配成功逐行填各自底价+1；超该行参考价的行不填、计入 over_detail 并带货号 label。"""
+    prices = [
+        {"label": "40cm", "daily": 188.88, "sale": 95, "price": 96.0},
+        {"label": "50cm", "daily": 188.88, "sale": 160.55, "price": 161.55},
+    ]
+    page = _FakeAccelDialogPage([
+        {"idx": 0, "ref": 100.0, "text": "40cm 款"},
+        {"idx": 1, "ref": 150.0, "text": "50cm 款"},  # 161.55 > 150 → 超参考价不填
+    ])
+    result = asyncio.run(pipeline._set_accel_prices(page, prices))
+    assert result["match"] == "ok"
+    assert result["rows_filled"] == 1 and result["rows_over"] == 1
+    assert page.filled == {0: "96.0"}
+    assert result["over_detail"][0]["label"] == "50cm"
+    assert result["over_detail"][0]["ref"] == 150.0
+
+
 def test_over_ref_recorded_as_failed(monkeypatch):
     """填价时申报价超过提报页参考价（Excel 与前端售价不一致）→ 记入 summary['failed']
     并带原因，exec_fill/exec_done 事件如实回报，绝不误报成功。"""
@@ -487,18 +632,18 @@ def test_over_ref_recorded_as_failed(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "off", "closed": True, "note": "no-op"}
 
-    async def fake_open(page, spu, allow=False, accel_price=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None):
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         # 模拟超参考价：未填成功、over_ref 标记 + 参考价 + 原因
         return {"filled": False, "submitted": False, "over_ref": True,
                 "ref_price": 47.31,
-                "note": f"申报价 {price} 高于提报页参考价 47.31（疑 Excel 日常价与前端实际售价不一致）"}
+                "note": f"申报价 {sku_prices[0]['submit_price']} 高于提报页参考价 47.31（疑 Excel 日常价与前端实际售价不一致）"}
 
     async def fake_submit(page, allow=False):
         return {"submitted": False, "note": "无已填 SPU"}
@@ -538,14 +683,14 @@ def test_empty_fill_skips_submit(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "off", "closed": True, "note": "no-op"}
 
-    async def fake_open(page, spu, allow=False, accel_price=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None):
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         return {"filled": False, "submitted": False, "note": "搜索后定位行数=0（非唯一），保守跳过"}
 
     async def fake_submit(page, allow=False):
@@ -584,8 +729,8 @@ def test_first_activity_rpa_failure_continues_scanning_without_open(monkeypatch)
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         return {"filled": False, "submitted": False, "failed_step": "query",
                 "note": "查询结果为 0 行"}
 
@@ -593,7 +738,7 @@ def test_first_activity_rpa_failure_continues_scanning_without_open(monkeypatch)
         calls["submit"].append(allow)
         return {"submitted": allow, "note": ""}
 
-    async def fake_open_accel(page, spu, allow=False, accel_price=None):
+    async def fake_open_accel(page, spu, allow=False, accel_prices=None):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -630,8 +775,8 @@ def test_unverified_submit_uses_log_and_continues(monkeypatch):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(_page, _spu, _act, _price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(_page, _spu, _act, _sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         return {"filled": True, "detail_eligible": True, "note": "已填价"}
 
     async def fake_submit(_page, allow=False):
@@ -640,7 +785,7 @@ def test_unverified_submit_uses_log_and_continues(monkeypatch):
             "note": "已点击提交并确认，未捕获明确结果提示",
         }
 
-    async def fake_open_accel(_page, spu, allow=False, accel_price=None):
+    async def fake_open_accel(_page, spu, allow=False, accel_prices=None):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -679,14 +824,14 @@ def test_success_feedback_without_log_record_fails_after_full_scan(monkeypatch):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(_page, _spu, _act, _price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(_page, _spu, _act, _sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         return {"filled": True, "detail_eligible": True, "note": "已填价"}
 
     async def fake_submit(_page, allow=False):
         return {"submitted": True, "verified": True, "note": "报名成功"}
 
-    async def fake_open_accel(_page, spu, allow=False, accel_price=None):
+    async def fake_open_accel(_page, spu, allow=False, accel_prices=None):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -724,8 +869,8 @@ def test_detail_ineligible_skips_activity_and_continues(monkeypatch):
         calls["open_page"].append(name)
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         if act == "活动A":
             return {"filled": False, "submitted": False, "detail_eligible": False,
                     "note": "详情页查询结果为 0"}
@@ -735,7 +880,7 @@ def test_detail_ineligible_skips_activity_and_continues(monkeypatch):
         calls["submit"].append((page.tag, allow))
         return {"submitted": allow, "note": "已点击提交"}
 
-    async def fake_open_accel(page, spu, allow=False, accel_price=None):
+    async def fake_open_accel(page, spu, allow=False, accel_prices=None):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -774,8 +919,8 @@ def test_enroll_exception_still_reopens(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "on", "closed": allow, "note": "已停止"}
 
-    async def fake_open(page, spu, allow=False, accel_price=None):
-        calls["open"].append((spu, allow, accel_price))
+    async def fake_open(page, spu, allow=False, accel_prices=None):
+        calls["open"].append((spu, allow, accel_prices))
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
@@ -794,7 +939,8 @@ def test_enroll_exception_still_reopens(monkeypatch):
     # 关成功 → 111 记入 closed；报名遍抛错被吞、记 errors；阶段三仍重开 111
     assert "111" in summary["closed"]
     assert any("报名遍异常" in e for e in summary["errors"])
-    assert calls["open"] == [("111", True, 47.5)]  # 底价（_plan 默认 sale=46.5）+1
+    # 底价（_plan 默认 sale=46.5）+1；accel_prices 是逐货号列表，断言取其中 price
+    assert [(c[0], c[1], [p["price"] for p in c[2]]) for c in calls["open"]] == [("111", True, [47.5])]
     assert "111" in summary["reopened"]
 
 
@@ -816,8 +962,8 @@ def test_live_run_is_irreversible(monkeypatch):
     assert calls["close"] == [("111", True)]
     # 只重开我们关掉的（live 下 summary["closed"] 含 111）
     assert calls["open"] == [("111", True)]
-    # 重开时加速价=底价+1（sale 默认 46.5 → 47.5）
-    assert calls["open_price"] == [("111", 47.5)]
+    # 重开时加速价=底价+1（sale 默认 46.5 → 47.5）；accel_prices 是逐货号列表
+    assert [(c[0], [p["price"] for p in c[1]]) for c in calls["open_price"]] == [("111", [47.5])]
     assert "111" in summary["closed"]
     close_check = next(
         event for event in events
@@ -1041,7 +1187,7 @@ def _patch_open_accel_full_path(monkeypatch, feedback, read_states):
     async def fake_select_super(_page, tries=6):
         return True
 
-    async def fake_set_prices(_page, _accel_price):
+    async def fake_set_prices(_page, _accel_prices):
         return {"rows_total": 1, "rows_over": 0, "rows_filled": 1, "over_detail": ""}
 
     async def fake_click_first(_page, _names):
@@ -1081,8 +1227,8 @@ def test_open_accel_retries_whole_flow_until_confirmed(monkeypatch):
     ])
     calls = []
 
-    async def fake_once(_page, spu, allow=False, accel_price=None):
-        calls.append((spu, allow, accel_price))
+    async def fake_once(_page, spu, allow=False, accel_prices=None):
+        calls.append((spu, allow, accel_prices))
         return dict(next(outcomes))
 
     async def no_wait(_seconds):
@@ -1092,7 +1238,8 @@ def test_open_accel_retries_whole_flow_until_confirmed(monkeypatch):
     monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
 
     result = asyncio.run(
-        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True, accel_price=41.0, tries=3)
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True,
+                            accel_prices=_accel_prices(41.0), tries=3)
     )
     assert result["opened"] is True
     assert result["open_attempts"] == 3
@@ -1107,13 +1254,14 @@ def test_open_accel_retry_is_idempotent_when_already_on(monkeypatch):
     """
     calls = []
 
-    async def fake_once(_page, spu, allow=False, accel_price=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None):
         calls.append(spu)
         return {"opened": True, "precheck_state": "on", "note": "本就在加速中，无需开启（no-op）"}
 
     monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
     result = asyncio.run(
-        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True, accel_price=41.0, tries=3)
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True,
+                            accel_prices=_accel_prices(41.0), tries=3)
     )
     assert result["opened"] is True and result["open_attempts"] == 1
     assert len(calls) == 1
@@ -1121,7 +1269,7 @@ def test_open_accel_retry_is_idempotent_when_already_on(monkeypatch):
 
 def test_open_accel_reports_failure_after_exhausting_retries(monkeypatch):
     """三轮都未确认成功时，如实报失败并在 note 标注已重试次数。"""
-    async def fake_once(_page, spu, allow=False, accel_price=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None):
         return {"opened": False, "note": "未捕获成功提示且回查流量页状态非加速中"}
 
     async def no_wait(_seconds):
@@ -1131,7 +1279,8 @@ def test_open_accel_reports_failure_after_exhausting_retries(monkeypatch):
     monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
 
     result = asyncio.run(
-        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True, accel_price=41.0, tries=3)
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=True,
+                            accel_prices=_accel_prices(41.0), tries=3)
     )
     assert result["opened"] is False
     assert result["open_attempts"] == 3
@@ -1142,13 +1291,14 @@ def test_open_accel_half_run_does_not_retry(monkeypatch):
     """半程 allow=False：不真开、opened 恒 False，整轮重试无意义，只跑一次。"""
     calls = []
 
-    async def fake_once(_page, spu, allow=False, accel_price=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None):
         calls.append((spu, allow))
         return {"opened": False, "note": "半程：未点「立即加速」（allow=False）"}
 
     monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
     result = asyncio.run(
-        pipeline.open_accel(FakePage("flux"), "2801689369", allow=False, accel_price=41.0, tries=3)
+        pipeline.open_accel(FakePage("flux"), "2801689369", allow=False,
+                            accel_prices=_accel_prices(41.0), tries=3)
     )
     assert result["opened"] is False
     assert len(calls) == 1
@@ -1166,7 +1316,7 @@ def test_open_accel_verifies_by_state_when_toast_unknown(monkeypatch):
         read_states=["off", "on"],  # precheck=off → 走完整路径；toast unknown 后回读=on
     )
     result = asyncio.run(
-        pipeline._open_accel_once(page, "2801689369", allow=True, accel_price=41.0)
+        pipeline._open_accel_once(page, "2801689369", allow=True, accel_prices=_accel_prices(41.0))
     )
     assert result["opened"] is True
     assert result["row_state_snapshot"] == "on"
@@ -1181,7 +1331,7 @@ def test_open_accel_stays_failed_when_toast_unknown_and_state_off(monkeypatch):
         read_states=["off", "off"],  # 回读仍 off
     )
     result = asyncio.run(
-        pipeline._open_accel_once(page, "2801689369", allow=True, accel_price=41.0)
+        pipeline._open_accel_once(page, "2801689369", allow=True, accel_prices=_accel_prices(41.0))
     )
     assert result["opened"] is False
     assert "回查流量页状态非加速中" in result["note"]
@@ -1218,8 +1368,8 @@ def test_cooldown_close_does_not_block_enroll(monkeypatch):
     async def fake_open_page(activity_page, name, timeout_s=25):
         return FakePage(f"enroll:{name}")
 
-    async def fake_enroll(page, spu, act, price, allow_submit=False, on_step=None,
-                          daily_price=None, discount_rate=None):
+    async def fake_enroll(page, spu, act, sku_prices, allow_submit=False, on_step=None,
+                          discount_rate=None):
         calls["fill"].append(spu)
         return {"filled": True, "submitted": False, "note": ""}
 
@@ -1380,7 +1530,8 @@ def test_open_accel_prechecks_by_spu_and_noops_when_already_on(monkeypatch):
     monkeypatch.setattr(pipeline, "read_accel_state", fake_read)
 
     result = asyncio.run(
-        pipeline._open_accel_once(FakePage("flux"), "9072868889", allow=True, accel_price=78.77)
+        pipeline._open_accel_once(FakePage("flux"), "9072868889", allow=True,
+                                  accel_prices=_accel_prices(78.77))
     )
 
     assert calls == [("9072868889", True)]
