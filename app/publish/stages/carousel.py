@@ -22,9 +22,10 @@ from app.publish.media.carousel import (
 from app.publish.upload import upload_many
 
 
-# 单张生图超时（实测一张约 35s），与 ⑤b 的 CLEAN_TIMEOUT 同值：同一种「curl 生图」
-# 调用、同一类图，没有理由在这里另定一套。
-EN_TIMEOUT = 90
+# 单张生图超时，与 ⑤b 的 CLEAN_TIMEOUT 同值：同一种「curl 生图」调用、同一类图，
+# 没有理由在这里另定一套。两者现在都直接取 images.EDIT_TIMEOUT（原先各写 90，
+# 依据的是单发耗时，并发下盖不住服务端实际的 30~79s，理由见那个常量的注释）。
+EN_TIMEOUT = images.EDIT_TIMEOUT
 EN_QC_TRIES = 3
 
 
@@ -114,8 +115,10 @@ async def _english_one(local_path: str, url: str, workdir: str,
                 "夸大宣传、情绪标语、水印直接抹除，不要翻译或换一个同义标语。"
                 "这些修正优先于保留原文案，但商品实物及客观参数、使用说明必须保留。")
         try:
-            edited = await asyncio.to_thread(
-                images.edit_image, local_path, prompt=prompt, out_path=out,
+            # 走 edit_image_async：并发闸门在那一层全局共用，不再由本阶段自己限流
+            # （各阶段各建 Semaphore 会把旋钮值乘上并行路数，见 images._EDIT_GATES）
+            edited = await images.edit_image_async(
+                local_path, prompt=prompt, out_path=out,
                 size="2048x2048", timeout=EN_TIMEOUT)
             prepared = _to_carousel_size(edited["output"], out, preserve_info=True)
             if not prepared:

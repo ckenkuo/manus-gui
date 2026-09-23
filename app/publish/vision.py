@@ -436,8 +436,12 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
 
     def _color_dirty(p: str) -> bool:
         n = notes.get(os.path.basename(p)) or {}
+        # 【unusable 的不算「待清」】被丢弃的图（内容审核拒收 / 质检多次未过，见 is_unusable）
+        # 不可能再清出干净图来，把它算成待清会挡住上面那条早退、且每一轮都把它送进 _one
+        # 重烧 4 发（2026-09-22 加，配合 ⑤b 的「质检未过即丢弃」）。
         return (os.path.basename(p) in color_main
                 and not n.get("clean")
+                and not n.get("unusable")
                 and (n.get("kind") or "") not in _SKIP_KINDS)
 
     if clean_n >= want and not any(_color_dirty(p) for p in mains):
@@ -451,6 +455,11 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
         if n.get("clean") or n.get("duplicate"):
             continue
         if (n.get("kind") or "") in _SKIP_KINDS:
+            continue
+        # 【已丢弃的图不再送清】见 is_unusable：这类图清不出来（审核拒收 / 质检多次未过），
+        # 再送进 _one 只是每轮白烧 4 发生图。补充循环（_st_clean_images）早有同一道跳过，
+        # 这里是 plan_clean 自己那条候选路径的对应闸门（2026-09-22 加）。
+        if n.get("unusable"):
             continue
         parts = ["移除图片中所有水印、店铺名、拍摄者账号文字和他人品牌 logo"
                  "（含商品吊牌/标牌上的品牌字样）"]
@@ -1248,6 +1257,19 @@ plan 必须覆盖上面每一个模块。"""
     return {"status": "ok", "plan": plan}
 
 
+def _claim_word_in(text) -> bool:
+    """这段文字里有没有夸大宣传词，【先把非 ASCII 字符换成空格再查一遍】。
+
+    直接查会漏掉中英相接的写法：claims 的英文词表用 \\b 卡边界，而汉字在 Python 正则
+    里也属于 \\w，于是「Guaranteed承诺」的 d 与 承 之间根本不构成边界、\\bguaranteed\\b
+    匹配不上——一句真宣称被判成「不在判据内」。同 is_style_only_image_claim 里
+    english_reason 那道处理（那边是为风格词豁免，这里是为词表复核，两边都要这一步）。
+    """
+    s = str(text or "")
+    return claims.has_marketing_claim(s) or claims.has_marketing_claim(
+        re.sub(r"[^\x00-\x7f]", " ", s))
+
+
 async def check_cleaned(image_path: str) -> dict:
     """AI 英化后的质检：残留中文/拼音/乱码/水印/夸大宣传或破坏主体都算不过。
 
@@ -1311,7 +1333,8 @@ bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原�
         return {"status": "error", "clean": False,
                 "issues": (data.get("issues") or "英化质检响应不完整")[:80],
                 "residualChinese": False, "garbled": False, "watermark": None,
-                "marketingClaim": False, "bannedTerm": False}
+                "marketingClaim": False, "bannedTerm": False,
+                "marketingClaimTexts": [], "bannedTermTexts": []}
     cjk = bool(data.get("residualChinese"))
     garbled = bool(data.get("garbled"))
     watermark = bool(data.get("watermark"))
@@ -1334,11 +1357,33 @@ bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原�
             banned = True
             logger.info(f"图片质检 bannedTerm 按原文复核翻为 true：{hits[:4]}")
     non_blocking = []
-    if claim and claims.is_style_only_image_claim(
-            data.get("issues"), data.get("marketingClaimTexts")):
+    claim_texts = data.get("marketingClaimTexts")
+    if claim and claims.is_style_only_image_claim(data.get("issues"), claim_texts):
         non_blocking.append(data.get("issues") or "普通风格描述无需修改")
         claim = False
         logger.info(f"图片质检普通风格描述不阻断：{non_blocking[0]}")
+    # 【词表复核：模型答 true 但举证的原文一条都不过判据时判为过判、降级放行】
+    # 上面 bannedTerm 那条是 false 翻 true（只往严里翻，漏判的代价是违规发上真店）；
+    # 这一条方向相反，因为误判的代价在另一端：视觉模型会把「品质夸大」的自由裁量扩到
+    # 客观工艺描述上——2026-09-22 实测 offer 652503071023 的 desc-04 第二发判
+    # 「'Fine Craftsmanship' 属品质夸大宣称」，而 claims 词表里只有 finest、不匹配
+    # fine（同 claims.py 开头「判据与说法只留这一处」）。继续按它执行，重烧提示词会
+    # 照着去抹掉一句客观工艺说明，白丢商品信息（见本函数 docstring 对误报代价的取向）。
+    # 【texts 为空/缺失时不翻】模型没给出原文就没有复核依据，保持原判——与
+    # is_style_only_image_claim 对空数组的处理同一取向。
+    # 【已知取舍】词表是有限枚举：图上若有词表外的生僻宣称、模型又如实抄了原文，会被
+    # 放过。宁可回到词表口径，也不让模型自造判据（同 claims.IMAGE_CLAIM_RULE 的出处）。
+    # 【issues 也要一起复核】模型偶尔把宣称写在 issues 的那句描述里、marketingClaimTexts
+    # 却抄漏或抄错（2026-09-22 单测 evidence「issues='Guaranteed承诺' + texts=['Cute']」
+    # 就是这个形状），只看 texts 会把这类真宣称一起放过。两道都干净才降级——同
+    # is_style_only_image_claim 对 reason 的那道检查。
+    if (claim and isinstance(claim_texts, list) and claim_texts
+            and not any(_claim_word_in(t) for t in claim_texts)
+            and not _claim_word_in(data.get("issues"))):
+        non_blocking.append(data.get("issues") or "举证的宣称原文不在夸大宣传判据内")
+        claim = False
+        logger.info(f"图片质检 marketingClaim 按原文复核翻为 false"
+                    f"（举证原文均不在夸大宣传判据内）：{claim_texts[:3]}")
     bad = (cjk or garbled or watermark or claim or banned
            or bool(data.get("brokenSubject")))
     issues = data.get("issues") or ("残留水印、店铺名或网址" if watermark else "")
@@ -1357,10 +1402,17 @@ bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原�
     # 重试发数（见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
     # 的 `qc.get("garbled")` 恒为 None，加长重试对乱码那一路形同虚设——而 ⑤b main-04
     # 两发恰好全是 garbled，正是要救的那种；marketingClaim 从一开始就按这个教训透出。
+    # 【两个 texts 也要透出去】调用方（build_retry_hint）靠它们把「具体是哪个词」喂回
+    # 重烧提示词——只有布尔的话，模型只知道「有夸大宣传」，不知道要动哪一块文字。
+    # 默认值兜底的理由同上面五个布尔：漏答时不该让 .get() 拿到 None。
     return {"status": "ok", "clean": not bad,
             "issues": issues[:80],
             "residualChinese": cjk, "garbled": garbled, "watermark": watermark,
             "marketingClaim": claim, "bannedTerm": banned,
+            "marketingClaimTexts": ([t for t in claim_texts if isinstance(t, str)]
+                                    if isinstance(claim_texts, list) else []),
+            "bannedTermTexts": ([t for t in banned_texts if isinstance(t, str)]
+                                if isinstance(banned_texts, list) else []),
             "nonBlockingIssues": non_blocking}
 
 
@@ -1390,3 +1442,190 @@ async def check_cleaned_twice(image_path: str) -> dict:
         return result
     except Exception as error:
         return {"status": "error", "clean": False, "issues": str(error)}
+
+
+# ---- 重烧提示词：看着上一发的产物图实时生成 ----------------------------------------
+# 【为什么不再是固定话术】cleaning_rules._retry_hint 是「按失败类型四选一」的固定模板，
+# 而卡住的图需要的是【逐块处置】：2026-09-22 实测 offer 652503071023 的 desc-03 一张图
+# 上同时踩四类——「High-Quality」该删、「Cotton Denim Fabric」该译、「38 斤」该换算成
+# lb、「FASHION.STREET」店铺名该整体抹掉。一句话覆盖不了四种动作，于是每发只碰到其中
+# 一块、修完又冒另一块（日志里 4 发各栽在不同地方）。images.edit_image 的 docstring 早
+# 就写明「建议调用方按图定制：先看图定位具体问题（什么文字、在哪个位置），针对性给提示
+# 词」——本段就是把这件事补上。
+
+
+class RetryBlock(BaseModel):
+    """重烧提示词里一块文字的处置。
+
+    【action 用 Literal】理由同 DescAction：本模块按动作渲染不同话术，没见过的词会落进
+    渲染的 else 静默丢掉，表现就是「模型指出了问题、提示词里却没有它」。提示词里白纸
+    黑字给的就是这五个小写词，照抄的成本比什么都低。
+
+    【where / note 给默认值】它们只是让定位更准的补充（渲染时拼进句子里），漏答不影响
+    处置动作本身，声明成必填等于为一个辅助字段把整次生成判失败（同 DescAuditItem 那条
+    「只声明答错了会静默出错的字段」的取向）。
+
+    【text 要 NonEmptyStr】空 text 渲染出来是「删掉某一块」这种没有指代的话，模型照做
+    只会乱改画面。要求它非空，逼模型回一个字面上真正看得见的字符串。
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    text: NonEmptyStr
+    where: str = ""
+    action: Literal["erase", "translate", "rename", "convert_unit", "keep"]
+    note: str = ""
+
+
+class RetryPlan(BaseModel):
+    """重烧提示词的生成结果：逐块处置 + 一句话概括。"""
+
+    model_config = ConfigDict(strict=True)
+
+    blocks: list[RetryBlock]
+    summary: str = ""
+
+
+# 动作 -> 渲染进提示词的中文指令。keep 不在表里：保留不动是默认行为，渲染出来只是噪音
+# （主旨提示词已写明商品介绍类文字都翻译保留），故 render_retry_hint 直接跳过它。
+_RETRY_ACTION_TEXT = {
+    "erase": "抹除——不要翻译、不要改写、不要保留，连同它的底色块、边框、角标一起"
+             "抹掉，抹除处按周围画面自然补全",
+    "translate": "译写——翻译成简洁英文、原位替换，字体风格、字号与排版尽量保持一致",
+    "rename": "改名不删——不要照译，改写成规范名称（如 PP棉改写成 Polyester Fiber），"
+              "它说明的材质信息要留下",
+    "convert_unit": "换算单位——把中文计量单位换成英文单位（斤→lb、两→oz、cm→in 等），"
+                    "不要留成拼音",
+}
+
+
+def render_retry_hint(plan: dict) -> str:
+    """把模型的逐块结论渲染成追加在 base 之后的提示词；没有可渲染的块时返回空串。
+
+    【渲染由代码做、不交给模型】动作话术必须与 claims 的口径同源；让模型自由组织语言，
+    它就会写出「把 High-Quality 改成 Premium Quality」这类与质检判据打架的建议——那正
+    是本次要修的失败形态（见 claims.py 开头的「判据与说法只留这一处」）。
+    """
+    lines = []
+    for b in plan.get("blocks") or []:
+        if not isinstance(b, dict):
+            continue
+        act = b.get("action")
+        if act not in _RETRY_ACTION_TEXT:
+            continue
+        text = str(b.get("text") or "").strip()
+        if not text:
+            continue
+        where = str(b.get("where") or "").strip()
+        note = str(b.get("note") or "").strip()
+        pos = f"（位于{where}）" if where else ""
+        tail = f"，{note}" if note else ""
+        lines.append(f"{len(lines) + 1}. 「{text}」{pos}：{_RETRY_ACTION_TEXT[act]}{tail}。")
+    if not lines:
+        return ""
+    return ("\n\n【上一发处理后仍存在的问题】请按下面逐块处理，"
+            "不要只做「移除所有文字」这种全局操作：\n" + "\n".join(lines))
+
+
+def _retry_action_menu() -> str:
+    """动作枚举说明。判据文本直接引用 claims 的既有片段，不在这里另写一份。"""
+    return ("动作只能是这五个，逐块选一个：\n"
+            '- "erase"：' + claims.CLAIM_REMOVE_RULE +
+            "水印、店铺名、拍摄者账号、他人品牌 logo 也用这个动作。\n"
+            '- "translate"：译成英文、原位替换。适用于商品介绍、说明类文字'
+            "（材质成分、工艺、尺寸、功能卖点、使用说明、注意事项）。\n"
+            '- "rename"：' + claims.BANNED_REMOVE_RULE + "\n"
+            '- "convert_unit"：把中文计量单位换成英文单位（斤→lb、两→oz、cm→in），'
+            "不要留成拼音。\n"
+            '- "keep"：保持原样不动。适用于商品实物上的印花、刺绣、织标、吊牌，'
+            "以及不该动的客观介绍文字。\n")
+
+
+def _retry_history_text(history: list) -> str:
+    """把累积的失败历史渲染成提示词里的一段。"""
+    out = []
+    for h in history or []:
+        if not isinstance(h, dict):
+            continue
+        flags = "、".join(name for name, key in (
+            ("残留中文", "residualChinese"), ("生图乱码/拼音", "garbled"),
+            ("水印", "watermark"), ("夸大宣传", "marketingClaim"),
+            ("平台禁词", "bannedTerm"), ("主体被改坏", "brokenSubject")) if h.get(key))
+        line = f"第 {h.get('attempt')} 发：质检未过。结论：{h.get('issues') or '（无描述）'}"
+        if flags:
+            line += f"（判定类别：{flags}）"
+        # 把模型自己举证的原文列出来——它比 issues 那句概述精确得多（见 check_cleaned
+        # 返回这两个字段的理由）。
+        if h.get("marketingClaimTexts"):
+            line += f"\n  它举证的宣称原文：{h['marketingClaimTexts']}"
+        if h.get("bannedTermTexts"):
+            line += f"\n  它举证的禁词原文：{h['bannedTermTexts']}"
+        if h.get("hint"):
+            line += f"\n  那一发追加的要求是：{h['hint']}"
+        out.append(line)
+    return "\n".join(out) or "（无历史记录）"
+
+
+async def build_retry_hint(base: str, history: list, image_path: str,
+                           stage: str = "desc", sizechart: bool = False) -> str:
+    """看着上一发的产物图，生成这一发该追加的重烧提示词；失败返回空串。
+
+    history 每发的形状见 _retry_history_text 的读法：{"attempt", "issues",
+    "residualChinese", "garbled", "watermark", "brokenSubject", "marketingClaim",
+    "marketingClaimTexts", "bannedTerm", "bannedTermTexts", "hint"}。
+    "hint" 是该发实际追加的加码话术——不带上的话，模型不知道自己上次要求过什么，
+    会重复给出同一个已经失败过的要求（同 llm._JSON_RETRY_HINT 每次重拼的取向）。
+    【累积历史而不是只给上一发】多类问题分散在不同发里时（desc-03 是拼音→perfect→
+    店铺名），只有看到全部才知道要一次全清掉。
+
+    base 只用来让模型知道主旨口径（哪些文字本来就该翻译保留），渲染结果由调用方拼在
+    base 之后。
+
+    【只做定位 + 选动作，不定义判据】见 render_retry_hint 与 RetryBlock 的说明。
+
+    【best-effort：失败返回空串】本函数是辅助路径，出图链路本身没坏，任何异常
+    （额度、JSON 断尾、产物读不到）都只记 warning 并返回空串，由调用方退回
+    cleaning_rules._retry_hint 的固定话术，绝不中断主流程（同本模块开头的取向）。
+
+    sizechart=True 表示这是尺码表/尺寸示意图，提示词里会额外锁住表格结构与数值。
+    【为什么必须锁】尺码表抹掉文字就只剩一张空网格、买家靠它选码，等于废图（这也是
+    调用方的末发对它豁免「全抹掉」的同一个理由）；而生成式的动作枚举里有 erase，
+    不点明就可能被当成「一块待清理的叠加文案」整表抹掉。
+    """
+    if not image_path or not os.path.exists(image_path):
+        logger.warning(f"重烧提示词生成：上一发产物不在（{image_path}），退回固定加码话术")
+        return ""
+    prompt = (f"下面这张商品图已经做过一次英化/清理，但上一发的结果没有通过质检。\n\n"
+              f"【最近几次的质检结论】\n{_retry_history_text(history)}\n\n"
+              f"【上一发原本的要求】\n{base}\n\n"
+              f"请看着这张图，逐块指出【现在图上还剩哪些需要处理的文字】，"
+              f"每一块都要给出它在图上的实际原文和位置，并选一个处置动作。\n"
+              f"{_retry_action_menu()}\n"
+              + ("【这是一张尺码表/尺寸示意图】表头、行列结构与每一个尺寸数值都必须"
+                 "完整保留，不能抹掉整块文字或整行整列：中文的尺码说明用 translate，"
+                 "长度数值用 convert_unit 换算成英寸。只有确认某块是店铺名、水印或"
+                 "营销标语时才用 erase。\n" if sizechart else "") +
+              f"【注意】只报你在图上真正看得见、且确实需要处理的文字；"
+              f"已经处理干净的部分不要再报。商品实物上的印花、刺绣、织标不是文案层，"
+              f"不要报出来。\n"
+              f"只输出 JSON：{{\"blocks\": [{{\"text\": \"<图上实际可见的原文>\", "
+              f"\"where\": \"<位置，如「左下角红色印章」>\", "
+              f"\"action\": \"erase|translate|rename|convert_unit|keep\", "
+              f"\"note\": \"<该块的特殊处置补充，没有就留空>\"}}], "
+              f"\"summary\": \"<一句话说清这一发要做什么>\"}}\n"
+              f"blocks 按图片从上到下、从左到右的顺序列出。")
+    try:
+        data = await ask_json_with_images(prompt, [image_path], what="重烧提示词生成",
+                                          system=_SYS, stage=stage,
+                                          result_model=RetryPlan)
+    except Exception as e:
+        logger.warning(f"重烧提示词生成失败、退回固定加码话术：{e}")
+        return ""
+    hint = render_retry_hint(data)
+    if not hint:
+        logger.warning(f"重烧提示词生成没给出可用的处置块（{data.get('summary') or ''}），"
+                       f"退回固定加码话术")
+        return ""
+    logger.info(f"重烧提示词已按图生成（{len(data.get('blocks') or [])} 块）："
+                f"{(data.get('summary') or '')[:40]}")
+    return hint

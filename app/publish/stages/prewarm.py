@@ -18,8 +18,21 @@ def _start_prewarm(ctx: dict, emit) -> None:
 
     【失败一律不影响主流程】_run_prewarm 内部逐项吞异常；这里再兜一层 done 回调只为
     把「整个预热协程炸了」也写成 warning——预热没跑成，各阶段照原路现场算而已。
-    """
+
+    【已在跑就直接返回，不能起第二份】publish_one 有两个调用点：循环外按 info_path 起
+    一次（为了 ① 被跳过、产物已在磁盘时也能预热），以及 ① 跑完后再起一次。首跑只命中
+    后者；而【续跑时 ctx 一开始就带着 info_path】，两处会双双命中，原先第二份直接把
+    ctx["prewarm_task"] 覆盖掉——收尾的 finally 只 cancel 得到第二份，第一份成了收不回
+    的孤儿，带着一整轮生图跨商品继续跑。
+    2026-09-22 实测后果（三个商品全是「上次 save 未成功」的续跑）：⑤b 清理与 ⑬ 备料
+    各起两份，15 张清理 + 14 张备料翻倍成 58 次调用、约一半白花钱（孤儿的产物没人取），
+    并发被抬到旋钮值的两倍以上，整批出图在 TLS 握手阶段被中转拒连（234 次 rc=35），
+    商品停在 ⑤b 的「清理 0/15 张」。
+    故这里按句柄判一次：已有未完成的任务就复用它，不再起新的。"""
     if not ctx.get("info_path") or not ctx.get("workdir"):
+        return
+    running = ctx.get("prewarm_task")
+    if running is not None and not running.done():
         return
 
     task = asyncio.ensure_future(_run_prewarm(ctx, emit))

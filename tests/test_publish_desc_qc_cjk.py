@@ -263,6 +263,12 @@ def _desc_stub_real_qc(tmp_path, monkeypatch, model_replies, calls):
     seq = list(model_replies)
 
     async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
+        # 【重烧提示词生成要走另一条分支】它同样是 ask_json_with_images 的调用方
+        # （vision.build_retry_hint），不区分就会把下面这个质检序列吃掉、让质检提前
+        # 判过，发数断言随之失真。返回空 blocks 表示「没生成出可用的处置块」，
+        # 调用方按 best-effort 退回固定加码话术——正是这些用例要钉的那条路径。
+        if what == "重烧提示词生成":
+            return {"blocks": [], "summary": ""}
         calls["qc"] = calls.get("qc", 0) + 1
         return seq.pop(0) if seq else {"residualChinese": False, "garbled": True,
                                        "brokenSubject": False, "watermark": False,
@@ -521,6 +527,10 @@ async def test_5b乱码走真实质检也给到四发(tmp_path, monkeypatch):
     seq = [bad, bad, bad, ok]
 
     async def fake_model(prompt, images, what="", system=None, stage=None, **kw):
+        # 重烧提示词生成与质检共用这一层，按 what 分流（理由见 _desc_stub_real_qc）：
+        # 这里给空 blocks，让这一路退回固定加码话术，下面那条「别编英文」的断言才成立。
+        if what == "重烧提示词生成":
+            return {"blocks": [], "summary": ""}
         calls["qc"] = calls.get("qc", 0) + 1
         return seq.pop(0) if seq else ok
 
@@ -578,18 +588,24 @@ async def test_5b质检未过绝不顶替原图(tmp_path, monkeypatch):
     r = await service._clean_main_images(
         {"info_path": str(info_path), "workdir": str(tmp_path)}, _emit)
 
-    # 【2026-09-15 起判 fail，不再「增益路径全失败也算 ok」】英化质检没过的图带着中文，
-    # 不能原样发上真店（Temu 最硬的红线），故如实判失败、停在现场交人工换图；
-    # 原先返回 ok 会让商品带着中文主图一路跑到发布。本条测试的钉子不变：
+    # 【2026-09-22 起：质检多次未过的图直接丢弃】原先判 fail、停在现场等人工换图，
+    # 代价是一张图拖停整单（offer 652503071023 的 desc-01 就是这么卡住的）；现在阶段
+    # 照常 ok、该图标 unusable 硬排除出选图。本条测试的钉子不变：
     # 无论判 ok 还是 fail，失败的产物都绝不能顶替原图。
-    assert r["status"] == "fail" and "未完成" in r["note"]
+    assert r["status"] == "ok" and "已丢弃" in r["note"]
     assert src.read_bytes() == original, "质检未过的产物绝不能顶替原图"
-    # 标注保持脏：该图仍以脏图身份参与 ⑥⑦ 兜底打分
     got = _json.loads(info_path.read_text(encoding="utf-8"))
-    assert got["complianceNotes"]["files"][0]["clean"] is False
-    # 这一档（产物确实带中文）才是真该人工换图的失败，文案要与出图失败区分开
+    entry = got["complianceNotes"]["files"][0]
+    # 丢弃 = 硬排除：clean 仍如实为 False（它确实带中文），但 unusable 让所有选图路径
+    # 跳过它（见 vision.is_unusable）——原先靠「以脏图身份参与兜底打分」是软排除，
+    # 图不够下限时还会被放回页面。
+    assert entry["clean"] is False
+    assert entry["unusable"] is True and entry["unusableReason"] == "qc_failed"
+    # 文案要说「已丢弃、不用处理」，不能再说「请人工换图」——后者会让人去处理一张
+    # 已经处理完（被丢弃）的图
     mc = [e for e in events if e["type"] == "manual_check"]
-    assert mc and "请人工换图" in mc[0]["message"]
+    assert mc and "已丢弃" in mc[0]["message"] and "不用处理" in mc[0]["message"]
+    assert "请人工换图" not in mc[0]["message"]
 
 
 # ---- ⑤b 内容审核拒收：标不可用绕开，不判 fail、不无限重跑 --------------------

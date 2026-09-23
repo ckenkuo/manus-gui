@@ -79,9 +79,12 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
         prompt += f" 本张图已知的问题：{str(issues)[:200]}。请一并修正。"
     for _ in range(3):
         try:
-            edited = await asyncio.to_thread(
-                images.edit_image, path, prompt=prompt, out_path=output,
-                no_downscale=True, timeout=90)
+            # 超时取出图链路统一值（原先写死 90，盖不住服务端并发时的 30~79s，
+            # 会在【已出图并计费】之后才被本地掐断，见 images.EDIT_TIMEOUT）；
+            # 并发也过那一层的全局闸门，不由本阶段自己限流
+            edited = await images.edit_image_async(
+                path, prompt=prompt, out_path=output,
+                no_downscale=True, timeout=images.EDIT_TIMEOUT)
             qc = await vision.check_cleaned(edited["output"])
             if qc.get("clean"):
                 return edited["output"]

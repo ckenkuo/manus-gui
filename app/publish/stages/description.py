@@ -156,6 +156,12 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     # 一次穷尽；本项目的取向是「靠自动重试保数据可靠性，不加人工卡点」，故这里补一轮
     # 重试：重试前先关掉编辑器再重开，让面板与滚动位置回到初始态（同一态下重试没意义）。
     failed_urls: list = []
+    # 【被判死、待扔掉的源 URL】与 failed_urls 刻意不同：那个每轮 clear（重试轮只关心本轮
+    # 失败），这个要跨轮累积——重试轮是同一个 _replace_round 的第二次调用，clear 会把第一轮
+    # 收集到的丢弃项洗掉。判据是 _prepare_desc_image 的 kind=="qc"（发数用尽仍不过）：这类图
+    # 重跑还是同一个结果，留在描述区只是一张带中文/夸大词的外链原图，还会让收尾 desc_save
+    # 判整阶段 fail（2026-09-22 用户定案：最后一律丢弃，不再保留原图等人工换图）。
+    discard_urls: set = set()
     # fatal 指「页签被导航走」这类对后续每一张都成立的错误。它必须抑制重试：页面已经
     # 不在编辑页，重开编辑器与重试都无从下手，只会把 test_fatal时中断整段而不是逐张重试
     # 盯着的那种噪音再来一遍（2026-08-24 实测 890843533224 的 7 条同样报错）。
@@ -201,9 +207,19 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             if got is None:
                 got = await stages_description_images._prepare_desc_image(ctx["workdir"], rep)
             if not got.get("ok"):
+                why = got.get('why') or '未知原因'
+                if got.get("kind") == "qc":
+                    # 【发数用尽仍不过 → 丢弃该图】2026-09-22 用户定案（原先保留 1688 外链
+                    # 原图，收尾 desc_save 因它同时命中 foreignHosts 与 tooSmall 判整阶段
+                    # fail，一张图拖停整单）。这里只收集、不当场删：此刻删会让后面每一张的
+                    # pos 前移，而它们都已按当前 pos 定位过一次了；统一到替换轮走完再删
+                    # （见下面「质检判死的图」那段）。
+                    discard_urls.add(rep["url"])
+                    await emit({"type": "manual_check", "stage": "desc",
+                                "message": f"{tag}{why}（已丢弃该图，不再保留原图）"})
+                    continue
                 # 【图片下载失败时检查尺码上下文】2026-09-02：单张描述图下载失败（如404）
                 # 不应让整个商品失败。如果该图可能是尺码表且已有文本或实测尺寸，提示影响较小。
-                why = got.get('why') or '未知原因'
                 hint = ""
                 if "下载" in why or "404" in why:
                     # 检查是否有尺码上下文：descText 或 sizeMeasurements 存在时，
@@ -250,6 +266,40 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
                 logger.warning(f"重试前关闭编辑器失败，仍尝试重试：{closed.get('reason')}")
             await _replace_round(retry)
 
+    # ---- 质检判死的图：从描述区删掉 ------------------------------------------
+    # 【为什么放在替换轮（含重试轮）之后】此刻描述编辑器还开着（ensure_desc_closed 在更
+    # 后面），而前面每一张都已按当时的 pos 定位替换过——提前删会让它们整体前移。
+    # 删除本身是安全的：desc_delete 内部重读 state、重建 idx 映射并按倒序删（见
+    # media.description.desc_delete），而紧随其后的 keep 转存按【源 URL】现查 pos
+    # （_resolve_desc_pos），不受前移影响。
+    discarded = 0
+    if discard_urls and not fatal_hit:
+        # 【整段 best-effort】丢弃是自动化的收尾动作，页面态异常（编辑器被关掉、页签被
+        # 导航走、描述区已变）都可能让定位或删除失败。失败只是退回原来的处置——图原样
+        # 留在描述区，收尾 desc_save 会把外链与尺寸报出来——不该把已经替换好的那些图
+        # 连坐掉（同下面 keep 转存那段的取向）。
+        try:
+            positions = []
+            for url in discard_urls:
+                cur_pos, perr, _fatal = await stages_description_images._resolve_desc_pos(
+                    session, url)
+                if perr:
+                    logger.warning(f"待丢弃的描述图在描述区找不到（原样留着）：{perr}")
+                    continue
+                positions.append(cur_pos)
+            if positions:
+                dd = await desc_delete(session, positions)
+                if dd.get("status") == "ok":
+                    discarded = len(dd.get("deleted") or [])
+                    logger.info(f"描述图丢弃 {discarded} 张：英化质检多次未过，不保留原图")
+                else:
+                    logger.warning(f"丢弃描述图失败（这几张保留原样）：{str(dd)[:150]}")
+                    await emit({"type": "manual_check", "stage": "desc",
+                                "message": f"{len(positions)} 张质检未过的描述图未能丢弃"
+                                           f"（保留原图）：{str(dd)[:120]}"})
+        except Exception as e:
+            logger.warning(f"丢弃描述图异常（这几张保留原样）：{e}")
+
     # ---- keep 的图也要转存到店小秘图床 --------------------------------------
     # 【这是「仍有外链图未转存」的真正成因】认领时平台按外链原样挂 1688 图，只有被
     # 替换过的才落图床；判 keep 的图从来没人动过，于是 desc_save 每轮都报外链未转存
@@ -271,7 +321,10 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
             # 绝不能让它把已经换好的那些图连坐掉
             logger.warning(f"描述图转存异常（保留外链，继续收尾）：{e}")
 
-    if not deleted and not replaced and not rehosted and not max_images:
+    # 【discarded 也要算进来】否则「本轮只有图被丢弃」时会走这条 skipped 早退，而早退
+    # 直接关编辑器、不调 desc_save——上面那次 desc_delete 就白删了（页面上删掉的模块会
+    # 随编辑器一起丢弃，下次重跑又重新处理一遍）。
+    if not deleted and not replaced and not rehosted and not discarded and not max_images:
         # 【这条早退路径也必须先关编辑器】2026-08-28 实测（1014675972015 仿真花）：
         # 9 张描述图全部替换失败（描述专属菜单未展开），走到这里 return skipped，
         # 把描述编辑器【留在页面上】。它是全屏 modal，于是 ⑭ save 点下去后：
@@ -320,7 +373,9 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
         # 【但「未转存」不止这一个成因】判 keep 的图本来也全是 1688 外链，与替换成败
         # 无关（2026-08-30 取证，见 _rehost_desc_keeps）。那条链路已在上面补了转存，
         # 故这里的归因只在【确有替换失败】时才给，替换全成功却仍报外链时不要乱指方向。
-        if kept_original := len(plan["replace"]) - replaced:
+        # 【减掉已丢弃的】丢弃的图已从页面上删掉，它既不会留下外链也不会有尺寸问题；
+        # 不减的话「已丢弃」会被报成「未替换成功」，把人引去查一条已经处理完的链路。
+        if kept_original := len(plan["replace"]) - replaced - discarded:
             parts.append(f"根因很可能是本阶段有 {kept_original} 张图未替换成功"
                          f"（它们的 1688 原始外链仍在页面上），请看上面各张的失败原因")
         elif s.get("foreignHosts"):
@@ -345,6 +400,8 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     elif s.get("status") != "ok":
         return {"status": "fail", "note": f"desc_save 失败：{str(s)[:150]}"}
     note = _desc_note(deleted, replaced, text_note, upscaled, reused, rehosted)
+    if discarded:
+        note += f" / 丢弃 {discarded} 张"
     if max_images:
         note += f" | 玩具描述图 {s['descImgs']}/{max_images} 张"
     return {"status": "ok", "note": note}

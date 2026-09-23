@@ -1,6 +1,7 @@
 """店小秘发布共用能力：stages.description_images。各来源流程由 workflows/ 独立定义。"""
 
 import asyncio
+import contextlib
 import os
 import shutil
 from app.logger import logger
@@ -193,13 +194,21 @@ async def _resolve_desc_pos(session: BrowserSession, url: str) -> tuple:
     return hits[0], "", False
 
 
-async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
+async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
     """把一张待替换的描述图备好本地产物，返回 {"ok", "path", "how", "why"}。
+
+    dl_sem 是【只管源站下载】的信号量（出图并发由 images.edit_image_async 的全局闸门
+    管，两者各管一段，理由见调用方那段注释）。缺省 None 表示不限流，便于单测直调。
 
     how ∈ cached（复用落盘产物）/ upscaled（纯几何放大）/ edited（生图英化）。
     三条分支的判据与取舍原样保留自原 _st_desc 内联实现——【不要在这里重新发明】：
     needsUpscale 走 compress 不烧生图、质检未过必须删产物、产物一律落 en_path
     （那是缓存键），每一条都是踩过坑换来的，理由见各分支注释。
+
+    失败时返回 {"ok": False, "kind": ..., "why": ...}，kind ∈ fetch（源站取不到）/
+    edit（出图链路报错）/ qc（质检发数用尽仍不过）。调用方按 kind 分流（见
+    description._replace_round）：qc 的这张图被判死、直接丢弃；另两类是「条件弄好再来
+    一次」，保留原图、重跑即可。2026-09-22 用户定案：最后一律丢弃，不再停下等人工换图。
 
     抽成独立函数【只为了能并发预热】：本函数不碰浏览器页面（输入是源 URL、输出是
     本地文件），故 N 张可以同时跑；而定位序号与替换必须逐张串行（见
@@ -210,6 +219,8 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
     同步阻塞调用（下载/生图/压缩都是 requests 与 curl 子进程）一律过 to_thread：
     并发跑时若直接调用会把事件循环整个占住，等于白并发（⑤b 清理已是这个写法）。
     """
+    # dl_sem 为 None 时退化成空上下文，免得两条下载各写一遍 if 分支
+    dl_gate = dl_sem if dl_sem is not None else contextlib.nullcontext()
     local, en_path = _desc_cache_paths(workdir, rep["url"])
     if os.path.exists(en_path) and os.path.getsize(en_path) > 0:
         # 缓存命中不再重复质检：check_cleaned 也是一次视觉调用，而落盘的前提就是它已通过。
@@ -241,9 +252,11 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 去重画一遍画面既贵又可能改坏内容。也因此不需要 check_cleaned 质检——
         # 画面根本没动过。
         try:
-            n = await asyncio.to_thread(extract._download_image, rep["url"], local)
+            async with dl_gate:
+                n = await asyncio.to_thread(extract._download_image, rep["url"], local)
             if not n:
-                return {"ok": False, "why": "放大失败：源站取不到原图（404 等）"}
+                return {"ok": False, "kind": "fetch",
+                        "why": "放大失败：源站取不到原图（404 等）"}
             # 【产物必须落到 en_path】那是缓存键（见 _desc_cache_paths）。若就地
             # 改 local，重跑时 cached 判定看不到产物，每轮都要重新下载再放大一次。
             shutil.copy(local, en_path)
@@ -262,17 +275,19 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
             # 【单张图下载失败时返回失败而不抛异常】2026-09-02：原先 upscale 分支的
             # _download_image 调用没有被 try-except 包裹，一张 404 就让整个商品失败。
             # 改为返回失败状态，由上层 _replace_round continue 跳过该图、继续处理其余图。
-            return {"ok": False, "why": f"放大失败：{e}"[:150]}
+            return {"ok": False, "kind": "edit", "why": f"放大失败：{e}"[:150]}
         return {"ok": True, "path": out, "how": "upscaled",
                 "note": f"{rep.get('reason')} -> {images.image_size(out)}"}
 
     try:
         # 同包复用，带过浏览器头的下载
-        n = await asyncio.to_thread(extract._download_image, rep["url"], local)
+        async with dl_gate:
+            n = await asyncio.to_thread(extract._download_image, rep["url"], local)
         if not n:
-            return {"ok": False, "why": "英化失败：源站取不到原图（404 等）"}
+            return {"ok": False, "kind": "fetch",
+                    "why": "英化失败：源站取不到原图（404 等）"}
     except Exception as e:
-        return {"ok": False, "why": f"英化失败：下载原图 {e}"[:150]}
+        return {"ok": False, "kind": "fetch", "why": f"英化失败：下载原图 {e}"[:150]}
 
     # 【质检未过要再烧一发】生图有随机性，同一张图同一个提示词两发结果就不同：
     # 2026-08-26 实测 700640528493 那张 749×513 的面料细节图，第一发被判
@@ -290,11 +305,19 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
     last_issues, cjk_left, claim_left = "", False, False
     banned_left = False
     attempt, tries = 0, DESC_QC_TRIES
+    # 【累积失败历史 + 下一发的加码在这里预备好】加码话术由 vision.build_retry_hint
+    # 看着上一发的产物图实时生成，而产物在本次循环末尾就要被删掉（缓存键，见下面
+    # os.remove 那段），故生成必须发生在删之前、"下一发"的事在本发末尾一并做掉。
+    history, next_hint = [], ""
     while attempt < tries:
         attempt += 1
         # 【重试要加码提示词，不能原样再发一遍】残留中文说明上一发没把那块文案吃掉，
         # 同样的话再说一次只是赌随机性；把「上一发残留了什么」当成新约束喂回去，
         # 命中率明显高于原样重发（同 llm._JSON_RETRY_HINT 的取向）。
+        # 【加码话术按图实时生成，不再是四选一的固定模板】固定模板一次只能说一类问题，
+        # 而卡住的图常在一张上同时踩好几类（2026-09-22 实测 desc-03：「High-Quality」
+        # 该删、「Cotton Denim Fabric」该译、「38 斤」该换算、「FASHION.STREET」该抹），
+        # 于是每发只修一块、修完又冒另一块、四发烧完才过。生成式逐块给动作，一次说清。
         # 第一发走【翻译优先】而非 DEFAULT_CLEAN_PROMPT 的「移除中文」：描述区这些图是
         # plan_desc 判 replace 的商品图，图上中文多是材质成分/工艺/卖点等有效信息，该翻译
         # 成英文原位保留，不能看到中文就消除（2026-09-03 用户要求）。
@@ -302,22 +325,19 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 买家按它选码（见 images.SIZECHART_TRANSLATE_PROMPT）。
         base = (images.SIZECHART_TRANSLATE_PROMPT if rep.get("sizechart")
                 else images.DEFAULT_TRANSLATE_PROMPT)
-        prompt = base
-        if attempt > 1 and last_issues:
-            # 【末发改成「全抹掉」，但尺码表图豁免】见 cleaning_rules._retry_hint 的
-            # last_chance 段。尺码表图抹掉文字就只剩一张空网格、买家按它选码，等于废图，
-            # 故这类图末发仍走原来的加码，宁可退回原图交人工。
-            prompt = base + stages_cleaning_rules._retry_hint(
-                last_issues, cjk_left, claim=claim_left, banned=banned_left,
-                last_chance=attempt == tries and not rep.get("sizechart"))
+        prompt = base + next_hint
+        next_hint = ""
         try:
             # desc_mode：按描述图口径出图与收尾，不套服装 1340x1785 闸门
             # （见 images.edit_image 的 desc_mode 说明）
-            ed = await asyncio.to_thread(images.edit_image, local, prompt=prompt,
-                                         out_path=en_path, desc_mode=True)
+            # 超时显式传，不吃默认值：这条原先是四条出图路径里唯一不传的，于是拿到
+            # 280 而另三条是 90，同一种调用凭阶段分出两套值（见 images.EDIT_TIMEOUT）
+            ed = await images.edit_image_async(local, prompt=prompt,
+                                               out_path=en_path, desc_mode=True,
+                                               timeout=images.EDIT_TIMEOUT)
             qc = await vision.check_cleaned(ed["output"])
         except Exception as e:
-            return {"ok": False, "why": f"英化失败：{e}"[:150]}
+            return {"ok": False, "kind": "edit", "why": f"英化失败：{e}"[:150]}
         if qc.get("clean"):
             return {"ok": True, "path": ed["output"], "how": "edited"}
         # 质检未过的产物必须删掉：留着会被下次重跑（以及下一轮重试）当成
@@ -335,20 +355,41 @@ async def _prepare_desc_image(workdir: str, rep: dict) -> dict:
         # 禁词一并抬高发数，理由同 marketingClaim（抹除比译写容易，多烧常常就过）
         if cjk_left or qc.get("garbled") or qc.get("marketingClaim") or banned_left:
             tries = max(tries, DESC_QC_TRIES_TEXT)
+        # 记一笔失败历史：带上该发实际追加的加码话术（prompt 去掉 base 的那部分），
+        # 模型才知道自己上次要求过什么，不会重复给一个已经失败过的要求。
+        history.append({**qc, "attempt": attempt, "hint": prompt[len(base):]})
+        # 【下一发的加码在这里预备，因为产物马上要删】末发仍走固定话术里的「全抹掉」
+        # （尺码表豁免）：2026-09-22 实测 desc-03/desc-04 都是前几发全废、靠末发全抹掉
+        # 才过，这一发是目前唯一真正有效的兜底，不交给生成式替换。其余各发走按图生成，
+        # 它失败（额度/断尾/产物读不到）时落回 _retry_hint 的固定话术——辅助路径
+        # best-effort，不能因为一次生成失败就让这张图连原样退回都做不到。
+        if attempt < tries:
+            if attempt + 1 == tries and not rep.get("sizechart"):
+                next_hint = stages_cleaning_rules._retry_hint(
+                    last_issues, cjk_left, claim=claim_left, banned=banned_left,
+                    last_chance=True)
+            else:
+                next_hint = await vision.build_retry_hint(
+                    base, history, ed["output"],
+                    sizechart=bool(rep.get("sizechart")))
+                if not next_hint:
+                    next_hint = stages_cleaning_rules._retry_hint(
+                        last_issues, cjk_left, claim=claim_left, banned=banned_left)
         try:
             os.remove(ed["output"])
         except OSError:
             pass
         if attempt < tries:
-            # 脏法要标出来：加码话术按它分支（见 _retry_hint），日志不带就无法从
-            # 「烧了 4 发还没过」反推当时喂的是哪套加码
+            # 脏法要标出来：日志不带就无法从「烧了 4 发还没过」反推当时脏的是哪几类
             flags = "，".join(f for f, v in (("残留中文", cjk_left),
                                             ("夸大宣传", claim_left),
                                             ("平台禁词", banned_left)) if v)
             logger.info(f"描述图英化质检未过（{attempt}/{tries}"
                         f"{'，' + flags if flags else ''}），重烧一发："
                         f"{last_issues[:60]}")
-    return {"ok": False, "why": f"英化质检未过：{last_issues}"[:150],
+    # kind 供调用方分流（见 _replace_round）：「qc」= 发数用尽仍不过，这张图被判死、该丢弃；
+    # 「fetch」/「edit」= 源站取不到 / 出图链路报错，图本身没被判死，重跑就该好，仍保留原图。
+    return {"ok": False, "kind": "qc", "why": f"英化质检未过：{last_issues}"[:150],
             "residualChinese": cjk_left, "marketingClaim": claim_left,
             "bannedTerm": banned_left}
 
@@ -365,16 +406,25 @@ async def _prewarm_desc_images(workdir: str, replace_plan: list, emit) -> dict:
     """
     if not replace_plan:
         return {}
+    # conc 只用于日志：出图限流已下沉到 images.edit_image_async 的全局闸门。
+    # 【为什么这里不再自己建 Semaphore】本轮与 ⑤b 清理常常同时在跑，各建一个计数器
+    # 等于把用户设的并发数乘上路数（见 images._EDIT_GATES 那段实测）。
     conc = preferences.get_image_concurrency()
-    sem = asyncio.Semaphore(conc)
+
+    # 【下载仍要单独限一层】出图闸门管不到 _prepare_desc_image 里那两条
+    # extract._download_image（upscale 分支与英化前置下载）：它们打的是 1688 源站，
+    # 而源站 CDN 对并发很敏感（见项目已知陷阱：裸 requests 会被连接重置/403）。
+    # 原先这两条是顺带受阶段 Semaphore 约束的，闸门下沉后若一并放开，18 张图会同时
+    # 砸源站。故这里保留一个只管下载的信号量，与出图闸门各管一段。
+    dl_sem = asyncio.Semaphore(conc)
 
     async def _one(rep: dict) -> tuple:
-        async with sem:
-            try:
-                return rep["url"], await _prepare_desc_image(workdir, rep)
-            except Exception as e:
-                # _prepare_desc_image 内部已分支吞异常，这里只兜住意料外的（如磁盘满）
-                return rep["url"], {"ok": False, "why": f"备料异常：{e}"[:150]}
+        try:
+            return rep["url"], await _prepare_desc_image(workdir, rep, dl_sem)
+        except Exception as e:
+            # _prepare_desc_image 内部已分支吞异常，这里只兜住意料外的（如磁盘满）
+            return rep["url"], {"ok": False, "kind": "edit",
+                                "why": f"备料异常：{e}"[:150]}
 
     logger.info(f"描述图备料：{len(replace_plan)} 张待处理（并发 {conc}）")
     pairs = await asyncio.gather(*(_one(r) for r in replace_plan))

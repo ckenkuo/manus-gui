@@ -746,6 +746,73 @@ def _cap_size(size: str) -> str:
 # 不会被误当成抖动重试，这是这个白名单能成立的前提。
 _CURL_TRANSIENT_RC = frozenset({6, 7, 16, 18, 28, 35, 52, 55, 56})
 
+# 单张出图（/images/edits）的超时：全链路共用这一个值，别再按阶段各定一套。
+# 【为什么是 240 而不是原来的 90】原先 ⑤b 清理、⑥ 轮播英化、⑪ SKU 预览图都写 90，
+# 依据是「实测一张约 35s」——那是单发的耗时。2026-09-22 从中转后台逐次核对：并发跑时
+# 服务端单次实际 30~79s（同一批里 1m19s 的都有），90s 只剩 11s 余量，链路稍挤就在
+# 本地先破线；而此时服务端那一发【已经出图并计费】，本地却判成抖动去重试，等于花了钱
+# 还把商品卡住（那批 54 次 rc=28 全部精确落在起跑后 90s，就是这么来的）。
+# 用户口径：最慢一张约 3 分钟，按它定超时。240 = 180s 最坏值 + 余量，既盖得住慢的
+# 那一发，又不至于像原来 ⑬ 那条 280s 一样让一张卡死的图拖满整批墙钟。
+#
+# 【为什么必须收成一个数】⑬ 描述图备料原先不传 timeout、吃 edit_image 默认的 280，
+# 另三条各自写 90，同一种 curl 生图调用凭阶段分出两套值，排查时先得逐条确认「这条到底
+# 是哪个超时」。故这里定一个常量，edit_image 默认取它，四条路径全部引用它。
+EDIT_TIMEOUT = 240
+
+
+# ---- 出图并发的全局闸门 ------------------------------------------------------
+#
+# 【为什么闸门必须在这一层，而不是各阶段自己建 Semaphore】用户旋钮的语义是「同时开多少
+# 路打中转」（见 preferences.get_image_concurrency），而原先 ⑤b 清理、⑥ 轮播英化、
+# ⑬ 描述图备料【各自 asyncio.Semaphore(conc)】——每个都是独立计数器，三路并行时实际
+# 在飞的就是 3 × conc。2026-09-22 实测：旋钮 30、⑤b 与 ⑬ 同时跑，再叠上当时那个双发
+# 预热缺陷（见 stages.prewarm._start_prewarm），最坏有上百个 curl.exe 同时打同一个
+# 中转，整批在 TLS 握手阶段就被拒连（234 次 rc=35）。调小旋钮治不了这个：它约束的是
+# 单个阶段，路数一多照样翻倍。故闸门下沉到实际发请求的这一层，让那个数字名副其实。
+#
+# 【为什么按事件循环缓存，而不是一个模块级 Semaphore】Semaphore 绑定创建时的事件循环，
+# 而 app.py 的 Web 请求、publish_run.py 的 CLI 各跑自己的 loop（测试里更是每个用例一个
+# 新 loop）。模块级单例会在第二个 loop 里报「attached to a different loop」。故按 loop
+# 存一份，跨 loop 互不干扰、同 loop 内共用同一个计数器。
+#
+# 【旋钮改动在下一批生效】同一个 loop 内首次取用时固定容量：Semaphore 不支持中途改
+# 容量，而批次跑到一半把闸门换掉会让新旧两份同时放行、瞬间超发。用户改完并发重跑即可。
+_EDIT_GATES: dict = {}
+
+
+def _edit_gate():
+    """取当前事件循环的出图并发闸门（同 loop 内共用一个，见上方注释）。"""
+    import asyncio
+    loop = asyncio.get_running_loop()
+    gate = _EDIT_GATES.get(loop)
+    if gate is None:
+        conc = 1
+        try:
+            from app.publish import preferences
+            conc = preferences.get_image_concurrency()
+        except Exception as e:
+            # best-effort：读不到偏好就退到一个保守值，宁可慢也不要无节制并发
+            logger.warning(f"读取生图并发偏好失败（本轮按 1 路串行）：{e}")
+        gate = asyncio.Semaphore(conc)
+        _EDIT_GATES[loop] = gate
+        logger.info(f"出图并发闸门建立：同时最多 {conc} 路打中转（全阶段共用）")
+    return gate
+
+
+async def edit_image_async(*args, **kwargs) -> dict:
+    """edit_image 的异步入口：过全局并发闸门 + 丢线程池，各阶段一律走这个。
+
+    【为什么各阶段不再自己 to_thread + Semaphore】那样每个阶段一个计数器，旋钮值会被
+    并行的阶段数乘上去（见 _EDIT_GATES 上方那段实测）。收到这里之后，无论多少条路径
+    同时要出图，在飞的 curl 总数都不超过用户设的那一个数。
+
+    edit_image 是同步 curl 子进程，故仍要 to_thread——直接调用会把事件循环整个占住。
+    """
+    import asyncio
+    async with _edit_gate():
+        return await asyncio.to_thread(edit_image, *args, **kwargs)
+
 
 class TransientNetError(RuntimeError):
     """链路瞬时故障（curl 退出码在 _CURL_TRANSIENT_RC 里），调用方可重试。
@@ -967,7 +1034,7 @@ def _is_bad_channel(resp_json: dict) -> bool:
             and _BAD_CHANNEL_MARK in str(err.get("message") or ""))
 
 
-def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = 280,
+def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TIMEOUT,
                            tries: int = EDIT_BAD_CHANNEL_RETRY) -> dict:
     """发 /images/edits，对【坏渠道】与【链路抖动】两类瞬时失败重试。
 
@@ -1015,7 +1082,7 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
                out_path: Optional[str] = None, size: Optional[str] = None,
                quality: str = "low", target: Optional[str] = None,
                do_compress: bool = True, no_downscale: bool = False,
-               timeout: int = 280, desc_mode: bool = False) -> dict:
+               timeout: int = EDIT_TIMEOUT, desc_mode: bool = False) -> dict:
     """AI 编辑单张图（去中文/去水印/英化）。
 
     prompt 缺省用 DEFAULT_CLEAN_PROMPT，但【建议调用方按图定制】：先看图定位具体问题

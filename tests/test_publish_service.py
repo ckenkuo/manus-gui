@@ -501,6 +501,45 @@ def test_plan_clean_无标注不清理(tmp_path):
     assert r["items"] == [] and "无 complianceNotes" in r["reason"]
 
 
+def test_plan_clean_跳过已丢弃的图(tmp_path):
+    """被丢弃的图（审核拒收 / 质检多次未过，见 vision.is_unusable）不可能再清出来。
+
+    不跳过就会每轮白烧 4 发生图：unusable 只写在 complianceNotes 里，而 plan_clean 原先
+    只看 clean / duplicate / _SKIP_KINDS 三个键（2026-09-22 加闸，配合「质检未过即丢弃」）。
+    """
+    for n in ("main-01.jpg", "main-02.jpg", "main-03.jpg"):
+        _write_main(tmp_path, n)
+    info = _notes(
+        {"file": "main-01.jpg", "clean": False, "chinese": True,
+         "unusable": True, "unusableReason": "qc_failed"},
+        {"file": "main-02.jpg", "clean": False, "watermark": True},
+        {"file": "main-03.jpg", "clean": False, "chinese": True})
+    r = vision.plan_clean(info, str(tmp_path), min_clean=3)
+    files = [i["file"] for i in r["items"]]
+    assert "main-01.jpg" not in files, "已丢弃的图不该再被送进清理"
+    assert files, "其余脏图照常清"
+
+
+def test_plan_clean_已丢弃的颜色主图不触发强制清理(tmp_path):
+    """颜色主图被丢弃后不该再算「待清」——否则每轮都把它送进 _one 重烧 4 发。
+
+    颜色主图走的是 `_color_dirty` 那条强制清理路径（不受「缺口张数」限制），故单独钉。
+    """
+    for i in range(1, 5):
+        _write_main(tmp_path, f"main-{i:02d}.jpg")
+    info = _notes(
+        {"file": "main-01.jpg", "clean": False, "chinese": True,
+         "unusable": True, "unusableReason": "qc_failed"},
+        {"file": "main-02.jpg", "clean": True},
+        {"file": "main-03.jpg", "clean": True},
+        {"file": "main-04.jpg", "clean": True})
+    info["colorImages"] = {"黑色": {"mainFile": "main-01.jpg"}}
+    r = vision.plan_clean(info, str(tmp_path), min_clean=3)
+    # 干净图已够下限，唯一那张脏的是已丢弃的颜色主图 —— _color_dirty 不认它，
+    # 于是走「无需清理」早退（不加闸的话每轮都把它强制送进清理）
+    assert r["items"] == [] and "无需清理" in r["reason"]
+
+
 def test_dirty_score_中文优先级最高():
     """兜底排序：中文 > 水印 > logo > 重复（2026-08-22 踩坑的直接回归点）。"""
     chinese = {"chinese": True, "watermark": True, "logo": True}
@@ -604,7 +643,7 @@ async def test_st_clean_images_失败不阻塞且发人工检查(tmp_path, monke
 
 
 @pytest.mark.asyncio
-async def test_st_clean_images_质检未过保留原图(tmp_path, monkeypatch):
+async def test_st_clean_images_质检未过丢弃该图(tmp_path, monkeypatch):
     _write_main(tmp_path, "main-01.jpg")
     info_path = str(tmp_path / "product-info.json")
     with open(info_path, "w", encoding="utf-8") as f:
@@ -624,11 +663,16 @@ async def test_st_clean_images_质检未过保留原图(tmp_path, monkeypatch):
     events = []
     r = await service._st_clean_images(
         {"info_path": info_path, "workdir": str(tmp_path)}, None, _collect_async(events))
-    # 【2026-09-15 起判 fail】理由同上：残留拼音的图不能发上真店。
-    assert r["status"] == "fail"
-    # 质检不过的产物绝不能顶替原图（否则把带拼音乱码的图挂上真店）
+    # 【2026-09-22 起：烧完发数仍不过的图直接丢弃，不再判 fail】原先判 fail、停在现场
+    # 等人工换图，代价是一张图拖停整单（offer 652503071023 的 desc-01 就这么卡住的）。
+    # 现在阶段照常 ok、该图标 unusable 硬排除出 ⑥⑦ 选图，其余图继续发布。
+    assert r["status"] == "ok" and "已丢弃" in r["note"]
+    # 丢弃归丢弃：产物绝不能顶替原图（否则把带拼音乱码的图挂上真店）
     assert open(str(tmp_path / "main-01.jpg"), "rb").read() == original
     assert "残留拼音" in events[0]["message"]
+    with open(info_path, encoding="utf-8") as f:
+        entry = json.load(f)["complianceNotes"]["files"][0]
+    assert entry["unusable"] is True and entry["unusableReason"] == "qc_failed"
 
 
 # ---- run_batch 批量编排 --------------------------------------------------------
@@ -990,6 +1034,41 @@ async def test_源图已不在描述区时跳过且不烧生图(tmp_path, monkey
     assert not calls.get("replaced")
     msgs = [e["message"] for e in events if e["type"] == "manual_check"]
     assert any("定位失败" in m for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_描述图质检未过的丢弃掉(tmp_path, monkeypatch):
+    """2026-09-22 起：英化质检烧完发数仍不过的描述图，从描述区删掉，不再留外链原图。
+
+    原先保留 1688 外链原图 → 收尾 desc_save 因它同时命中 foreignHosts 与 tooSmall，
+    判整阶段 fail，一张图拖停整单（offer 652503071023 的 desc-01 就是这么卡住的）。
+    """
+    calls, events = {}, []
+    ctx = _desc_env(tmp_path, monkeypatch, calls)
+
+    async def bad_qc(path):
+        return {"clean": False, "issues": "还有中文", "residualChinese": True}
+    monkeypatch.setattr(service.vision, "check_cleaned", bad_qc)
+
+    # 重烧时的「按图生成提示词」也是视觉调用，给个空结果让它退回固定加码话术
+    async def fake_vision(prompt, images, **kw):
+        return {"blocks": [], "summary": ""}
+    monkeypatch.setattr(service.vision, "ask_json_with_images", fake_vision)
+
+    deleted = {}
+
+    async def fake_delete(session, positions):
+        deleted["positions"] = list(positions)
+        return {"status": "ok", "deleted": list(positions)}
+    monkeypatch.setattr("app.publish.stages.description.desc_delete", fake_delete)
+
+    r = await service._st_desc(ctx, None, _collect_async(events))
+
+    assert deleted.get("positions") == [1], "质检未过的描述图应当从描述区删掉"
+    assert r["status"] == "ok" and "丢弃 1 张" in r["note"]
+    # 文案要说「已丢弃」，不能再说「（保留原图）」
+    msgs = [e["message"] for e in events if e["type"] == "manual_check"]
+    assert any("已丢弃" in m for m in msgs), msgs
 
 
 @pytest.mark.asyncio
