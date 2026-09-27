@@ -434,21 +434,39 @@ async def confirm_region_from_context(ctx, want_label: str = "") -> Region:
 
     # UI 指定了区域 → 以它为准：把第一个后台页签切过去（已在目标区域则原地返回）。
     # 只切这一个页签：它就是下面用来确认区域的基准，其余页签由后面的一致性校验兜。
+    base_page = pages[0]
     if str(want_label or "").strip():
-        base = await switch_region(pages[0], want_label)
+        base = await switch_region(base_page, want_label)
     else:
-        # 轮询等顶栏渲染：进来时页面可能刚导航完，区域切换器还没挂载，
-        # 单次读会把「还没渲染」误报成「读不到区域」。
-        base = await await_region(pages[0])
-        if not base.ok:
-            known = "、".join(base.labels) if base.labels else "未读到"
-            raise RegionUnconfirmed(
-                f"读不到当前区域（{base.describe()}；顶栏区域标签：{known}）。"
-                "请确认后台页面已加载完成、顶栏能看到区域标签后重试。"
-            )
+        # 先快速扫一遍各页签，取第一个能读到区域的：提报页(detail-new)没有顶栏区域切换器，
+        # 若它恰好排在第一个，只读 pages[0] 会让整批「未能确认区域」而中止
+        # （实测 2026-09-25：残留提报页排在前面，正式批次直接失败）。
+        base = None
+        for page in pages:
+            quick = await read_region(page)
+            if quick.ok:
+                base, base_page = quick, page
+                break
+        if base is None:
+            # 都读不到：退回轮询第一个页签等顶栏渲染（页面可能刚导航完，切换器还没挂载），
+            # 仍读不到才抛——不猜区域。
+            base = await await_region(pages[0])
+            if not base.ok:
+                known = "、".join(base.labels) if base.labels else "未读到"
+                raise RegionUnconfirmed(
+                    f"读不到当前区域（{base.describe()}；顶栏区域标签：{known}）。"
+                    "请确认后台页面已加载完成、顶栏能看到区域标签后重试。"
+                )
 
-    for p in pages[1:]:
-        conflict = region_conflict(base, await read_region(p))
+    for p in pages:
+        if p is base_page:
+            continue
+        cur = await read_region(p)
+        if not cur.ok and host_of(getattr(p, "url", "")) == base.host:
+            # 顶栏读不到但域名与基准一致：提报页这类页面本来就没有区域切换器，
+            # 「这个页面没有区域标签」不等于「它在别的区域」——域名才是区域主键。
+            continue
+        conflict = region_conflict(base, cur)
         if conflict:
             # UI 指定了区域时，其它页签也一并切过去——以 UI 为准就该把环境对齐，
             # 而不是让操作者回去手动收拾页签。切不动才报错。

@@ -140,15 +140,18 @@ def read_document(document: str, sheet: str = "") -> dict:
     return result
 
 
-def read_costs(document: str, sheet: str, spus) -> dict:
-    """读取所选 SPU 的逐货号价格 → {spu: {"items": [{label, daily, sale, purchase, row_number}]}}。
+def costs_from_snapshot(snapshot: dict, spus, strict: bool = True) -> dict:
+    """从已读到的文档快照里取所选 SPU 的逐货号价格 → {spu: {"items": [{label, daily, sale, purchase, row_number}]}}。
 
     一个 SPU 可有多个货号行（各自日常价/底价不同），items 按行号升序、货号序即表内行序。
     仅当该 SPU 全部货号行都有效（selectable）才收录——提报页勾选是 SPU 级，无法只报
     部分货号，任一货号价格无效都不给价，避免按残缺价格申报。label 取货号列，无货号列
     兜底「行N」（执行层加速器按货号文本匹配时会因此中止不开，属预期 fail-closed）。
+
+    strict=False 时缺价 SPU 只是不出现在结果里、不抛错：识别扫描用——一个商品缺价不该让
+    整张矩阵扫不出来（矩阵里那几格标成「成本表无有效价格」即可）。批次路径保持 strict=True：
+    缺价必须整批中止，这是 source 层既有的安全设计。
     """
-    snapshot = read_document(document, sheet)
     targets = set(spus)
     costs = {}
     for record in snapshot["rows"]:
@@ -162,6 +165,11 @@ def read_costs(document: str, sheet: str, spus) -> dict:
                 "row_number": record["row_number"],
             })
     missing = targets - costs.keys()
-    if missing:
+    if missing and strict:
         raise ValueError("文档中的商品已缺失或价格无效，请刷新后重新选择：" + "、".join(sorted(missing)))
     return costs
+
+
+def read_costs(document: str, sheet: str, spus) -> dict:
+    """读取所选 SPU 的逐货号价格（读文档 + 取价两步，取价规则见 costs_from_snapshot）。"""
+    return costs_from_snapshot(read_document(document, sheet), spus)

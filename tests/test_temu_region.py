@@ -361,6 +361,42 @@ class TestConfirmRegionFromContext:
             asyncio.run(confirm_region_from_context(ctx))
         assert "区域不一致" in str(e.value)
 
+    def test_first_tab_without_region_selector_does_not_abort(self):
+        """第一个页签读不到区域（提报页 detail-new 没有顶栏切换器）时，应继续看后面的页签，
+        而不是整批「未能确认区域」而中止——实测 2026-09-25 残留提报页排在前面就这样失败过。"""
+        detail = FakePage("https://agentseller.temu.com/activity/marketing-activity/detail-new?x=1",
+                          {"labels": [], "active": "", "ambiguous": []})
+        ctx = FakeContext([detail, FakePage(GLOBAL_URL, _tabs("全球"))])
+        assert asyncio.run(confirm_region_from_context(ctx)).host == "agentseller.temu.com"
+
+    def test_detail_tab_with_same_host_is_not_a_conflict(self):
+        """顶栏读不到但域名与基准一致的页签不算「区域冲突」：域名才是区域主键，
+        「这个页面没有区域标签」不等于「它在别的区域」。"""
+        detail = FakePage("https://agentseller.temu.com/activity/marketing-activity/detail-new?x=1",
+                          {"labels": [], "active": "", "ambiguous": []})
+        ctx = FakeContext([FakePage(GLOBAL_URL, _tabs("全球")), detail])
+        assert asyncio.run(confirm_region_from_context(ctx)).label == "全球"
+
+    def test_detail_tab_on_another_host_still_aborts(self):
+        """域名不同的页签仍是真冲突（读不到顶栏也不放过）：不能因为读不到就当成同一区域。"""
+        detail = FakePage("https://agentseller-us.temu.com/activity/marketing-activity/detail-new",
+                          {"labels": [], "active": "", "ambiguous": []})
+        ctx = FakeContext([FakePage(GLOBAL_URL, _tabs("全球")), detail])
+        with pytest.raises(RegionUnconfirmed):
+            asyncio.run(confirm_region_from_context(ctx))
+
+    def test_all_tabs_unreadable_still_aborts(self, monkeypatch):
+        # 全部读不到时会退回轮询（等顶栏渲染）：测试里把轮询掐掉，否则要白等 15 秒。
+        async def _no_wait(_page, tries=30, interval=0.5):
+            return Region()
+
+        monkeypatch.setattr("app.temu_region.await_region", _no_wait)
+        blank = FakePage("https://agentseller.temu.com/activity/marketing-activity/detail-new",
+                         {"labels": [], "active": "", "ambiguous": []})
+        ctx = FakeContext([blank])
+        with pytest.raises(RegionUnconfirmed):
+            asyncio.run(confirm_region_from_context(ctx))
+
 
 class TestActivityPathsHaveNoHardcodedHost:
     def test_paths_are_relative(self):

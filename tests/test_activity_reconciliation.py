@@ -154,3 +154,16 @@ def test_total_change_and_missing_response_cannot_look_like_complete_query():
     assert not asyncio.run(pipeline._collect_activity_log_pages(first, next_page))["complete"]
     with pytest.raises(ValueError, match="list/total"):
         asyncio.run(pipeline._collect_activity_log_pages({}, next_page))
+
+
+def test_zero_records_response_is_a_complete_query():
+    """「确实没有报名记录」的平台响应是 {"total": 0, "list": null}（实测 2026-09-25，页面同时显示
+    「暂无数据 / 共有 0 条」）。旧实现要求 list 必须是数组，把 0 条误判成「查询不完整」，
+    导致没有记录的商品全被记成「报名未确认」失败。"""
+    next_page = AsyncMock(side_effect=AssertionError("0 条不该拉分页"))
+    result = asyncio.run(pipeline._collect_activity_log_pages({"total": 0, "list": None}, next_page))
+    assert result["complete"] is True and result["items"] == [] and result["total"] == 0
+    next_page.assert_not_called()
+    # total>0 却没有内容 → 仍是不完整（不能把「有记录但没读到」当成 0 条）
+    with pytest.raises(ValueError, match="list 为空"):
+        asyncio.run(pipeline._collect_activity_log_pages({"total": 3, "list": None}, next_page))

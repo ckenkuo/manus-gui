@@ -624,24 +624,69 @@ from app.activity import service as activity_service
 
 
 class ActivityJob:
-    """一次活动管理作业：持有进度队列，供 SSE 消费（对标 CollectJob）。"""
+    """一次活动作业（批次或识别扫描）：持有进度队列，供 SSE 消费（对标 CollectJob）。
+
+    为什么还要留一份有界事件日志：队列是一次性消费的。旧实现里 SSE 的 `_end` 哨兵被读走后
+    新连接会永远阻塞在 queue.get()，刷新页面既卡死、又丢掉全部已发生的事件（识别矩阵点不亮、
+    暂停态读不到）。现在每条事件同时进 events + 序号，重连时按 ?since=N 回放再挂队列等新事件。
+    """
+
+    MAX_EVENTS = 5000
+    MAX_KEPT_JOBS = 10  # 跑完的作业最多留几个：留着的才能回放，但也不能无限涨内存
 
     def __init__(
         self, job_id: str, excel: str = "", sheet: str = "", dry_run: bool = True,
+        kind: str = "batch",
     ):
         self.id = job_id
         self.excel = excel
         self.sheet = sheet
         self.dry_run = dry_run
+        self.kind = kind  # batch（规划/报名）| scan（只读识别）
         self.queue: asyncio.Queue = asyncio.Queue()
+        self.events: list = []  # 有界事件日志（重连回放用）
+        self.seq = 0
         self.done = False
         self.summary: dict = {}
+        # 暂停/继续与逐格跳过的控制对象；service 在安全边界查它，HTTP 侧置位。
+        from app.activity.control import ActivityControl
+
+        self.control = ActivityControl()
 
     async def push(self, event: dict):
+        if event.get("type") == "_end":
+            # 收尾哨兵不进事件日志：它是「本次消费结束」的信号，不是可回放的历史事件。
+            await self.queue.put(event)
+            return
+        self.seq += 1
+        event = {**event, "_seq": self.seq}
+        self.events.append(event)
+        if len(self.events) > self.MAX_EVENTS:
+            del self.events[: len(self.events) - self.MAX_EVENTS]
         await self.queue.put(event)
 
 
 activity_jobs: dict = {}
+
+
+def _prune_activity_jobs() -> None:
+    """只保留最近的若干作业（含已结束的，用于 SSE 重连回放），避免常驻内存无限增长。"""
+    finished = [job_id for job_id, job in activity_jobs.items() if job.done]
+    for job_id in finished[: max(0, len(finished) - ActivityJob.MAX_KEPT_JOBS)]:
+        activity_jobs.pop(job_id, None)
+
+
+def _activity_page_busy() -> bool:
+    """是否有作业正占用提报页（detail-new）：识别扫描总是，批次只在正式执行时。
+
+    互斥是硬约束不是优化：两者都靠 ctx.pages 里 detail-new 页的【对象身份 diff】认自己
+    新开的页签，并发跑会互相把对方的提报页认成自己的 → 开错活动、把资格记到别的活动名下。
+    纯 dry-run 批次不开提报页，故不与扫描互斥。
+    """
+    return any(
+        not job.done and (job.kind == "scan" or not job.dry_run)
+        for job in activity_jobs.values()
+    )
 
 
 @app.get("/activity/worklist")
@@ -669,11 +714,17 @@ async def activity_batch(
     min_margin: Optional[float] = Body(None, embed=True),
     dry_run: bool = Body(True, embed=True),
     cloud_url: str = Body("", embed=True),
+    region_label: str = Body("", embed=True),
+    live: Optional[bool] = Body(None, embed=True),
+    selection: Optional[list] = Body(None, embed=True),
 ):
     """启动一批活动管理作业，返回 job_id；进度经 /activity/batch/{job_id}/events (SSE) 消费。
 
     cloud_url 为在线成本表分享链接，sheet 为工作表名；excel 兼容旧客户端传链接。
     dry_run 默认 True；开始前重新读取所选 SPU 的云端价格。
+    live 显式给定时用它分半程/全程：live=False 只开提报页填价（不提交、不真开关流量），
+    live=True 真提交；不给则沿用旧口径 live=not dry_run（dry-run 恒不执行）。
+    selection 是识别矩阵勾选的 [[spu, 活动名], ...]：只报这些格子，没勾的 SPU 连流量都不动。
     """
     from app.activity.source import validate_document
 
@@ -683,6 +734,13 @@ async def activity_batch(
             raise ValueError("请选择工作表并勾选要做活动的商品。")
     except ValueError as exc:
         return JSONResponse(status_code=400, content={"error": str(exc)})
+    will_live = (not dry_run) if live is None else bool(live)
+    if not dry_run and _activity_page_busy():
+        return JSONResponse(
+            status_code=409,
+            content={"error": "已有活动作业在用提报页（识别扫描或正式执行），请等它结束后再发起。"},
+        )
+    _prune_activity_jobs()
     job_id = str(uuid.uuid4())
     job = ActivityJob(job_id, document, sheet, dry_run)
     activity_jobs[job_id] = job
@@ -694,7 +752,8 @@ async def activity_batch(
         try:
             job.summary = await activity_service.run_activity_batch(
                 spus, document, sheet,
-                min_margin=min_margin, dry_run=dry_run, live=not dry_run,
+                min_margin=min_margin, dry_run=dry_run, live=will_live,
+                region_label=region_label, selection=selection, control=job.control,
                 on_progress=_on_progress,
             )
         except Exception as e:
@@ -707,14 +766,142 @@ async def activity_batch(
     return {"job_id": job_id}
 
 
+@app.post("/activity/scan")
+async def activity_scan(
+    excel: str = Body("", embed=True),
+    sheet: str = Body("", embed=True),
+    spus: str = Body("", embed=True),
+    cloud_url: str = Body("", embed=True),
+    region_label: str = Body("", embed=True),
+    force: bool = Body(False, embed=True),
+):
+    """启动一次只读的「活动识别」扫描，返回 job_id；进度经 /activity/batch/{job_id}/events 消费。
+
+    扫描只读：读成本表与活动列表、逐个（商品×活动）开提报页探资格，不勾选、不填价、不提交、
+    不碰流量。结果落盘当天文件，重扫时命中即跳过；force=True 忽略缓存全量重探。
+    """
+    from app.activity.source import validate_document
+
+    try:
+        document = validate_document(cloud_url or excel)
+        if not sheet.strip() or not spus.strip():
+            raise ValueError("请选择工作表并勾选要识别的商品。")
+    except ValueError as exc:
+        return JSONResponse(status_code=400, content={"error": str(exc)})
+    if _activity_page_busy():
+        return JSONResponse(
+            status_code=409,
+            content={"error": "已有活动作业在用提报页（识别扫描或正式执行），请等它结束后再识别。"},
+        )
+    _prune_activity_jobs()
+    job_id = str(uuid.uuid4())
+    job = ActivityJob(job_id, document, sheet, True, kind="scan")
+    activity_jobs[job_id] = job
+
+    async def _on_progress(event: dict):
+        await job.push(event)
+
+    async def _run():
+        try:
+            job.summary = await activity_service.scan_activity_matrix(
+                spus, document, sheet,
+                on_progress=_on_progress, control=job.control,
+                cloud_url=document, region_label=region_label, force=force,
+            )
+        except Exception as e:
+            await job.push({"type": "aborted", "reason": f"活动识别异常：{e}"})
+        finally:
+            job.done = True
+            await job.push({"type": "_end"})
+
+    asyncio.create_task(_run())
+    return {"job_id": job_id}
+
+
+@app.get("/activity/matrix")
+async def activity_matrix_get(cloud_url: str = "", sheet: str = "", day: str = ""):
+    """回读当天识别矩阵（不连 CDP、不读成本表）：刷新页面后矩阵与资格仍在。
+
+    fresh=False 表示文件里的文档/工作表与本次请求的不是同一份，前端应提示重新识别。
+    """
+    from app.activity import matrix as matrix_store
+
+    data = matrix_store.load(day)
+    return {
+        "day": data["day"], "generated_at": data.get("generated_at", ""),
+        "document": data.get("document", ""), "sheet": data.get("sheet", ""),
+        "region": data.get("region", ""), "activities": data.get("activities", []),
+        "cells": matrix_store.flatten_cells(data), "counts": data.get("counts", {}),
+        "path": matrix_store.matrix_path(data["day"]),
+        "fresh": bool(data.get("activities"))
+        and (not cloud_url or data.get("document") == cloud_url)
+        and (not sheet or data.get("sheet") == sheet),
+    }
+
+
+@app.post("/activity/batch/{job_id}/pause")
+async def activity_batch_pause(job_id: str, paused: bool = Body(True, embed=True)):
+    """暂停/继续活动作业（暂停可恢复：在当前动作收尾后的安全边界挂起）。
+
+    收尾阶段（重开流量）拒绝暂停：此刻流量已关，挂起等于商品在无流量状态下卖货。
+    """
+    job = activity_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
+    if job.done:
+        return JSONResponse(status_code=409, content={"error": "作业已结束，无需暂停"})
+    result = job.control.set_paused(paused)
+    if result["refused"]:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "收尾阶段不可暂停：已关闭的流量必须恢复后才能结束"},
+        )
+    return {"paused": result["paused"], "phase": job.control.phase}
+
+
+@app.post("/activity/batch/{job_id}/skip")
+async def activity_batch_skip(
+    job_id: str,
+    spu: str = Body(..., embed=True),
+    activity: str = Body(..., embed=True),
+    skipped: bool = Body(True, embed=True),
+):
+    """执行中逐格跳过/撤销跳过：跳过的格子不填价、不提交、也不参与报名记录对账。"""
+    job = activity_jobs.get(job_id)
+    if job is None:
+        return JSONResponse(status_code=404, content={"error": "job not found"})
+    if job.done:
+        return JSONResponse(status_code=409, content={"error": "作业已结束，无法再改"})
+    result = job.control.request_skip(spu, activity, skipped)
+    if not result["accepted"]:
+        return JSONResponse(status_code=409, content={
+            "error": "该商品在该活动已填价（活动级一次提交拦不回来），"
+                     "如需排除请在提报页手动取消勾选。"})
+    return {"accepted": True, "skipped": job.control.skipped_cells()}
+
+
 @app.get("/activity/batch/{job_id}/events")
-async def activity_batch_events(job_id: str):
-    """SSE 推送某次活动管理作业的结构化进度事件（原样转发 service 的 on_progress 事件）。"""
+async def activity_batch_events(job_id: str, since: int = 0):
+    """SSE 推送某次活动作业的结构化进度事件（原样转发 service 的 on_progress 事件）。
+
+    since > 0 时先回放序号大于它的历史事件（刷新/断线重连补课），再挂到队列上等新事件。
+    作业已结束时立刻回放完并收尾——旧实现只认队列里的 _end 哨兵，哨兵被上一个连接读走后
+    新连接会永久阻塞，页面刷新就卡死。
+    """
 
     async def event_generator():
         job = activity_jobs.get(job_id)
         if job is None:
             yield f"event: error\ndata: {dumps({'reason': 'job not found'})}\n\n"
+            return
+        seen = 0
+        for event in list(job.events):
+            if event["_seq"] <= since:
+                continue
+            seen = event["_seq"]
+            yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
+        if job.done:
+            yield f"event: done\ndata: {dumps(job.summary)}\n\n"
             return
         while True:
             try:
@@ -724,6 +911,8 @@ async def activity_batch_events(job_id: str):
             if event.get("type") == "_end":
                 yield f"event: done\ndata: {dumps(job.summary)}\n\n"
                 break
+            if event["_seq"] <= seen:
+                continue  # 回放阶段已经发过（队列里还压着的历史事件）
             yield f"event: {event.get('type', 'log')}\ndata: {dumps(event)}\n\n"
 
     return StreamingResponse(

@@ -21,7 +21,7 @@
 """
 import asyncio
 import re
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN
 from typing import Any, Optional
 
 # 复用采集管道已实测的 JSON 解析（剥 ```json 围栏 + 兜底抓首个 {...}），避免重复实现。
@@ -647,13 +647,23 @@ _MARK_ACTIVITY_LOG_NEXT_JS = r"""
 
 
 async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
-    """按首个响应的 total/pageSize 拉完当前 SPU 的报名记录分页。"""
-    if not isinstance(first_result.get("list"), list) or first_result.get("total") is None:
+    """按首个响应的 total/pageSize 拉完当前 SPU 的报名记录分页。
+
+    "0 条记录" 的平台响应是 {"total": 0, "list": null}（实测 2026-09-25：无报名记录的商品，
+    页面同时显示「暂无数据 / 共有 0 条」）。旧实现要求 list 必须是数组，于是把「确实没有记录」
+    误判成「响应缺少 list/total → 查询不完整」，而调用方据此判「报名未确认」，让无记录的商品
+    全部记成失败。这里把 null 归一成空列表：total 是权威计数，list 只提供内容。
+    """
+    raw_list = first_result.get("list")
+    total = first_result.get("total")
+    if not isinstance(raw_list, (list, type(None))) or total is None:
         raise ValueError("报名记录响应缺少 list/total，无法确认查询完整性")
-    first_items = first_result["list"]
-    total = int(first_result["total"])
+    first_items = raw_list or []
+    total = int(total)
     if total < 0:
         raise ValueError("报名记录 total 无效")
+    if not first_items and total > 0:
+        raise ValueError("报名记录响应 total>0 但 list 为空，无法确认查询完整性")
     reported_size = int(first_result.get("pageSize") or first_result.get("page_size") or 0)
     page_size = reported_size or len(first_items) or 10
     expected_pages = max(1, (total + page_size - 1) // page_size)
@@ -664,12 +674,13 @@ async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
     for page_number in range(2, expected_pages + 1):
         try:
             result = await fetch_next(page_number)
-            if not isinstance(result.get("list"), list) or int(result.get("total", -1)) != total:
+            page_list = result.get("list")
+            if not isinstance(page_list, (list, type(None))) or int(result.get("total", -1)) != total:
                 raise ValueError("报名记录分页响应不完整或 total 发生变化，请重新查询")
         except Exception as exc:
             error = str(exc)[:120]
             break
-        page_items = result.get("list") or []
+        page_items = page_list or []
         pages_read += 1
         items.extend(page_items)
 
@@ -963,8 +974,10 @@ def compute_submit_price(daily_price, discount_rate, sale) -> dict:
     用户方案（2026-07-16）：红线从「毛利率」改为 Excel「销售价格」列——即用户手填的可接受
     最低售价（底价），完全替代旧的 成本÷(1−毛利率)。判定只看申报价是否够底价，与成本/毛利率
     无关（等价式：submit≥sale ⟺ 活动折扣率 ≥ sale/日常价）。
-    - 申报价策略 discount_ceiling：submit_price = 日常价 × 活动折扣率（贴折扣上限、少让利）。
-    - within_floor：submit_price ≥ sale（销售底价）。
+    - 申报价策略 discount_ceiling：submit_price = 日常价 × 活动折扣率（贴折扣上限、少让利），
+      结果按【向下取整】到分——与平台参考价同口径，理由见下面的实现注释。
+    - within_floor：submit_price ≥ sale（销售底价）。判定用的是取整后的价：平台上限够不到
+      底价的活动在初筛就被淘汰，不会等到填价时才失败。
     - 防御：任一关键值缺失（日常价/折扣率/底价读不到）→ within_floor=False，note 标注原因。
     返回 {submit_price, floor_price(=sale), within_floor, note}。
     """
@@ -982,11 +995,17 @@ def compute_submit_price(daily_price, discount_rate, sale) -> dict:
 
     submit_price = None
     if dp is not None and dr is not None:
-        # 不用内置 round：它是银行家舍入，精确 x.xx5 中点会舍向偶数（少 1 分钱），
-        # 底价压线商品（如 188.88×0.85=160.548=底价）会被误判穿底。运营口径是
-        # 四舍五入，用 Decimal ROUND_HALF_UP 钉死。
+        # 舍入口径必须与平台一致：申报价一旦高于平台的「参考价」就填不进提报页。
+        # 实测（2026-09-24）平台的参考价 = 平台日常价 × 折扣率【向下取整到分】：
+        #   188.88 × 0.85 = 160.548 → 平台给 160.54（四舍五入会给 160.55）
+        #   163.23 × 0.85 = 138.7455 → 平台给 138.74（四舍五入会给 138.75）
+        # 用四舍五入时，第三位小数 ≥5（约占一半）的商品申报价就比上限高 1 分、必被平台拒——
+        # 这正是历史上「Excel 日常价与参考价对不上」的一大来源。故这里同样向下取整到分。
+        # 代价：极少数情况下比四舍五入少报 1 分；换来的是「不会再因 1 分差报不上」，
+        # 且底价高于平台上限的活动会在初筛阶段就被判不达底价（矩阵里直接可见），
+        # 而不是等填价时才失败。
         submit_price = float(
-            Decimal(str(dp * dr)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            Decimal(str(dp * dr)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
         )
     within = bool(submit_price is not None and fl is not None and submit_price >= fl)
 
@@ -998,67 +1017,231 @@ def compute_submit_price(daily_price, discount_rate, sale) -> dict:
     }
 
 
-def match_enroll_rows(sku_prices, page_rows) -> Optional[dict]:
-    """把提报页价格行匹配到成本表货号，返回 {行idx: {label,daily,ref,submit_price}} 或 None。
+def norm_sku_label(value) -> str:
+    """归一化货号文本用于比对：小写、去掉除字母数字与汉字外的一切（点、斜杠、空格、连字符）。
 
-    匹配键是【日常价多重集合】：申报价 = 日常价 × 折扣率，同日常价的货号申报价必然
-    相同，无需区分谁是谁——故只要求页面各行日常价的多重集合与成本表各货号日常价的
-    多重集合相等。行数不等、或某行日常价在成本表里没有剩余名额 → None（调用方
-    fail-closed：配不上就绝不填价）。
+    实测（2026-09-24）成本表写「70cm0.2kg」而平台货号字段是「70cm02kg」——只差点号，
+    归一化后相等。中英混写的（成本表「30厘米/0.2kg」对平台「30cm02kg」）归一化也救不了，
+    那种情况交给日常价匹配兜底。
     """
-    if not sku_prices or not page_rows or len(sku_prices) != len(page_rows):
+    return re.sub(r"[^0-9a-z一-鿿]+", "", str(value or "").lower())
+
+
+def _match_by_label(sku_prices, page_rows) -> Optional[dict]:
+    """按【平台货号】把页面行配对到成本表货号（身份键，最可靠）。
+
+    日常价以表为准（用户 2026-09-24 定）：平台显示的日常价可能过期或与表不一致，不能拿它
+    当配对键，否则一有差异就整单报不上。页面行里的货号字段才是身份。要求每个页面行都能唯一
+    命中一个成本表货号、且每个货号至多被一行……允许多行（同货号多款式），但不能有行落空。
+    行里没有货号字段、或归一化后对不上任何货号 → None（交给日常价匹配兜底）。
+    """
+    if not sku_prices or not page_rows:
+        return None
+    pool = {}
+    for item in sku_prices:
+        key = norm_sku_label(item["label"])
+        if not key or key in pool:  # 货号重复/为空：身份不可判，放弃这条键
+            return None
+        pool[key] = item
+    covered = set()
+    assigned = {}
+    for row in page_rows:
+        key = norm_sku_label(row.get("label"))
+        item = pool.get(key) if key else None
+        if item is None:
+            return None
+        covered.add(key)
+        assigned[row["idx"]] = {
+            "label": item["label"], "labels": [item["label"]],
+            "daily": item["daily"], "ref": row.get("ref"),
+            "submit_price": item["submit_price"], "matched_by": "label",
+        }
+    if covered != set(pool):
+        return None
+    return assigned
+
+
+def _match_by_daily(sku_prices, page_rows) -> Optional[dict]:
+    """按【日常价】把页面行配对到成本表货号（平台价与表一致时可用）。
+
+    申报价 = 日常价 × 折扣率，同日常价的货号填的价必然相同，故日常价相同的不必区分身份；
+    但 label 要把它们都列出来——只写其中一个，超参考价时的失败文案就会张冠李戴
+    （真机实测过：40cm 行被写成 50cm）。所以只有在平台价与表一致时这条键才成立。
+    """
+    if not sku_prices or not page_rows:
         return None
     pool: dict = {}
     for item in sku_prices:
         pool.setdefault(round(float(item["daily"]), 2), []).append(item)
+    covered = set()
     assigned = {}
     for row in page_rows:
         daily = row.get("daily")
         if daily is None:
             return None
-        candidates = pool.get(round(float(daily), 2))
-        if not candidates:
+        key = round(float(daily), 2)
+        items = pool.get(key)
+        if not items:
             return None
-        item = candidates.pop()  # 同 daily 的货号 submit_price 相同，任取一个即可
+        covered.add(key)
         assigned[row["idx"]] = {
-            "label": item["label"], "daily": item["daily"],
-            "ref": row.get("ref"), "submit_price": item["submit_price"],
+            "label": "、".join(item["label"] for item in items),
+            "labels": [item["label"] for item in items],
+            "daily": items[0]["daily"], "ref": row.get("ref"),
+            "submit_price": items[0]["submit_price"], "matched_by": "daily",
         }
+    if covered != set(pool):  # 有货号的日常价没有任何页面行覆盖 → 那个货号会漏填
+        return None
     return assigned
 
 
-def match_accel_rows(accel_prices, rows) -> Optional[dict]:
-    """把「调整申报价」对话框的行匹配到成本表货号，返回 {行idx: accel_item} 或 None。
+def match_enroll_rows(sku_prices, page_rows) -> Optional[dict]:
+    """把提报页价格行匹配到成本表货号，返回 {行idx: {label,daily,ref,submit_price}} 或 None。
 
-    加速价 = 各自底价 + 1：同日常价的货号底价可以不同（实测 40cm/50cm 日常价同为
-    188.88、底价 95 vs 160.5），价格键在原理上区分不了，只能靠【货号 label 在页面
-    行文本中唯一命中】配对。货号是卖家自定义文本、平台行里不一定出现；任一货号
-    命中数不为 1（或撞行）→ None，调用方中止不开——错配 = 给错价，不可逆，宁可不开。
+    匹配键是【平台货号】优先、【日常价】兜底（顺序有讲究：货号是身份，日常价只是巧合相同）：
+    ① 用户规则「日常价以表为准」——平台显示的日常价可能过期，不能因为与表不一致就整单不报；
+       真机实测（2026-09-24）一个 2 货号商品就是这样被整单拦下的（表 163.23 / 平台 188.88）。
+    ② 货号字段缺失或中英写法差太大（表「30厘米/0.2kg」对平台「30cm02kg」）时，退回按日常价
+       配对——那种情况下平台价通常与表一致，配对依然成立。
+    两条键都配不齐（行数少于货号数、有行落空、日常价与货号都对不上）→ None，调用方 fail-closed
+    不填价：报错价不可逆，报不上可重试。
     """
-    if not accel_prices or not rows or len(accel_prices) != len(rows):
+    by_label = _match_by_label(sku_prices, page_rows)
+    if by_label is not None:
+        return by_label
+    return _match_by_daily(sku_prices, page_rows)
+
+
+def accel_price_groups(accel_prices) -> dict:
+    """把逐货号加速价合并成「日常价档 → 该档要填的价」。
+
+    档的键用【平台日常价】（platform_daily，从提报页读到的那个），没有才退回表里的日常价：
+    对话框按平台的日常价档列行（实测 2026-09-25：SPU 8791757215 表里两个货号都写 163.23，
+    平台却是 163.23 / 188.88 两档，对话框就给 2 行——用表里的价分组只有 1 档，档数对不上必中止）。
+    同档平台只让填一个价，故取该档【最高底价 + 1】：绝不会低于档内任一货号的底价
+    （便宜的货号加速价被抬高、少拿这部分流量，但不会亏），用户 2026-09-25 拍板的口径。
+    """
+    groups: dict = {}
+    for item in accel_prices or []:
+        key = round(float(item.get("platform_daily") or item["daily"]), 2)
+        group = groups.get(key)
+        if group is None:
+            groups[key] = {"daily": key, "labels": [item.get("label")],
+                           "price": float(item["price"])}
+            continue
+        group["labels"].append(item.get("label"))
+        group["price"] = max(group["price"], float(item["price"]))
+    return groups
+
+
+def match_accel_rows(accel_prices, rows) -> Optional[dict]:
+    """把「调整申报价」对话框的行匹配到【日常价档】，返回 {行idx: 档} 或 None。
+
+    身份键是行文本里的「参考申报价格 + 让价」：两者之和正好是该档的日常价（实测
+    30.27+44.45=74.72、168.67+20.21=188.88）。行数不等于档数、某行的日常价算不出、
+    或与档对不上 → None，调用方中止不开——给错价比不开严重得多（不可逆）。
+    """
+    groups = accel_price_groups(accel_prices)
+    if not groups or not rows or len(rows) != len(groups):
         return None
-    if len(accel_prices) == 1:
-        return {rows[0]["idx"]: accel_prices[0]}
+    if len(groups) == 1:
+        # 单档单行：只有一个价可填，读不出日常价也没有错配对象，直接对应。
+        return {rows[0]["idx"]: next(iter(groups.values()))}
     pairs = {}
-    for item in accel_prices:
-        label = str(item.get("label") or "").strip()
-        # 无货号列时 read_costs 的 label 是「行N」兜底，不可能在页面命中，直接判失败。
-        if not label or re.fullmatch(r"行\d+", label):
+    used = set()
+    for row in rows:
+        daily = row.get("daily")
+        if daily is None:
             return None
-        hits = [row for row in rows if label in (row.get("text") or "")]
-        if len(hits) != 1 or hits[0]["idx"] in pairs:
+        key = round(float(daily), 2)
+        group = groups.get(key)
+        if group is None or key in used:
             return None
-        pairs[hits[0]["idx"]] = item
+        used.add(key)
+        pairs[row["idx"]] = group
+    if len(pairs) != len(groups):
+        return None
     return pairs
+
+
+def accel_price_hint(suggested_daily, sku_prices) -> str:
+    """平台「认可日常价」若与某货号的加速价（底价+1）吻合 → 前端售价是被加速器压住的。
+
+    实测 2026-09-25：某商品加速价设为 64.0 / 98.94 后，报名页的参考价变成
+    57.6 / 89.04（= 加速价 × 0.9 活动折扣），按表里日常价算的申报价必然超——因为
+    「加速器一开，前端显示价以加速价为准」，而活动申报上限是按前端售价算的。
+    这种失败光说「请核对 Excel 日常价」会把人带偏，得直说是加速器压的。
+    """
+    if suggested_daily is None or not sku_prices:
+        return ""
+    for item in sku_prices:
+        try:
+            accel = round(float(item["sale"]) + 1, 2)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if abs(float(suggested_daily) - accel) <= 0.02:
+            return (f"；该数值与货号{item['label']}的加速价 {accel} 吻合——该商品前端售价很可能"
+                    f"已被加速价压低（加速器一开，前端显示价以加速价为准），"
+                    f"请先在流量页关闭加速器再报名")
+    return ""
+
+
+def summarize_over_ref(over_rows, discount_rate, sku_prices=None) -> dict:
+    """把「逐行超参考价」整理成人能读的文案：同一货号 + 同一参考价只写一条并带行数。
+
+    为什么必须去重：提报页按平台 SKC 列行（实测一个货号两行、3 货号 6 行），不去重的话
+    同一个原因会在失败文案里重复三四遍，操作者反而看不出到底几行有问题、是哪个货号。
+    over_rows: [(assigned_item, ref)]，assigned_item 见 match_enroll_rows 的返回。
+    sku_prices 给定时，若平台的「认可日常价」与某货号加速价吻合，会在文案里点明是加速器压的。
+    返回 {"notes":[str], "ref_price", "daily_price", "suggested_daily_price"}。
+    """
+    groups: dict = {}
+    for item, ref in over_rows:
+        key = (item["label"], item["daily"], item["submit_price"], ref)
+        groups[key] = groups.get(key, 0) + 1
+    notes = []
+    first = {}
+    for (label, daily, submit_price, ref), count in groups.items():
+        note = build_over_ref_note(submit_price, ref, daily, discount_rate)
+        # 行数标在货号后面：build_over_ref_note 的文案自带「——已跳过未报名」结尾，别再追加尾巴。
+        head = f"货号{label}" + (f"（{count} 行）" if count > 1 else "")
+        hint = accel_price_hint(note.get("suggested_daily_price"), sku_prices)
+        notes.append(f"{head}：{note['note']}{hint}")
+        if not first:
+            first = {"ref_price": ref, "daily_price": daily,
+                     "suggested_daily_price": note.get("suggested_daily_price")}
+    return {"notes": notes, **first}
+
+
+def match_keys_desc(rows) -> str:
+    """把页面行汇成「货号(日常价)」一句，供匹配失败时人工核对（货号可能读不到）。"""
+    return "、".join(
+        f"{row.get('label') or '行' + str(row['idx'])}({row.get('daily')})" for row in rows)
+
+
+def rows_text_desc(rows, limit: int = 220) -> str:
+    """把行文本摘要成一句（截断到 limit）写进失败 note。
+
+    平台行结构只能实测得知：读不到日常价/归属不明时，把页面实际文本带出来，人一眼就能
+    看出是哪一层结构变了，不用再跑一轮抓页面。
+    """
+    desc = "；".join(f"[{row.get('idx')}] {(row.get('text') or '')[:60]}" for row in rows)
+    return desc[:limit]
 
 
 # ---- 变更动作：阶段1 全部留桩（绝不在 dry-run 里被调用）------------------------
 # 安全约束：真实商家账号、操作不可逆。阶段3 才实现，实现时每步须先 verify_state 确认幂等、
 # 失败即停不硬闯。阶段1/dry-run 分支绝不调用以下任一函数。
 # 在流量页某 SPU 行内标记指定文案的操作 a（查看效果/立即开启），供点击。
+# 开启加速器的入口文案随商品状态变（实测 2026-09-24）：待开启的是「立即开启」，
+# 待关注的是「报名流量加速器」。按顺序试，命中即用。
+ACCEL_ENTRY_WORDS = ("立即开启", "报名流量加速器")
 _MARK_ROW_ACTION_JS = r"""
 (args) => {
   const [spu, word] = args;
+  const norm = s => (s || '').replace(/\s+/g, '');
+  const hit = el => (el.textContent || '').replace(/\s+/g, '').includes(norm(word));
+  // ① 同一容器内找（容器文本同时含 SPU ID 与目标文案）
   const all=[...document.querySelectorAll('div,tr,td,section')];
   let best=null,min=1e9;
   for(const el of all){
@@ -1067,12 +1250,65 @@ _MARK_ROW_ACTION_JS = r"""
     if(t.indexOf(word)<0) continue;
     if(t.length<min){min=t.length;best=el;}
   }
-  if(!best) return null;
-  const a=[...best.querySelectorAll('a,button,[role="button"]')]
-    .find(e=>(e.textContent||'').replace(/\s+/g,'').includes(word.replace(/\s+/g,'')));
-  if(!a) return null;
-  a.setAttribute('data-kiro-act','1');
-  return (best.innerText||'').replace(/\s+/g,' ').trim().slice(0,60);
+  if(best){
+    const a=[...best.querySelectorAll('a,button,[role="button"]')].find(hit);
+    if(a){a.setAttribute('data-kiro-act','1'); return (best.innerText||'').replace(/\s+/g,' ').trim().slice(0,60);}
+  }
+  // ② 同高查找（这平台的大表左右分栏渲染：SPU 信息列与操作列不在同一 DOM 子树里，
+  //    按容器找必然漏；改成按纵向坐标对齐操作列）。
+  let label=null,lmin=1e9;
+  for(const el of all){
+    const t=el.innerText||'';
+    if(!new RegExp('SPU\\s*ID[：:\\s]*'+spu+'(\\D|$)').test(t)) continue;
+    if(t.length<lmin){lmin=t.length;label=el;}
+  }
+  if(!label) return null;
+  const lr=label.getBoundingClientRect();
+  const cy=(lr.top+lr.bottom)/2;
+  let pick=null,pd=1e9,ptext='';
+  for(const el of document.querySelectorAll('a,button,[role="button"],[class*=btn],[class*=Btn]')){
+    if(!hit(el)) continue;
+    const r=el.getBoundingClientRect();
+    if(r.width===0||r.height===0) continue;
+    const d=Math.abs((r.top+r.bottom)/2-cy);
+    if(d>40) continue;                      // 只认同一条视觉带
+    if(d<pd){pd=d;pick=el;ptext=(el.textContent||'').replace(/\s+/g,'').slice(0,40);}
+  }
+  if(!pick) return null;
+  pick.setAttribute('data-kiro-act','1');
+  return '同高命中：'+ptext;
+}
+"""
+
+# 找不到操作入口时把该 SPU 那行的【加速器列】文本带回来：用来区分「页面结构变了」和「平台本来
+# 就没给这个入口」（实机 2026-09-24：该行加速器列写「商品流量待关注 / 您可加速提效 / 报名流量
+# 加速器」，而没有「立即开启」）。只读。
+# 为什么按坐标取：这平台的大表左右分栏渲染，加速器列与 SPU 信息列不在同一 DOM 子树里，
+# 按「含 SPU ID 的最小容器」取只会拿到「SPU ID：xxx」这几个字，什么也说明不了。
+_ROW_TEXT_JS = r"""
+(spu) => {
+  const re = new RegExp('SPU\\s*ID[：:\\s]*' + spu + '(\\D|$)');
+  const all = [...document.querySelectorAll('div,tr,td,section')];
+  let label = null, min = 1e9;
+  for (const el of all) {
+    const t = el.innerText || '';
+    if (!re.test(t) || t.length > 600) continue;
+    if (t.length < min) { min = t.length; label = el; }
+  }
+  if (!label) return '';
+  const r = label.getBoundingClientRect();
+  const cy = (r.top + r.bottom) / 2;
+  const parts = [];
+  for (const el of document.querySelectorAll('*')) {
+    const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
+    if (!own || own.length > 30) continue;
+    if (!/加速|开启|关注/.test(own)) continue;
+    const b = el.getBoundingClientRect();
+    if (b.width === 0 || b.height === 0) continue;
+    if (Math.abs((b.top + b.bottom) / 2 - cy) > 40) continue;
+    if (parts.indexOf(own) < 0) parts.push(own);
+  }
+  return parts.slice(0, 4).join(' / ').slice(0, 120);
 }
 """
 
@@ -1533,6 +1769,31 @@ _CLICK_ACTIVITY_RULE_JS = r"""
 """
 
 
+async def sweep_late_detail_tabs(ctx, initial_before, tries: int = 12, interval: float = 0.5) -> list:
+    """关掉「本次调用之后才出现」的迟到提报页（detail-new），返回被关页的 URL 列表。
+
+    平台有时在 open_enroll_page 放弃【之后】才把提报页开出来（实测 2026-09-25：三次都
+    「未捕获到新 tab」，事后浏览器里却多出 3 个 detail-new 页签）。这些页会一直堆着，还会让
+    下一次运行的区域确认失败（提报页没有顶栏区域切换器，被当成「读不到区域」）。
+    只关本次调用后新出现的页签（initial_before 快照之外的），绝不碰操作者原本打开的页面。
+    """
+    for _ in range(max(1, tries)):
+        late = [p for p in ctx.pages
+                if "detail-new" in (getattr(p, "url", "") or "")
+                and all(p is not old for old in initial_before)]
+        if late:
+            closed = []
+            for page in late:
+                try:
+                    await page.close()
+                    closed.append(getattr(page, "url", ""))
+                except Exception:
+                    pass
+            return closed
+        await asyncio.sleep(interval)
+    return []
+
+
 async def open_enroll_page(activity_page, activity_name, timeout_s=25):
     """从活动页打开指定活动的提报页(detail-new) tab 并返回该 Page（未填未提交、可逆）。
 
@@ -1552,6 +1813,7 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
     # 故把「标记→点报名→同意规则→diff 认新 tab」整段包 3 次重试，每次用较短认 tab 超时，
     # 失败即重新标记再点，而非一次等满超时。
     per_try_s = max(6, int(timeout_s / 3))
+    initial_before = list(ctx.pages)  # 收尾清场用：只关本次尝试后新出现的页
     for attempt in range(3):
         # 所有活动提报页 URL 都相同，必须按 Page 对象身份识别新标签，不能按 URL diff。
         before = list(ctx.pages)
@@ -1644,6 +1906,10 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
                     pass
         await asyncio.sleep(1)
     logger.warning(f"[活动] 重试 3 次仍未捕获提报页 tab：{activity_name}")
+    # 收尾清场：平台有时在本函数放弃【之后】才把提报页开出来，那些迟到页会一直堆着并污染
+    # 下一次运行的区域确认。只关本次调用后新出现的页签。
+    for url in await sweep_late_detail_tabs(ctx, initial_before):
+        logger.info(f"[活动] 关掉迟到的提报页：{url[:80]}")
     return None
 
 
@@ -1752,11 +2018,15 @@ async def _set_sessions_all(page) -> dict:
 
 
 # 枚举提报页本 SPU 的全部 SKU 价格行：从含「SPU ID: {spu}」的锚点 tr 起向后续兄弟 tr
-# 收集，遇到写着【其它 SPU】的行即停（防越界到别的商品）；无 SPU ID 或同 SPU 的续行都算
-# 本商品的 SKU 行。每个行容器取第一个非 disabled 的 text input（勾选后「活动申报价格」框
-# 才可用），打 data-enroll-sku-idx 标记供 Playwright 逐行填价；行文本解析日常价/参考价供
-# Python 侧与成本表逐行匹配。多 SKU 的行结构未实测（2026-09-21）：读不到行/行数与成本表
-# 货号数对不上时 Python 侧 fail-closed 不填价，最坏是报不上，不会报错价。
+# 收集，遇到写着【其它 SPU】的行即停（防越界到别的商品）；锚点行本身就是第一个货号的价格行。
+# 每个行容器取【第一个空的】可填 text input（勾选后「活动申报价格」框才可用），打
+# data-enroll-sku-idx 标记供 Playwright 逐行填价；行文本解析日常价/参考价供 Python 侧匹配。
+# 为什么必须挑「空的」而不是「第一个」（2026-09-24 真机 dump 教训）：一行里有多个 text input
+# ——申报价（空）+ 参考库存/销售库存（预填 30 那种）。取第一个纯属侥幸命中；万一列序变了，
+# 就会把价格填进库存框并被提交。取空框既避开预填的库存，也容得下列序变化；一个空框都没有
+# 时标 fillable=False，由 Python 侧 fail-closed 报「该行没有可填的申报价框」。
+# 实测（2026-09-24）：行是平台 SKC 粒度，一个货号多款式时会有多行（3 货号的商品出现 6 个
+# 价格行），故行数不与货号数比对，改按日常价配对（见 match_enroll_rows）。
 _MARK_ENROLL_SKU_ROWS_JS = r"""
 (spu) => {
   const target = String(spu);
@@ -1788,16 +2058,103 @@ _MARK_ENROLL_SKU_ROWS_JS = r"""
     if (!inputs.length) continue;
     const text = norm(tr.innerText);
     const idx = rows.length;
-    inputs[0].setAttribute('data-enroll-sku-idx', String(idx));
+    const blank = inputs.find(x => !(x.value || '').trim());
+    if (blank) blank.setAttribute('data-enroll-sku-idx', String(idx));
+    // 平台货号：行里有「货号: xxx」（SKU 属性列）与「货号:xxx」（真正的货号字段）两处，
+    // 取最后一处；它是对上成本表货号的身份键，比日常价可靠（表与平台价可能不一致）。
+    const labels = [...text.matchAll(/货号[:：]\s*([^\s]+)/g)];
     rows.push({
       idx,
       daily: priceOf(text, ['日常价', '供货价', '售价', '现价']),
       ref: priceOf(text, ['参考价']),
+      label: labels.length ? labels[labels.length - 1][1] : '',
+      text: text.slice(0, 120),
+      fillable: !!blank,
     });
   }
   return {rows};
 }
 """
+
+
+async def probe_detail_eligibility(page, spu, on_step=None) -> dict:
+    """提报页只读资格探测：定位 SPU 搜索框 → 填 SPU → 点「查询」→ 等结果行数。
+
+    从 `enroll_activity` 的搜索段原样抽出，供两处共用同一份判定：
+    - 报名（enroll_activity）：探测通过后继续勾选/场次/填价；
+    - 识别扫描（service.scan_activity_matrix）：只想拿资格、不勾选不填价。
+    判据只能有一份实现——资格要落盘当天复用，两边判定不一致就是脏数据。
+
+    返回 {"queried": bool, "detail_eligible": bool|None, "failed_step": str|None, "note": str}：
+    True  = 查询后目标行恰为 1（详情页可报名）；
+    False = 行数为 0（平台正常业务结果：列表页价格初筛通过不等于详情资格通过）；
+    None  = fail-closed（未定位搜索框 / 未点到查询 / 行数非唯一 / 异常）。
+    不勾选、不设场次、不填价、不提交，任何分支都不点按钮。
+    """
+    async def report(step, ok, note=""):
+        if on_step is not None:
+            await on_step({"step": step, "ok": bool(ok), "note": note})
+
+    out = {"queried": False, "detail_eligible": None, "failed_step": None, "note": ""}
+
+    # 1. 搜索 SPU（过滤出目标行）。详情页 domcontentloaded 后搜索区(「SPU ID」标签框)仍异步
+    #    渲染，须轮询等其出现再搜（否则立即 evaluate 得 no-label）。
+    loc = "no-label"
+    for _ in range(20):  # 最多等 ~10s
+        loc = await page.evaluate(_SEARCH_SPU_JS, str(spu))
+        if loc == "ok":
+            break
+        await asyncio.sleep(0.5)
+    if loc != "ok":
+        out["failed_step"] = "input_spu"
+        out["note"] = f"未定位到 SPU 搜索框（{loc}）"
+        await report("input_spu", False, out["note"])
+        return out
+    try:
+        await page.locator('[data-kiro-spu="1"]').fill(str(spu))
+        await report("input_spu", True, f"已输入 {spu}")
+        await asyncio.sleep(0.4)
+        query_clicked = await page.evaluate(
+            r"""() => { for (const b of document.querySelectorAll('button')) {"""
+            r"""if ((b.textContent||'').replace(/\s+/g,'') === '查询') { b.click(); return true; } } return false; }"""
+        )
+        if not query_clicked:
+            out["failed_step"] = "query"
+            out["note"] = "未点到「查询」按钮"
+            await report("query", False, out["note"])
+            return out
+    except Exception as e:
+        out["failed_step"] = "query"
+        out["note"] = f"搜索 SPU 异常：{e}"
+        await report("query", False, out["note"])
+        return out
+
+    # 2. 目标行须唯一（防呆：搜索后结果非唯一/为 0 一律跳过，绝不误报）
+    row = page.locator("tr").filter(has_text=f"SPU ID: {spu}")
+    n = 0
+    for _ in range(20):
+        n = await row.count()
+        if n == 1:
+            break
+        await asyncio.sleep(0.5)
+    if n == 0:
+        out["queried"] = True
+        out["detail_eligible"] = False
+        out["note"] = (
+            "详情页查询结果为 0：该 SPU 不在本活动可报名商品列表中"
+            "（列表页价格初筛通过不等于详情资格通过）"
+        )
+        await report("query", True, out["note"])
+        return out
+    if n != 1:
+        out["failed_step"] = "query"
+        out["note"] = f"搜索后定位行数={n}（非唯一），保守跳过"
+        await report("query", False, out["note"])
+        return out
+    out["queried"] = True
+    out["detail_eligible"] = True
+    await report("query", True, "查询结果唯一")
+    return out
 
 
 async def enroll_activity(
@@ -1807,10 +2164,11 @@ async def enroll_activity(
     """在提报页(detail-new)给某 SPU 搜索→勾选→设置场次(全选)→逐货号填申报价；allow_submit=False 停在提交前。
 
     sku_prices：成本表逐货号价格 [{label, daily, sale, submit_price}]（submit_price 由
-    规划层按 各自日常价×折扣率 算好）。一个 SPU 可有多个货号——页面价格行数必须等于货号
-    数、各行日常价必须与成本表多重集合对上（match_enroll_rows），任一不满足都 fail-closed
-    不填价（报错价不可逆，报不上可重试）。单货号是 n=1 特例；页面行读不到日常价时单货号
-    无错配对象，只校验参考价直接填。
+    规划层按 各自日常价×折扣率 算好）。提报页价格行是平台 SKC 粒度、可能一行货号对应多行
+    （实测 3 货号的商品 6 个价格行），故不按行数比对，而是逐行按【该行自身日常价】配到成本表
+    货号（match_enroll_rows）后填各自申报价；页面日常价与成本表对不上、或某个货号无行覆盖，
+    一律 fail-closed 不填价（报错价不可逆，报不上可重试）。单货号单行是 n=1 特例；该行读不到
+    日常价时无错配对象，只校验参考价直接填。
     discount_rate 仅在超参考价时反推「建议核对的日常价」写进失败 note，可缺省。
 
     page 须为该活动已打开的 detail-new 提报页。实测操作序列（2026-07-17 半程试点验证）：
@@ -1836,63 +2194,21 @@ async def enroll_activity(
         if on_step is not None:
             await on_step({"step": step, "ok": bool(ok), "note": note})
 
-    # 1. 搜索 SPU（过滤出目标行）。详情页 domcontentloaded 后搜索区(「SPU ID」标签框)仍异步
-    #    渲染，须轮询等其出现再搜（否则立即 evaluate 得 no-label）。
-    loc = "no-label"
-    for _ in range(20):  # 最多等 ~10s
-        loc = await page.evaluate(_SEARCH_SPU_JS, str(spu))
-        if loc == "ok":
-            break
-        await asyncio.sleep(0.5)
-    if loc != "ok":
-        result["failed_step"] = "input_spu"
-        result["note"] = f"未定位到 SPU 搜索框（{loc}）"
-        await report("input_spu", False, result["note"])
-        return result
-    try:
-        await page.locator('[data-kiro-spu="1"]').fill(str(spu))
-        await report("input_spu", True, f"已输入 {spu}")
-        await asyncio.sleep(0.4)
-        query_clicked = await page.evaluate(
-            r"""() => { for (const b of document.querySelectorAll('button')) {"""
-            r"""if ((b.textContent||'').replace(/\s+/g,'') === '查询') { b.click(); return true; } } return false; }"""
-        )
-        if not query_clicked:
-            result["failed_step"] = "query"
-            result["note"] = "未点到「查询」按钮"
-            await report("query", False, result["note"])
-            return result
-    except Exception as e:
-        result["failed_step"] = "query"
-        result["note"] = f"搜索 SPU 异常：{e}"
-        await report("query", False, result["note"])
-        return result
+    # 1-2. 搜索 SPU 并判资格（判定实现在 probe_detail_eligibility，识别扫描共用同一份）。
+    async def probe_step(event):
+        await report(event["step"], event["ok"], event["note"])
 
-    # 2. 目标行须唯一（防呆：搜索后结果非唯一/为 0 一律跳过，绝不误报）
-    row = page.locator("tr").filter(has_text=f"SPU ID: {spu}")
-    n = 0
-    for _ in range(20):
-        n = await row.count()
-        if n == 1:
-            break
-        await asyncio.sleep(0.5)
-    if n == 0:
-        result["queried"] = True
-        result["detail_eligible"] = False
-        result["note"] = (
-            "详情页查询结果为 0：该 SPU 不在本活动可报名商品列表中"
-            "（列表页价格初筛通过不等于详情资格通过）"
-        )
-        await report("query", True, result["note"])
+    probe = await probe_detail_eligibility(page, spu, on_step=probe_step)
+    result["queried"] = probe["queried"]
+    result["detail_eligible"] = probe["detail_eligible"]
+    if probe["failed_step"]:
+        result["failed_step"] = probe["failed_step"]
+        result["note"] = probe["note"]
         return result
-    if n != 1:
-        result["failed_step"] = "query"
-        result["note"] = f"搜索后定位行数={n}（非唯一），保守跳过"
-        await report("query", False, result["note"])
+    if probe["detail_eligible"] is False:
+        # 平台正常业务结果（列表页初筛通过 ≠ 详情有资格）：不填价、如实回报，由调用方按 info 处理。
+        result["note"] = probe["note"]
         return result
-    result["queried"] = True
-    result["detail_eligible"] = True
-    await report("query", True, "查询结果唯一")
     result["located"] = True
 
     # 勾选商品行（beast 左右分表，按 y 对齐点可见 wrapper）
@@ -1920,7 +2236,7 @@ async def enroll_activity(
     #    实测教训（2026-07-20）：Excel 日常价可能与商品前端实际售价不一致——参考价按前端
     #    实际售价×折扣给出，若 Excel 日常价偏高，按 Excel 算的申报价会超过参考价，提交必被
     #    平台拒。此处【不擅自改价重报】，而是【记失败、清晰上报】交人核对。
-    #    多货号同理：行数/日常价对不上说明「成本表货号 ≠ 平台 SKU」，填价必错，保守不填。
+    #    多货号/多款式同理：页面日常价与成本表对不上，说明「成本表价格 ≠ 平台价格」，填价必错，保守不填。
     info = None
     for _ in range(6):
         info = await page.evaluate(_MARK_ENROLL_SKU_ROWS_JS, str(spu))
@@ -1934,35 +2250,48 @@ async def enroll_activity(
         result["note"] = "提报页未识别到 SKU 价格输入行"
         await report("match_sku", False, result["note"])
         return result
-    if len(rows) != n:
+    unfillable = [row["idx"] for row in rows if not row.get("fillable", True)]
+    if unfillable:
+        # 行里所有文本输入框都已有值：可能是页面结构变了、也可能是上一轮已填过。
+        # 不猜、不覆盖，如实说不填（报不上比填错字段好——库存框也在这一行里）。
         result["failed_step"] = "match_sku"
-        result["note"] = (f"提报页价格行数 {len(rows)} 与成本表货号数 {n} 不一致——"
-                          f"请核对成本表是否缺/多货号，保守不填价")
+        result["note"] = (f"提报页价格行 {unfillable} 没有空的申报价输入框"
+                          f"（可能已填过或页面结构变了），保守不填价"
+                          f"（行文本：{rows_text_desc(rows)}）")
         await report("match_sku", False, result["note"])
         return result
-    # n==1 且页面行读不到日常价：只有一个框一个价、无错配对象，退回只校验参考价的旧路径。
-    if n == 1 and rows[0].get("daily") is None:
+    # 行数不要求等于货号数：提报页价格行按平台 SKC 列出（款式×尺码），多款式时是货号数的
+    # 整数倍（实测 2026-09-24：3 货号的商品 6 个价格行）。归口判定交给 match_enroll_rows——
+    # 每个页面行的日常价都必须能在成本表找到、且每个货号都至少被一行覆盖；逐行按该行自身
+    # 日常价填价，配不上就一行不填（fail-closed）。
+    # n==1 且页面只有一行、且读不到日常价：只有一个框一个价、无错配对象，退回只校验参考价的旧路径。
+    if n == 1 and len(rows) == 1 and rows[0].get("daily") is None:
         assigned = {rows[0]["idx"]: {**sku_prices[0], "ref": rows[0].get("ref")}}
     else:
         unreadable = [row["idx"] for row in rows if row.get("daily") is None]
         if unreadable:
             result["failed_step"] = "match_sku"
             result["note"] = (f"提报页价格行 {unreadable} 读不到日常价，"
-                              f"多货号无法逐行匹配，保守不填价")
+                              f"无法按日常价逐行配对，保守不填价"
+                              f"（行文本：{rows_text_desc(rows)}）")
             await report("match_sku", False, result["note"])
             return result
         assigned = match_enroll_rows(sku_prices, rows)
         if assigned is None:
             result["failed_step"] = "match_sku"
-            result["note"] = (f"提报页行日常价 {[row.get('daily') for row in rows]} "
-                              f"与成本表货号日常价 {[it['daily'] for it in sku_prices]} 对不上"
-                              f"——请核对成本表，保守不填价")
+            cost_desc = "、".join(f"{it['label']}({it['daily']})" for it in sku_prices)
+            result["note"] = (
+                f"提报页 {len(rows)} 个价格行（{match_keys_desc(rows)}）与成本表 {n} 个货号"
+                f"（{cost_desc}）的货号与日常价都对不上——请核对成本表，保守不填价"
+                f"（行文本：{rows_text_desc(rows)}）")
             await report("match_sku", False, result["note"])
             return result
     result["ref_price"] = rows[0].get("ref") if n == 1 else None
 
     # 5. 逐行参考价校验（平台硬约束：申报价不可大于参考价）。任一行超价都 all-or-nothing
     #    一行不填——部分货号填上、部分没填就提交，等于按残缺价格报名。
+    #    同一格会出现在多行里（提报页按 SKC 列出，实测一个货号两行），失败原因必须按
+    #    「货号 + 参考价」去重后带上行数，否则同一句话在文案里重复三四遍。
     over = []
     for row in rows:
         a = assigned[row["idx"]]
@@ -1972,17 +2301,11 @@ async def enroll_activity(
     if over:
         result["over_ref"] = True
         result["failed_step"] = "fill_price"
-        notes = []
-        for a, ref in over:
-            o = build_over_ref_note(a["submit_price"], ref, a["daily"], discount_rate)
-            notes.append(f"货号{a['label']}：{o['note']}")
-        first_over, first_ref = over[0]
-        result["ref_price"] = first_ref
-        result["suggested_daily_price"] = build_over_ref_note(
-            first_over["submit_price"], first_ref, first_over["daily"], discount_rate,
-        ).get("suggested_daily_price")
-        result["current_daily_price"] = first_over["daily"]
-        result["note"] = "；".join(notes)
+        summary = summarize_over_ref(over, discount_rate, sku_prices=sku_prices)
+        result["ref_price"] = summary.get("ref_price")
+        result["suggested_daily_price"] = summary.get("suggested_daily_price")
+        result["current_daily_price"] = summary.get("daily_price")
+        result["note"] = "；".join(summary["notes"])
         await report("fill_price", False, result["note"])
         return result
 
@@ -1993,6 +2316,15 @@ async def enroll_activity(
         try:
             await inp.click()
             await inp.fill(str(a["submit_price"]))
+            # 回读校验：React 受控输入可能把我们的写入吞掉（不报错但值没进去），
+            # 只捕获异常是不够的——「写了但没生效」必须当成填价失败，绝不当作已填。
+            back = (await inp.input_value() or "").strip()
+            if back != str(a["submit_price"]):
+                result["failed_step"] = "fill_price"
+                result["note"] = (f"填写第 {k} 行（货号{a['label']}）申报价未生效："
+                                  f"写入 {a['submit_price']} 但读回 {back!r}")
+                await report("fill_price", False, result["note"])
+                return result
         except Exception as exc:
             result["failed_step"] = "fill_price"
             result["note"] = f"填写第 {k} 行（货号{a['label']}）申报价失败：{exc}"
@@ -2002,13 +2334,26 @@ async def enroll_activity(
     result["sku_rows"] = [{
         "idx": row["idx"], "label": assigned[row["idx"]]["label"],
         "daily": assigned[row["idx"]]["daily"],
+        "platform_daily": row.get("daily"),
         "submit_price": assigned[row["idx"]]["submit_price"],
         "ref": assigned[row["idx"]].get("ref"),
     } for row in rows]
+    # 平台侧每个货号的真实日常价：后续加速器对话框按【平台日常价档】列行，要用它配对上
+    # （表里的日常价可能被人工填错/过期，实测 8791757215 就差了 25 元）。
+    result["platform_daily"] = {}
+    for row in rows:
+        value = row.get("daily")
+        if value is None:
+            continue
+        for label in (assigned[row["idx"]].get("labels") or [assigned[row["idx"]]["label"]]):
+            result["platform_daily"][label] = value
     if n == 1:
         prices_desc = str(sku_prices[0]["submit_price"])
     else:
         prices_desc = "、".join(f"{it['label']} {it['submit_price']}" for it in sku_prices)
+    if len(rows) > n:
+        # 提报页行多于货号数（同一货号的多个款式）：把实际填了几行一并报出来供核对。
+        prices_desc += f"（提报页 {len(rows)} 个价格行）"
     await report("fill_price", True, f"已填写 {prices_desc}")
 
     if not allow_submit:
@@ -2195,12 +2540,41 @@ async def submit_enroll_page(page, allow=False, feedback_tries=20) -> dict:
                 }
         else:
             blocked_polls = 0
+    # 点了提交却既没弹二次确认、也没抓到成功/失败提示（实测 2026-09-25：平台侧最终 0 条记录）。
+    # 这时页面往往有行内报错（资格/站点/库存/价格），但不在 toast 里 → 抓一次现场写进 note，
+    # 否则只剩「已点击提交」这句没法定位原因。
+    scene = ""
+    try:
+        scene = await page.evaluate(_SUBMIT_SCENE_JS)
+    except Exception:
+        scene = ""
+    tail = f"（提交后页面现场：{scene}）" if scene else ""
     return {
         "submitted": True, "verified": False, "clicked_submit": True,
-        "confirmed": confirmed,
+        "confirmed": confirmed, "scene": scene,
         "note": ("已点击提交并确认，未捕获明确结果提示" if confirmed
-                 else "已点击提交，等待期间未出现二次确认或明确结果提示"),
+                 else "已点击提交，等待期间未出现二次确认或明确结果提示") + tail,
     }
+
+
+# 提交后没回执时抓页面现场：URL + 含「报错关键词」的短句（行内校验/资格提示多半长这样）。
+_SUBMIT_SCENE_JS = r"""
+() => {
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+  const keys = /失败|错误|异常|不可|不能|已结束|已过期|库存不足|不符合|无资格|不支持|超出|请选择|请填写|请设置/;
+  const hits = [];
+  for (const el of document.querySelectorAll('*')) {
+    const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('');
+    const t = norm(own);
+    if (!t || t.length > 60 || !keys.test(t)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    if (hits.indexOf(t) < 0) hits.push(t);
+    if (hits.length >= 4) break;
+  }
+  return (hits.join(' / ') + ' @ ' + location.pathname).slice(0, 200);
+}
+"""
 
 
 # 在开启弹窗里选「超级流量加权」档卡片（用户规则 2026-07-17：加速统一选超级档）。
@@ -2264,9 +2638,9 @@ async def _select_super_tier(page, tries=20) -> bool:
     return False
 
 # 在「调整申报价」对话框里，给每个含「参考申报价格」的行的可填输入框打 data-accel-idx 标记，
-# 返回 [{idx, ref, text, current}]（ref=该行参考申报价格上限；text=行容器文本、current=输入框
-# 当前值，供多货号按货号 label 匹配行）。Python 侧据此逐行填价（React 友好）并校验
-# 目标价 ≤ ref。多 SKC 会有多行，逐行标记。
+# 返回 [{idx, ref, daily, text, current}]。ref=该行参考申报价格上限；daily=该行所属【日常价档】
+# （= 参考申报价格 + 让价，实测 30.27+44.45=74.72、168.67+20.21=188.88，这是行的身份键，
+# 因为对话框按日常价档列行、不是按货号）；text=行容器文本、current=输入框当前值。
 _MARK_PRICE_INPUTS_JS = r"""
 () => {
   const rows = [];
@@ -2283,9 +2657,14 @@ _MARK_PRICE_INPUTS_JS = r"""
         const key = (r.innerText || '').slice(0, 80);
         if (seen.has(key)) break;
         seen.add(key);
-        const m = (r.innerText || '').match(/参考申报价格[：:]\s*¥?\s*([\d.]+)/);
+        const text = r.innerText || '';
+        const mRef = text.match(/参考申报价格[：:]\s*¥?\s*([\d.]+)/);
+        const mCut = text.match(/让价\s*¥?\s*([\d.]+)/);
+        const ref = mRef ? Number(mRef[1]) : null;
+        const cut = mCut ? Number(mCut[1]) : null;
         ins[0].setAttribute('data-accel-idx', String(idx));
-        rows.push({ idx, ref: m ? Number(m[1]) : null,
+        rows.push({ idx, ref: ref,
+                    daily: (ref !== null && cut !== null) ? Math.round((ref + cut) * 100) / 100 : null,
                     text: (r.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200),
                     current: ins[0].value || '' });
         idx++;
@@ -2300,18 +2679,21 @@ _MARK_PRICE_INPUTS_JS = r"""
 
 
 async def _set_accel_prices(page, accel_prices) -> dict:
-    """在「调整申报价」对话框逐行填加速价（每货号 = 各自底价+1，须 ≤ 每行参考价）。
+    """在「调整申报价」对话框逐行填加速价（每【日常价档】= 该档最高底价+1，须 ≤ 每行参考价）。
 
-    accel_prices: [{label, daily, sale, price}]。多货号必须先靠货号 label 把对话框行
-    匹配到货号（match_accel_rows）：行数不等 → count_mismatch；匹配不上 → match_failed；
-    调用方对这两种都中止不开（给错价比不开严重得多）。逐行超参考价的行不填、计入 over。
+    accel_prices: [{label, daily, sale, price}]（逐货号传入，内部按日常价档合并，见
+    accel_price_groups）。对话框按日常价档列行，行身份键是「参考申报价格+让价」= 日常价；
+    行数不等于档数 → count_mismatch；某行对不上档 → match_failed；两种情况调用方都中止不开
+    （给错价比不开严重得多）。逐行超参考价的行不填、计入 over。
     """
     rows = await page.evaluate(_MARK_PRICE_INPUTS_JS)
     base = {"rows_total": len(rows or []), "rows_filled": 0, "rows_over": 0,
-            "over_detail": [], "match": "ok"}
+            "over_detail": [], "match": "ok",
+            # 行文本摘要随结果返回：匹配失败时写进 note，人工能直接看到对话框里是什么行。
+            "rows_desc": rows_text_desc(rows or [], limit=400)}
     if not rows:
         return base
-    if len(rows) != len(accel_prices):
+    if len(rows) != len(accel_price_groups(accel_prices)):
         return {**base, "match": "count_mismatch"}
     pairs = match_accel_rows(accel_prices, rows)
     if pairs is None:
@@ -2319,19 +2701,29 @@ async def _set_accel_prices(page, accel_prices) -> dict:
     filled = 0
     over = []
     for row in rows:
-        item = pairs[row["idx"]]
-        price = item["price"]
+        group = pairs[row["idx"]]
+        price = group["price"]
         ref = row.get("ref")
+        label = "、".join(str(x) for x in group["labels"])
         if ref is not None and float(price) > float(ref):
-            over.append({"idx": row["idx"], "label": item.get("label"), "ref": ref})
+            # 该档的平台上限低于「最高底价+1」：这一档填不进合底价的价 → 整单中止（用户
+            # 2026-09-25 定：不冒险填低价，如实报「上限 < 底价」）。
+            over.append({"idx": row["idx"], "label": label,
+                         "daily": group["daily"], "price": price, "ref": ref,
+                         "reason": "档上限低于该档最高底价+1"})
             continue
         inp = page.locator(f'[data-accel-idx="{row["idx"]}"]').first
         try:
             await inp.click()
             await inp.fill(str(price))
+            back = (await inp.input_value() or "").strip()
+            if back != str(price):
+                over.append({"idx": row["idx"], "label": label, "daily": group["daily"],
+                             "ref": ref, "err": f"回读 {back!r} 与写入不一致"})
+                continue
             filled += 1
         except Exception as e:
-            over.append({"idx": row["idx"], "label": item.get("label"),
+            over.append({"idx": row["idx"], "label": label, "daily": group["daily"],
                          "ref": ref, "err": str(e)[:60]})
     return {**base, "rows_filled": filled, "rows_over": len(over), "over_detail": over}
 
@@ -2341,9 +2733,10 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
     →继续让价「去获取」→「调整申报价」对话框【逐货号】填加速价(=各自底价+1)→确认→
     (授权后)立即加速。accel_prices=None 时退回旧简单路径（只点开启确认）。
 
-    accel_prices: [{label, daily, sale, price}]。多货号时对话框行必须先按货号 label 匹配
-    （match_accel_rows）；行数不等/匹配不上 → 中止不开（fail-closed：同日常价的货号底价
-    可以不同，瞎填就是把高底价货号按低价卖，不可逆）。
+    accel_prices: [{label, daily, sale, price}]。多货号时对话框行必须先按货号 label 归属到
+    成本表货号（match_accel_rows，一行货号可对应多行）；行数少于货号数、或有行归属不到任何
+    货号 → 中止不开（fail-closed：同日常价的货号底价可以不同，瞎填就是把高底价货号按低价卖，
+    不可逆）。
 
     allow=False（默认）只走到最终「立即加速」前不点（半程、可逆）。返回 {state, opened, note,
     price_set}。若该 SPU 已加速（on）→ opened=True(no-op)。
@@ -2368,18 +2761,32 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
         result["note"] = f"加速态={state}，保守不操作"
         return result
 
-    marked = await page.evaluate(_MARK_ROW_ACTION_JS, [str(spu), "立即开启"])
+    # 入口文案随商品状态变（实测 2026-09-24）：待开启的商品是「立即开启」，待关注的是
+    # 「报名流量加速器」（同一行的加速器列还写「商品流量待关注 / 您可加速提效」）。按顺序试，
+    # 命中哪个就用哪个——只认「立即开启」会让待关注的商品永远开不了流量。
+    marked = None
+    entry_word = ""
+    for word in ACCEL_ENTRY_WORDS:
+        marked = await page.evaluate(_MARK_ROW_ACTION_JS, [str(spu), word])
+        if marked:
+            entry_word = word
+            break
     if not marked:
-        result["note"] = "未定位到该行「立即开启」入口"
+        # 带上加速器列的现场文本：平台没给这个入口和页面结构变了是两回事，只报「未定位到」
+        # 操作者分不出来。
+        row_text = await page.evaluate(_ROW_TEXT_JS, str(spu))
+        result["note"] = ("未定位到该行的加速器入口"
+                          + (f"（加速器列：{row_text}）" if row_text else "（也没读到该 SPU 的行）"))
         return result
+    result["entry_word"] = entry_word
 
     # 旧路径：未给 accel_prices → 只点开启确认（兼容老调用/半程探测）。
     if accel_prices is None:
         if not allow:
-            result["note"] = "半程：已定位「立即开启」，未点击（allow=False）"
+            result["note"] = f"半程：已定位「{entry_word}」，未点击（allow=False）"
             return result
         if not await _click_marked(page):
-            result["note"] = "「立即开启」点击失败"
+            result["note"] = f"「{entry_word}」点击失败"
             return result
         await asyncio.sleep(2)
         for word in ("确定", "确认", "立即开启", "开启"):
@@ -2422,31 +2829,40 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
         result["note"] = "「调整申报价」对话框未识别到可填行"
         return result
     if price.get("match") == "count_mismatch":
-        # 对话框行数 ≠ 成本表货号数：成本表货号与平台 SKU 对不上，填价必错 → 中止不开。
+        # 对话框按【日常价档】列行，档数对不上说明成本表与平台的价格结构不一致 → 中止不开。
         await _abort_accel_dialog(page)
         result["match_failed"] = True
-        result["note"] = (f"「调整申报价」行数 {price['rows_total']} 与成本表货号数 "
-                          f"{len(accel_prices)} 不一致，已中止不开（请核对成本表货号）")
+        result["note"] = (f"「调整申报价」有 {price['rows_total']} 行，与成本表的 "
+                          f"{len(accel_price_groups(accel_prices))} 个日常价档对不上，"
+                          f"已中止不开（请核对成本表价格）")
         return result
     if price.get("match") == "match_failed":
-        # 货号 label 未在对话框行文本中唯一命中，无法确定哪行是哪个货号 → 中止不开。
+        # 有行的日常价（参考申报价格+让价）对不上任何一档 → 无法确定填哪个价，中止不开。
         await _abort_accel_dialog(page)
         result["match_failed"] = True
-        result["note"] = ("多货号加速价无法逐行匹配（货号未在页面行中唯一命中），"
-                          "已中止不开——请人工核对或补齐成本表货号列")
+        result["note"] = (f"「调整申报价」{price['rows_total']} 行无法按日常价对上成本表的价格档"
+                          f"（对话框行：{price.get('rows_desc') or '无文本'}），"
+                          f"已中止不开——请人工核对")
         return result
     if price["rows_over"] > 0:
-        # 有行超参考价填不进 → 保守中止，不开（避免开成默认价）。取消退出。
+        # 有档的上限低于「该档最高底价+1」→ 填不进合底价的价，保守中止，不开（避免开成
+        # 默认价或低于底价的价）。取消退出。
         await _abort_accel_dialog(page)
-        result["note"] = (f"加速价高于 {price['rows_over']} 个 SKC 的参考价"
-                          f"（{price['over_detail']}），已中止不开")
+        detail = "；".join(
+            f"日常价 {o.get('daily')} 档（{o.get('label')}）上限 {o.get('ref')} "
+            f"低于该档最高底价+1={o.get('price')}" if o.get("reason") else
+            f"日常价 {o.get('daily')} 档（{o.get('label')}）填价失败：{o.get('err')}"
+            for o in price["over_detail"])
+        result["note"] = f"加速价按日常价档校验后中止不开：{detail}"
         return result
     # 确认调价对话框
     await _click_first_button(page, ("确认", "确定"))
     await asyncio.sleep(1.5)
 
-    price_desc = (str(accel_prices[0]["price"]) if len(accel_prices) == 1
-                  else f"{len(accel_prices)} 个货号各自底价+1")
+    # 加速价按【日常价档】算（同档多货号取最高底价+1），对话框也是一档一行，故这里报档数。
+    groups = accel_price_groups(accel_prices)
+    price_desc = (f"{next(iter(groups.values()))['price']}" if len(groups) == 1
+                  else f"{len(groups)} 个价格档各自底价+1（同档取最高底价）")
     if not allow:
         result["note"] = (f"半程：已选超级档、填加速价 {price_desc}（{price['rows_filled']} 个 SKC）"
                           f"并确认，未点「立即加速」（allow=False）")
@@ -2459,35 +2875,39 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
     if not result["clicked_open"]:
         result["note"] = "未点到最终「立即加速」按钮"
         return result
-    result["opened"] = feedback["status"] == "success"
-    # 成功 toast 抓到即权威判成功。但 toast 是瞬时的：点「立即加速」后页面刷新/toast 一闪而过
-    # 时 _wait_accel_submit_feedback 会返回 unknown（实测 2026-07-24：动作已执行、填价 41，却因
-    # 没抓到成功提示被判失败）。此时不能像旧代码那样直接判未开——回读一次流量页按 SPU 查询，
-    # 用平台列表接口的持久状态（read_accel_state 内部走 /list 接口 + 行「流量加速中」文本）兜底。
-    # 这与本项目「submitted 不可信、必须回查对账」的铁律同构：toast 不权威，接口状态才权威。
-    # 只对 unknown 兜底；busy（火爆）与明确 success 的既有判定不变。
-    verified_by_state = False
-    if not result["opened"] and feedback.get("status") == "unknown":
-        recheck_state = await read_accel_state(page, spu, search=True)
-        if recheck_state == "on":
-            result["opened"] = True
-            verified_by_state = True
-    # 商品行状态快照：opened 时回读一次作非权威快照（兜底路径已读过则复用其结论）。
-    result["row_state_snapshot"] = (
-        "on" if verified_by_state
-        else (await read_accel_state(page, spu) if result["opened"] else "off")
-    )
-    if result["opened"] and verified_by_state:
+    # 最终判据：平台受理（成功提示）+ 回查状态。【实测 2026-09-25 的时序】
+    #   18:29 点「立即加速」→ 成功提示「流量加速成功…」；18:30~18:50 回查该 SPU 仍是
+    #   「开启流量加速器 / 立即开启」（状态 off）；19:0x 再看已是「流量加速中」（状态 on，
+    #   「查看效果」入口也出现了）——**平台生效有延迟（约半小时）**。
+    # 所以：状态读不到「加速中」不能立刻判未开（那会触发外层整轮重试、反复点「立即加速」），
+    # 但要如实把「平台已受理、状态尚未生效」写进 note，让人知道这一格还没落地。
+    # 只有「平台没给成功提示 + 回查也非加速中」才是真的没开成。
+    state_after = "unknown"
+    for attempt in range(3):
+        state_after = await read_accel_state(page, spu, search=True)
+        if state_after == "on":
+            break
+        if attempt < 2:
+            await asyncio.sleep(5)
+    result["row_state_snapshot"] = state_after
+    accepted = feedback["status"] == "success"
+    if state_after == "on":
+        result["opened"] = True
+        tail = f"成功提示：{feedback['message']}" if feedback.get("message") else "回查确认"
         result["note"] = (f"已开启加速、加速价设为 {price_desc}（{price['rows_filled']} 个 SKC，"
-                          f"最终按钮点击 {feedback['clicks']} 次；未捕获成功提示，"
-                          f"但回查流量页确认状态=加速中）")
-    elif result["opened"]:
-        result["note"] = (f"已开启加速、加速价设为 {price_desc}（{price['rows_filled']} 个 SKC，"
-                          f"最终按钮点击 {feedback['clicks']} 次，成功提示：{feedback['message']}）")
+                          f"回查流量页确认状态=加速中；{tail}）")
+    elif accepted:
+        result["opened"] = True
+        result["note"] = (f"已点「立即加速」并收到平台成功提示（{feedback['message']}），"
+                          f"但回查该 SPU 尚未显示加速中——平台生效有延迟（实测约半小时），"
+                          f"已按受理记录；加速价已设为 {price_desc}，"
+                          f"在生效前该商品的活动申报上限仍按加速价算")
     else:
-        result["note"] = (f"最终按钮点击 {feedback['clicks']} 次、填价 {price_desc}；"
-                          f"未捕获成功提示且回查流量页状态非加速中"
-                          f"（{feedback['message'] or feedback['status']}）")
+        result["opened"] = False
+        result["note"] = (f"点「立即加速」{feedback['clicks']} 次"
+                          f"（{feedback.get('message') or feedback.get('status')}），"
+                          f"且回查该 SPU 非加速中，已如实记为【未开启】；"
+                          f"加速价已设为 {price_desc}")
     return result
 
 

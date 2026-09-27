@@ -138,6 +138,9 @@ OUTPUT_SUBDIRS = {
     # 商品发布管线：每品一个 product-<offerId>/ 工作目录，装 raw.json /
     # product-info.json / 主图 / 详情图 / 处理后的合规图。见 app/publish/extract.py
     "publish": "商品发布",
+    # 活动管线的识别矩阵：activity-matrix-<日期>.json，存当天扫出来的
+    # 「商品×活动」资格结论（跨日作废，见 app/activity/matrix.py）
+    "activity": "活动识别矩阵",
 }
 
 

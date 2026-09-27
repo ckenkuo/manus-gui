@@ -95,6 +95,29 @@
         font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         font-size: 0.85rem;
       }
+      /* 识别矩阵：列数随活动数增长、活动名又长，首行与首列必须吸住，否则横向滚动后
+         根本看不出某一格属于哪个商品/哪个活动 */
+      #matrixTable {
+        font-size: 0.8125rem;
+      }
+      #matrixTable th,
+      #matrixTable td {
+        white-space: nowrap;
+        vertical-align: middle;
+      }
+      #matrixTable thead th {
+        position: sticky;
+        top: 0;
+        background: var(--bs-body-bg);
+        z-index: 3;
+      }
+      #matrixTable thead th:first-child,
+      #matrixTable tbody td:first-child {
+        position: sticky;
+        left: 0;
+        background: var(--bs-body-bg);
+        z-index: 2;
+      }
       @media (max-width: 576px) {
         .navbar-brand {
           white-space: normal;
@@ -289,6 +312,69 @@
         </div>
       </div>
 
+      <!-- 活动识别矩阵：先只读扫出「哪个商品能报哪个活动」，人工勾选后再执行 -->
+      <div class="card mb-3" id="matrixCard">
+        <div class="card-body">
+          <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
+            <span class="fw-semibold"><i class="bi bi-grid-3x3-gap"></i> 活动识别矩阵</span>
+            <span id="matrixMeta" class="small text-muted"></span>
+            <div class="form-check form-switch ms-2">
+              <input class="form-check-input" type="checkbox" id="switchForceScan" />
+              <label
+                class="form-check-label small text-muted"
+                for="switchForceScan"
+                title="默认复用当天已扫到的资格（识别很贵，每格 10~20 秒）；开启则忽略缓存全量重探"
+                >强制重扫</label
+              >
+            </div>
+            <div class="form-check form-switch ms-2">
+              <input class="form-check-input" type="checkbox" id="switchAllActivities" />
+              <label
+                class="form-check-label small text-muted"
+                for="switchAllActivities"
+                title="默认只显示有候选（价格初筛通过）的活动列；开启显示活动页上的全部活动"
+                >显示全部活动</label
+              >
+            </div>
+            <button id="btnScan" class="btn btn-outline-primary btn-sm ms-auto">
+              <span
+                id="scanSpinner"
+                class="spinner-border spinner-border-sm d-none"
+                role="status"
+              ></span>
+              <i class="bi bi-search"></i> <span id="scanLabel">识别</span>
+            </button>
+          </div>
+          <div class="table-scroll" style="max-height: 420px; overflow-x: auto">
+            <table class="table table-sm table-bordered align-middle mb-0" id="matrixTable">
+              <thead id="matrixHead"></thead>
+              <tbody id="matrixBody"></tbody>
+            </table>
+          </div>
+          <div class="d-flex flex-wrap gap-2 align-items-center mt-2">
+            <span class="small text-muted" id="matrixSummary">尚未识别</span>
+            <select
+              id="execLevel"
+              class="form-select form-select-sm w-auto ms-auto"
+              title="半程=开提报页并填价，但不提交、不真关/开流量（可逆，适合首次验证）；全程=真提交/真关/真开（不可逆）"
+            >
+              <option value="half">半程（填价不提交）</option>
+              <option value="full">全程（正式提交）</option>
+            </select>
+            <button id="btnExecSel" class="btn btn-primary btn-sm" disabled>
+              <i class="bi bi-play-fill"></i> <span id="execSelLabel">执行选中</span>
+            </button>
+            <button
+              id="btnPause"
+              class="btn btn-warning btn-sm d-none"
+              title="暂停：当前动作收尾后停住，点「继续」从下一个活动接着跑（不打断正在填的商品）"
+            >
+              <i class="bi bi-pause-fill"></i> <span id="pauseLabel">暂停</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
       <!-- 进度条 + 事件日志 -->
       <div class="card mb-3">
         <div class="card-body">
@@ -394,6 +480,8 @@
         sel = { cloud_url: selection.cloud_url, sheet: selection.sheet };
         $("spusInput").value = selection.spus.join("\n");
         updateStartEnabled();
+        // 选定文档/工作表后回读当天识别结果（只读文件，很快；同一份文档只回读一次）
+        loadMatrix();
       });
       // 计划表状态：order 记录 SPU 首次出现顺序；plans[spu] 是「达底价」活动数组（一 SPU 多行）；
       // dones[spu] 存 SPU 级最终状态；activityStates[spu][activity] 存每个活动行的实时状态。
@@ -429,7 +517,7 @@
         return v == null ? "–" : `${(v * 100).toFixed(1)}%`;
       }
 
-      // 未选 Sheet / SPU 清单为空时禁用「开始」
+      // 未选 Sheet / SPU 清单为空时禁用「开始」；识别与「执行选中」各有自己的前置条件
       function updateStartEnabled() {
         const bad = batchRunning || !sel.cloud_url || !sel.sheet || !$("spusInput").value.trim();
         $("btnStart").disabled = bad;
@@ -438,6 +526,10 @@
           : bad
           ? "请先勾选 WPS 文档中的商品"
           : "";
+        $("btnScan").disabled = bad;
+        const picked = cellSelection.size;
+        $("btnExecSel").disabled = batchRunning || !sel.cloud_url || !sel.sheet || !picked;
+        $("execSelLabel").textContent = picked ? `执行选中 ${picked} 格` : "执行选中";
       }
 
       function isExecute() {
@@ -828,6 +920,7 @@
             data.ok ? "" : "text-danger"
           );
         } else if (type === "exec_activity_skip") {
+          // 列表页可报名、点进详情搜不到该 SPU 是平台正常业务结果，按 info 记录，不当错误。
           setActivityStatus(
             data.spu,
             data.activity,
@@ -839,7 +932,7 @@
             `[详情资格] ${data.activity || ""} / SPU=${data.spu}：不可报名，跳过当前活动（${
               data.note || "详情页无可报名商品行"
             }）`,
-            "text-warning"
+            "text-info"
           );
         } else if (type === "exec_fill") {
           const detailSkipped = Boolean(data.ineligible);
@@ -856,20 +949,26 @@
             )}：${data.ok ? "完成" : detailSkipped ? "详情不可报，未填价" : "失败"}${
               data.note ? `（${data.note}）` : ""
             }`,
-            data.ok ? "" : detailSkipped ? "text-warning" : "text-danger"
+            data.ok ? "" : detailSkipped ? "text-info" : "text-danger"
           );
         } else if (type === "exec_enroll") {
           const submitted = Boolean(data.submitted || data.clicked_submit);
           const verified = Boolean(data.verified);
           const feedbackVerified = Boolean(data.feedback_verified);
-          const label = !submitted
-            ? "未提交/失败"
-            : verified
-              ? "报名记录页已确认"
-              : feedbackVerified
-                ? "结果页确认已提交，待报名记录页最终核验"
-                : "已点击提交，待报名记录页最终核验";
           const targets = (data.filled || []).map(String);
+          // 详情页搜不到该 SPU（正常业务结果）：不当「未提交/失败」，按 info 记录并跳过。
+          const detailSkipped =
+            !submitted && !targets.length &&
+            (data.status === "detail_ineligible" || (data.ineligible || []).length > 0);
+          const label = detailSkipped
+            ? "详情无可报名商品，跳过"
+            : !submitted
+              ? "未提交/失败"
+              : verified
+                ? "报名记录页已确认"
+                : feedbackVerified
+                  ? "结果页确认已提交，待报名记录页最终核验"
+                  : "已点击提交，待报名记录页最终核验";
           if (submitted) {
             targets.forEach((spu) =>
               setActivityStatus(
@@ -891,7 +990,13 @@
           }
           logLine(
             `[提交] ${data.activity || ""}：${label}${data.note ? `（${data.note}）` : ""}`,
-            verified ? "text-success" : submitted ? "text-warning" : "text-danger"
+            detailSkipped
+              ? "text-info"
+              : verified
+                ? "text-success"
+                : submitted
+                  ? "text-warning"
+                  : "text-danger"
           );
         } else if (type === "exec_log_verify") {
           const labels = {
@@ -914,7 +1019,7 @@
             `[记录核验] ${data.activity || ""} / SPU=${data.spu}：${
               labels[data.status] || data.status
             }${data.note ? `（${data.note}）` : ""}`,
-            data.ok ? "text-success" : data.status === "detail_ineligible" ? "text-warning" : "text-danger"
+            data.ok ? "text-success" : data.status === "detail_ineligible" ? "text-info" : "text-danger"
           );
         } else if (type === "exec_reopen") {
           const state = ensureAccelState(data.spu);
@@ -998,6 +1103,71 @@
           showToast("活动批次中止", data.reason, "danger");
           $("statusText").textContent = "已中止";
           $("statusText").dataset.final = "1";
+        } else if (type === "scan_start") {
+          // 骨架一次性下发（价格判定是本地算的，零成本），矩阵整体先出现，资格再逐格点亮
+          matrixData = {
+            activities: data.activities || [], cells: data.cells || [],
+            counts: data.counts || {}, generated_at: "", path: data.path || "",
+          };
+          // 上次勾的格子若已不存在（活动下架/换文档），留着只会让「执行选中 N 格」虚高
+          const alive = new Set(matrixCells().map((c) => cellKey(c.spu, c.activity)));
+          [...cellSelection].forEach((key) => {
+            if (!alive.has(key)) cellSelection.delete(key);
+          });
+          saveCellSelection();
+          renderMatrix();
+          logLine(
+            `[识别] ${data.spu_total} 个商品 × ${data.activity_total} 个活动；待探 ${
+              (data.counts || {}).unknown || 0
+            } 格，缓存命中 ${data.cached || 0} 格`,
+            "text-info"
+          );
+        } else if (type === "scan_activity_start") {
+          $("progressLabel").textContent = `${data.index} / ${data.total}`;
+          $("progressBar").style.width =
+            Math.round((data.index / Math.max(1, data.total)) * 100) + "%";
+          logLine(
+            `[识别] 活动「${data.activity}」（${data.index}/${data.total}），待探 ${data.probe_count} 格`
+          );
+        } else if (type === "activity_cell") {
+          upsertCell({
+            spu: data.spu, activity: data.activity, eligible: data.eligible,
+            verdict: data.verdict, from_cache: data.from_cache, note: data.note,
+          });
+          renderMatrix();
+          if (data.verdict === "probe_failed") {
+            logLine(`[识别] ${data.activity} / SPU=${data.spu}：探测失败，未记录（${data.note}）`, "text-warning");
+          }
+        } else if (type === "scan_done") {
+          if (matrixData) {
+            matrixData.counts = { cells: 0, eligible: data.eligible || 0,
+                                  ineligible: data.ineligible || 0, unknown: data.unknown || 0 };
+            matrixData.generated_at = new Date().toLocaleString();
+            matrixData.path = data.path || "";
+          }
+          renderMatrix();
+          logLine(
+            `[识别] 完成：可报 ${data.eligible}、详情无资格 ${data.ineligible}、待识别 ${
+              data.unknown
+            }；结果存于 ${data.path}`,
+            "text-success"
+          );
+        } else if (type === "paused") {
+          $("statusText").textContent = "已暂停";
+          logLine(`已暂停（${data.scope || ""}）：点「继续」接着跑${data.note ? `｜${data.note}` : ""}`, "text-warning");
+        } else if (type === "resumed") {
+          $("statusText").textContent = "已继续";
+          logLine("已继续", "text-info");
+        } else if (type === "pause_refused") {
+          setPauseButton(false);
+          logLine(`暂停被拒：${data.note}`, "text-warning");
+          showToast("不能暂停", data.note || "收尾阶段不可暂停", "warning");
+        } else if (type === "exec_cell_skip") {
+          // 矩阵里把这格标成「已跳过」：跳过是操作者自己的决定，不该显示成平台不可报
+          upsertCell({ spu: data.spu, activity: data.activity, skipped: true, note: data.note });
+          renderMatrix();
+          logLine(`[跳过] ${data.activity} / SPU=${data.spu}：${data.note}`, "text-info");
+          setActivityStatus(data.spu, data.activity, "skipped", "已跳过", data.note || "");
         } else if (type === "log") {
           const cls =
             data.level === "error"
@@ -1009,6 +1179,304 @@
         }
       }
 
+      // ---- 活动识别矩阵：行=SPU、列=活动，勾选要报的格子 ----
+      // 为什么单独一套状态：识别是只读扫描（不填价不提交），与报名批次是两条不同的作业；
+      // 矩阵只管「一眼看清 + 勾选」，执行期的逐格状态仍由下方报名计划表承载（那里已有
+      // activityStates 与徽标体系，不重复造一套）。
+      const MATRIX_SEL_KEY = "activity-matrix-selection-v1";
+      let matrixData = null; // {activities, cells, counts, generated_at, path}
+      let cellSelection = new Set(); // 键 JSON.stringify([spu, activity])
+      let matrixLoadedFor = ""; // 已回读过的「文档|工作表」，避免选择变化时反复请求
+      let currentJobId = null;
+      let paused = false; // 是否已请求暂停（真正停住由后端 paused 事件告知）
+
+      const cellKey = (spu, activity) => JSON.stringify([String(spu), String(activity)]);
+
+      function loadCellSelection() {
+        try {
+          const raw = JSON.parse(localStorage.getItem(MATRIX_SEL_KEY) || "[]");
+          cellSelection = new Set(Array.isArray(raw) ? raw : []);
+        } catch (e) {
+          cellSelection = new Set(); // 隐私模式/存储被禁：退化成内存态，不影响功能
+        }
+      }
+
+      function saveCellSelection() {
+        try {
+          localStorage.setItem(MATRIX_SEL_KEY, JSON.stringify([...cellSelection]));
+        } catch (e) {}
+      }
+
+      function matrixCells() {
+        return (matrixData && matrixData.cells) || [];
+      }
+
+      function cellAt(spu, activity) {
+        const key = cellKey(spu, activity);
+        return matrixCells().find((c) => cellKey(c.spu, c.activity) === key);
+      }
+
+      function upsertCell(patch) {
+        if (!matrixData) matrixData = { activities: [], cells: [], counts: {}, generated_at: "" };
+        const key = cellKey(patch.spu, patch.activity);
+        const i = matrixData.cells.findIndex((c) => cellKey(c.spu, c.activity) === key);
+        if (i >= 0) matrixData.cells[i] = { ...matrixData.cells[i], ...patch };
+        else matrixData.cells.push(patch);
+      }
+
+      // 能勾的条件：价格初筛通过、且详情资格不是「不可报」。未识别的格子可以勾
+      // （执行期开页时会再确认一次资格，真不可报就按 info 跳过）。
+      function cellSelectable(cell) {
+        return Boolean(cell) && cell.verdict === "pass" && cell.eligible !== false;
+      }
+
+      function cellBadge(cell) {
+        if (!cell) return '<span class="text-muted">–</span>';
+        const note = escapeHtml(cell.note || "");
+        if (cell.skipped) return '<span class="badge text-bg-warning" title="已按操作者指令跳过">已跳过</span>';
+        if (cell.verdict === "probe_failed") {
+          return `<span class="badge text-bg-warning" title="${note}">探测失败</span>`;
+        }
+        if (cell.verdict === "under_floor") {
+          return `<span class="badge text-bg-light" title="${note}">价格不达底价</span>`;
+        }
+        if (cell.verdict === "no_rate") {
+          return `<span class="badge text-bg-light" title="${note}">无固定折扣</span>`;
+        }
+        if (cell.verdict === "no_cost") {
+          return `<span class="badge text-bg-secondary" title="${note}">成本表不可用</span>`;
+        }
+        if (cell.eligible === true) {
+          const cache = cell.from_cache ? "（当天缓存）" : "";
+          return `<span class="badge text-bg-success" title="详情页可报名${cache}">可报</span>`;
+        }
+        if (cell.eligible === false) {
+          return `<span class="badge text-bg-secondary" title="${note}">详情无资格</span>`;
+        }
+        return '<span class="badge text-bg-info" title="尚未探测详情资格">待识别</span>';
+      }
+
+      function cellPrice(cell) {
+        if (!cell || cell.verdict !== "pass") return "";
+        return cell.sku_count > 1 ? `${cell.sku_count} 个货号` : fmtNum(cell.submit_price);
+      }
+
+      function matrixSpus() {
+        return [...new Set(matrixCells().map((c) => String(c.spu)))];
+      }
+
+      // 默认只列「有候选」的活动列：活动页有近百个活动，全列出来矩阵没法看
+      function matrixColumns() {
+        const all = ((matrixData && matrixData.activities) || []).map((a) => a.name);
+        if ($("switchAllActivities").checked) return all;
+        const withCandidate = new Set(
+          matrixCells().filter((c) => c.verdict === "pass").map((c) => c.activity)
+        );
+        return all.filter((name) => withCandidate.has(name));
+      }
+
+      function renderMatrix() {
+        const spus = matrixSpus();
+        const cols = matrixColumns();
+        if (!matrixData || (!spus.length && !cols.length)) {
+          $("matrixHead").innerHTML = "";
+          $("matrixBody").innerHTML =
+            '<tr><td class="text-center text-muted py-4">尚未识别：选好商品后点「识别」，只读扫出「商品×活动」矩阵</td></tr>';
+          $("matrixSummary").textContent = "尚未识别";
+          return;
+        }
+        const head = ['<tr><th style="min-width: 130px">SPU \\ 活动</th>'];
+        cols.forEach((name, i) => {
+          head.push(
+            `<th title="${escapeHtml(name)}"><div class="d-flex align-items-center gap-1">
+               <input type="checkbox" class="form-check-input m-0" data-matrix-col="${escapeHtml(name)}" />
+               <span class="cell-ellipsis d-inline-block" style="max-width: 140px">${i + 1}. ${escapeHtml(name)}</span>
+             </div></th>`
+          );
+        });
+        head.push("</tr>");
+        $("matrixHead").innerHTML = head.join("");
+
+        $("matrixBody").innerHTML = spus
+          .map((spu) => {
+            const tds = [
+              `<td><div class="d-flex align-items-center gap-1">
+                 <input type="checkbox" class="form-check-input m-0" data-matrix-row="${escapeHtml(spu)}" />
+                 <span class="small">${escapeHtml(spu)}</span></div></td>`,
+            ];
+            cols.forEach((name) => {
+              const cell = cellAt(spu, name);
+              const key = cellKey(spu, name);
+              tds.push(
+                `<td class="text-center">
+                   <input type="checkbox" class="form-check-input m-0" data-matrix-pick="${escapeHtml(key)}"
+                          ${cellSelection.has(key) ? "checked" : ""} ${cellSelectable(cell) ? "" : "disabled"} />
+                   <div class="small">${cellBadge(cell)}</div>
+                   <div class="small text-muted">${cellPrice(cell)}</div>
+                 </td>`
+              );
+            });
+            return `<tr>${tds.join("")}</tr>`;
+          })
+          .join("");
+        syncMatrixHeaders();
+        const counts = (matrixData && matrixData.counts) || {};
+        const stamp = matrixData && matrixData.generated_at ? `识别于 ${matrixData.generated_at}（仅当天有效）` : "";
+        $("matrixSummary").textContent =
+          `已选 ${cellSelection.size} 格；可报 ${counts.eligible || 0}、详情无资格 ${counts.ineligible || 0}、` +
+          `待识别 ${counts.unknown || 0}。${stamp}`;
+        $("matrixSummary").title = (matrixData && matrixData.path) || "";
+      }
+
+      // 列头/行首的三态全选：与格子勾选保持同步（半选用 indeterminate）
+      function syncMatrixHeaders() {
+        const sync = (box, keys) => {
+          const on = keys.filter((k) => cellSelection.has(k)).length;
+          box.checked = on > 0 && on === keys.length;
+          box.indeterminate = on > 0 && on < keys.length;
+          box.disabled = !keys.length;
+        };
+        document.querySelectorAll("[data-matrix-col]").forEach((box) => {
+          const name = box.getAttribute("data-matrix-col");
+          sync(box, matrixSpus().filter((spu) => cellSelectable(cellAt(spu, name)))
+            .map((spu) => cellKey(spu, name)));
+        });
+        document.querySelectorAll("[data-matrix-row]").forEach((box) => {
+          const spu = box.getAttribute("data-matrix-row");
+          sync(box, matrixColumns().filter((name) => cellSelectable(cellAt(spu, name)))
+            .map((name) => cellKey(spu, name)));
+        });
+      }
+
+      function toggleCells(keys, on) {
+        keys.forEach((k) => (on ? cellSelection.add(k) : cellSelection.delete(k)));
+        saveCellSelection();
+        renderMatrix();
+        updateStartEnabled();
+      }
+
+      function onMatrixChange(box) {
+        if (box.matches("[data-matrix-pick]")) {
+          const key = box.getAttribute("data-matrix-pick");
+          if (box.checked) cellSelection.add(key);
+          else cellSelection.delete(key);
+          saveCellSelection();
+          syncMatrixHeaders();
+          updateStartEnabled();
+          return;
+        }
+        if (box.matches("[data-matrix-col]")) {
+          const name = box.getAttribute("data-matrix-col");
+          return toggleCells(
+            matrixSpus().filter((spu) => cellSelectable(cellAt(spu, name))).map((spu) => cellKey(spu, name)),
+            box.checked
+          );
+        }
+        if (box.matches("[data-matrix-row]")) {
+          const spu = box.getAttribute("data-matrix-row");
+          return toggleCells(
+            matrixColumns().filter((name) => cellSelectable(cellAt(spu, name))).map((name) => cellKey(spu, name)),
+            box.checked
+          );
+        }
+      }
+
+      // 刷新页面后回读当天识别结果（只读文件，不连 CDP、不读成本表）
+      async function loadMatrix() {
+        if (!sel.cloud_url || !sel.sheet) return;
+        const key = `${sel.cloud_url}|${sel.sheet}`;
+        if (key === matrixLoadedFor) return;
+        matrixLoadedFor = key;
+        try {
+          const r = await fetch(
+            `/activity/matrix?cloud_url=${encodeURIComponent(sel.cloud_url)}&sheet=${encodeURIComponent(sel.sheet)}`
+          );
+          if (!r.ok) return;
+          const data = await r.json();
+          matrixData = {
+            activities: data.activities || [], cells: data.cells || [],
+            counts: data.counts || {}, generated_at: data.generated_at || "", path: data.path || "",
+          };
+          renderMatrix();
+          if ((data.activities || []).length) {
+            logLine(
+              `[识别] 已回读当天识别结果（${data.generated_at}）${
+                data.fresh ? "" : "；注意：该结果来自另一份文档或工作表，建议重新识别"
+              }`,
+              data.fresh ? "text-info" : "text-warning"
+            );
+          }
+        } catch (e) {
+          /* best-effort：回读失败不影响识别与执行 */
+        }
+      }
+
+      async function startScan() {
+        if (batchRunning) return;
+        if (!sel.sheet) {
+          showToast("无法识别", "请先选择目标 Sheet", "warning");
+          return;
+        }
+        const spus = $("spusInput").value.trim();
+        if (!spus) {
+          showToast("无法识别", "请先勾选 WPS 文档中的商品", "warning");
+          return;
+        }
+        batchRunning = true;
+        sourcePicker.setRunning(true);
+        delete $("statusText").dataset.final;
+        $("statusText").textContent = "识别中…";
+        $("scanSpinner").classList.remove("d-none");
+        $("scanLabel").textContent = "识别中…";
+        updateStartEnabled();
+        try {
+          const r = await fetch("/activity/scan", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              cloud_url: sel.cloud_url,
+              sheet: sel.sheet,
+              spus,
+              force: $("switchForceScan").checked,
+            }),
+          });
+          const response = await r.json();
+          if (!r.ok) throw new Error(response.error || "启动失败");
+          subscribeJob(response.job_id);
+        } catch (e) {
+          showToast("启动失败", String(e), "danger");
+          finishRun();
+        }
+      }
+
+      function setPauseButton(requested) {
+        paused = requested;
+        $("pauseLabel").textContent = requested ? "继续" : "暂停";
+        $("btnPause").className = requested ? "btn btn-success btn-sm" : "btn btn-warning btn-sm";
+      }
+
+      async function togglePause() {
+        if (!currentJobId) return;
+        const want = !paused;
+        $("btnPause").disabled = true;
+        try {
+          const r = await fetch(`/activity/batch/${currentJobId}/pause`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ paused: want }),
+          });
+          const body = await r.json();
+          if (!r.ok) throw new Error(body.error || "暂停失败");
+          setPauseButton(body.paused);
+          logLine(body.paused ? "已请求暂停：当前动作收尾后停住" : "已请求继续", "text-warning");
+        } catch (e) {
+          setPauseButton(false);
+          showToast("暂停失败", String(e), "warning");
+        } finally {
+          $("btnPause").disabled = false;
+        }
+      }
+
       function finishRun() {
         batchRunning = false;
         sourcePicker.setRunning(false);
@@ -1016,26 +1484,88 @@
           evtSource.close();
           evtSource = null;
         }
+        currentJobId = null;
+        setPauseButton(false);
+        $("btnPause").classList.add("d-none");
         $("startSpinner").classList.add("d-none");
+        $("scanSpinner").classList.add("d-none");
+        $("scanLabel").textContent = "识别";
         if (!$("statusText").dataset.final) $("statusText").textContent = "";
         updateStartEnabled();
       }
 
-      async function startBatch() {
+      // 一个作业的全部事件名：批次与识别共用同一条 SSE 端点（app.py 按 job_id 取队列）
+      const JOB_EVENTS = [
+        "batch_start",
+        "product_start",
+        "product_plan",
+        "product_done",
+        "exec_start",
+        "exec_accel_step",
+        "exec_close",
+        "exec_rpa_step",
+        "exec_activity_skip",
+        "exec_fill",
+        "exec_enroll",
+        "exec_log_verify",
+        "exec_reopen",
+        "exec_product_done",
+        "exec_cell_skip",
+        "exec_done",
+        "scan_start",
+        "scan_activity_start",
+        "activity_cell",
+        "scan_done",
+        "paused",
+        "resumed",
+        "pause_refused",
+        "batch_done",
+        "aborted",
+        "log",
+      ];
+
+      function subscribeJob(jobId) {
+        currentJobId = jobId;
+        evtSource = new EventSource(`/activity/batch/${jobId}/events`);
+        JOB_EVENTS.forEach((ev) =>
+          evtSource.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)))
+        );
+        evtSource.addEventListener("done", () => finishRun());
+        evtSource.onerror = () => {
+          // 流结束或断开：done 事件后浏览器会触发一次 error，忽略即可
+          if (evtSource && evtSource.readyState === EventSource.CLOSED) finishRun();
+        };
+        setPauseButton(false);
+        $("btnPause").classList.remove("d-none");
+        return evtSource;
+      }
+
+      async function startBatch(selection) {
         if (batchRunning) return;
         if (!sel.sheet) {
           showToast("无法开始", "请先选择目标 Sheet", "warning");
           return;
         }
-        const spus = $("spusInput").value.trim();
+        const spus = selection && selection.length
+          ? [...new Set(selection.map((cell) => String(cell[0])))].join("\n")
+          : $("spusInput").value.trim();
         if (!spus) {
           showToast("无法开始", "请先勾选 WPS 文档中的商品", "warning");
           return;
         }
+        if (selection && selection.length) {
+          // 批次只对 spus 里的商品读成本表，勾选的格子必须带上它们的 SPU——否则会因缺 SPU
+          // 整批中止（source 层的安全设计）。回写输入框也让操作者看见实际要跑哪些商品。
+          $("spusInput").value = spus;
+        }
         const execute = isExecute();
+        // 半程/全程：只有勾了「正式执行」才谈得上真动作；半程=填价不提交、不真开关流量。
+        const live = execute && $("execLevel").value === "full";
         // 正式执行为不可逆操作，二次确认后才发
         if (execute && !confirm(
-          "正式执行将对真实商家账号执行不可逆操作（关加速器/报名/重开加速器）。\n确认继续？"
+          live
+            ? "正式执行（全程）将对真实商家账号执行不可逆操作（关加速器/报名/重开加速器）。\n确认继续？"
+            : "半程执行会打开提报页并填写申报价，但不提交、不真关/开流量（可逆）。\n确认继续？"
         )) {
           return;
         }
@@ -1063,39 +1593,13 @@
               sheet: sel.sheet,
               spus,
               dry_run: !execute, // 默认 dry-run；仅「正式执行」勾选才 false
+              live, // 半程 false / 全程 true（dry-run 下无意义）
+              selection: selection && selection.length ? selection : null,
             }),
           });
           const response = await r.json();
           if (!r.ok) throw new Error(response.error || "启动失败");
-          const { job_id } = response;
-          evtSource = new EventSource(`/activity/batch/${job_id}/events`);
-          [
-            "batch_start",
-            "product_start",
-            "product_plan",
-            "product_done",
-            "exec_start",
-            "exec_accel_step",
-            "exec_close",
-            "exec_rpa_step",
-            "exec_activity_skip",
-            "exec_fill",
-            "exec_enroll",
-            "exec_log_verify",
-            "exec_reopen",
-            "exec_product_done",
-            "exec_done",
-            "batch_done",
-            "aborted",
-            "log",
-          ].forEach((ev) =>
-            evtSource.addEventListener(ev, (e) => onEvent(ev, JSON.parse(e.data)))
-          );
-          evtSource.addEventListener("done", () => finishRun());
-          evtSource.onerror = () => {
-            // 流结束或断开：done 事件后浏览器会触发一次 error，忽略即可
-            if (evtSource && evtSource.readyState === EventSource.CLOSED) finishRun();
-          };
+          subscribeJob(response.job_id);
         } catch (e) {
           showToast("启动失败", String(e), "danger");
           finishRun();
@@ -1111,7 +1615,16 @@
         $("btnStart").classList.toggle("btn-primary", !on);
       });
 
-      $("btnStart").addEventListener("click", startBatch);
+      $("btnStart").addEventListener("click", () => startBatch(null));
+      $("btnScan").addEventListener("click", startScan);
+      $("btnExecSel").addEventListener("click", () =>
+        startBatch([...cellSelection].map((key) => JSON.parse(key)))
+      );
+      $("btnPause").addEventListener("click", togglePause);
+      $("matrixTable").addEventListener("change", (e) => onMatrixChange(e.target));
+      $("switchAllActivities").addEventListener("change", renderMatrix);
+      loadCellSelection();
+      renderMatrix();
       sourcePicker.init();
     </script>
   </body>

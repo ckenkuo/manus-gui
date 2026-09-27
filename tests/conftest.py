@@ -29,6 +29,7 @@ os.environ.setdefault("MANUS_CONFIG_SOURCE", "file")
 import pytest
 
 from app import cloud_docs
+from app.activity import matrix as activity_matrix
 from app.publish import alert as publish_alert
 from app.publish import cache as publish_cache
 
@@ -41,6 +42,13 @@ def _isolate_cloud_docs(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def _isolate_publish_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(publish_cache, "CACHE_DIR", str(tmp_path / "publish-cache"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_activity_matrix(tmp_path, monkeypatch):
+    """识别矩阵落盘目录指向 tmp_path：默认实现是 get_output_dir（会 mkdir 桌面输出目录），
+    单测里绝不能真写桌面。与 _isolate_publish_cache 同理。"""
+    monkeypatch.setattr(activity_matrix, "_dir", lambda: str(tmp_path / "activity-matrix"))
 
 
 @pytest.fixture(autouse=True)
