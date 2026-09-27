@@ -49,7 +49,9 @@ COLOR_THUMB_MAX_DISTANCE = 6
 
 _SYS = (
     "你是跨境电商选品与合规审核助手，在为 Temu 半托管发布挑选/审核商品图片。"
-    "Temu 的硬规则：不接受任何中文文字、水印、他人品牌 logo。"
+    "Temu 的硬规则：不接受任何中文文字、水印、他人品牌 logo、夸大宣传文案、"
+    "平台禁词与环保声明；也不接受图上出现材质成分说明（会与属性里填的材质对不上）。"
+    "商品实物上的品牌标识（商标、品牌名、品牌小标签）同样属于要清理的侵权风险。"
     "只描述你在图里真正看到的东西，认不准就标 uncertain，绝对不要推测或编造。"
     "只输出 JSON，不要加 ``` 围栏、不要任何解释文字。"
 )
@@ -109,6 +111,10 @@ class DescAction(BaseModel):
     的写法，任何没见过的词都会落进 else 当成 keep。模型要是回个 "remove"，
     表现就是「该删的图安安静静留下了」并发上真店。这里宁可判错重问：
     提示词里白纸黑字给的就是这三个小写词，照抄的成本比什么都低。
+
+    【nonProductText 给默认值而不是必填】漏答退回加这个字段之前的行为（该图按
+    action 原样处置），不比现状更差；声明必填等于为一个新字段把整批规划判失败重问，
+    而这一批是几十张图一次过的最贵调用（同 scope/confidence 的取向）。
     """
 
     model_config = ConfigDict(strict=True)
@@ -117,6 +123,11 @@ class DescAction(BaseModel):
     action: Literal["keep", "delete", "replace", "sizechart"]
     scope: Literal["skuRelevance", "productShared", "irrelevant"] = "productShared"
     confidence: float = 0.0
+    # 【为什么单开一个布尔而不是往 action/scope 里塞一个新枚举值】这类图要绕开
+    # 「scope == irrelevant 且 confidence >= 0.9」双闸（理由见 plan_desc 里的分支
+    # 注释），而 action 与 scope 的每个取值都已经绑定了既有处置。独立字段能让判据
+    # 优先于 action：模型把纯文案图判成 replace 时也拦得住——那才是主要漏法。
+    nonProductText: bool = False
 
 
 class DescPlan(BaseModel):
@@ -150,14 +161,16 @@ class DescAuditItem(BaseModel):
     pos: int
     sizeTable: bool = False
     marketingClaim: bool = False
-    # 【与 marketingClaim 同样给默认值】理由同上：它也只用于分类上报与日志，漏答不
-    # 影响处置（脏了就改判生图英化，三种脏法一样做），声明成必填只会白判整批失败。
+    # 【与 marketingClaim 同样给默认值】理由同上：它们也只用于分类上报与日志，漏答不
+    # 影响处置（脏了就改判生图英化，几种脏法一样做），声明成必填只会白判整批失败。
     bannedTerm: bool = False
+    materialText: bool = False
+    brandMark: bool = False
     what: str = ""
 
 
 class DescAudit(BaseModel):
-    """阶段⑬ keep 复核（查中文、夸大宣传与平台禁词，只列脏的）。"""
+    """阶段⑬ keep 复核（查中文、夸大宣传、平台禁词、品牌标识与材质说明，只列脏的）。"""
 
     model_config = ConfigDict(strict=True)
 
@@ -222,7 +235,7 @@ def _listing(paths: list) -> str:
 
 
 def is_dirty(n: dict) -> bool:
-    """这条标注是否仍带中文/水印/他人 logo/夸大宣传（⑤b 清理成功的会被回写成全 False）。
+    """这条标注是否仍带中文/水印/他人 logo/夸大宣传/材质说明（⑤b 清理成功的会被回写成全 False）。
 
     【标注不全时算合规】几项都没标、也没有 clean 时返回 False：不能因为模型漏标就
     把图丢掉，那会静默排除一张本来能用的图——与 images.ahash「算不出就别当重复」
@@ -233,9 +246,14 @@ def is_dirty(n: dict) -> bool:
     于是一张纯英文的 BEST-SELLER 角标图三项全 False、clean=true，⑤b 不清它、⑥ 直接
     把它选作素材图（也就是轮播首图）——而 ⑥⑦ 这条路【不跑 check_cleaned】，标注就是
     它们唯一的判据，漏在这里等于漏到真店。
+
+    【material 同理，2026-09-25 加】阶段① 新标的「图上有材质成分说明」（如实物织标上的
+    100% COTTON）。这一项漏标的后果与 claim 完全一样：图直接进 ⑥⑦ 的选图池、不经过
+    check_cleaned，而平台判的正是「图上含棉材质宣传、属性材质却不匹配」。
+    logo 的语义同时扩到「含实物上的品牌标识」——它本来就是 is_dirty 的一员，不必新开字段。
     """
     return bool(n.get("chinese") or n.get("watermark") or n.get("logo")
-                or n.get("claim"))
+                or n.get("claim") or n.get("material"))
 
 
 def is_unusable(n: dict) -> bool:
@@ -260,7 +278,7 @@ def is_unusable(n: dict) -> bool:
 
 
 def _dirty_score(n: dict) -> tuple:
-    """脏图排序键（越小越优）：中文 > 夸大宣传 > 水印 > logo > 重复。
+    """脏图排序键（越小越优）：中文 > 夸大宣传 > 水印 > logo > 材质说明 > 重复。
 
     只在「一张干净图都没有」时用。原先兜底只排除 duplicate、其余按编号取第一张，
     2026-08-22 实测踩坑：某商品 6 张全脏，first 恰好是带中文店名水印的 main-01，
@@ -268,10 +286,13 @@ def _dirty_score(n: dict) -> tuple:
 
     【claim 排第二，在水印之前】夸大宣传是实罚项（平台按虚假宣传处理），而水印/logo
     多是审核打回重传；两害相权，宁可兜底选一张带水印的也不选一张写着 BEST-SELLER 的。
+
+    【material 排在 logo 之后、重复之前】它同样是平台实罚项，但一张写着 100% COTTON 的
+    实物图通常还是张能用的商品图；排在这里是为了让它在「没得挑」时仍排在重复图前面。
     """
     return (bool(n.get("chinese")), bool(n.get("claim")),
             bool(n.get("watermark")), bool(n.get("logo")),
-            bool(n.get("duplicate")))
+            bool(n.get("material")), bool(n.get("duplicate")))
 
 
 def _norm_color(s: str) -> str:
@@ -462,15 +483,18 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
         if n.get("unusable"):
             continue
         parts = ["移除图片中所有水印、店铺名、拍摄者账号文字和他人品牌 logo"
-                 "（含商品吊牌/标牌上的品牌字样）"]
+                 "（含商品实物上的品牌标识、品牌小标签）"]
         if n.get("chinese"):
-            # 商品图上的中文若是商品介绍/说明类（材质成分、尺码、工艺、卖点、使用说明等）直接删
-            # 会丢信息，故先英化保留再删非商品信息；材质/质量特写图上的说明正是商品要传达的信息，
+            # 商品图上的中文若是商品介绍/说明类（尺码、工艺、卖点、使用说明等）直接删
+            # 会丢信息，故先英化保留再删非商品信息；质量特写图上的说明正是商品要传达的信息，
             # 绝不能当装饰抹掉（2026-09-03 用户要求）。范围用开放措辞、别只列举几个类别——
             # 用户明确「商品介绍只要不违规都翻译」。标点要单独点出来：只说「中文文字」时模型会
             # 留下『』这类中日韩标点，过不了 check_cleaned（理由见 images._NO_CJK_PUNCT）
+            # 【材质成分 2026-09-25 从保留清单移出】理由见 images.DEFAULT_TRANSLATE_PROMPT
+            # 那段：图上材质会与属性里填的材质对不上，平台的判罚正是「含棉材质宣传但属性
+            # 材质不匹配」，故改为一律抹掉（由下面的 MARK_REMOVE_RULE 讲清楚）。
             parts.append("图中若有中文文字，翻译成简洁英文并原位替换，字体风格和排版尽量保持一致；"
-                         "凡是商品介绍、说明类文字（材质成分、工艺、尺寸、功能卖点、使用说明、注意事项等）"
+                         "凡是商品介绍、说明类文字（工艺、尺寸、功能卖点、使用说明、注意事项等）"
                          "都翻译保留、不要删除；"
                          "仅水印、店铺名、拍摄者账号文字、他人品牌 logo 这类非商品信息直接移除；"
                          "中文标点（『』「」、，。！？等）也必须一并去掉或换成英文标点")
@@ -481,9 +505,13 @@ def plan_clean(info: dict, workdir: str, min_clean: int = MIN_CLEAN_IMAGES) -> d
         if n.get("claim"):
             parts.append(claims.CLAIM_REMOVE_RULE.rstrip("。"))
         # 【禁词这条无条件加，不像 claim 那样看标记】阶段① 的 complianceNotes 只标
-        # chinese/watermark/logo/claim，没有 banned 这一项，故没有可依据的逐图标记；
+        # chinese/watermark/logo/claim/material，没有 banned 这一项，故没有可依据的逐图标记；
         # 而禁词的代价是发上去必然违规，漏一张就是一张。多说一句话的成本远小于漏判。
         parts.append(claims.BANNED_REMOVE_RULE.rstrip("。"))
+        # 【实物标记（品牌标识 / 材质成分说明）同样无条件加】虽然阶段① 标了 material、
+        # logo 的语义也扩到了实物品牌标识，但模型逐张标那一步本身会漏（它常把实物小标签
+        # 当成「商品的一部分」而不标），而这两类的判罚都是直接的侵权/违规。理由同上一句。
+        parts.append(claims.MARK_REMOVE_RULE.rstrip("。"))
         parts.append("商品主体、配色、图案和构图完全不变，被移除处按周围内容自然补全")
         cands.append((_dirty_score(n),
                       {"file": name, "path": p, "prompt": "，".join(parts) + "。",
@@ -565,6 +593,8 @@ async def plan_carousel(entries: list, info: Optional[dict] = None) -> dict:
    叠加文案层拿不准时算有中文：漏掉的代价是它原样发上真店。
    （实物标签不适用这条——那类图误报的代价是每张图白烧一次生图、还会把整单卡住，
    而真站实测这种误报是压倒性的：21 张商品图 21 张被实物吊牌带成「有中文」。）
+   【实物上的品牌标识与材质成分说明不在这一问的范围】它们由后续的清理与质检环节
+   按 claims.MARK_IMAGE_RULE 处理，这里不要因为它们去判 chinese=true。
 
 只输出 JSON：{{"items": [{{"file": "<上面清单里的文件名，逐字照抄>",
 "isInfo": true/false, "kind": "", "value": 0, "chinese": true/false,
@@ -621,9 +651,17 @@ async def pick_material(info: dict, workdir: str) -> dict:
         pool = usable or mains
         for p in pool:  # 按编号序取第一张干净图
             n = notes.get(os.path.basename(p))
-            if n and n.get("clean"):
+            # 【clean 之外还要过 is_dirty】clean 是阶段① 模型自己填的字段，而模型偶发会
+            # 一边标 logo/material=true、一边把 clean 填成 true（两个字段在同一份响应里，
+            # 提示词说清了判据也拦不住这种自相矛盾）。只看 clean 就会把一张带品牌标
+            # （商标侵权）或带材质说明的图选成素材图——那正是轮播第一张、最显眼的位置，
+            # 也正是 2026-09-25 那两条违规通知的场景。is_dirty 是确定性判据，两道都过
+            # 才算干净；不满足的落到下面的兜底分支，代价只是多一次人工确认。
+            # ⑤b 清理成功的图不受影响：回写时把 chinese/watermark/logo/claim/material
+            # 一并清零，is_dirty 自然为 False。
+            if n and n.get("clean") and not is_dirty(n):
                 return {"status": "ok", "image": p, "source": "notes", "uncertain": False,
-                        "reason": f"complianceNotes 标注干净（{(n.get('note') or '无中文/水印/logo')[:20]}）"}
+                        "reason": f"complianceNotes 标注干净（{(n.get('note') or '无中文/水印/logo/材质说明')[:20]}）"}
         # 没有干净图：按脏度打分取最不脏的一张兜底，标 uncertain 交人工
         # （不能只排除 duplicate 就取首张，见 _dirty_score 注释里的实测踩坑）
         cand = min(pool, key=lambda p: _dirty_score(notes.get(os.path.basename(p)) or {}))
@@ -631,7 +669,8 @@ async def pick_material(info: dict, workdir: str) -> dict:
         flags = "、".join(k for k, v in (("含中文", n.get("chinese")),
                                         ("有夸大宣传", n.get("claim")),
                                         ("有水印", n.get("watermark")),
-                                        ("有logo", n.get("logo"))) if v)
+                                        ("有logo", n.get("logo")),
+                                        ("有材质说明", n.get("material"))) if v)
         return {"status": "ok", "image": cand, "source": "notes-fallback", "uncertain": True,
                 "reason": f"无干净图，取最不脏的一张兜底（{flags or '标注不全'}），需人工确认"}
 
@@ -642,10 +681,13 @@ async def pick_material(info: dict, workdir: str) -> dict:
 {_listing(mains)}
 
 请挑出最适合做 Temu 产品素材图的一张：
-- 无任何中文文字、水印、他人品牌 logo；
+- 无任何中文文字、水印、他人品牌 logo，也没有商品实物上的品牌标识
+  （商标、品牌名、品牌小标签这类，会构成商标侵权）；
 - 无夸大宣传或绝对化宣称的叠加文案（BEST-SELLER、Best Seller、Hot Sale、Top Quality、
   Premium、Must Have、Amazing、Guaranteed、热卖、爆款、销量第一这类，纯英文的也算），
-  商品实物上的印花/刺绣/织标不算；
+  商品实物上的装饰性印花/刺绣不算（品牌标识与材质说明算）；
+- 无平台禁词与环保声明（安抚、PP棉、eco-friendly、sustainable、环保这类），
+  也无材质成分说明（「棉」「100% Cotton」这类会与属性里填的材质对不上）；
 - 画面就是商品本身（白底/干净背景优先），主体完整；
 - 模特实拍图可以，但不能带中文海报文案或营销标语。
 
@@ -750,7 +792,8 @@ async def plan_skc(info: dict, workdir: str,
                 names = [os.path.basename(p) for p in add]
                 forced.update(names)
                 logger.warning(f"合规图只有 {len(out)} 张，凑不够 {min_keep} 张行下限，"
-                               f"被迫放回 {len(add)} 张仍带中文/水印/logo 的图：{names}")
+                               f"被迫放回 {len(add)} 张仍不合规的图（中文/水印/logo/"
+                               f"夸大宣传/材质说明）：{names}")
                 out += add
         if out:
             return out
@@ -915,6 +958,17 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
     规则（SKILL.md 阶段⑪）：工厂/公司/尺码表/与商品无关的图删、重复图删、
     含中文或水印/他人 logo 的商品图标记待清理（英化+去水印）。Temu 只关心商品图。
 
+    【非商品文案图单独一条判据，绕开 scope/confidence 双闸】整版排版文案、没有商品
+    画面，且讲的是卖家自己或交易条款（发货售后、品牌实力、工厂介绍、购物流程、好评
+    返现）的图一律直接删。四个动作枚举里原先没有它的位置，模型只能凑一个，而提示词
+    的几处倾向性都在把它往保留方向推（productShared 明写「洗护…共用的信息」、删除要
+    「irrelevant 且 confidence >= 0.9」、漏判兜底是 keep），于是它落到 keep 走中文复核
+    改判英化、或落到 replace 直奔英化——两条都是拿 4 次付费生图去译一整版卖家话术，
+    烧完不过才以 kind=qc 丢弃，碰巧过了则带着机器英文上真店。判据独立于 action 才拦得住
+    replace 那条主要漏法，实现见下面分支注释；判据本身问的是「文字讲的是不是商品本身」
+    而非「是不是纯文字」——材质成分、规格参数、玩具功能玩法说明形式上同样是纯文字，
+    但都有买家价值（玩具那条另见 sizechart_line 上方注释）。sizechart 无条件豁免。
+
     【尺寸是与内容正交的第二条判据，不交给模型判】服装类下限 1340×1785 是平台硬
     校验，而模型看图判的是「脏不脏」——一张干净的 900×1200 商品图内容上该 keep，
     却过不了保存校验（2026-08-23 真站取证：描述区 10 张 1688 外链全是 1000×1000
@@ -994,9 +1048,24 @@ async def plan_desc(modules: list, info: Optional[dict] = None) -> dict:
 {listing}
 
 Temu 半托管发布只关心商品图，请逐张决定动作：
-{sizechart_line}- "replace"：图本身是商品展示图，但含中文文字、水印、店铺名或他人品牌 logo
-  ——保留画面，把中文英化并移除水印后替换；
-- "keep"：干净的商品图（无中文/水印/他人 logo）——保留。
+{sizechart_line}- "replace"：图本身是商品展示图，但含中文文字、水印、店铺名、他人品牌 logo、
+  商品实物上的品牌标识（商标、品牌小标签），或含平台禁词/环保声明、材质成分说明
+  ——保留画面，把中文英化并移除上述内容后替换；
+- "keep"：干净的商品图（无中文/水印/他人 logo/品牌标识、无禁词与环保声明、
+  无材质成分说明）——保留。
+
+另外对每张图判一个独立的标记 "nonProductText"：这张图【整版都是排版文案、没有商品
+实物画面】，而且文字讲的【不是商品本身】，而是卖家自己或交易条款。为 true 的一律直接
+删除（不必再看下面的 scope 与 confidence）：
+- 发货时效、物流方式、仓库与配送说明；
+- 售后退换、保修条款、质检承诺、免责声明；
+- 品牌故事、公司简介、工厂实力、资质荣誉、团队介绍；
+- 购物流程、下单与付款指引、好评返现、客服联系方式、关注店铺引导。
+下面这些【即便整张都是文字也必须填 false】——它们讲的是商品本身，买家靠它们做购买
+决策：尺码表与尺寸示意、规格参数、材质成分、洗护方式、功能与玩法说明、配件清单、
+适龄与安全提示。
+只要画面里有商品实物（哪怕旁边配了大段文案），一律填 false——那是商品展示图，
+该走 replace 把文字英化，不是删。认不准就填 false。
 
 同时给出图片范围标注：
 - "skuRelevance"：明确展示某个已发布 SKU/颜色；
@@ -1008,7 +1077,7 @@ Temu 半托管发布只关心商品图，请逐张决定动作：
 
 只输出 JSON：{{{category_output}"actions": [{{"pos": 1, "action": "{acts_enum}",
 "reason": "<10字内>", "scope": "skuRelevance|productShared|irrelevant",
-"confidence": 0.0}}]}}
+"confidence": 0.0, "nonProductText": true/false}}]}}
 actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
     # pos 必须是整数：模型偶尔回字符串 "1"，下面 `pos not in valid_pos` 不成立就把
     # 那张图整条动作丢掉（既不删也不换、静默留着 1688 原图），故在这里先重问。
@@ -1034,6 +1103,22 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
             confidence = float(confidence)
         except (TypeError, ValueError):
             confidence = 0.0
+        # 【非商品文案图走独立的删除通道，不经 scope/confidence 双闸】这类图（发货售后、
+        # 品牌实力、工厂介绍、购物流程）整版都是排版文案、没有商品画面，删掉是确定的。
+        # 而双闸只管 act == "delete" 那一支：满屏中文的文案图模型极可能判 replace，
+        # 那条路绕过全部闸门直奔英化——一张文字最密的图正是 DESC_QC_TRIES_TEXT 注释
+        # 点名的确定性失败（字太密、译不干净），4 发生图烧完仍不过才以 kind=qc 丢弃；
+        # 运气不好某一发「碰巧过了」，它就带着一版机器英文的卖家话术上真店。
+        # 故判据优先于 action，把 replace/keep 两条路一起拉回来。
+        # 【sizechart 无条件豁免】尺码表/尺寸示意图形式上也是「整版表格文字、无商品
+        # 画面」，是本判据唯一的高危误伤方向，而 size_missing 时它是买家唯一的准确尺码
+        # 来源（见 sizechart_line）。把豁免写在代码里而不是只靠提示词：宁可漏删一张卖家
+        # 话术图，也不能删掉尺码表。
+        if a.get("nonProductText") and act != "sizechart":
+            delete.append(pos)
+            logger.info(f"阶段⑬描述图 pos {pos} 判非商品文案图直接删："
+                        f"{(a.get('reason') or '')[:20]}")
+            continue
         # Keep compatibility with older model responses/tests that only returned action.
         legacy_delete = "scope" not in a
         if act == "delete" and ((legacy_delete and confidence == 0.0)
@@ -1113,7 +1198,14 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
                 # reason 要说清是哪一类：它进 manual_check 与阶段说明给用户看，
                 # 把「BEST-SELLER 角标」讲成「复核发现中文」会让人去找根本不存在的中文
                 # （同 stages.cleaning._fail_message「文案必须与事实相符」的取向）。
-                why = "复核发现夸大宣传：" if d.get("marketingClaim") else "复核发现中文："
+                # 2026-09-25 起类别变多，按「判罚最直接」排序取第一个命中的：夸大宣传与
+                # 禁词是实罚项，品牌标识是侵权，材质说明是与属性打架，最后才是中文。
+                why = "复核发现" + (
+                    "夸大宣传" if d.get("marketingClaim")
+                    else "平台禁词" if d.get("bannedTerm")
+                    else "品牌标识" if d.get("brandMark")
+                    else "材质说明" if d.get("materialText")
+                    else "中文") + "："
                 rep["reason"] = (why + (d.get("what") or ""))[:60]
             replace.sort(key=lambda r: r["pos"])
 
@@ -1129,15 +1221,19 @@ actions 必须覆盖上面列出的每一张（pos 取值：{all_pos}）。"""
 
 async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
                             info: Optional[dict] = None) -> dict:
-    """对「将按原画面发布」的描述图查中文、夸大宣传与平台禁词，返回 {pos: {...}}（只含脏的）。
+    """对「将按原画面发布」的描述图查中文、夸大宣传、平台禁词、品牌标识与材质说明，
+    返回 {pos: {...}}（只含脏的）。
 
     【为什么夸大宣传也要在这一遍查】这批图的共同点是【原画面原样上架】，全链路没有
     任何环节再看一眼它们的内容（见 plan_desc docstring 末段）。原先这一遍只问中文，
     于是纯英文的营销海报（BEST-SELLER 角标、Hot Sale 横幅）在每一道闸都判「干净」：
     阶段① 只标 chinese/watermark/logo，check_cleaned 当时也不查宣称，这里又只问中文。
     判据与 check_cleaned 同源（claims.IMAGE_CLAIM_RULE），改口径只改 claims 一处。
-    平台禁词（安抚 / PP棉）同理加在这一遍：这批图没有别的环节会再看一眼，
+    平台禁词（安抚 / PP棉 / 环保声明）同理加在这一遍：这批图没有别的环节会再看一眼，
     漏了就是原样发上真店（判据同源于 claims.BANNED_IMAGE_RULE）。
+    【品牌标识与材质说明 2026-09-25 也加在这一遍】理由完全相同——原样上架的图只有
+    这里会看一眼，而这两类正是用户当天收到的违规通知里的两条
+    （侵权小标签、图上材质与属性材质不匹配），判据同源于 claims.MARK_IMAGE_RULE。
 
     与初判分两遍的原因（单任务小批量比几十张混审可靠）见 plan_desc docstring 末段。
     传图复用初判已解析好的 data URL（ref_by_pos），不重复下载。
@@ -1156,20 +1252,24 @@ async def _audit_desc_keeps(audit_pos: list, ref_by_pos: dict,
 下面是同一商品描述区里的 {len(chunk)} 张图，序号是 pos：
 {listing}
 
-它们初判为「干净的商品图」，将【原样】发布到 Temu 海外站。请复核每张图两件事：
+它们初判为「干净的商品图」，将【原样】发布到 Temu 海外站。请复核每张图：
 
 1. 是否存在任何【中文字符或中文标点】——标题大字、小字说明、表格文字、水印、
    吊牌/标签上的字都算；英文、数字、符号不算。
 2. {claims.IMAGE_CLAIM_RULE}
 3. {claims.BANNED_IMAGE_RULE}
+4. {claims.MARK_IMAGE_RULE}
 
 只输出 JSON：{{"dirty": [{{"pos": 1, "sizeTable": true/false,
 "marketingClaim": true/false, "bannedTerm": true/false,
+"materialText": true/false, "brandMark": true/false,
 "what": "<10 字内说清问题在哪，如「模特信息卡全文」「右上角BEST-SELLER角标」>"}}]}}
-dirty 只列【有中文、有夸大宣传文案或有平台禁词】的图（pos 必须从 {chunk} 里取），
-三项都干净才不列，全部干净就返回空数组。
+dirty 只列【有中文、有夸大宣传文案、有平台禁词、有品牌标识或有材质成分说明】的图
+（pos 必须从 {chunk} 里取），五项都干净才不列，全部干净就返回空数组。
 marketingClaim 标出这一条是不是因为夸大宣传（只有中文问题时填 false）。
-bannedTerm 标出这一条是不是因为平台禁词。
+bannedTerm 标出这一条是不是因为平台禁词（含环保声明）。
+materialText 标出这一条是不是因为图上有材质成分说明。
+brandMark 标出这一条是不是因为图上有品牌标识。
 sizeTable 表示该图是不是尺码表/尺寸示意图。
 拿不准一律算脏——漏掉的代价是它原样发上真店。"""
         data = await ask_json_with_images(
@@ -1184,16 +1284,24 @@ sizeTable 表示该图是不是尺码表/尺寸示意图。
             dirty[p] = {"sizeTable": bool(v.get("sizeTable")),
                         "marketingClaim": bool(v.get("marketingClaim")),
                         "bannedTerm": bool(v.get("bannedTerm")),
+                        "materialText": bool(v.get("materialText")),
+                        "brandMark": bool(v.get("brandMark")),
                         "what": (v.get("what") or "")[:20]}
 
     await asyncio.gather(*(_one(c) for c in
                            (audit_pos[i:i + _DESC_AUDIT_CHUNK]
                             for i in range(0, len(audit_pos), _DESC_AUDIT_CHUNK))))
     if dirty:
-        n_claim = sum(1 for d in dirty.values() if d.get("marketingClaim"))
-        n_banned = sum(1 for d in dirty.values() if d.get("bannedTerm"))
-        logger.warning(f"阶段⑬合规复核：{len(dirty)} 张初判保留的图发现中文、夸大宣传"
-                       f"或平台禁词（夸大宣传 {n_claim} 张、禁词 {n_banned} 张），"
+        # 每一类各报一个张数：日志里只说「N 张脏」时，无法从「复核拦下一批图」反推
+        # 拦的是哪一类，也就无从判断这次改动是否在生效（同 claims 把两类词分开的取向）。
+        flags = "、".join(f"{name} {n} 张" for name, n in (
+            ("夸大宣传", sum(1 for d in dirty.values() if d.get("marketingClaim"))),
+            ("平台禁词", sum(1 for d in dirty.values() if d.get("bannedTerm"))),
+            ("品牌标识", sum(1 for d in dirty.values() if d.get("brandMark"))),
+            ("材质说明", sum(1 for d in dirty.values() if d.get("materialText"))),
+        ) if n)
+        logger.warning(f"阶段⑬合规复核：{len(dirty)} 张初判保留的图发现中文、夸大宣传、"
+                       f"平台禁词、品牌标识或材质说明（{flags or '仅中文'}），"
                        f"改判生图英化：pos {sorted(dirty)}")
     return dirty
 
@@ -1233,6 +1341,8 @@ async def translate_size_texts(texts: list, info: Optional[dict] = None) -> dict
 3b. 译文里不许出现平台禁词：「安抚」类（Soothing、Soother、Comforter）与「PP棉」类
    （PP Cotton、Polypropylene Cotton）——命中整段会被删掉。原文有这类词时改用规范写法：
    安抚→Comfort、PP棉→Polyester Fiber。Comfort（舒适）与 Polyester Fiber 不是禁词；
+   环保声明（eco-friendly、sustainable、环保、可降解这类）【不要译、直接删掉那句话】，
+   任何环保声明平台都不接受，换成别的环保说法同样违规；
 4. 每个模块译文不超过 500 字符（平台上限），超了就精简次要信息。
 
 只输出 JSON：{{"plan": [{{"idx": "<原样照抄模块 idx>", "text": "<英文译文>"}}]}}
@@ -1283,11 +1393,21 @@ async def check_cleaned(image_path: str) -> dict:
     （修图痕迹之类）多烧也是同样结果。调用方据此给中文那一类更多次数，见
     service.DESC_QC_TRIES_CJK。
 
-    【商品实物上的图案/刺绣/品牌织标一律不算问题】2026-08-26 实测这条提示词的代价：
-    一张棒球服图被判「衣服上有品牌logo及疑似乱码英文字符」而退回原图，可那是衣服上
-    真实的绣标与装饰字母——人工选品阶段已经筛掉了不能用的款，实物的一部分不是「待
-    清理的文字层」。误报的后果不是保守而是更糟：退回原图 = 中文外链图留在描述区，
-    既过不了 1340×1785 闸门、也过不了合规。故这里把判据收窄到【叠加在图上的文案层】。
+    【判据的范围：装饰性的实物图案不算，品牌标识与材质说明要判】2026-08-26 实测这条
+    提示词的代价：一张棒球服图被判「衣服上有品牌logo及疑似乱码英文字符」而退回原图，
+    可那是衣服上真实的绣标与装饰字母——人工选品阶段已经筛掉了不能用的款，实物的一部分
+    不是「待清理的文字层」。误报的后果不是保守而是更糟：退回原图 = 中文外链图留在
+    描述区，既过不了 1340×1785 闸门、也过不了合规。故【装饰性】的印花、刺绣、图案
+    继续豁免。
+    【2026-09-25 起实物上另有两类要判】品牌标识与材质成分说明，判据见
+    claims.MARK_IMAGE_RULE：前者是平台认定的商标侵权（用户实测一条裤子链接因模特鞋上
+    的标识被判侵权、一条童裤因口袋上的方标被投诉），后者让平台判「含棉材质宣传但属性
+    中材质描述不匹配」。这两类与「实物不算」的分界靠「装饰性」与「品牌/材质」区分，
+    提示词两边都要写清楚，否则模型会退回「实物一律不报」的旧口径。
+    【新字段同样不进必答清单】materialText 与 brandMark 是 2026-09-25 新加的，理由与
+    bannedTerm 一字不差（老响应漏答不该判 error 把整批图退回原图）。区别在兜底：
+    材质说明有词表可复核（claims.material_hits，模型列了原文就按词表翻严），品牌标识
+    没有——品牌名是开放集合，缩写进词表会误伤正常文案，故只取模型的布尔。
 
     【marketingClaim 是第五项，与中文同级】原先五项里没有夸大宣传这一条，于是一张
     纯英文的 BEST-SELLER 角标图在全链路每一道闸都判「干净」：阶段① 只标
@@ -1301,7 +1421,8 @@ async def check_cleaned(image_path: str) -> dict:
     """
     prompt = """请对这张商品图片做英化质检（可能是原图，也可能已将中文文案改成英文）：
 
-只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）：
+前五项只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）；
+最后一项的实物标记要连【商品实物上的标签、吊牌、织标】一起看：
 - residualChinese：是否还残留任何中文字符或中文标点（『』「」、，。！？；：《》等）；
 - garbled：是否有拼音、乱码、断词、无意义字母串（正常英文单词不算）；
 - watermark：是否残留后期叠加的水印、店铺名、拍摄者账号、网址或联系方式。
@@ -1311,9 +1432,10 @@ async def check_cleaned(image_path: str) -> dict:
 - brokenSubject：是否有明显修图痕迹破坏了商品主体（糊掉、变形、缺块）；
 - """ + claims.IMAGE_CLAIM_RULE + """
 - """ + claims.BANNED_IMAGE_RULE + """
+- """ + claims.MARK_IMAGE_RULE + """
 
 【以下一律不算问题，不要报】：
-- 商品实物本身的印花、刺绣、织标、袖标、胸标、图案上的字母或品牌标识
+- 商品实物上的装饰性印花、刺绣、图案上的字母（不含品牌标识的）
   —— 那是实物的一部分，选品时已人工确认过，不需要清理；
 - 图片本身的构图、留白、配色。
 
@@ -1321,10 +1443,13 @@ async def check_cleaned(image_path: str) -> dict:
 "watermark": true/false, "brokenSubject": true/false,
 "marketingClaim": true/false, "marketingClaimTexts": ["实际可见的宣称词或短语"],
 "bannedTerm": true/false, "bannedTermTexts": ["实际可见的禁词原文"],
+"materialText": true/false, "materialTexts": ["实际可见的材质文字原文"],
+"brandMark": true/false, "brandMarkTexts": ["实际可见的品牌名或标识名"],
 "issues": "<具体问题，没有问题留空>"}
-六个布尔字段必须全部填写。marketingClaimTexts 必须列全判为宣称的原文，
+八个布尔字段必须全部填写。marketingClaimTexts 必须列全判为宣称的原文，
 没有宣称时返回空数组；不得只写其中一个词而漏掉其他宣称。
-bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原文，没有禁词时返回空数组。"""
+bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原文，没有禁词时返回空数组。
+materialTexts / brandMarkTexts 同理：判 true 时列全可见的原文，没有就返回空数组。"""
     data = await ask_json_with_images(prompt, [image_path], what="英化质检", system=_SYS,
                                       stage="clean_images")
     fields = ("residualChinese", "garbled", "watermark", "brokenSubject",
@@ -1334,7 +1459,9 @@ bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原�
                 "issues": (data.get("issues") or "英化质检响应不完整")[:80],
                 "residualChinese": False, "garbled": False, "watermark": None,
                 "marketingClaim": False, "bannedTerm": False,
-                "marketingClaimTexts": [], "bannedTermTexts": []}
+                "materialText": False, "brandMark": False,
+                "marketingClaimTexts": [], "bannedTermTexts": [],
+                "materialTexts": [], "brandMarkTexts": []}
     cjk = bool(data.get("residualChinese"))
     garbled = bool(data.get("garbled"))
     watermark = bool(data.get("watermark"))
@@ -1356,8 +1483,48 @@ bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原�
         if hits and not banned:
             banned = True
             logger.info(f"图片质检 bannedTerm 按原文复核翻为 true：{hits[:4]}")
+    # 【材质说明同样走「漏答当没有 + 文本兜底」】它也是 2026-09-25 新加的字段，理由与
+    # bannedTerm 一字不差：进必答清单会让老响应漏答直接判 error、整批图退回带中文的原图，
+    # 比漏判一次更糟；而材质词是确定性判据，模型给了 materialTexts 就能用词表复核。
+    # 品牌标识没有词表可依（品牌名是开放集合，且缩写如 NY 放进词表会误伤正常文案），
+    # 故 brandMark 只取模型的布尔——它的识别能力对商标/品牌小标签足够（视觉特征明显），
+    # 兜底反而会引入误判。
+    material = bool(data.get("materialText"))
+    material_texts = data.get("materialTexts")
+    if isinstance(material_texts, list):
+        hits = [w for t in material_texts if isinstance(t, str)
+                for w in claims.material_hits(t)]
+        if hits and not material:
+            material = True
+            logger.info(f"图片质检 materialText 按原文复核翻为 true：{hits[:4]}")
+    brand = bool(data.get("brandMark"))
+    brand_texts = data.get("brandMarkTexts")
     non_blocking = []
     claim_texts = data.get("marketingClaimTexts")
+    # 【模型归类会飘：降级之前先按举证原文把另外两类翻严】2026-09-25 加。阶段① 的
+    # claim 判据里写着「环保声明也算」（extract._VISION_PROMPT_DETAIL 第 5 条），于是
+    # 同一个模型在 check_cleaned 这一步常把 Eco-Friendly 归到 marketingClaimTexts、
+    # 而不是 bannedTermTexts。而下面那段降级只查夸大宣传词表——一个确定性命中的违规词
+    # （eco-friendly 就在禁词表里）会被判成「模型过判」放行，banned/material 又都是
+    # false，于是 clean=True、图原样上架，等于新加的闸被自己的降级逻辑绕过去。
+    # 故先拿举证原文（含 issues）过一遍禁词与材质词表：命中就翻成对应的那一类，
+    # 让 bad 与重试话术都落在正确的类别上——材质词同理，模型会把「100% Cotton」
+    # 当成宣称填进 claim_texts。方向仍是单向的（只往严里翻，不反向放行）。
+    claim_evidence = ([str(t) for t in claim_texts if isinstance(t, str)]
+                      if isinstance(claim_texts, list) else [])
+    claim_evidence.append(str(data.get("issues") or ""))
+    if not banned:
+        hit = next((t for t in claim_evidence if claims.has_banned_term(t)), "")
+        if hit:
+            banned = True
+            logger.info(f"图片质检 bannedTerm 按 marketingClaim 举证原文翻为 true"
+                        f"（模型把禁词归到了宣称）：{claims.banned_hits(hit)[:4]}")
+    if not material:
+        hit = next((t for t in claim_evidence if claims.material_hits(t)), "")
+        if hit:
+            material = True
+            logger.info(f"图片质检 materialText 按 marketingClaim 举证原文翻为 true"
+                        f"（模型把材质说明归到了宣称）：{claims.material_hits(hit)[:4]}")
     if claim and claims.is_style_only_image_claim(data.get("issues"), claim_texts):
         non_blocking.append(data.get("issues") or "普通风格描述无需修改")
         claim = False
@@ -1384,35 +1551,50 @@ bannedTermTexts 同理：判 bannedTerm=true 时必须列全可见的禁词原�
         claim = False
         logger.info(f"图片质检 marketingClaim 按原文复核翻为 false"
                     f"（举证原文均不在夸大宣传判据内）：{claim_texts[:3]}")
-    bad = (cjk or garbled or watermark or claim or banned
+    bad = (cjk or garbled or watermark or claim or banned or material or brand
            or bool(data.get("brokenSubject")))
     issues = data.get("issues") or ("残留水印、店铺名或网址" if watermark else "")
     if non_blocking:
+        # 【这个重建清单必须列全所有阻断项】它是【覆盖】而不是追加 issues，漏一类就会让
+        # 「残留中文 + 品牌标识」这种组合只剩「残留中文」——判定与透出的布尔都没丢
+        # （bad 与 brandMark 仍在），但日志与 qc["issues"] 这一路看不出还有品牌标识。
+        # 2026-09-25 补上夸大宣传、材质说明与品牌标识三类（原清单只有五项）。
         issues = "、".join(reason for present, reason in (
             (cjk, "残留中文"), (garbled, "乱码或拼写错误"),
-            (watermark, "残留水印、店铺名或网址"), (banned, "图上有平台禁词"),
+            (watermark, "残留水印、店铺名或网址"), (banned, "图上有平台禁词或环保声明"),
+            (claim, "图上有夸大宣传文案"), (brand, "图上有品牌标识"),
+            (material, "图上有材质成分说明"),
             (data.get("brokenSubject"), "商品主体破坏")) if present)
     # issues 留空而 marketingClaim 为真时要自己补一句：调用方把 issues 原样报给用户，
     # 空串会让提醒变成「质检未过：」这种看不出原因的话（同 watermark 那句的理由）。
     if not issues and claim:
         issues = "图上有夸大宣传/绝对化宣称文案"
     if not issues and banned:
-        issues = "图上有平台禁词（安抚 / PP棉 这类）"
+        issues = "图上有平台禁词或环保声明（安抚 / PP棉 / eco-friendly 这类）"
+    if not issues and brand:
+        issues = "图上有品牌标识（商标或实物上的品牌小标签）"
+    if not issues and material:
+        issues = "图上有材质成分说明（会与属性里的材质对不上）"
     # 【residualChinese / garbled / marketingClaim 都要透出去】service 侧靠这些字段决定
     # 重试发数（见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
     # 的 `qc.get("garbled")` 恒为 None，加长重试对乱码那一路形同虚设——而 ⑤b main-04
     # 两发恰好全是 garbled，正是要救的那种；marketingClaim 从一开始就按这个教训透出。
-    # 【两个 texts 也要透出去】调用方（build_retry_hint）靠它们把「具体是哪个词」喂回
+    # 【四个 texts 也要透出去】调用方（build_retry_hint）靠它们把「具体是哪个词」喂回
     # 重烧提示词——只有布尔的话，模型只知道「有夸大宣传」，不知道要动哪一块文字。
     # 默认值兜底的理由同上面五个布尔：漏答时不该让 .get() 拿到 None。
     return {"status": "ok", "clean": not bad,
             "issues": issues[:80],
             "residualChinese": cjk, "garbled": garbled, "watermark": watermark,
             "marketingClaim": claim, "bannedTerm": banned,
+            "materialText": material, "brandMark": brand,
             "marketingClaimTexts": ([t for t in claim_texts if isinstance(t, str)]
                                     if isinstance(claim_texts, list) else []),
             "bannedTermTexts": ([t for t in banned_texts if isinstance(t, str)]
                                 if isinstance(banned_texts, list) else []),
+            "materialTexts": ([t for t in material_texts if isinstance(t, str)]
+                              if isinstance(material_texts, list) else []),
+            "brandMarkTexts": ([t for t in brand_texts if isinstance(t, str)]
+                               if isinstance(brand_texts, list) else []),
             "nonBlockingIssues": non_blocking}
 
 
@@ -1492,8 +1674,10 @@ _RETRY_ACTION_TEXT = {
     "erase": "抹除——不要翻译、不要改写、不要保留，连同它的底色块、边框、角标一起"
              "抹掉，抹除处按周围画面自然补全",
     "translate": "译写——翻译成简洁英文、原位替换，字体风格、字号与排版尽量保持一致",
-    "rename": "改名不删——不要照译，改写成规范名称（如 PP棉改写成 Polyester Fiber），"
-              "它说明的材质信息要留下",
+    "rename": "改名不删——不要照译，改写成规范名称（如「安抚玩偶」改写成 "
+              "Comfort Plush Toy），它说明的信息要留下。"
+              "【材质类的不要用这个动作】2026-09-25 起图上材质成分说明一律 erase"
+              "（改成规范材质名仍是材质声明，会与平台属性里填的材质对不上）",
     "convert_unit": "换算单位——把中文计量单位换成英文单位（斤→lb、两→oz、cm→in 等），"
                     "不要留成拼音",
 }
@@ -1531,14 +1715,17 @@ def _retry_action_menu() -> str:
     """动作枚举说明。判据文本直接引用 claims 的既有片段，不在这里另写一份。"""
     return ("动作只能是这五个，逐块选一个：\n"
             '- "erase"：' + claims.CLAIM_REMOVE_RULE +
-            "水印、店铺名、拍摄者账号、他人品牌 logo 也用这个动作。\n"
+            "水印、店铺名、拍摄者账号、他人品牌 logo，以及商品实物上的品牌标识与"
+            "材质成分说明（见下面那段），也用这个动作。\n"
             '- "translate"：译成英文、原位替换。适用于商品介绍、说明类文字'
-            "（材质成分、工艺、尺寸、功能卖点、使用说明、注意事项）。\n"
-            '- "rename"：' + claims.BANNED_REMOVE_RULE + "\n"
+            "（工艺、尺寸、功能卖点、使用说明、注意事项）——材质成分不在此列。\n"
+            '- "rename"：' + claims.BANNED_REMOVE_RULE +
+            "（材质类不要用这个动作，改规范材质名仍是材质声明、照样对不上，用 erase）\n"
             '- "convert_unit"：把中文计量单位换成英文单位（斤→lb、两→oz、cm→in），'
             "不要留成拼音。\n"
-            '- "keep"：保持原样不动。适用于商品实物上的印花、刺绣、织标、吊牌，'
-            "以及不该动的客观介绍文字。\n")
+            '- "keep"：保持原样不动。适用于商品实物上的装饰性印花、刺绣、图案，'
+            "以及不该动的客观介绍文字。\n"
+            + claims.MARK_REMOVE_RULE + "\n")
 
 
 def _retry_history_text(history: list) -> str:
@@ -1550,7 +1737,9 @@ def _retry_history_text(history: list) -> str:
         flags = "、".join(name for name, key in (
             ("残留中文", "residualChinese"), ("生图乱码/拼音", "garbled"),
             ("水印", "watermark"), ("夸大宣传", "marketingClaim"),
-            ("平台禁词", "bannedTerm"), ("主体被改坏", "brokenSubject")) if h.get(key))
+            ("平台禁词", "bannedTerm"), ("品牌标识", "brandMark"),
+            ("材质说明", "materialText"),
+            ("主体被改坏", "brokenSubject")) if h.get(key))
         line = f"第 {h.get('attempt')} 发：质检未过。结论：{h.get('issues') or '（无描述）'}"
         if flags:
             line += f"（判定类别：{flags}）"
@@ -1560,6 +1749,10 @@ def _retry_history_text(history: list) -> str:
             line += f"\n  它举证的宣称原文：{h['marketingClaimTexts']}"
         if h.get("bannedTermTexts"):
             line += f"\n  它举证的禁词原文：{h['bannedTermTexts']}"
+        if h.get("brandMarkTexts"):
+            line += f"\n  它举证的品牌标识：{h['brandMarkTexts']}"
+        if h.get("materialTexts"):
+            line += f"\n  它举证的材质文字：{h['materialTexts']}"
         if h.get("hint"):
             line += f"\n  那一发追加的要求是：{h['hint']}"
         out.append(line)
@@ -1572,7 +1765,8 @@ async def build_retry_hint(base: str, history: list, image_path: str,
 
     history 每发的形状见 _retry_history_text 的读法：{"attempt", "issues",
     "residualChinese", "garbled", "watermark", "brokenSubject", "marketingClaim",
-    "marketingClaimTexts", "bannedTerm", "bannedTermTexts", "hint"}。
+    "marketingClaimTexts", "bannedTerm", "bannedTermTexts", "materialText",
+    "materialTexts", "brandMark", "brandMarkTexts", "hint"}。
     "hint" 是该发实际追加的加码话术——不带上的话，模型不知道自己上次要求过什么，
     会重复给出同一个已经失败过的要求（同 llm._JSON_RETRY_HINT 每次重拼的取向）。
     【累积历史而不是只给上一发】多类问题分散在不同发里时（desc-03 是拼音→perfect→
@@ -1606,8 +1800,10 @@ async def build_retry_hint(base: str, history: list, image_path: str,
                  "长度数值用 convert_unit 换算成英寸。只有确认某块是店铺名、水印或"
                  "营销标语时才用 erase。\n" if sizechart else "") +
               f"【注意】只报你在图上真正看得见、且确实需要处理的文字；"
-              f"已经处理干净的部分不要再报。商品实物上的印花、刺绣、织标不是文案层，"
-              f"不要报出来。\n"
+              f"已经处理干净的部分不要再报。商品实物上的【装饰性】印花、刺绣、图案"
+              f"不是文案层、不要报；但实物上的品牌标识与材质成分说明要报出来"
+              f"——这两类【都用 erase】（材质类不要用 rename：改成规范材质名仍是材质声明，"
+              f"照样与属性里的材质对不上）。\n"
               f"只输出 JSON：{{\"blocks\": [{{\"text\": \"<图上实际可见的原文>\", "
               f"\"where\": \"<位置，如「左下角红色印章」>\", "
               f"\"action\": \"erase|translate|rename|convert_unit|keep\", "

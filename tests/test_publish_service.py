@@ -920,7 +920,9 @@ def _desc_env(tmp_path, monkeypatch, calls: dict):
         calls.setdefault("replacedPos", []).append(pos)
         return {"status": "ok"}
 
-    async def fake_save(session):
+    # 签名跟真 desc_save 一致（它一直有 allow_empty）：桩少一个参数时，被测代码
+    # 传了就 TypeError，看着像业务改错、实际是桩过时了
+    async def fake_save(session, allow_empty=False):
         return {"status": "ok"}
 
     async def fake_ensure_closed(session):

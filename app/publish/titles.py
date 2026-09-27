@@ -271,19 +271,24 @@ async def generate_titles(info: dict) -> dict:
         return f"含夸大宣传用语 {hits[:4]}" if hits else None
 
     def _banned_reject(text: str) -> Optional[str]:
-        """平台禁词硬闸（安抚 / PP棉）：命中返回带具体词的拒因，合规返回 None。
+        """平台禁词硬闸（安抚 / PP棉 / 环保声明）：命中返回带具体词的拒因，合规返回 None。
 
         判据走 claims.has_banned_term（与图片链路同一份词表，中英文都查）。与
         _claim_reject 分开是因为两类的修正方向不同：夸大宣传要「删掉这个形容词」，禁词要
         【换一种说法】（安抚玩偶→Plush Companion Doll、PP棉→聚酯纤维），拒因里必须说出
         改法，否则模型只会把词删掉、把商品说成别的东西。
+        【环保声明是反例：只许删、不许换说法】它 2026-09-25 并进禁词表，但处置与另外两类
+        不同——任何环保声明平台都不接受，换成别的环保说法同样违规，故拒因里必须说清楚
+        「删掉这个概念」而不是「换个同义写法」，否则模型会写出 Sustainable 替 Eco-Friendly。
         """
         hits = claims.banned_hits(text)
         if not hits:
             return None
-        return (f"含平台禁词 {hits[:4]}——这类词禁止出现，须换成同义的规范写法"
+        return (f"含平台禁词 {hits[:4]}——这类词禁止出现：安抚/PP棉要换成同义的规范写法"
                 f"（安抚玩偶→Plush Companion Doll/Comfort Plush Toy/毛绒公仔、"
-                f"PP棉→Polyester Fiber/聚酯纤维），不要只删掉词")
+                f"PP棉→Polyester Fiber/聚酯纤维），不要只删掉词；"
+                f"环保声明（Eco-Friendly/Sustainable/环保/可降解这类）则【整句删掉、"
+                f"不要用别的环保说法替代】，直接不提环保这件事")
 
     def _en_reject(en: str) -> Optional[str]:
         """英文标题不合格的具体原因；合格返回 None。
@@ -376,6 +381,12 @@ async def generate_titles(info: dict) -> dict:
         "                 中文 聚酯纤维填充、纤维棉填充。\n"
         "   注意 Comfort（舒适）不是禁词，可以正常用，只有 Comforter 才算；\n"
         "   「聚酯纤维」「聚丙烯纤维/丙纶」是规范材质名，不受本条限制。\n"
+        "   - 环保声明：【整句删掉、直接不提环保这件事】，不要用别的环保说法替代——\n"
+        "     任何环保声明平台都不接受，换一个词同样违规。含 eco-friendly、\n"
+        "     environmental friendly、planet-friendly、sustainable、biodegradable、\n"
+        "     recycled、carbon neutral、zero waste、环保、可持续、可降解、可回收、\n"
+        "     生态友好 这类说法的表述一律不要写。注意 Green（绿色）、Natural（自然色）\n"
+        "     是普通颜色与客观描述，可以正常用。\n"
         "9. 禁止年份及短期时效词（2025/2026/25/26、New Arrival、Latest、This Year、新款、新品、上新）；\n"
         "   Winter/Fall 等真实季节属性可以保留。禁止 Emoji、商标蹭词和特殊符号。\n"
         "10. 英文标题只允许 ASCII 字母、数字、空格和连字符，长度严格 40-70 个字符（含空格）。\n"

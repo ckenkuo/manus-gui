@@ -121,7 +121,7 @@ def test_fatal时中断整段而不是逐张重试(monkeypatch, tmp_path):
         calls["replace"] += 1
         return {"status": "ok"}
 
-    async def _save(session):
+    async def _save(session, allow_empty=False):
         return {"status": "ok", "descImgs": 1, "dxmHosted": 1}
 
     async def _closed(session):

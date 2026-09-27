@@ -72,6 +72,25 @@ def _fail_message(r: dict) -> str:
         return (f"{r['file']} 多次英化质检均未通过：图上的夸大宣传文案"
                 f"（BEST-SELLER、热卖、爆款这类角标或标语）没能抹除干净。"
                 f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
+    # 品牌标识（商标、实物上的品牌小标签）与材质成分说明同理单独点名：它们也常常一个
+    # 汉字都没有（实物织标上的 100% COTTON、口袋上的英文方标），讲成「该图带中文」
+    # 会让人对着一张全英文的图找中文（同本函数开头「文案必须与事实相符」的取向）。
+    if r.get("brandMark"):
+        return (f"{r['file']} 多次英化质检均未通过：图上的品牌标识"
+                f"（商标、商品实物上的品牌小标签）没能抹除干净——它会构成商标侵权。"
+                f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
+    if r.get("materialText"):
+        return (f"{r['file']} 多次英化质检均未通过：图上的材质成分说明"
+                f"（「棉」「100% Cotton」这类）没能抹除干净——它会与属性的材质对不上。"
+                f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
+    # 平台禁词与环保声明也要单独点名：这一类同样一个汉字都不必有（纯英文的
+    # Eco-Friendly 角标），而 _one 早就把 bannedTerm 透出来了、原先却没人渲染——2026-09-20
+    # 加禁词时漏的，2026-09-25 环保声明并进同一份词表后它成了常态失败，措辞与事实不符
+    # 的代价随之放大（用户会去一张全英文的图上找中文）。
+    if r.get("bannedTerm"):
+        return (f"{r['file']} 多次英化质检均未通过：图上的平台禁词或环保声明"
+                f"（安抚、PP棉、Eco-Friendly、Sustainable 这类）没能清除干净。"
+                f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
     return (f"{r['file']} 多次英化质检均未通过（仍带中文/水印，不能发布）。"
             f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
 
@@ -109,16 +128,30 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
     plan = vision.plan_clean(info, ctx["workdir"], min_clean=SKC_ROW_MIN_IMAGES)
     items = plan.get("items") or []
     # 轮播图会被素材图和 SKU 预览图复用。plan_clean 为控制成本只补最低张数，
-    # 但明确标记含中文的其余主图不能原样发布，必须同样经过英化和质检。
+    # 但明确标记为不能原样发布的其余主图，必须同样经过英化和质检。
+    # 【2026-09-25 起判据从「含中文」扩到三类】原先只看 chinese，于是标了 logo（他人品牌
+    # logo，语义现已含商品实物上的品牌标识）或 material（图上有材质成分说明，如实物织标
+    # 上的 100% COTTON）的图，只要没被 plan_clean 的候选池挑中，就【不进任何清理链路】：
+    # 它们不跑 check_cleaned，标注就是唯一判据，于是原样发上真店——而这两类正是用户当天
+    # 收到的违规通知（商标侵权、图上材质与属性材质不匹配）。水印与夸大宣传仍不加进来：
+    # 它们由 plan_clean 的候选池覆盖，且每加一类就是每张一次付费生图。
     planned = {item.get("file") for item in items}
     notes = info.get("complianceNotes") or {}
     main_dir = ctx["workdir"]
     for entry in notes.get("files") or []:
         filename = entry.get("file") if isinstance(entry, dict) else ""
-        if not filename or filename in planned or not entry.get("chinese"):
+        if not filename or filename in planned or not (
+                entry.get("chinese") or entry.get("logo")
+                or entry.get("material")):
             continue
         path = os.path.join(main_dir, filename)
-        if not os.path.isfile(path) or entry.get("clean") or entry.get("duplicate"):
+        # 【clean 要连 is_dirty 一起看】clean 是阶段① 模型填的字段，它偶发会和同一份
+        # 响应里的 logo/material 自相矛盾（标了脏却把 clean 填成 true）。只看 clean 会
+        # 让这张图既进不了清理链路、又被 is_dirty 挡在选图池外，等于凭空少一张图；
+        # 这里改成「确定干净才跳过」，让矛盾的标注照样送去清理（清理通过后回写会
+        # 把所有脏标记一起清零，两个字段就一致了）。
+        if (not os.path.isfile(path) or entry.get("duplicate")
+                or (entry.get("clean") and not vision.is_dirty(entry))):
             continue
         # 上一轮已被审核拒收的图不再送：重跑必然同样被拒（见 images.ModerationBlocked），
         # 白等一发还会把这张图重新报一次人工确认。
@@ -136,17 +169,19 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         items.append({
             "file": filename,
             "path": path,
-            # 非尺码表那条也要带上营销标语的处置口径：这段是按 chinese 标注追加的补充
+            # 非尺码表那条也要带上营销标语的处置口径：这段是按合规标注追加的补充
             # 循环，原先只说「中文译成英文 + 移除水印」，纯英文的 BEST-SELLER 角标两头
             # 都不沾、被原样留下（SIZECHART_TRANSLATE_PROMPT 那条已由
-            # DEFAULT_TRANSLATE_PROMPT 带上，不必重复）。
+            # DEFAULT_TRANSLATE_PROMPT 带上，不必重复）。实物标记（品牌标识 / 材质说明）
+            # 同一道理：纯英文的 100% COTTON 织标与红标不在「中文」范围内。
             "prompt": (images.SIZECHART_TRANSLATE_PROMPT if is_sizechart else
                        "将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、"
                        "构图和颜色；同时移除水印、店铺名和第三方 logo。"
                        + claims.CLAIM_REMOVE_RULE
-                       + claims.BANNED_REMOVE_RULE),
+                       + claims.BANNED_REMOVE_RULE
+                       + claims.MARK_REMOVE_RULE),
             "sizechart": is_sizechart,
-            "note": "轮播图中文复核",
+            "note": "轮播图合规复核",
         })
     if not items:
         return {"status": "skipped", "note": plan.get("reason") or "无可清理项"}
@@ -182,7 +217,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         """
         dst = os.path.join(outdir, os.path.splitext(item["file"])[0] + "-clean.png")
         last_why, cjk_left, claim_left = "", False, False
-        banned_left = False
+        banned_left, brand_left, material_left = False, False, False
         attempt, tries = 0, stages_description_images.DESC_QC_TRIES
         # 【累积失败历史 + 下一发的加码在本发末尾预备】同 _prepare_desc_image 的取向：
         # 加码话术由 vision.build_retry_hint 看着上一发的产物图实时生成，而产物路径
@@ -228,6 +263,12 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
             cjk_left = bool(qc.get("residualChinese"))
             claim_left = bool(qc.get("marketingClaim"))
             banned_left = bool(qc.get("bannedTerm"))
+            # 品牌标识与材质说明分开记、分开报：两者的话术同属一档（都是抹掉、不翻译），
+            # 故传给 _retry_hint 时合起来（见下面 mark=），但日志与失败文案必须分得清
+            # 是哪一类——讲成「图上有品牌标识」而实际是材质说明，用户会去错的地方找问题
+            # （同 _fail_message 开头「文案必须与事实相符」的取向）。
+            brand_left = bool(qc.get("brandMark"))
+            material_left = bool(qc.get("materialText"))
             # 同 _prepare_desc_image：中文残留与生图乱码都算「这发没弄好」，多烧
             # 有救。main-04 那次两发全是 garbled，只给 2 发正好白放弃。
             # marketingClaim 同样抬发数（理由见 _prepare_desc_image 那处注释）：
@@ -235,8 +276,11 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
             # 以脏图身份放回打分池。
             # 禁词与中文/乱码/夸大同属「重烧一发常常就过」（抹除比译写容易），
             # 故一并抬高发数，理由见 vision.check_cleaned 对 marketingClaim 那段。
+            # 实物标记（品牌标识 / 材质说明）同样抬发数：它们和中文一样是「这一发没弄
+            # 干净」而非「做不成」，且代价是实罚（商标侵权、材质与属性不符），不该只给
+            # 2 发就退回原图——退回的那张恰恰带着那个标。
             if (cjk_left or qc.get("garbled") or qc.get("marketingClaim")
-                    or banned_left):
+                    or banned_left or brand_left or material_left):
                 tries = max(tries, stages_description_images.DESC_QC_TRIES_TEXT)
             # 记一笔失败历史：带上该发实际追加的加码话术（prompt 去掉 base 的那部分），
             # 模型才知道自己上次要求过什么，不会重复给一个已经失败过的要求。
@@ -248,24 +292,28 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                 if attempt + 1 == tries and not item.get("sizechart"):
                     next_hint = stages_cleaning_rules._retry_hint(
                         last_why, cjk_left, claim=claim_left, banned=banned_left,
-                        last_chance=True)
+                        mark=brand_left or material_left, last_chance=True)
                 else:
                     next_hint = await vision.build_retry_hint(
                         base, history, ed["output"], stage="clean_images",
                         sizechart=bool(item.get("sizechart")))
                     if not next_hint:
                         next_hint = stages_cleaning_rules._retry_hint(
-                            last_why, cjk_left, claim=claim_left, banned=banned_left)
+                            last_why, cjk_left, claim=claim_left, banned=banned_left,
+                            mark=brand_left or material_left)
                 # 脏法要进日志：不带就无法从「烧了 4 发还没过」反推当时脏的是哪几类
                 flags = "，".join(f for f, v in (("残留中文", cjk_left),
                                                 ("夸大宣传", claim_left),
-                                                ("平台禁词", banned_left)) if v)
+                                                ("平台禁词", banned_left),
+                                                ("品牌标识", brand_left),
+                                                ("材质说明", material_left)) if v)
                 logger.info(f"{item['file']} 清理质检未过（{attempt}/{tries}"
                             f"{'，' + flags if flags else ''}），"
                             f"重烧一发：{(qc.get('issues') or '')[:60]}")
         return {"file": item["file"], "ok": False, "kind": "qc",
                 "why": last_why[:120], "marketingClaim": claim_left,
-                "bannedTerm": banned_left}
+                "bannedTerm": banned_left, "brandMark": brand_left,
+                "materialText": material_left}
 
     logger.info(f"图片清理：{len(items)} 张待处理（并发 {conc}）")
     results = await asyncio.gather(*(_one(it) for it in items))
@@ -314,10 +362,11 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         shutil.copy(r["path"], os.path.join(ctx["workdir"], r["file"]))
         e = by_name.get(r["file"])
         if e is not None:
-            # claim 必须跟着一起清零：它是 is_dirty 的判据之一，留着 True 会让 ⑥⑦
-            # 继续把这张【已清干净且质检通过】的图当脏图排除，表现是「清了也白清」。
+            # claim 与 material 必须跟着一起清零：它们是 is_dirty 的判据，留着 True 会让
+            # ⑥⑦ 继续把这张【已清干净且质检通过】的图当脏图排除，表现是「清了也白清」。
             e.update({"clean": True, "chinese": False, "watermark": False, "logo": False,
-                      "claim": False, "cleaned": True, "note": "AI 清理后质检通过"})
+                      "claim": False, "material": False, "cleaned": True,
+                      "note": "AI 清理后质检通过"})
     if by_name:
         notes["files"] = [by_name[k] for k in sorted(by_name)]
         notes["cleanFiles"] = sorted(k for k, v in by_name.items() if v.get("clean"))

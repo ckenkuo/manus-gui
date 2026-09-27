@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import json
 import os
 import shutil
 from app.logger import logger
@@ -47,6 +48,111 @@ def _desc_cache_paths(workdir: str, url: str) -> tuple:
     h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
     base = os.path.join(workdir, "desc-edit")
     return os.path.join(base, f"{h}.jpg"), os.path.join(base, f"{h}-en.jpg")
+
+
+def _carousel_en_product(workdir: str, url: str) -> str:
+    """同一源 URL 在 ⑤c 轮播图阶段已英化过的产物路径；没有就返回空串。
+
+    【为什么会有这张图】⑤c 与 ⑬ 都会把带中文的图送生图英化，而轮播图与描述区常挂
+    着同一张源图。两边各按【源 URL 哈希】缓存产物，只是落在不同目录（⑤c 的
+    carousel-edit/ 与本阶段的 desc-edit/），彼此不看，于是同一张图被烧两次。
+    2026-09-23 在 93 单实测产物里量过：10 单两个阶段都出过图，其中 9 单存在重复
+    出图，41 对重复里 37 对【两侧 URL 哈希键完全相同】——即绝大多数重复只差这一次
+    跨目录探测，不需要任何画面判重。剩下 4 对是 URL 不同而画面相似，刻意不管：
+    那要引入 ahash 或视觉判重，而 ahash 分不清同款不同色（见 extract.dedup_images
+    记的两个坑）、视觉判定本身有抖动（见 carousel 复检那段），为一成的残余承担
+    这些误伤面不值当。
+
+    【只认逐字符相同的 URL，不做归一】本函数刻意用裸 URL 哈希：⑤c 与 ⑬ 两边的键都是
+    这么算的（见 carousel._en_cache_path），要归一得两边一起改，否则新键探不到旧产物。
+    跨 CDN 后缀的那种重复由 _cleaned_main_product 那条路覆盖（它比的是归一键）。
+
+    【方向是单向的，只能 ⑬ 探 ⑤c】STAGES 里 ⑤c 在 ⑬ 之前，反向那一刻产物还不存在。
+    且口径只有这个方向安全：轮播产物是 1:1、边长 >= 800，必然落在描述图要求的
+    比例 0.5~2 与两边 >= 480 之内；反过来描述图可能是超长通栏图，喂给轮播要先过
+    _to_carousel_size 才行。
+
+    不在这里做尺寸复核：调用方对自己目录的缓存本来就要复核一遍（check_desc_size），
+    复用这张图走的是同一道闸，没有理由另写一份判断。
+    """
+    import hashlib
+
+    if not workdir or not url:
+        return ""
+    h = hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+    path = os.path.join(workdir, "carousel-edit", f"{h}-en.jpg")
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    except OSError:
+        # 探缓存是辅助路径，取不到文件状态一律当未命中（本项目 best-effort 取向）
+        return ""
+    return ""
+
+
+def _cleaned_main_product(workdir: str, url: str) -> str:
+    """同一张图在 ⑤b 已清理过的主图产物路径（main-NN.jpg）；没有就返回空串。
+
+    【为什么 ⑤c 那条路覆盖不到它】⑤b 清完是直接 shutil.copy 顶替原文件 main-NN.jpg
+    （⑥⑦ 按文件名找图，故它不需要 URL 键），于是它的成果没有任何以源 URL 为键的落盘，
+    _carousel_en_product 探不到。而 1688 常把同一张图既挂在主图区又放进详情区：⑤b 为
+    ⑥⑦ 把它清干净了，⑬ 到点又按描述区的源 URL 重烧一发，两次做的是同一件事。
+
+    【下标对应是可靠的】main-NN.jpg 的 NN 来自 extract 下载主图时的 enumerate(imgs, 1)，
+    下载失败那张只 continue、不改后续编号，所以 raw.json 的 images[N-1] 恒等于
+    main-NN.jpg 的源 URL。注意字段名是 images 而不是 mainImages——后者只存在于提取期的
+    prod 对象上，prod.as_raw() 落盘时已展开成 images（2026-09-23 按 mainImages 读过一次，
+    一单都匹配不上）。
+
+    【必须按归一键比，不能比裸 URL】同一张原图在主图区与详情区常带不同的 CDN 尺寸/格式
+    后缀（a.jpg_960x960.jpg 与 a.jpg_q75.webp），裸串比会大面积漏判。extract.image_url_key
+    就是为这件事写的，主图侧的 main_by_key 也已在用它，这里沿用同一把尺子。
+
+    【三个条件同时成立才复用，缺一不可】判据取 complianceNotes 里那条记录的
+    cleaned（⑤b 确实处理过并质检通过）+ clean（当前判定是干净的）+ chinese 不为真。
+    只看 cleaned 不够：⑤b 单张失败时【保留原标注、不顶替原文件】（见 cleaning.py 里
+    copy 前的 continue），此时 main-NN.jpg 仍是带中文的原图。把它复用到描述区就是让
+    中文图直接上真店，而中文是 Temu 最硬的红线、后面没有第二道闸会再拦它。宁可漏一次
+    复用白烧一发生图，不可漏一张中文图（同 vision 模块头「拿不准一律交人工」的取向）。
+
+    读不到文件/结构不对一律返回空串当未命中：这是省钱的辅助路径，坏了只是没省下，
+    不能影响主流程（本项目 best-effort 取向）。
+    """
+    if not workdir or not url:
+        return ""
+    try:
+        raw_path = os.path.join(workdir, "raw.json")
+        with open(raw_path, encoding="utf-8") as f:
+            raw = json.load(f)
+        mains = [u for u in (raw.get("images") or []) if isinstance(u, str)]
+        if not mains:
+            return ""
+        want = extract.image_url_key(url)
+        # setdefault：同一张图重复挂在主图区时认第一个，与 extract.main_by_key 同口径
+        by_key = {}
+        for i, u in enumerate(mains, 1):
+            by_key.setdefault(extract.image_url_key(u), f"main-{i:02d}.jpg")
+        fname = by_key.get(want)
+        if not fname:
+            return ""
+
+        info_path = os.path.join(workdir, "product-info.json")
+        with open(info_path, encoding="utf-8") as f:
+            info = json.load(f)
+        notes = (info.get("complianceNotes") or {}).get("files") or []
+        note = next((n for n in notes
+                     if isinstance(n, dict) and n.get("file") == fname), None)
+        if not note:
+            return ""
+        if not (note.get("cleaned") and note.get("clean")) or note.get("chinese"):
+            return ""
+
+        path = os.path.join(workdir, fname)
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            return path
+    except Exception as e:
+        logger.warning(f"探 ⑤b 已清理产物失败（忽略，照常英化）：{e}")
+    return ""
 
 
 def _desc_geometry_fix(workdir: str, url: str, src: str) -> str:
@@ -245,6 +351,44 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
         else:
             return {"ok": True, "path": en_path, "how": "cached"}
 
+    # 【本目录未命中时，再探前面阶段已经处理过同一张图的产物】同一张图在 ⑤c（轮播图
+    # 英化）或 ⑤b（主图清理）已经烧过一发生图，⑬ 到点又按自己的键重烧一发，两次做的是
+    # 同一件事。实测中这是最主要的重复开销，理由与各自的判据见两个探测函数。
+    # 顺序上先 ⑤c 后 ⑤b：⑤c 的产物是 1:1、且走的是轮播专用英化提示词，口径与描述图
+    # 更接近；⑤b 的产物是按服装 1340×1785 出的主图。两条都按归一/哈希键认图，互不影响。
+    # 探测函数传的是【函数本身】而不是调用结果：⑤c 命中时就不必再去读 ⑤b 那两个
+    # JSON（raw.json 与 product-info.json 都是每张图探一次，白读没有意义）。
+    for stage_name, probe in (("⑤c 轮播图", _carousel_en_product),
+                              ("⑤b 主图清理", _cleaned_main_product)):
+        reuse = probe(workdir, rep["url"])
+        if not reuse:
+            continue
+        # 【必须过和本目录缓存同一道尺寸闸】两边的产物理论上都落在描述图口径内
+        # （轮播 1:1/>=800；主图 1340×1785 比例 0.751），但历史产物可能是更早的口径、
+        # 也可能被各自阶段的压缩改过，故不凭推理放行，一律实测一次再用。
+        rsz = images.image_size(reuse)
+        rchk = (images.check_desc_size(*rsz) if rsz
+                else {"ok": None, "reasons": ["宽高读取失败"]})
+        if rchk.get("ok") is False:
+            logger.warning(
+                f"{stage_name}产物不合描述图口径"
+                f"（{rsz[0]}x{rsz[1]}：{'、'.join(rchk['reasons'])}），不复用，照常英化")
+            continue
+        # 【复制到 en_path 而不是直接返回来源路径】en_path 是本阶段的缓存键：不落一份
+        # 的话下次重跑这里仍是未命中，还要再探一遍；而来源产物随时可能变——⑤c 的图在它
+        # 自己复检未过时会被删掉（carousel 那段 os.remove），⑤b 的 main-NN.jpg 则可能
+        # 被后续阶段再次顶替。复制一份等于就地定格，与其它两条分支的行为也一致。
+        try:
+            os.makedirs(os.path.dirname(en_path), exist_ok=True)
+            shutil.copy(reuse, en_path)
+        except Exception as e:
+            # 复制失败不算失败：照常往下走生图，只是没省下这一发
+            logger.warning(f"复用{stage_name}产物时落盘失败（忽略，改为照常英化）：{e}")
+            continue
+        logger.info(f"描述图复用{stage_name}已处理的产物，省掉一次生图："
+                    f"{os.path.basename(reuse)} <- {rep['url']}")
+        return {"ok": True, "path": en_path, "how": "cached"}
+
     if rep.get("needsUpscale"):
         # 【只缺像素的图走纯几何放大，不烧生图】plan_desc 判 needsUpscale 的图内容
         # 是干净的（模型本来判 keep），只是尺寸不符合描述图要求过不了保存校验。
@@ -303,7 +447,7 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
     #     「仍有外链图未转存」+「三张破线」就是三张图退回原图的后果，不是独立故障）。
     #   - 其它 issues（修图痕迹之类）→ DESC_QC_TRIES 发，多烧是同样结果。
     last_issues, cjk_left, claim_left = "", False, False
-    banned_left = False
+    banned_left, brand_left, material_left = False, False, False
     attempt, tries = 0, DESC_QC_TRIES
     # 【累积失败历史 + 下一发的加码在这里预备好】加码话术由 vision.build_retry_hint
     # 看着上一发的产物图实时生成，而产物在本次循环末尾就要被删掉（缓存键，见下面
@@ -319,8 +463,10 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
         # 该删、「Cotton Denim Fabric」该译、「38 斤」该换算、「FASHION.STREET」该抹），
         # 于是每发只修一块、修完又冒另一块、四发烧完才过。生成式逐块给动作，一次说清。
         # 第一发走【翻译优先】而非 DEFAULT_CLEAN_PROMPT 的「移除中文」：描述区这些图是
-        # plan_desc 判 replace 的商品图，图上中文多是材质成分/工艺/卖点等有效信息，该翻译
-        # 成英文原位保留，不能看到中文就消除（2026-09-03 用户要求）。
+        # plan_desc 判 replace 的商品图，图上中文多是工艺/卖点等有效信息，该翻译成英文
+        # 原位保留，不能看到中文就消除（2026-09-03 用户要求）。
+        # （材质成分 2026-09-25 起从「翻译保留」里移出，由 DEFAULT_TRANSLATE_PROMPT 带的
+        # MARK_REMOVE_RULE 讲明要抹掉，理由见 images.DEFAULT_TRANSLATE_PROMPT 那段。）
         # 尺码表图（plan_desc 标了 sizechart）用专用提示词：额外要求 cm 换算成英寸，
         # 买家按它选码（见 images.SIZECHART_TRANSLATE_PROMPT）。
         base = (images.SIZECHART_TRANSLATE_PROMPT if rep.get("sizechart")
@@ -346,6 +492,8 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
         cjk_left = bool(qc.get("residualChinese"))
         claim_left = bool(qc.get("marketingClaim"))
         banned_left = bool(qc.get("bannedTerm"))
+        brand_left = bool(qc.get("brandMark"))
+        material_left = bool(qc.get("materialText"))
         # 文字层没清干净（中文残留 or 生图吐了乱码）都给到 DESC_QC_TRIES_TEXT 发，
         # 理由见该常量注释。发数在循环里抬而不是一开始就取大值：只有确实是这两类才
         # 多烧，brokenSubject 照旧 2 发。
@@ -353,7 +501,10 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
         # 比翻译容易得多（不必读懂、不必排版），多烧一发命中率明显高；而它漏过去的代价
         # 与中文同级（平台按虚假宣传实罚），不该只给 2 发就退回原图。
         # 禁词一并抬高发数，理由同 marketingClaim（抹除比译写容易，多烧常常就过）
-        if cjk_left or qc.get("garbled") or qc.get("marketingClaim") or banned_left:
+        # 品牌标识与材质说明（2026-09-25 加）也是抹除类，且漏过去的代价是商标侵权与
+        # 「图上材质与属性材质不符」两类实罚，同样不该只给 2 发。
+        if (cjk_left or qc.get("garbled") or qc.get("marketingClaim")
+                or banned_left or brand_left or material_left):
             tries = max(tries, DESC_QC_TRIES_TEXT)
         # 记一笔失败历史：带上该发实际追加的加码话术（prompt 去掉 base 的那部分），
         # 模型才知道自己上次要求过什么，不会重复给一个已经失败过的要求。
@@ -367,14 +518,15 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
             if attempt + 1 == tries and not rep.get("sizechart"):
                 next_hint = stages_cleaning_rules._retry_hint(
                     last_issues, cjk_left, claim=claim_left, banned=banned_left,
-                    last_chance=True)
+                    mark=brand_left or material_left, last_chance=True)
             else:
                 next_hint = await vision.build_retry_hint(
                     base, history, ed["output"],
                     sizechart=bool(rep.get("sizechart")))
                 if not next_hint:
                     next_hint = stages_cleaning_rules._retry_hint(
-                        last_issues, cjk_left, claim=claim_left, banned=banned_left)
+                        last_issues, cjk_left, claim=claim_left, banned=banned_left,
+                        mark=brand_left or material_left)
         try:
             os.remove(ed["output"])
         except OSError:
@@ -383,7 +535,9 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
             # 脏法要标出来：日志不带就无法从「烧了 4 发还没过」反推当时脏的是哪几类
             flags = "，".join(f for f, v in (("残留中文", cjk_left),
                                             ("夸大宣传", claim_left),
-                                            ("平台禁词", banned_left)) if v)
+                                            ("平台禁词", banned_left),
+                                            ("品牌标识", brand_left),
+                                            ("材质说明", material_left)) if v)
             logger.info(f"描述图英化质检未过（{attempt}/{tries}"
                         f"{'，' + flags if flags else ''}），重烧一发："
                         f"{last_issues[:60]}")
@@ -391,7 +545,8 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
     # 「fetch」/「edit」= 源站取不到 / 出图链路报错，图本身没被判死，重跑就该好，仍保留原图。
     return {"ok": False, "kind": "qc", "why": f"英化质检未过：{last_issues}"[:150],
             "residualChinese": cjk_left, "marketingClaim": claim_left,
-            "bannedTerm": banned_left}
+            "bannedTerm": banned_left, "brandMark": brand_left,
+            "materialText": material_left}
 
 
 async def _prewarm_desc_images(workdir: str, replace_plan: list, emit) -> dict:

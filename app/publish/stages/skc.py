@@ -137,7 +137,8 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
                 vision._dirty_score(_note(p)))
 
     need = SKC_ROW_MIN_IMAGES - len(picked)
-    # 【不合规图优先不用，凑不够才放回】带中文/水印/他人 logo 是 Temu 的硬红线，
+    # 【不合规图优先不用，凑不够才放回】带中文/水印/他人 logo/夸大宣传/材质说明
+    # （判据是 vision.is_dirty，2026-09-25 起含最后两类）都是 Temu 的硬红线，
     # 原实现只把它们按 _dirty_score 排到后面、照样补进颜色行——等于 plan_skc 那边
     # 刚排除掉，这里又补回来。现在先只用合规图，仍不足行下限才放回（整行不足 3 张
     # 会让阶段⑫ save 被静默拦下，两害相权），放回的由 _st_skc 逐行查出来报人工确认。
@@ -147,8 +148,9 @@ def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
                        key=_key)[:need - len(added)]
         if extra:
             logger.warning(f"合规图只够补 {len(added)} 张，凑不满每行下限 "
-                           f"{SKC_ROW_MIN_IMAGES} 张，被迫补 {len(extra)} 张仍带"
-                           f"中文/水印/logo 的图：{[os.path.basename(p) for p in extra]}")
+                           f"{SKC_ROW_MIN_IMAGES} 张，被迫补 {len(extra)} 张仍不合规的图"
+                           f"（中文/水印/logo/夸大宣传/材质说明）："
+                           f"{[os.path.basename(p) for p in extra]}")
             added += extra
     return picked + added, [os.path.basename(p) for p in added]
 

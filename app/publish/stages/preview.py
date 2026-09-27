@@ -74,7 +74,7 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
     # 范围，模型会原样留下，而 check_cleaned 的 marketingClaim 那关必然判不过。
     prompt = ("将图片中的所有中文文字翻译成自然英文并原位替换，保留商品主体、构图和颜色；"
               "移除水印、店铺名和第三方 logo。" + claims.CLAIM_REMOVE_RULE
-              + claims.BANNED_REMOVE_RULE)
+              + claims.BANNED_REMOVE_RULE + claims.MARK_REMOVE_RULE)
     if issues:
         prompt += f" 本张图已知的问题：{str(issues)[:200]}。请一并修正。"
     for _ in range(3):
@@ -88,11 +88,23 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
             qc = await vision.check_cleaned(edited["output"])
             if qc.get("clean"):
                 return edited["output"]
-            # 加码话术按上一发的实际问题分两类（同 cleaning_rules._retry_hint 的取向）：
-            # 对营销标语说「清除中文」是无效的，它压根没有中文。
-            prompt += (" 上一版仍有夸大宣传文案，请把那些标语连同背景一起彻底抹除、按周围画面补全。"
-                       if qc.get("marketingClaim")
-                       else " 上一版仍有中文或乱码，请彻底清除所有中文字符并保持商品不变。")
+            # 加码话术按上一发的实际问题分类（同 cleaning_rules._retry_hint 的取向）：
+            # 对营销标语说「清除中文」是无效的，它压根没有中文。2026-09-25 起类别变多，
+            # 按判罚最直接的取第一条命中的（夸大宣传与禁词是实罚项、品牌标识是侵权、
+            # 材质说明是与属性打架），都没命中的才是老口径的中文/乱码。
+            if qc.get("marketingClaim"):
+                prompt += (" 上一版仍有夸大宣传文案，请把那些标语连同背景一起彻底抹除、"
+                           "按周围画面补全。")
+            elif qc.get("bannedTerm"):
+                prompt += (" 上一版仍有平台禁词或环保声明（安抚、PP棉、eco-friendly、"
+                           "sustainable 这类），请连同所在整句文案一起彻底抹除、"
+                           "按周围画面补全。")
+            elif qc.get("brandMark") or qc.get("materialText"):
+                prompt += (" 上一版仍有品牌标识或材质成分说明（商标、实物上的品牌小标签、"
+                           "「棉」「100% Cotton」这类），请把它们连同标签一起彻底抹除、"
+                           "按周围画面补全。")
+            else:
+                prompt += " 上一版仍有中文或乱码，请彻底清除所有中文字符并保持商品不变。"
         except Exception:
             continue
     return ""

@@ -56,7 +56,9 @@ def _env(tmp_path, monkeypatch, calls: dict, replace_results: list,
             return replace_results[i]
         return {"status": "ok"}
 
-    async def _save(session):
+    # 签名要跟真 desc_save 一致（它一直有 allow_empty）：桩少一个参数时，
+    # 被测代码传了就 TypeError，看着像业务改错、实际是桩过时了
+    async def _save(session, allow_empty=False):
         calls["saves"] = calls.get("saves", 0) + 1
         # 只有【最后】那次保存用给定的结果：前面的是重试前的中途保存
         if save_result and calls["saves"] > 1:

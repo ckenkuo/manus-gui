@@ -109,11 +109,17 @@ def _no_sleep(monkeypatch):
 # ---- check_cleaned 的判据 -------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_衣服实物logo和图案不算质检失败(monkeypatch):
-    """选品阶段已人工过滤，实物绣标不是「待清理的文字层」，误报会让图退回原图。"""
+async def test_装饰性印花刺绣不算质检失败(monkeypatch):
+    """选品阶段已人工过滤，实物【装饰性】绣标不是「待清理的文字层」，误报会让图退回原图。
+
+    【2026-09-25 起这条收窄到「装饰性」】实物上的品牌标识与材质成分说明改为要判
+    （平台判了商标侵权与「含棉材质宣传但属性材质不匹配」，见 claims.MARK_IMAGE_RULE）。
+    提示词必须同时写清两半——只写「实物不算」会让模型漏掉红标与 COTTON 织标，
+    只写「要判」会让模型把装饰字母也报成品牌字（21/21 误报那次的老路）。
+    """
     async def _fake(prompt, images, what="", system=None, stage=None, **kw):
-        # 提示词必须明确把实物印花/刺绣排除在外，否则模型照旧误报
-        assert "刺绣" in prompt and "印花" in prompt
+        assert "装饰性印花" in prompt and "刺绣" in prompt
+        assert "品牌标识" in prompt and "材质成分说明" in prompt
         assert "不算问题" in prompt
         return {"residualChinese": False, "garbled": False,
                 "brokenSubject": False, "watermark": False,

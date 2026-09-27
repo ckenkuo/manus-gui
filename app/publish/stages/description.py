@@ -341,7 +341,17 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"描述编辑器未能关闭（会挡住 ⑭ 保存）："
                                    f"{closed.get('reason')}"})
         return {"status": "skipped", "note": f"{len(mods)} 张全部保留"}
-    s = await desc_save(session)
+    # 【描述图被删光时要放行「读回必须有图」】源商品的详情图全是非商品文案图（发货售后、
+    # 品牌实力、工厂介绍）时，plan_desc 会把它们整批判删，页面于是一张图都不剩，而
+    # desc_save 的读回校验必然报「保存后编辑页描述区没有图片」、整个 ⑬ 判 fail——那是
+    # 假失败，本阶段该做的事（删干净）恰恰全做完了。判据用【本阶段确实把所有模块都处理
+    # 掉了】而不是「读回为 0」：后者分不清「删光了」与「编辑器状态异常读不到图」，
+    # 后一种仍该判 fail。discarded 也算进来（质检判死的图同样是从页面上删掉的）。
+    emptied = deleted + discarded >= len(mods)
+    if emptied:
+        logger.info(f"描述区 {len(mods)} 张图已全部删除（删 {deleted} / 丢弃 {discarded}）："
+                    f"源详情图全是非商品内容，保存时放行「读回必须有图」校验")
+    s = await desc_save(session, allow_empty=emptied)
     # 【关编辑器必须在所有 return 之前】它是全屏 modal，开着会盖住整个编辑页，后续
     # ⑦⑧⑩⑪⑭ 全部点不中，且报的是「瞄点未命中」——看着像时序问题，实际是被遮住
     # （2026-08-24 实测：阶段⑦ 连续两次 open-space 失败，诊断才发现瞄点落在描述弹窗的
