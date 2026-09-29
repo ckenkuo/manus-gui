@@ -45,15 +45,22 @@ from typing import Optional
 #   - 【合成 hover 即可展开菜单】不必像 ⑦ SKC 行那样走 CDP 真实点击。⑦ 那条约束的
 #     成因是「JS click 会命中素材图残留的菜单实例」，这里的菜单是行内 trigger 自己
 #     的实例，hover 展开后菜单项集合就能唯一认出（见下方 SKU_PREVIEW_MENU_ITEMS）。
-#   - 菜单 8 项，含「空间图片」（与素材图同名；注意描述图那处叫「空间【上传】」，
-#     三处文案不统一，每处都必须实测，别互相照抄）。
+#   - 菜单 2026-09-29 起改为分组 9 项（组标题「更换图片」「图片运用到」「图片编辑」，
+#     新增「小秘美图」），且【展开方位从 trigger 正下方改成右侧顶对齐】
+#     （ant-dropdown-placement-rightTop）——菜单项仍带 .ant-dropdown-menu-item
+#     （在 item-group-list 里），特征项识别不受影响，但几何锚定必须认这个方位
+#     （见 _JS_OPEN_SKU_PREVIEW_SPACE 的 menuNear）。含「空间图片」（与素材图同名；
+#     注意描述图那处叫「空间【上传】」，三处文案不统一，每处都必须实测，别互相照抄）。
 #   - 弹窗与 ⑥⑦ 是【同一个组件实例】：标题「从图片空间选择」、20 个 .img-item、
 #     .img-check 文本「点击选择」、计数器「已选择N张图片」全部一致，故 _pick_from_space
 #     可以直接复用，不必另写选图逻辑。
 #   - 菜单里有「应用到全部」，能一次给所有行赋同一张图。【刻意不用】：那会让 8 个
 #     颜色共用一张预览图，等于把每个 SKU 的辨识度抹掉，人工发布也不会这么做。
 
-# 预览图行内菜单的特征菜单项（2026-08-30 实测该菜单共 8 项）。
+# 预览图行内菜单的特征菜单项（菜单项随版本增减，特征集不变）。
+# 2026-08-30 实测该菜单共 8 项；2026-09-29 起为 9 项分 3 组（组标题「更换图片」/
+# 「图片运用到」/「图片编辑」，新增「小秘美图」），项仍带 .ant-dropdown-menu-item
+# 类（在 .ant-dropdown-menu-item-group-list 里），故文本特征匹配不受分组影响。
 # 用于在页面众多 .ant-dropdown 实例里认出它——「应用到全部」是它独有的特征项，
 # 素材图菜单只有 4 项且没有这一项，故两者可明确区分（同 ⑦ 靠「应用到所有颜色」区分）。
 SKU_PREVIEW_MENU_ITEMS = ("空间图片", "应用到全部")
@@ -103,6 +110,13 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
   const iPrev = heads.findIndex(h => h.includes('预览图'));
   __DIM_COLS__
   const {colorIdx: iColor} = dimIdx(heads);
+  // 【真实颜色维列】与行标识列不同的「颜色」表头列。行标识（第一维）可能是尺码/
+  // 型号维（2026-09-28 offer 1067355258988 宠物保暖打底衫：第一维是尺码），空位补图的
+  // 「商家给没给这个颜色配图」判据要按本列的值查 colorImages，拿尺码名查颜色键必然
+  // 全落空。单维类目没有第二维时 iColorDim 恒 -1，下游退回行标识（维持原行为）。
+  const iColorDim = heads.findIndex((h, k) => k !== iColor &&
+    (h.includes('颜色') || h.includes('色系') ||
+     h.toLowerCase().includes('color')));
   if (iPrev < 0) return JSON.stringify({err: 'no-preview-column', heads: heads});
   const MIN = __MIN__;
   const rows = [];
@@ -133,6 +147,7 @@ _JS_SKU_PREVIEW_STATE = r"""(() => {
     // 判据与 ⑤c 轮播图（media/carousel.py 的 w === h）自此同口径。
     const square = known && w === h;
     rows.push({i: i, color: iColor >= 0 ? txt(tds[iColor]) : '',
+               colorDim: iColorDim >= 0 ? txt(tds[iColorDim]) : '',
                url: empty ? '' : src,
                w: w, h: h, empty: empty,
                // 行级换图入口：变种表只有部分行（颜色主行）有 trigger，其余行共享
@@ -218,18 +233,68 @@ _JS_OPEN_SKU_PREVIEW_SPACE = r"""(async () => {
   // 判「展开」只认 display:none 之外的实例——菜单 off-screen 停靠时 offsetHeight
   // 不可靠（见本模块阶段⑥⑦ 公共机制段落的第 3 条实测结论）
   const WANT = __ITEMS__;
+  // 【命中菜单必须锚定在本行 trigger 旁】2026-09-28 offer 1067355258988 续跑
+  // 语言关 13 行换图全灭（readback src 一动不动、0/13）而单放/连放 3 行全成：
+  // 残留菜单（上一行 hover 展开、点「空间图片」后未收）与当前行菜单文案完全
+  // 一致，只靠 items 匹配会先命中残留菜单，弹窗绑到上一行——连环错挂。合成
+  // hover 展开的菜单连合成 mouseleave 都收不掉（2026-09-29 实测：派发后菜单
+  // 原样挂着），每行一个 dropdown 实例、残留菜单会一直积累，几何锚定是唯一的闸。
+  //
+  // 【方位判据必须吃新版 rightTop】2026-09-29 店小秘改版（同页取证 id=
+  // 184807703157293429）：菜单展开方位从「trigger 正下方」（bottomLeft）改成
+  // 「trigger 右侧、顶边与 trigger 顶边对齐」（DOM 类名
+  // ant-dropdown-placement-rightTop；菜单 388px 高、顶边与 trigger 顶边仅差 1px；
+  // trigger 在视口外也不 flip，仍顶边对齐）。只认正上/正下的旧判据因此全行落空
+  // ——菜单明明开着却报「悬停后菜单未展开」（2026-09-29 该商品 16 行全灭即此）。
+  // 故四种方位都收：
+  //   正下（旧版 bottomLeft）：菜单 top 贴 trigger bottom（antd 约 4px 间隙）
+  //   正上（旧版 flip）：菜单 bottom 贴 trigger top
+  //   右侧顶对齐（现行 rightTop）：菜单 top 贴 trigger top
+  //   右侧底对齐（rightTop 的理论 flip 位，未实测到，容差收下无碍）
+  // 容差 40px 远小于行距（预览图行带缩略图约 76px），邻行残留菜单四种判据下都出局。
+  const trigRect = trig.getBoundingClientRect();
+  const menuNear = d => {
+    const r = d.getBoundingClientRect();
+    const near = Math.abs(r.top - trigRect.bottom) < 40
+      || Math.abs(r.bottom - trigRect.top) < 40
+      || Math.abs(r.top - trigRect.top) < 40
+      || Math.abs(r.bottom - trigRect.bottom) < 40;
+    return near && r.left < trigRect.right + 20 && r.right > trigRect.left - 20;
+  };
   let menu = null;
   for (let k = 0; k < 30; k++) {
     menu = Array.from(document.querySelectorAll('.ant-dropdown')).find(d => {
       if (/display:\s*none/.test(d.getAttribute('style') || '')) return false;
+      if (!menuNear(d)) return false;
       const its = Array.from(d.querySelectorAll('.ant-dropdown-menu-item')).map(i => txt(i));
       return WANT.every(w => its.includes(w));
     });
     if (menu) break;
     await sleep(100);
   }
-  if (!menu) return JSON.stringify({stage: 'menu', err: '悬停后预览图菜单未展开',
-                                    nowColor: nowColor});
+  if (!menu) {
+    // 【超时要分清「菜单没出」与「菜单出了但锚不上」】两者成因完全不同：前者是交互
+    // 失效或菜单项改版，后者是展开方位改版——2026-09-29 就是后者被报成前者，排查
+    // 多走一圈才定位。把可见菜单的矩形与项带回日志，下次改版一眼能认出是哪种。
+    const cand = Array.from(document.querySelectorAll('.ant-dropdown'))
+      .filter(d => !/display:\s*none/.test(d.getAttribute('style') || ''))
+      .slice(0, 6)
+      .map(d => {
+        const r = d.getBoundingClientRect();
+        return {rect: [Math.round(r.top), Math.round(r.bottom),
+                       Math.round(r.left), Math.round(r.right)],
+                items: Array.from(d.querySelectorAll('.ant-dropdown-menu-item'))
+                  .map(i => txt(i)).slice(0, 12)};
+      });
+    const itemHit = cand.some(c => WANT.every(w => c.items.includes(w)));
+    return JSON.stringify({stage: 'menu',
+      err: itemHit ? '菜单已展开但位置不贴近本行 trigger（几何锚定未过）'
+                   : '悬停后预览图菜单未展开',
+      nowColor: nowColor,
+      trigRect: [Math.round(trigRect.top), Math.round(trigRect.bottom),
+                 Math.round(trigRect.left), Math.round(trigRect.right)],
+      candidates: cand});
+  }
   const item = Array.from(menu.querySelectorAll('.ant-dropdown-menu-item'))
     .find(i => txt(i) === '空间图片');
   if (!item) return JSON.stringify({stage: 'menu', err: '菜单里没有「空间图片」项',
@@ -347,6 +412,28 @@ _JS_SKU_PREVIEW_ROW_SRC = r"""(() => {
 })()"""
 
 
+# readback 失败后的定位扫查：新 fileId 到底挂到哪一行（或哪都没挂）。
+# 2026-09-28 offer 1067355258988 的 0/13 教训：readback 只说「本行 src 没变」，分辨不了
+# 「确定后平台没生效（图哪都没挂）」与「弹窗绑错行（图挂到别的行上去了）」——后者连环
+# 发生时本行要到下一轮才会被挂上，事后排查需要知道错位方向。逐行扫第一列预览图的 img。
+_JS_SKU_PREVIEW_FIND_FID = r"""(() => {
+  const FID = __FID__, PREV = __PREV__;
+  const sku = document.getElementById('skuDataInfo');
+  if (!sku) return JSON.stringify({err: 'no-skuDataInfo'});
+  const t0 = sku.querySelector('table');
+  if (!t0) return JSON.stringify({err: 'no-table'});
+  const hits = [];
+  Array.from(t0.querySelectorAll('tbody tr')).forEach((tr, i) => {
+    const cell = Array.from(tr.children)[PREV];
+    if (!cell) return;
+    const im = Array.from(cell.querySelectorAll('img'))
+      .find(x => (x.currentSrc || x.src || '').includes(FID));
+    if (im) hits.push(i);
+  });
+  return JSON.stringify({hits: hits});
+})()"""
+
+
 async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
                                   image_path: str, preview_idx: int,
                                   color_idx: int = -1, expect_color: str = "",
@@ -448,7 +535,12 @@ async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
             f"预览图第 {row_idx + 1} 行打不开空间弹窗[{opened.get('stage') or '?'}]："
             f"{opened.get('err') or ''}"
             + (f"（页面共 {opened['rowCount']} 行）" if opened.get("rowCount") else "")
-            + f" 当前颜色「{now_color}」")
+            + f" 当前颜色「{now_color}」"
+            # 几何/项诊断（2026-09-29 起超时分支带回）：下次菜单改版一眼分清
+            # 「菜单没出」与「菜单出了但锚不上」
+            + (f" | trigger矩形={opened['trigRect']}" if opened.get("trigRect") else "")
+            + (f" | 可见菜单候选={opened['candidates']}"
+               if opened.get("candidates") else ""))
         await media_space._close_space_modal(session)
         return {"status": "error", "stage": "open-space", "row": row_idx,
                 "detail": opened, "upload": up}
@@ -476,7 +568,12 @@ async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
         _JS_SKU_PREVIEW_ROW_SRC.replace("__IDX__", J(row_idx))
         .replace("__PREV__", J(preview_idx)))
     fid = up["fileId"].rsplit("/", 1)[-1]
-    for attempt in range(10):
+    # 【回读要给图片字节加载留预算】成功判据含 naturalWidth/Height（见
+    # _JS_SKU_PREVIEW_ROW_SRC），而 src 换上新 fileId 后图片字节是异步加载的：网络慢时
+    # 老的 3s 预算内读不到尺寸，会把【已经挂成功】的行误报成替换失败——2026-09-28
+    # 1067355258988 实况：落点扫查确认新图就在本行（src 已含 fid），只是字节没加载完，
+    # readback 误报、整行被计成失败交人工。循环照常提前退出，只有加载慢时才多花轮询。
+    for _ in range(20):
         if fid in (after.get("src") or "") and after.get("w") and after.get("h"):
             break
         await asyncio.sleep(0.3)
@@ -486,16 +583,44 @@ async def sku_preview_replace_row(session: BrowserSession, row_idx: int,
     # 【成功判据是回读到的 src 含新 fileId】只看「src 变了」不够：挂错行时本行 src
     # 同样可能变（原脚本的素材图误替换事故正是这么发生的，见 set_material 的注释）
     width, height = after.get("w") or 0, after.get("h") or 0
+    src_after = after.get("src") or ""
+    fid_ok = fid in src_after
+    load_ok = bool(width and height)
     # 回读校验与 _JS_SKU_PREVIEW_STATE 的 bad 同口径：方图判严格相等，理由见那处注释
-    ok = (fid in (after.get("src") or "") and min(width, height) >= PREVIEW_MIN_SIDE
-          and width == height)
+    dim_ok = min(width, height) >= PREVIEW_MIN_SIDE and width == height
+    ok = fid_ok and load_ok and dim_ok
     if not ok:
-        logger.error(f"预览图第 {row_idx + 1} 行替换后回读不含新 fileId："
+        # 【失败必扫：fid 挂到哪行】「本行 src 没变」有两种完全不同的成因——平台没
+        # 生效（哪都没挂，重试本行有意义）与弹窗绑错行（挂在别行，重试本行只会把局面
+        # 搅更乱，得先纠正错挂的行）。0/13 那种连环错位从单行日志看不出来，必须把
+        # 落点扫出来（2026-09-28 1067355258988 教训）。best-effort：扫不出来不阻断
+        # 错误返回。
+        placed = None
+        try:
+            scan = await session.eval_json(
+                _JS_SKU_PREVIEW_FIND_FID.replace("__FID__", J(fid))
+                .replace("__PREV__", J(preview_idx)))
+            placed = scan.get("hits")
+        except Exception:
+            pass
+        # 【失败原因按环节分开写】旧文案一律写「不含新 fileId」，而 fid 明明在 src 里、
+        # 真正未过的可能是「字节没加载完」或「尺寸不合判据」——网络慢时尤其误导
+        # （阶段失败文案按环节分类的既定要求，2026-09-28 readback 误报实况）。
+        if not fid_ok:
+            reason = "回读 src 不含新 fileId"
+        elif not load_ok:
+            reason = "新图字节未加载完（naturalWidth/Height 仍为 0，网络慢时常见）"
+        else:
+            reason = (f"回读尺寸 {width}x{height} 不合判据"
+                      f"（需严格 1:1 且短边≥{PREVIEW_MIN_SIDE}）")
+        logger.error(f"预览图第 {row_idx + 1} 行替换后回读未过：{reason}："
                      f"before={(opened.get('srcBefore') or '')[-50:]} "
-                     f"after={(after.get('src') or '')[-50:]}")
+                     f"after={src_after[-50:]}"
+                     + (f"（该图实际挂在行 {placed}）" if placed else
+                        "（全表也没找到该图：确定未生效）"))
     return {"status": "ok" if ok else "error",
             "stage": "" if ok else "readback",
             "row": row_idx, "color": now_color, "upload": up,
-            "fileId": up["fileId"],
+            "fileId": up["fileId"], "err": None if ok else reason,
             "srcBefore": opened.get("srcBefore"), "srcAfter": after.get("src"),
             "sizeAfter": {"w": after.get("w"), "h": after.get("h")}}

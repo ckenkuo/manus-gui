@@ -21,7 +21,7 @@
 """
 import asyncio
 import re
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN
 from typing import Any, Optional
 
 # 复用采集管道已实测的 JSON 解析（剥 ```json 围栏 + 兜底抓首个 {...}），避免重复实现。
@@ -1017,6 +1017,20 @@ def compute_submit_price(daily_price, discount_rate, sale) -> dict:
     }
 
 
+def ceil_cent(value) -> Optional[float]:
+    """向上取整到分（None/非法值原样返回）。
+
+    保活动所需加速价用（用户规则 2026-09-28）：平台要求活动价 ≤ 加速价×0.9，故加速价
+    须 ≥ 申报价÷0.9，向上取整宁可高 1 分——保证「申报价 ≤ 加速价×0.9」在整分边界上恒成立；
+    向下取整会在边界上少 1 分、活动价恰好顶破 0.9 倍线。与 compute_submit_price 的
+    ROUND_DOWN 同理：都是把边界误差推到「约束更严」的一侧，只是两侧利益方向相反。
+    """
+    v = _to_number(value)
+    if v is None:
+        return None
+    return float(Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_CEILING))
+
+
 def norm_sku_label(value) -> str:
     """归一化货号文本用于比对：小写、去掉除字母数字与汉字外的一切（点、斜杠、空格、连字符）。
 
@@ -1118,19 +1132,27 @@ def accel_price_groups(accel_prices) -> dict:
     档的键用【平台日常价】（platform_daily，从提报页读到的那个），没有才退回表里的日常价：
     对话框按平台的日常价档列行（实测 2026-09-25：SPU 8791757215 表里两个货号都写 163.23，
     平台却是 163.23 / 188.88 两档，对话框就给 2 行——用表里的价分组只有 1 档，档数对不上必中止）。
-    同档平台只让填一个价，故取该档【最高底价 + 1】：绝不会低于档内任一货号的底价
-    （便宜的货号加速价被抬高、少拿这部分流量，但不会亏），用户 2026-09-25 拍板的口径。
+    同档平台只让填一个价，故取该档【最高传入价】：绝不会低于档内任一货号的底价，也不会
+    低于任一货号「保活动所需加速价」（=申报价÷0.9，见 service 层 accel_prices 构造）——
+    价由调用方按货号算好传入（底价+1 与活动价÷0.9 取高），这里只管同档取最高。
+    floor 额外保留「档内最高底价+1」：传入价超对话框上限时退填这个旧逻辑价（用户 2026-09-28
+    定「接收活动失效」），见 _set_accel_prices。
     """
     groups: dict = {}
     for item in accel_prices or []:
         key = round(float(item.get("platform_daily") or item["daily"]), 2)
+        floor = (round(float(item["sale"]) + 1, 2)
+                 if item.get("sale") is not None else None)
         group = groups.get(key)
         if group is None:
             groups[key] = {"daily": key, "labels": [item.get("label")],
-                           "price": float(item["price"])}
+                           "price": float(item["price"]), "floor": floor}
             continue
         group["labels"].append(item.get("label"))
         group["price"] = max(group["price"], float(item["price"]))
+        if floor is not None:
+            group["floor"] = (floor if group["floor"] is None
+                              else max(group["floor"], floor))
     return groups
 
 
@@ -2679,16 +2701,21 @@ _MARK_PRICE_INPUTS_JS = r"""
 
 
 async def _set_accel_prices(page, accel_prices) -> dict:
-    """在「调整申报价」对话框逐行填加速价（每【日常价档】= 该档最高底价+1，须 ≤ 每行参考价）。
+    """在「调整申报价」对话框逐行填加速价（传入价须 ≤ 每行参考价，超上限的档退填底价+1）。
 
-    accel_prices: [{label, daily, sale, price}]（逐货号传入，内部按日常价档合并，见
-    accel_price_groups）。对话框按日常价档列行，行身份键是「参考申报价格+让价」= 日常价；
-    行数不等于档数 → count_mismatch；某行对不上档 → match_failed；两种情况调用方都中止不开
-    （给错价比不开严重得多）。逐行超参考价的行不填、计入 over。
+    accel_prices: [{label, daily, sale, price}]（逐货号传入，price 由调用方算好=底价+1 与
+    活动价÷0.9 取高；内部按日常价档合并，见 accel_price_groups）。对话框按日常价档列行，
+    行身份键是「参考申报价格+让价」= 日常价；行数不等于档数 → count_mismatch；某行对不上档
+    → match_failed；两种情况调用方都中止不开（给错价比不开严重得多）。
+
+    逐行超参考价分两种：传入价（保活动价）超上限但「档内最高底价+1」能填进 → 退填底价+1
+    并计入 degraded（用户 2026-09-28 定「接收活动失效」，如实注明，不中止）；连底价+1 都
+    超上限 → 计入 over，调用方整单中止不开（不冒险填低价）。
     """
     rows = await page.evaluate(_MARK_PRICE_INPUTS_JS)
     base = {"rows_total": len(rows or []), "rows_filled": 0, "rows_over": 0,
-            "over_detail": [], "match": "ok",
+            "over_detail": [], "rows_degraded": 0, "degraded_detail": [],
+            "match": "ok",
             # 行文本摘要随结果返回：匹配失败时写进 note，人工能直接看到对话框里是什么行。
             "rows_desc": rows_text_desc(rows or [], limit=400)}
     if not rows:
@@ -2700,18 +2727,28 @@ async def _set_accel_prices(page, accel_prices) -> dict:
         return {**base, "match": "match_failed"}
     filled = 0
     over = []
+    degraded = []
     for row in rows:
         group = pairs[row["idx"]]
         price = group["price"]
         ref = row.get("ref")
         label = "、".join(str(x) for x in group["labels"])
         if ref is not None and float(price) > float(ref):
-            # 该档的平台上限低于「最高底价+1」：这一档填不进合底价的价 → 整单中止（用户
-            # 2026-09-25 定：不冒险填低价，如实报「上限 < 底价」）。
-            over.append({"idx": row["idx"], "label": label,
-                         "daily": group["daily"], "price": price, "ref": ref,
-                         "reason": "档上限低于该档最高底价+1"})
-            continue
+            floor_price = group.get("floor")
+            if floor_price is not None and float(floor_price) <= float(ref):
+                # 保活动所需价超该行上限：退填「档内最高底价+1」（用户 2026-09-28 定
+                # 「接收活动失效」）——加速价没达到申报价÷0.9，如实注明活动将失效，照开。
+                degraded.append({"idx": row["idx"], "label": label,
+                                 "daily": group["daily"], "price": price,
+                                 "filled": floor_price, "ref": ref})
+                price = floor_price
+            else:
+                # 该档的平台上限低于「最高底价+1」：这一档填不进合底价的价 → 整单中止（用户
+                # 2026-09-25 定：不冒险填低价，如实报「上限 < 底价」）。
+                over.append({"idx": row["idx"], "label": label,
+                             "daily": group["daily"], "price": price, "ref": ref,
+                             "reason": "档上限低于该档最高底价+1"})
+                continue
         inp = page.locator(f'[data-accel-idx="{row["idx"]}"]').first
         try:
             await inp.click()
@@ -2725,7 +2762,9 @@ async def _set_accel_prices(page, accel_prices) -> dict:
         except Exception as e:
             over.append({"idx": row["idx"], "label": label, "daily": group["daily"],
                          "ref": ref, "err": str(e)[:60]})
-    return {**base, "rows_filled": filled, "rows_over": len(over), "over_detail": over}
+    return {**base, "rows_filled": filled, "rows_over": len(over),
+            "over_detail": over, "rows_degraded": len(degraded),
+            "degraded_detail": degraded}
 
 
 async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
@@ -2859,10 +2898,18 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
     await _click_first_button(page, ("确认", "确定"))
     await asyncio.sleep(1.5)
 
-    # 加速价按【日常价档】算（同档多货号取最高底价+1），对话框也是一档一行，故这里报档数。
+    # 加速价按【日常价档】算（同档多货号取最高传入价），对话框也是一档一行，故这里报档数。
     groups = accel_price_groups(accel_prices)
     price_desc = (f"{next(iter(groups.values()))['price']}" if len(groups) == 1
-                  else f"{len(groups)} 个价格档各自底价+1（同档取最高底价）")
+                  else f"{len(groups)} 个价格档同档取最高价")
+    if price.get("rows_degraded"):
+        # 有档保活动价超上限、退填了底价+1：活动将失效（用户 2026-09-28 定「接收活动
+        # 失效」），note 里必须点名哪一档、保活动需多少、退填成多少，操作者才知道哪个活动
+        # 保不住——笼统一句「活动可能失效」排查时要翻对话框。
+        price_desc += "；" + "；".join(
+            f"档{o.get('daily')}（{o.get('label')}）按活动价需 {o.get('price')}、超上限 "
+            f"{o.get('ref')}，已退填底价+1={o.get('filled')}（活动将失效）"
+            for o in price["degraded_detail"])
     if not allow:
         result["note"] = (f"半程：已选超级档、填加速价 {price_desc}（{price['rows_filled']} 个 SKC）"
                           f"并确认，未点「立即加速」（allow=False）")

@@ -4,10 +4,20 @@ import json
 import asyncio
 import os
 import shutil
+from typing import Optional
 from app.logger import logger
-from app.publish import claims, extract, images, variant_colors, vision
+from app.publish import claims, extract, images, variant_colors, vision, size_rules
 from app.publish.browser import BrowserSession
 from app.publish.media.preview import PREVIEW_MIN_SIDE, sku_preview_replace_row, sku_preview_state
+
+
+def _color_key(s: str) -> str:
+    """颜色比对键：先过颜色维判伪的归一口径（剥空白/连字符/标点、转小写），再剥
+    Unicode So 装饰符。两侧形态天然不对称——colorImages 的键是 1688 颜色选择器名
+    （源形态，卖家会把标记拼进去，2026-09-28 实测 `莓红✦★`），而店小秘页面列值
+    通常渲染成干净名；不归一，「商家给没给这个颜色配图」的闸会在符号差上整维失配。
+    """
+    return size_rules._strip_decoration(variant_colors._norm_color_name(s))
 
 
 def _pick_fill_source(row: dict, rows: list, color_files: dict,
@@ -15,14 +25,20 @@ def _pick_fill_source(row: dict, rows: list, color_files: dict,
     """给一个空预览格找源图，返回本地文件路径（找不到返回空串）。
 
     取源优先级（越靠前越贴近「这一行本该有的那张图」）：
-      1. 同规格的源图：colorImages[本行规格名].mainFile，阶段① 已下载到本地；
-      2. 同规格其它行页面上已挂的图：同一个规格名的另一行（多尺码商品里同色行共用
+      1. 同颜色的源图：colorImages[本行颜色].mainFile，阶段① 已下载到本地；
+      2. 同颜色其它行页面上已挂的图：同一个颜色的另一行（多尺码商品里同色行共用
          一张预览图，那张就是本行缺的）；
       3. 【2026-09-12 新增】任意一行页面上已挂的图：单维类目（车贴/桌布/型号维）里
-         每行就是一个独立规格，第 2 条按规格名找必然落空，而「同一款商品的另一张
+         每行就是一个独立规格，第 2 条按颜色找必然落空，而「同一款商品的另一张
          预览图」仍比空图位强——空图位是平台硬拒（「请上传预览图」），挂上同款别的
          图只是辨识度差一点。这一条也是「同一款有一样的 SKC 就用同一张图」的落地：
          同款各行的图本就同源，取哪一张都不算挂错款。
+
+    【取源按「本行颜色」而不是行标识】行标识是变种表第一维，可能是尺码/型号维——
+    拿它查 colorImages 的颜色键必落空（2026-09-28 offer 1067355258988 宠物保暖打底衫
+    实况：第一维是尺码，S/XL 两行空位因此全部只能退化到第 3 条挂错色图、还先被
+    known_colors 闸全部反选）。本行的真实颜色在 row.colorDim（JS 按「颜色」表头列取的，
+    与第一维列不同）；单维类目/旧数据取不到 colorDim 时退回行标识，维持原行为。
 
     notes 是 complianceNotes.files 的 {文件名: 标注}，只用来把【永久不可用】的主图从
     第 3 条兜底里摘掉（审核拒收、清不干净的图，见 vision.is_unusable）。传空就是原来的
@@ -30,15 +46,20 @@ def _pick_fill_source(row: dict, rows: list, color_files: dict,
     而空图位是平台硬拒项，挂同款任意一张也比空着好（见上面第 3 条的理由）。unusable 是
     唯一的例外——那张图 ⑤b 压根没能清，挂上去就是把带中文的图发上真店。
     """
-    i, color = row["i"], row.get("color") or ""
-    mf = color_files.get(color)
+    i = row["i"]
+    # 颜色维值优先：行标识可能是尺码/型号维，见 docstring「取源按本行颜色」；
+    # color_files 的键是归一后的源侧名（见调用方构造），查找同样要过 _color_key，
+    # 否则页面干净名（`杏白色`）对不上源侧带标记键（`杏白色✦★`）。
+    color = row.get("colorDim") or row.get("color") or ""
+    mf = color_files.get(_color_key(color))
     if mf:
         p = os.path.join(workdir, mf)
         if os.path.exists(p):
             return p
-    # 页面已挂的图：先找同规格行，再退到任意非空行
+    # 页面已挂的图：先找同颜色行，再退到任意非空行（同行颜色维值同样优先）
     peers = [x for x in rows if x.get("url") and not x.get("empty")]
-    peer = next((x for x in peers if x.get("color") == color), None)
+    peer = next((x for x in peers
+                 if (x.get("colorDim") or x.get("color")) == color), None)
     if peer is None and peers:
         peer = peers[0]
         logger.info(f"预览图第 {i + 1} 行「{color}」没有同规格源图，"
@@ -59,6 +80,19 @@ def _pick_fill_source(row: dict, rows: list, color_files: dict,
     return raw if extract._download_image(peer["url"], raw) else ""
 
 
+class PreviewImageCleanError(RuntimeError):
+    """⑦b 回源预览图英化链路失败的专用异常（区别于「生成图质检未过」）。
+
+    【为什么要分两类】_clean_downloaded_preview 的 3 次尝试可能栽在两种完全不同
+    的环节：出图链路异常（API 错误、结果图下载失败如 curl rc=35、配置中心断连）
+    与生成图质检不过。原先两者都返回空串，调用方一律报「英化质检未通过」——出图
+    失败被讲成图片问题，正是阶段失败文案按环节分类要消灭的语义错误
+    （2026-09-28 1067355258988 实录：shyfai 结果 CDN TLS 握手失败被报成
+    「英化质检未通过（…均为否）」，排查方向被带偏）。约定：本异常表示前者，
+    空串仍表示后者（质检真实未过）。
+    """
+
+
 async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> str:
     """回源下载的预览图必须先英化并通过质检。
 
@@ -77,6 +111,10 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
               + claims.BANNED_REMOVE_RULE + claims.MARK_REMOVE_RULE)
     if issues:
         prompt += f" 本张图已知的问题：{str(issues)[:200]}。请一并修正。"
+    # last_exc 记录最近一次的出图异常：3 次尝试耗尽时按「最后栽在哪」分类——
+    # 最后一步是出图异常就抛 PreviewImageCleanError，是质检未过就返回空串，
+    # 调用方据此给不同环节的错误文案（见 PreviewImageCleanError docstring）。
+    last_exc: Optional[Exception] = None
     for _ in range(3):
         try:
             # 超时取出图链路统一值（原先写死 90，盖不住服务端并发时的 30~79s，
@@ -85,6 +123,7 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
             edited = await images.edit_image_async(
                 path, prompt=prompt, out_path=output,
                 no_downscale=True, timeout=images.EDIT_TIMEOUT)
+            last_exc = None
             qc = await vision.check_cleaned(edited["output"])
             if qc.get("clean"):
                 return edited["output"]
@@ -105,8 +144,13 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
                            "按周围画面补全。")
             else:
                 prompt += " 上一版仍有中文或乱码，请彻底清除所有中文字符并保持商品不变。"
-        except Exception:
+        except Exception as e:
+            last_exc = e
             continue
+    if last_exc is not None:
+        raise PreviewImageCleanError(
+            f"英化出图链路 3 次尝试未成功，最后一次栽在出图异常"
+            f"（{type(last_exc).__name__}: {str(last_exc)[:120]}）") from last_exc
     return ""
 
 
@@ -121,6 +165,13 @@ async def _drop_unfixable_rows(session: BrowserSession, emit, rows: list) -> dic
 
     【绝不反选到「只剩它自己」】某维只剩一个已勾选项时不能再反选——变种维不能为空，
     平台会把整张变种表清掉。这种情况如实报人工。
+
+    【这一步必须是动变种勾选的最后一步】调用它的 ⑦b 现在排在 ⑧ 尺码勾选【之后】（见
+    workflows/alibaba1688.build_stages 的取证）：⑧ 的职责是「勾选状态与源 SKU 一致」，
+    它会把这里刚反选掉的规格原封不动勾回来，勾回来那行又是空图位，整单照样卡在 ⑭。
+    2026-09-28 宠物保暖打底衫（offer 1067355258988）那单变种表第一维是尺码，反选掉的
+    正是尺码 S/XL，⑧ 一勾回来反选等于白做。⑨⑩a⑩⑪ 也都在 ⑦b 之后，故它们按行填数时
+    拿到的是反选后的最终行集——变种表行数中途一变，按行回填的价/重/货号就全对不上。
 
     反选完等变种表稳定（走 variant_colors 的共用件），调用方据此重读页面。
     """
@@ -160,6 +211,13 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
     （变种信息表）第一列每 SKU 一张的预览图。玩具类那单证实了两者正交——
     ⑦ 因该类目无图位而正确 skipped，⑦b 却被平台拒（详见 pipeline 里
     「阶段⑦b SKU 预览图」段落开头的取证记录）。
+
+    【本阶段排在 ⑧ 尺码勾选之后，不是排错了】原先它在 ⑦ 之后、⑧ 之前，结果是：它反选
+    掉的规格（预览图补不上、发出去必被平台拒）被 ⑧ 按「勾选状态与源 SKU 一致」重新勾
+    回来，反选等于没做（2026-09-28 offer 1067355258988 实况）。挪到 ⑧ 之后，反选才是
+    「预览图缺失的规格不发」的最后一步；顺带 ⑧ 重建变种表之后才换图，这次换上的图不再
+    被下一次重建冲掉。阶段 id（sku_preview）与显示名（⑦b）都保持不变——续跑状态文件、
+    各处注释与记忆库都按这个 id 认它。详见 workflows/alibaba1688.build_stages。
 
     【不重判归属，只补几何】认领时店小秘已按 SKU 把每行图带过来了，归属本来就对。
     这里下载该行现有的图、square_image 成 1:1 后原位换回：画面一张不换、行序一动
@@ -246,19 +304,22 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
         # 源颜色图映射：colorImages[颜色].mainFile 是本地已下载文件名，优先用；读不到
         # 或该颜色没映射就退化到同色行 url，不因读文件失败就判整段失败（best-effort）。
         color_files = {}
-        # 【配图颜色集合】colorImages 的全部 key＝商家在源站配过图的颜色。空位行颜色
+        # 【配图颜色集合】colorImages 的全部 key＝商家在源站配过图的颜色。空位行的颜色
         # 不在里面，说明商家建了 SKU 却没上传图（如毛绒玩偶的「小鬼皮壳」「木乃伊皮壳」），
         # 这种不能用别的颜色图去补——挂错图会被平台罚，直接反选（见下方循环）。
+        # 【集合键与源图键都归一】源侧键是 1688 颜色选择器名、可能带卖家标记（`莓红✦★`），
+        # 而页面列值通常渲染成干净名——不归一，闸与源图查找会在符号差上整维失配
+        # （2026-09-28 实测，见 _color_key）。
         known_colors = set()
         # 主图标注：只给 _pick_fill_source 用来跳过永久不可用的图（见那边的说明）
         notes_by_file = {}
         try:
             with open(ctx["info_path"], encoding="utf-8") as f:
                 info = json.load(f)
-            known_colors = set((info.get("colorImages") or {}).keys())
+            known_colors = {_color_key(c) for c in (info.get("colorImages") or {})}
             for c, v in (info.get("colorImages") or {}).items():
                 if isinstance(v, dict) and v.get("mainFile"):
-                    color_files[c] = v["mainFile"]
+                    color_files[_color_key(c)] = v["mainFile"]
             notes_by_file = vision._notes_by_file(info)
         except Exception as e:
             logger.warning(f"读 colorImages 失败（空位补图退化为同色行 url）：{e}")
@@ -272,7 +333,13 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
             # 颜色选择器里 hasImg=false），用别的颜色图补会挂错图、被平台罚款。仅当
             # colorImages 提取到（非空）才做这个判断——提取得空说明是页面结构/提取问题
             # 而非「商家没配图」，此时退回 _pick_fill_source 的同款退化逻辑，不误伤。
-            if color and known_colors and color not in known_colors:
+            # 【闸按「本行真实颜色」判，不是行标识】行标识是变种表第一维，尺码维商品里
+            # 装的是尺码名——拿它查颜色键必然全落空，闸会从「商家没给颜色配图才反选」
+            # 退化成「所有尺码都反选」（2026-09-28 offer 1067355258988 宠物保暖打底衫实况：
+            # S/XL 空位全进 unfixable，而商家明明给颜色配了图，本来走 _pick_fill_source
+            # 是能补上的）。取不到颜色维（单维类目/旧数据）时退回行标识，维持原行为。
+            probe = r.get("colorDim") or color
+            if probe and known_colors and _color_key(probe) not in known_colors:
                 logger.warning(f"预览图 {tag} 颜色「{color}」商家未配图，直接反选该规格")
                 unfixable.append(r)
                 continue
@@ -287,7 +354,17 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 unfixable.append(r)
                 continue
             if "-raw" in os.path.basename(src_path):
-                src_path = await _clean_downloaded_preview(src_path, prep)
+                try:
+                    src_path = await _clean_downloaded_preview(src_path, prep)
+                except PreviewImageCleanError as e:
+                    # 出图链路异常（API/结果下载/配置中心）≠ 质检未过，按环节分开报
+                    # （PreviewImageCleanError docstring 的既定分类要求）
+                    logger.warning(f"预览图 {tag} 回源图英化出图失败，改为反选该规格：{e}")
+                    unfixable.append(r)
+                    await emit({"type": "manual_check", "stage": "sku_preview",
+                                "message": f"{tag} 回源预览图英化出图失败，已阻止上传"
+                                           f"（{str(e)[:100]}）"})
+                    continue
                 if not src_path:
                     unfixable.append(r)
                     await emit({"type": "manual_check", "stage": "sku_preview",
@@ -396,8 +473,17 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 logger.info(f"预览图 {tag} 画面已干净（{r['w']}x{r['h']} 仅几何不合规），"
                             "只做 1:1 合规化、不动画面")
             else:
-                cleaned = await _clean_downloaded_preview(
-                    raw, prep, issues=qc.get("issues") or "")
+                try:
+                    cleaned = await _clean_downloaded_preview(
+                        raw, prep, issues=qc.get("issues") or "")
+                except PreviewImageCleanError as e:
+                    # 出图链路异常按环节直报（理由同 fill 通道那处 try）
+                    logger.warning(f"预览图 {tag} 回源图英化出图失败，保持原样：{e}")
+                    fail_rows.append(tag)
+                    await emit({"type": "manual_check", "stage": "sku_preview",
+                                "message": f"{tag} 预览图 {r['w']}x{r['h']} 不合规，"
+                                           f"但英化出图失败、仍是原图：{str(e)[:100]}"})
+                    continue
                 if not cleaned:
                     fail_rows.append(tag)
                     await emit({"type": "manual_check", "stage": "sku_preview",
@@ -506,7 +592,19 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"{tag} 预览图含中文/水印，但整组没有换图入口、无法自动"
                                    f"英化（{qc.get('issues') or ''}），需人工换图"})
             continue
-        cleaned = await _clean_downloaded_preview(raw, prep, issues=qc.get("issues") or "")
+        try:
+            cleaned = await _clean_downloaded_preview(raw, prep, issues=qc.get("issues") or "")
+        except PreviewImageCleanError as e:
+            # 出图链路异常（API/结果下载/配置中心）≠ 质检未过，按环节分开报
+            # （PreviewImageCleanError docstring 的既定分类要求；2026-09-28 实录：
+            # 结果 CDN TLS 握手失败被报成「英化质检未通过」）
+            logger.warning(f"预览图 {tag} 英化出图失败，原图照旧：{e}")
+            lang_failed.append(tag)
+            fail_rows.append(tag)
+            await emit({"type": "manual_check", "stage": "sku_preview",
+                        "message": f"{tag} 预览图判脏需英化，但出图失败、仍是源图"
+                                   f"（{str(e)[:100]}），请人工换图"})
+            continue
         if not cleaned:
             logger.warning(f"预览图 {tag} 英化质检未通过（{qc.get('issues')}），原图照旧")
             lang_failed.append(tag)

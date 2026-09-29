@@ -188,8 +188,12 @@ STAGES = [
     ("material", "⑥ 素材图"),
     ("drop_acc", "⑦a 剔配件色"),
     ("skc", "⑦ SKC颜色图"),
-    ("sku_preview", "⑦b SKU预览图"),
+    # ⑦b 排在 ⑧ 之后：⑧ 按「勾选状态与源 SKU 一致」会把 ⑦b 反选掉的规格重新勾回来，
+    # 反选补不上预览图的规格必须是动变种勾选的最后一步（理由与取证见 workflows/
+    # alibaba1688.build_stages）。本表只驱动阶段名/顺序展示与续跑下拉，实际执行顺序由
+    # 各来源的 workflows/*.build_stages 决定，两边顺序必须一致。
     ("fix_sizes", "⑧ 尺码勾选"),
+    ("sku_preview", "⑦b SKU预览图"),
     ("sizechart", "⑨ 尺码表"),
     ("sku_code", "⑩a SKU货号"),
     ("variant", "⑩ 变种信息"),

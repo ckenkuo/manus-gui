@@ -1575,6 +1575,25 @@ materialTexts / brandMarkTexts 同理：判 true 时列全可见的原文，没�
         issues = "图上有品牌标识（商标或实物上的品牌小标签）"
     if not issues and material:
         issues = "图上有材质成分说明（会与属性里的材质对不上）"
+    # 【阻断类别前置】模型常把「哪里没问题」的长篇写进 issues、把真正的阻断项埋在
+    # 后半句，[:80] 一截，日志里只剩「…均为否」这类看不出为何拦的残句（2026-09-28
+    # 1067355258988 ⑦b 实录：brandMark=true，截断却把品牌标识一句砍没，用户看到
+    # 「全否还要换图」的矛盾文案）。故 bad 时把阻断类别标签拼到最前再截断；模型
+    # 文案与下方合成/重建文案同词表，已以标签开头的不再重复拼。
+    if bad:
+        labels = "、".join(reason for present, reason in (
+            (cjk, "残留中文"), (garbled, "乱码或拼写错误"),
+            (watermark, "残留水印、店铺名或网址"), (banned, "图上有平台禁词或环保声明"),
+            (claim, "图上有夸大宣传文案"), (brand, "图上有品牌标识"),
+            (material, "图上有材质成分说明"),
+            (data.get("brokenSubject"), "商品主体破坏")) if present)
+        if not issues:
+            issues = labels
+        elif not any(issues.startswith(x) for x in (
+                "残留中文", "乱码或拼写错误", "残留水印、店铺名或网址",
+                "图上有平台禁词或环保声明", "图上有夸大宣传",
+                "图上有品牌标识", "图上有材质成分说明", "商品主体破坏")):
+            issues = f"{labels}：{issues[:60]}"
     # 【residualChinese / garbled / marketingClaim 都要透出去】service 侧靠这些字段决定
     # 重试发数（见 DESC_QC_TRIES_TEXT）。garbled 原先只参与算 bad、没进返回值，于是调用方
     # 的 `qc.get("garbled")` 恒为 None，加长重试对乱码那一路形同虚设——而 ⑤b main-04

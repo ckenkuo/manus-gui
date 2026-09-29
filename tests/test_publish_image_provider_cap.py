@@ -16,7 +16,19 @@ from app.publish import images
 
 @pytest.fixture
 def 钉通道(monkeypatch):
-    """把 [publish] 配置钉成指定通道，避免读真实 config.toml（各机 key 不同）。"""
+    """把 [publish] 配置钉成指定通道，避免读真实 config.toml（各机 key 不同）。
+
+    【必须连发布页偏好一起钉住】_provider() 的优先级是「页面所选 > config.toml >
+    代码默认」，只钉配置文件的话，这个文件会随「用户上一次在发布页切了哪个通道」
+    变红或变绿：2026-09-28 用户手动切到 shyfai 后，下面「packy 封顶」与「未知通道名」
+    两条立刻失败（prefs 的非空值盖掉了被钉的通道名），看着像代码坏了、实际是测试
+    没隔离外部状态。单测的标准是「不受用户当前选择影响」。
+    """
+    from app.publish import preferences
+
+    monkeypatch.setattr(preferences, "get_image_provider", lambda: "")
+    monkeypatch.setattr(preferences, "get_image_model", lambda: "")
+
     def _pin(provider, **extra):
         monkeypatch.setattr(images, "_publish_conf",
                             lambda: {"image_provider": provider,

@@ -28,12 +28,20 @@ from app.publish import service as S
 
 # ---- 1) 阶段接线：⑦b 必须是独立阶段且进续跑重跑集 ----------------------------
 
-def test_阶段已注册且顺序在skc之后fix_sizes之前():
+def test_阶段已注册且顺序在fix_sizes之后save之前():
     """⑦b 的位置不能随意挪：它读的是变种信息表，而那张表由 ③ 类目决定何时渲染，
-    放在 ⑦ 之后是因为两者都属图片类、便于人看日志；必须在 ⑭ save 之前。"""
+    放在 ⑦ 之后是因为两者都属图片类、便于人看日志；必须在 ⑭ save 之前。
+
+    【2026-09-28 起从「⑧ 之前」改成「⑧ 之后」】⑧ 的职责是「勾选状态与源 SKU 一致」，
+    会把 ⑦b 反选掉的规格重新勾回来——而 ⑦b 的反选正是「预览图补不上就不发这个规格」
+    的落地手段，被勾回来那行又是空图位，整单卡在 ⑭「请上传预览图」（1688 offer
+    1067355258988 实况：变种表第一维是尺码，反选的是 S/XL）。故反选必须排在 ⑧ 之后，
+    同时也在 ⑨⑩a⑩⑪ 之前——那几步按行填数，行集中途一变就全对不上。
+    阶段 id 与显示名保持 sku_preview / ⑦b 不变，续跑状态文件按 id 认它。"""
     ids = [k for k, _ in S.STAGES]
     assert "sku_preview" in ids
-    assert ids.index("skc") < ids.index("sku_preview") < ids.index("fix_sizes")
+    assert ids.index("skc") < ids.index("fix_sizes") < ids.index("sku_preview")
+    assert ids.index("sku_preview") < ids.index("sizechart")
     assert ids.index("sku_preview") < ids.index("save")
 
 

@@ -168,6 +168,20 @@ async def upload_image(session: BrowserSession, file_path: str,
     """
     if not os.path.exists(file_path):
         return {"status": "error", "stage": "precheck", "err": f"文件不存在: {file_path}"}
+    # 【完整解码校验：截断/损坏文件在此被拦】出图下载中断留下的残缺 PNG（PIL 宽容
+    # 模式还能读出尺寸）传图床时三步接口全过、文件也真存上了，但图床列表服务对残缺
+    # 文件不建索引——空间弹窗永远找不到它，报错落在 pick 的「弹窗里找不到刚上传的图」，
+    # 离根因（文件残缺）很远（1067355258988 2026-09-28 实录：15:46 下载中断的 10.1MB
+    # 半张 PNG 被「复用落盘产物」再次上传，⑬ 整单失败）。上传是所有图片进平台的唯一
+    # 入口，把关放这里不会被某条调用路径绕过。im.load() 全量解码，截断文件必抛。
+    try:
+        from PIL import Image
+        with Image.open(file_path) as _im:
+            _im.load()
+    except Exception as e:
+        return {"status": "error", "stage": "precheck",
+                "err": f"图片文件损坏或截断，拒绝上传：{os.path.basename(file_path)} "
+                        f"（{type(e).__name__}: {str(e)[:80]}）"}
     if not skip_size_check:
         # 【下限按用途传，不能一律套服装的 1340×1785】2026-08-29 实测
         # （草稿 173539495458370139 第 10 张描述图）：描述图的平台要求只是

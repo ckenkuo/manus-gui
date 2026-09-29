@@ -24,9 +24,14 @@ _CAT_STAGES = ["auto_cat", "attrs"]
 # 【carousel 必须在册】2026-09-17 修：下面 _stale_form_stages 里一直有
 # `stale.append("carousel")`，但它不在这张表里、末尾那行会把不在册的项全部过滤掉，
 # 于是那句是死代码——续跑时 ⑤c 永远不会被排进重跑集，即使轮播图实况已经破线。
+# 【本表顺序与各来源 build_stages 的阶段顺序一致】它决定 _stale_form_stages 过滤结果的
+# 排列（也就是「重跑：…」那条提示的行文顺序），是否进重跑集只由【在不在表里】决定；
+# 真正的执行顺序来自 workflow.stages()。⑦b 与 ⑧ 的位置按新顺序（⑧ 在前）摆，理由见
+# workflows/alibaba1688.build_stages：⑧ 会把 ⑦b 反选掉的规格重新勾回来。
 _FORM_STAGES_AFTER_CAT = [
-    "titles", "clean_images", "carousel", "material", "drop_acc", "skc", "sku_preview",
-    "fix_sizes", "sizechart", "sku_code", "variant", "stock", "shipping", "desc", "video",
+    "titles", "clean_images", "carousel", "material", "drop_acc", "skc",
+    "fix_sizes", "sku_preview", "sizechart", "sku_code", "variant", "stock",
+    "shipping", "desc", "video",
 ]
 
 

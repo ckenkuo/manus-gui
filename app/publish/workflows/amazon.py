@@ -61,8 +61,10 @@ def build_stages():
         Stage("material", "⑥ 素材图", material._st_material),
         Stage("drop_acc", "⑦a 剔配件色", skc._st_drop_acc),
         Stage("skc", "⑦ SKC颜色图", skc._st_skc),
-        Stage("sku_preview", "⑦b SKU预览图", preview._st_sku_preview),
+        # ⑦b 排在 ⑧ 之后：⑧ 会把 ⑦b 反选掉的规格重新勾回来，反选必须放在它后面。
+        # 取证与完整理由见 workflows/alibaba1688.build_stages 上的那段注释。
         Stage("fix_sizes", "⑧ 尺码勾选", variants._st_fix_sizes),
+        Stage("sku_preview", "⑦b SKU预览图", preview._st_sku_preview),
         Stage("sizechart", "⑨ 尺码表", variants._st_sizechart),
         Stage("sku_code", "⑩a SKU货号", variants._st_sku_code),
         Stage("variant", "⑩ 变种信息", variants._st_variant),

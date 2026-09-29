@@ -838,8 +838,10 @@ async def test_尺码勾选丢了连带重跑尺码表变种库存(tmp_path, mon
     await service.publish_one(None, {"rowid": "102", "info_path": "x.json"},
                               "Pawly", on_progress=_collect(events))
 
+    # 顺序按 workflows 的阶段表：⑦b 现在是 ⑧ 之后（⑧ 会把 ⑦b 反选掉的规格勾回来，
+    # 见 workflows/alibaba1688.build_stages 的取证）
     assert [c for c in calls if c != "open_edit"] == [
-        "carousel", "sku_preview", "fix_sizes", "sizechart", "sku_code", "variant",
+        "carousel", "fix_sizes", "sku_preview", "sizechart", "sku_code", "variant",
         "stock", "video", "save"]
     assert "titles" not in calls and "skc" not in calls
 

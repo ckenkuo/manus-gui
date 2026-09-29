@@ -90,12 +90,13 @@ def check_desc_size(w, h, size_bytes=None) -> dict:
 
 
 # ---- AI 编辑（出图供应商，默认 zzlye gpt-image-2.5-flare）------------------
-# 【为什么要两家供应商、而不是只留一家】原先只有 Packy（cf.api.fan）一条链路，它挂在
+# 【为什么要多家供应商、而不是只留一家】原先只有 Packy（cf.api.fan）一条链路，它挂在
 # Clash 代理后面、节点一挂整批出图就全灭（见 [[image-api-needs-proxy]]），且后端随机
 # 分流到不接 multipart 的坏渠道（见下方 _BAD_CHANNEL_CODE）。2026-09-20 起接入 zzlye
 # 中转的 gpt-image-2.5-flare 作为默认通道，Packy 留着可随时切回——两家协议形状一致
 # （都是 OpenAI 兼容的 /images/edits 与 /images/generations），故只需换 base/model/key，
-# 上面那套坏渠道重试、审核拒绝判定、curl 指纹策略全部原样复用。
+# 上面那套坏渠道重试、审核拒绝判定、curl 指纹策略全部原样复用。2026-09-28 按同一形状
+# 接入第三家 shyfai，见 PROVIDERS 里那条的实测记录。
 #
 # 【为什么不做「失败自动切另一家」】项目默认不写 fallback：自动切家会把「key 配错」
 # 「模型名写错」这类确定性错误伪装成偶发抖动，真因埋在两家的重试日志里，排查成本远高于
@@ -134,6 +135,19 @@ PROVIDERS = {
     # 默认通道：zzlye 中转。按次计费，不封尺寸
     "zzlye": {"base": "https://api.zzlye.xyz/v1", "model": "gpt-image-2.5-flare",
               "key_field": "zzlye_api_key", "max_pixels": None},
+    # 第三家：shyfai 直连（agent3.shyfai.cn，2026-09-22 首次实测、2026-09-28 接入）。
+    # 【为什么值得加这一家】它的尺寸保真优于 zzlye 基础档：请求 2448x1792 原样返回
+    # 438 万像素，没有那个 ~157 万像素预算，服装红线 1340x1785 原生满足，不必靠
+    # compress 的 _fit_min_size 放大补（放大 1.66x 的代价是织标小字糊一档）。
+    # 【max_pixels 为什么不封顶】它的计费查不到（无 /api/pricing、无 billing/usage），
+    # 但封顶在本项目只会白降画质——要么按次计费（压了不省）、要么按尺寸（省的那点
+    # 换回放大糊字）。要省钱就切通道，别在这里偷偷压尺寸，这与 zzlye 那条同源。
+    # 【它只回 url 不给 b64_json】结果域名同域（v4-gateway-v*.shyfai.cn），不像 zzlye
+    # 的裸 IP 结果 CDN 有到不了的机器，_save_result 的 url 分支可直接用。
+    # 【必须配合下面的 _TRANSIENT_TASK_CODES】它的上游忙时返 477/434 这类自定义码，
+    # 不纳入重试会有一半的首发失败直接炸单。
+    "shyfai": {"base": "https://agent3.shyfai.cn/v1", "model": "gpt-image-2.5-flare",
+               "key_field": "shyfai_api_key", "max_pixels": None},
     # 旧通道：Packy。同样挂着 2.5-flare（无 4k/满血变体），key 沿用既有
     # [publish].packy_api_key，不用改配置就能切回。按尺寸计费，封 ~1MP
     "packy": {"base": "https://cf.api.fan/v1", "model": "gpt-image-2.5-flare",
@@ -995,6 +1009,17 @@ def _save_result(resp_json: dict, out_path: str) -> str:
             last_err = r.stderr.decode("utf-8", "replace")[:200]
             logger.warning(f"结果图下载失败（{attempt + 1}/3）：{last_err}")
             time.sleep(2 * (attempt + 1))
+        # 【失败必须删掉部分下载的文件】curl 超时会留下不完整字节（2026-09-28 实测：
+        # 14.9MB 的 PNG 中断后留下 10.1MB 前段，PIL 还能宽容读出尺寸），而 out_path
+        # 是调用方给的【产物缓存路径】——残留文件会被「复用落盘产物」的探测当成合法
+        # 英化图（存在即复用），下次直传图床时接口照收，但图床列表服务对残缺文件不建
+        # 索引，空间弹窗永远找不到它，⑬ 表现为「弹窗里找不到刚上传的图」整单失败
+        # （1067355258988 2026-09-28 实录）。残缺产物比没有更糟：没有会重新出图。
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
         raise RuntimeError(f"下载结果图失败：{last_err}")
     # 内容审核拒绝要单独抛类型：它与「响应结构没有图」是两件事，处置完全相反
     # （见 ModerationBlocked）。混成一句「响应中没有图片」会让调用方去重跑，而重跑
@@ -1029,8 +1054,9 @@ _BAD_CHANNEL_MARK = "does not accept"
 # 重试次数：单发命中坏渠道约 35s。按实测最差档（12 并发 83% 成功）算，4 发全落坏渠道
 # 的概率极低；给 4 次上限，最坏也就多等约 105s，不至于把整个阶段拖垮。
 #
-# 【坏渠道与网络抖动共用这一份预算】两者都靠「重发一次」解决，各记一套次数会叠乘成
-# 最坏 16 发、十几分钟，把阶段拖死。共用后无论怎么交替失败，总发数都不超过 4。
+# 【坏渠道、网络抖动与上游排队共用这一份预算】三者都靠「重发一次」解决，各记一套次数
+# 会叠乘成最坏 64 发、十几分钟，把阶段拖死。共用后无论怎么交替失败，总发数都不超过 4。
+# （477 那一发要耗满约 200s 才返回，预算给大反而更危险——4 次已是十几分钟的墙钟上限。）
 EDIT_BAD_CHANNEL_RETRY = 4
 # 抖动重试的退避基数（秒）：第 n 次失败后睡 n × 这个值。
 # 【为什么抖动要退避、坏渠道不要】坏渠道是随机分流、与时间无关，等待纯属浪费；
@@ -1050,15 +1076,54 @@ def _is_bad_channel(resp_json: dict) -> bool:
             and _BAD_CHANNEL_MARK in str(err.get("message") or ""))
 
 
+# 上游任务侧的瞬时失败码（2026-09-22 在 shyfai 上实测）：477
+# `image_task_failed_or_requires_review`（耗满约 200s 才返回）与 434 `生图超时`。
+#
+# 【为什么必须单独认这两个码】它们不是 HTTP 错误：网关返的是 HTTP 200 + 错误 JSON，
+# 而 _curl_json 刻意不带 --fail（带了会把业务错误一起吞成 rc≠0，判据就散了），于是这类
+# 响应会被当成正常结果往下走，最终在 _save_result 抛「响应中没有图片」——一句只描述
+# 响应结构、与真因无关的话，而且【不经过任何重试】直接判这张图失败。实测这两个码重发
+# 即成功（单发时段首发失败率约 50%，30 并发压测时段全 200，判为上游忙时排队），不认
+# 它们等于让一半的首发失败炸单。
+_TRANSIENT_TASK_CODES = frozenset({"477", "434"})
+# 码之外的兜底签名：网关把错误码换字段或改成字符串时，这两个文案仍认得出。
+_TRANSIENT_TASK_MARKS = ("image_task_failed_or_requires_review", "生图超时")
+
+
+def _is_upstream_busy(resp_json: dict) -> bool:
+    """判响应是否为「上游任务侧瞬时失败」（477/434）——重发一次能过，值得重试。
+
+    【为什么两层都查】这家的错误 JSON 有两种形状：坏 key 是顶层
+    `{"code": "INVALID_API_KEY", ...}`，参数错是 `{"error": {"message", "type"}}`，
+    477/434 落在哪一层没有稳定保证，故两层的 code 都取、文案拼一起判。
+    """
+    if not isinstance(resp_json, dict):
+        return False
+    err = resp_json.get("error")
+    err = err if isinstance(err, dict) else {}
+    if {str(resp_json.get("code") or ""), str(err.get("code") or "")} & _TRANSIENT_TASK_CODES:
+        return True
+    blob = " ".join(str(err.get(k) or resp_json.get(k) or "")
+                    for k in ("type", "message", "status", "stage"))
+    return any(mark in blob for mark in _TRANSIENT_TASK_MARKS)
+
+
+def _err_brief(resp_json: dict) -> str:
+    """一行摘要错误响应，供日志与异常文案用（截断，别把整段 JSON 刷进日志）。"""
+    err = resp_json.get("error")
+    err = err if isinstance(err, dict) else resp_json
+    return f"{err.get('code') or ''} {err.get('message') or err.get('type') or ''}".strip()[:160]
+
+
 def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TIMEOUT,
                            tries: int = EDIT_BAD_CHANNEL_RETRY) -> dict:
-    """发 /images/edits，对【坏渠道】与【链路抖动】两类瞬时失败重试。
+    """发 /images/edits，对【坏渠道】【链路抖动】【上游任务瞬时失败】三类失败重试。
 
-    两类失败的判据与取舍见上方 _BAD_CHANNEL_CODE / _CURL_TRANSIENT_RC 注释；
-    共用同一份 tries 预算（理由见 EDIT_BAD_CHANNEL_RETRY），退避只给抖动
-    （理由见 EDIT_TRANSIENT_BACKOFF）。
+    三类失败的判据与取舍分别见上方 _BAD_CHANNEL_CODE / _CURL_TRANSIENT_RC /
+    _TRANSIENT_TASK_CODES 注释；共用同一份 tries 预算（理由见 EDIT_BAD_CHANNEL_RETRY），
+    退避给抖动与上游排队（理由见 EDIT_TRANSIENT_BACKOFF）。
 
-    【只有这两类重试，别扩大】确定性失败（参数错、图片路径错、被 Cloudflare 拦）
+    【只有这三类重试，别扩大】确定性失败（参数错、图片路径错、被 Cloudflare 拦）
     一律原样抛出：重试多少次都是同样的错，白等还把真错误埋成一串重试噪音
     （见 [[publish-vision-400-no-retry]]）。这也是抖动必须按 curl 退出码白名单
     判、而不是「有异常就重试」的原因。
@@ -1081,6 +1146,21 @@ def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TI
             logger.warning(
                 f"gpt-image-2 链路抖动（{attempt}/{tries}），{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试："
                 f"{os.path.basename(image_path)} {e}"
+            )
+            time.sleep(EDIT_TRANSIENT_BACKOFF * attempt)
+            continue
+        if _is_upstream_busy(resp):
+            # 上游忙时排队（477/434）：与链路抖动同源（重发能过、与时间有关），故同样
+            # 退避后重试。预算耗尽时抛 TransientNetError 而不是把坏响应交出去——交给
+            # _save_result 只会报「响应中没有图片」，上层按阶段 fail 处置，而这里的
+            # 正确处置与抖动一致：这张图没做出来，best-effort 兜住、继续跑别的图。
+            if attempt >= tries:
+                raise TransientNetError(
+                    f"出图服务上游任务失败（{attempt}/{tries}）：{_err_brief(resp)}")
+            logger.warning(
+                f"gpt-image-2 上游任务瞬时失败（{attempt}/{tries}），"
+                f"{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试："
+                f"{os.path.basename(image_path)} {_err_brief(resp)}"
             )
             time.sleep(EDIT_TRANSIENT_BACKOFF * attempt)
             continue
@@ -1125,6 +1205,14 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
                                            gate_aware=not desc_mode),
         "quality": quality,
         "n": 1,
+        # 【为什么固定请求 jpeg】2026-09-28 shyfai 通道实测：其结果 CDN（v4-gateway-*.shyfai
+        # .cn）单连接仅 ~20KB/s 且【不支持 Range】（-r 请求回 200 全量，断点续传/多段并发
+        # 都无路），默认 PNG 一张 14MB 顶死 280s 超时，1067355258988 ⑬ 描述图 3 次重试全
+        # 败、整单未落库。jpeg 后同图 115KB 数秒下完（实测 1024x1024 仅 37KB）。下游链本
+        # 就全按 JPEG 走（compress q80、扩展名不可信按内容识别），无透明通道依赖，PNG 的
+        # 无损优势在照片级商品图上没有落点。三家兼容性实测：shyfai 认；zzlye 忽略参数
+        # 仍回 PNG（b64 优先路径不受影响）；Packy 未测（OpenAI 兼容网关通常忽略未知参数）。
+        "output_format": "jpeg",
     }
     resp = _edits_post_with_retry(fields, image_path, timeout=timeout)
     saved = _save_result(resp, out_path)
@@ -1142,11 +1230,36 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
 
 def generate_image(prompt: str, out_path: str, size: str = "1024x1024",
                    quality: str = "low", do_compress: bool = True) -> dict:
-    """文生图（描述区营销图增补用）。"""
+    """文生图（描述区营销图增补用）。
+
+    重试口径与 edit_image 对齐：链路抖动（curl 退出码）与上游排队（477/434）退避重发，
+    共用 EDIT_BAD_CHANNEL_RETRY 那份预算。这条原先直接单发——走 shyfai 时约一半的首发会
+    撞上 477，单发等于让描述图备料凭空少几张，而它本来就是 best-effort 补图：少了不报错、
+    只静默缺图，是最难发现的一种失败。
+    """
     prov = _provider()
-    resp = _json_post(f"{prov['base']}/images/generations", {
-        "model": prov["model"], "prompt": prompt, "size": size, "quality": quality, "n": 1,
-    })
+    payload = {"model": prov["model"], "prompt": prompt, "size": size,
+               "quality": quality, "n": 1,
+               # 同 edit_image：结果图固定要 jpeg，理由见那里 output_format 的长注释
+               "output_format": "jpeg"}
+    for attempt in range(1, EDIT_BAD_CHANNEL_RETRY + 1):
+        try:
+            resp = _json_post(f"{prov['base']}/images/generations", payload)
+        except TransientNetError as e:
+            if attempt >= EDIT_BAD_CHANNEL_RETRY:
+                raise
+            logger.warning(f"文生图链路抖动（{attempt}/{EDIT_BAD_CHANNEL_RETRY}），"
+                           f"{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试：{e}")
+            time.sleep(EDIT_TRANSIENT_BACKOFF * attempt)
+            continue
+        if not _is_upstream_busy(resp):
+            break
+        if attempt >= EDIT_BAD_CHANNEL_RETRY:
+            raise TransientNetError(
+                f"文生图上游任务失败（{attempt}/{EDIT_BAD_CHANNEL_RETRY}）：{_err_brief(resp)}")
+        logger.warning(f"文生图上游任务瞬时失败（{attempt}/{EDIT_BAD_CHANNEL_RETRY}），"
+                       f"{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试：{_err_brief(resp)}")
+        time.sleep(EDIT_TRANSIENT_BACKOFF * attempt)
     saved = _save_result(resp, out_path)
     if do_compress:
         saved = compress(saved)

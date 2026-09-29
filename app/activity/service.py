@@ -607,9 +607,11 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
     # ---- 阶段三：开启流量 ----
     # 初始 on：仅关闭成功后重开；关闭失败/冷却时仍为 on，不重复操作。
     # 初始 off：业务允许先报名再开启，因此报名遍结束后也开启。
-    # 初始 unknown：保守不操作。加速价逐货号 = 各自 Excel 底价+1（前端显示价以加速价为准，
-    # 各货号底价不同，统一单值会把高底价货号按低价卖——多货号必须逐行设价）。
+    # 初始 unknown：保守不操作。加速价逐货号 = max(底价+1, 活动申报价÷0.9 向上取整)——
+    # 平台要求活动价 ≤ 加速价×0.9（活动是引流价，加速价没高出约 11% 活动就失效，用户规则
+    # 2026-09-28）；抬不进对话框上限的档由 pipeline 退填底价+1 并注明活动将失效（接收失效）。
     skus_by_spu = {r["spu"]: r.get("skus") for r in plans}
+    plan_by_spu = {r["spu"]: r for r in plans}
     initially_off = [r["spu"] for r in plans if r.get("accel_state") == "off"]
     if control is not None:
         # 阶段三不接暂停：此刻流量已关，挂起 = 商品无流量在售。HTTP 侧按 phase 拒（409），
@@ -654,12 +656,28 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
     for spu in to_open:
         try:
             plat = (summary.get("platform_daily") or {}).get(spu) or {}
+            plan = plan_by_spu.get(spu) or {}
+            # 平台规则（2026-09-28）：活动价 ≤ 加速价×0.9 活动才有效，故须按「本次对账确认
+            # 报上的活动里该货号的最高申报价 ÷0.9」抬加速价。只认对账报上的（planned 里
+            # 选了但被平台拒/跳过的活动没有生效价，拿它抬价会把加速价抬得虚高）。
+            need_by_label: dict = {}
+            for item in plan.get("enrolled_activities") or []:
+                if spu not in (summary["enrolled_activities"].get(item["activity"]) or []):
+                    continue
+                for sk in item.get("sku_prices") or []:
+                    sub = sk.get("submit_price")
+                    if sub is None or sk.get("label") is None:
+                        continue
+                    need_by_label[sk["label"]] = max(
+                        need_by_label.get(sk["label"], 0.0), float(sub))
             accel_prices = [{
                 "label": s.get("label"), "daily": s.get("daily"), "sale": s.get("sale"),
                 # 平台侧该货号的真实日常价（本次提报页读到的）：加速器对话框按平台价格档列行，
                 # 用它才能把行配到货号；读不到时退回表里的价（旧行为）。
                 "platform_daily": plat.get(s.get("label")),
-                "price": round(float(s["sale"]) + 1, 2),
+                "price": max(
+                    round(float(s["sale"]) + 1, 2),
+                    pipeline.ceil_cent(need_by_label.get(s.get("label"), 0.0) / 0.9) or 0.0),
             } for s in (skus_by_spu.get(spu) or []) if s.get("sale") is not None] or None
             await _emit(on_progress, {
                 "type": "exec_accel_step", "phase": "open", "step": "checking",

@@ -58,6 +58,17 @@ def build_stages():
     from app.publish.stages import variants
     from app.publish.stages import video
 
+    # 【⑦b 排在 ⑧ 之后不是笔误，2026-09-28 定】⑦b 的「补不上预览图的规格就反选掉」必须
+    # 是动变种勾选的最后一步 —— ⑧ 的职责恰恰是「勾选状态与源 SKU 一致」，它会把 ⑦b 反选
+    # 掉的规格重新勾回来，那些行就又是空图位，一路走到 ⑭ 才被平台拒「请上传预览图」。
+    # 1688 offer 1067355258988（宠物保暖打底衫）实测：该单变种表第一维是【尺码】，⑦b 因
+    # 补不上预览图反选的正是尺码 S/XL，⑧ 立刻把这两个尺码勾回来，反选等于白做。
+    # ⑦b 反选到颜色维时与 ⑧ 不冲突（⑧ 只管尺码组），故此前一直没暴露。
+    # 放 ⑧ 之后还有两个好处：一是 ⑨⑩a⑩⑪ 按行填数时拿到的是反选后的最终行集（变种表
+    # 行数中途一变，按行回填的价/重/货号就全对不上了）；二是 ⑧ 重建变种表之后才动预览图，
+    # ⑦b 换上的图不会再被下一次重建冲掉。
+    # 【阶段 id 与名字保持 sku_preview/⑦b 不变】状态文件、续跑判定、四五个模块的注释与
+    # 记忆库都按这个 id/记号认它，改名只会留下一堆对不上的记号。
     return (
         Stage("extract", "① 1688采集提炼", extracting._st_extract),
         Stage("claim", "② 1688商品认领", form._st_claim),
@@ -69,8 +80,8 @@ def build_stages():
         Stage("material", "⑥ 素材图", material._st_material),
         Stage("drop_acc", "⑦a 剔配件色", skc._st_drop_acc),
         Stage("skc", "⑦ SKC颜色图", skc._st_skc),
-        Stage("sku_preview", "⑦b SKU预览图", preview._st_sku_preview),
         Stage("fix_sizes", "⑧ 尺码勾选", variants._st_fix_sizes),
+        Stage("sku_preview", "⑦b SKU预览图", preview._st_sku_preview),
         Stage("sizechart", "⑨ 尺码表", variants._st_sizechart),
         Stage("sku_code", "⑩a SKU货号", variants._st_sku_code),
         Stage("variant", "⑩ 变种信息", variants._st_variant),
