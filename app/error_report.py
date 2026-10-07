@@ -54,20 +54,20 @@ _MESSAGE_MAX = 2000
 _TRACEBACK_MAX = 8000
 
 _DDL = """CREATE TABLE IF NOT EXISTS `{table}` (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    machine VARCHAR(64) NOT NULL,
-    instance VARCHAR(64) NOT NULL DEFAULT '',
-    pipeline VARCHAR(32) NOT NULL,
-    stage VARCHAR(64) NOT NULL DEFAULT '',
-    item VARCHAR(128) NOT NULL DEFAULT '',
-    level VARCHAR(16) NOT NULL DEFAULT 'error',
-    message TEXT,
-    traceback TEXT,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    machine VARCHAR(64) NOT NULL COMMENT '上报机器 hostname（多台 PC 靠它区分）',
+    instance VARCHAR(64) NOT NULL DEFAULT '' COMMENT '实例标识（[error_report].instance）：同机多实例/多账号时区分，空=只按机器区分',
+    pipeline VARCHAR(32) NOT NULL COMMENT '管线标识（attach 切面传入：collect/publish/activity 等）',
+    stage VARCHAR(64) NOT NULL DEFAULT '' COMMENT '管线内阶段（如发布管线的阶段号），可空',
+    item VARCHAR(128) NOT NULL DEFAULT '' COMMENT '业务对象标识（SPU/货号等），可空',
+    level VARCHAR(16) NOT NULL DEFAULT 'error' COMMENT '级别（error/warning），默认 error',
+    message TEXT COMMENT '错误摘要（写入前截断 2000 字符）',
+    traceback TEXT COMMENT '异常堆栈（写入前截断 8000 字符）',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '落库时间',
     PRIMARY KEY (id),
     KEY idx_pipeline_time (pipeline, created_at),
     KEY idx_item (item)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='管线错误集中上报主表（各机各管线共享，best-effort 写入）'"""
 
 _INSERT = """INSERT INTO `{table}`
     (machine, instance, pipeline, stage, item, level, message, traceback)
@@ -80,23 +80,23 @@ _INSERT = """INSERT INTO `{table}`
 # shot_png 用 MEDIUMBLOB（16MB）：PNG 截图几百 KB 到 1MB，BLOB(64KB) 会截断，
 # LONGBLOB 是浪费。shot_bytes 单列出来，几 KB 就基本是空白页/黑帧，一眼能认出来。
 _SNAP_DDL = """CREATE TABLE IF NOT EXISTS `{table}` (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    error_id BIGINT UNSIGNED NOT NULL,
-    machine VARCHAR(64) NOT NULL,
-    instance VARCHAR(64) NOT NULL DEFAULT '',
-    pipeline VARCHAR(32) NOT NULL,
-    item VARCHAR(128) NOT NULL DEFAULT '',
-    stage VARCHAR(64) NOT NULL DEFAULT '',
-    exit_tag VARCHAR(8) NOT NULL DEFAULT '',
-    snapshot MEDIUMTEXT,
-    shot_png MEDIUMBLOB,
-    shot_bytes INT UNSIGNED NOT NULL DEFAULT 0,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '自增主键',
+    error_id BIGINT UNSIGNED NOT NULL COMMENT '关联主表 id（同一连接先插主表拿 lastrowid，顺序不能反）',
+    machine VARCHAR(64) NOT NULL COMMENT '上报机器 hostname（冗余主表字段，明细可独立检索）',
+    instance VARCHAR(64) NOT NULL DEFAULT '' COMMENT '实例标识（冗余主表字段）',
+    pipeline VARCHAR(32) NOT NULL COMMENT '管线标识（冗余主表字段）',
+    item VARCHAR(128) NOT NULL DEFAULT '' COMMENT '业务对象标识（冗余主表字段）',
+    stage VARCHAR(64) NOT NULL DEFAULT '' COMMENT '管线内阶段（冗余主表字段）',
+    exit_tag VARCHAR(8) NOT NULL DEFAULT '' COMMENT '失败退出点标签（发布管线的失败出口分类字母 A/B/C/D/E/F）',
+    snapshot MEDIUMTEXT COMMENT '失败现场 JSON（页面 URL/任务状态等快照）',
+    shot_png MEDIUMBLOB COMMENT '失败页 PNG 截图二进制',
+    shot_bytes INT UNSIGNED NOT NULL DEFAULT 0 COMMENT 'shot_png 字节数；几 KB 即空白页/黑帧，免取 BLOB 一眼认出',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '落库时间',
     PRIMARY KEY (id),
     KEY idx_error (error_id),
     KEY idx_item (item),
     KEY idx_time (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='失败现场明细表（主表之外的快照+截图；另起表是因主表 CREATE IF NOT EXISTS 加列不生效）'"""
 
 _SNAP_INSERT = """INSERT INTO `{table}`
     (error_id, machine, instance, pipeline, item, stage, exit_tag, snapshot, shot_png, shot_bytes)

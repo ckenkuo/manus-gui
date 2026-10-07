@@ -30,12 +30,12 @@ DEFAULT_TABLE = "app_config"
 GLOBAL_NAME = "global"
 
 _DDL = """CREATE TABLE IF NOT EXISTS `{table}` (
-    name VARCHAR(64) NOT NULL,
-    content MEDIUMTEXT,
-    updated_by VARCHAR(64) NOT NULL DEFAULT '',
-    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    name VARCHAR(64) NOT NULL COMMENT '配置名；当前固定 global——整份配置文本存一行',
+    content MEDIUMTEXT COMMENT '配置原文（TOML 全文）',
+    updated_by VARCHAR(64) NOT NULL DEFAULT '' COMMENT '最后写入者标识（config_sync push 的机器名）',
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '最后更新时间（ON UPDATE 自动维护）',
     PRIMARY KEY (name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"""
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='配置中心：整份 config.toml 文本存一行（name=global），各机启动时拉取'"""
 
 _UPSERT = """INSERT INTO `{table}` (name, content, updated_by)
     VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE content = VALUES(content),
