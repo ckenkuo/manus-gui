@@ -232,7 +232,10 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # （分件配对已在勾选参数之前完成，src_meas 就是本张表那件的数据）
     src_norm = {normalize_size(k): (v or {}) for k, v in src_meas.items()}
     size_keys = {normalize_size(s) for s in sizes}
-    if src_norm and not (set(src_norm) & size_keys):
+    # 键集是否相交要留给下面 source_unused 归因：尺码键对不上与参数名对不上是两类
+    # 根因（参数名根本没机会参与对齐 vs 对齐词表兜不住），人工复核要核对的东西完全不同
+    keys_disjoint = bool(src_norm) and not (set(src_norm) & size_keys)
+    if keys_disjoint:
         logger.warning(f"源尺寸表尺码 {list(src_norm)[:5]} 与弹窗尺码 {list(size_keys)[:5]} "
                        f"完全对不上，保留为模型估算参考")
     # 【「键在不在」与「值能不能填」必须是同一个判据】need 原先只判参数键在不在，
@@ -291,12 +294,20 @@ async def add_sizechart(session: BrowserSession, info_path: str,
     # 都对不上任何可选项（或源数据与商品严重不符）。源数据全白费意味着买家拿到一份
     # 维度对不上实物的尺码表，必须报出来交人工复核，不能静默填。
     source_unused = bool(src_meas) and bool(need) and set(need) == set(check_params)
+    # 归因分两类（人工复核要核对的东西完全不同，消息文案见 stages.variants 的分支）：
+    #   size-keys     —— 源表尺码键与弹窗尺码行完全不相交，参数名根本没机会参与对齐。
+    #                    2026-10-07 939043735707：源键是商家码 7/9/11/13/15，弹窗行是
+    #                    身高码 90~140；估算以 sizeChart 身高参考为桥锚定，不是凭空估。
+    #   param-headers —— 尺码键对得上但参数名一个都对不上（真站取证见 _PARAM_SYNONYMS）。
+    source_unused_reason = ("size-keys" if keys_disjoint else "param-headers") \
+        if source_unused else ""
     if source_unused:
         logger.warning(
             "尺码表参数与源实测尺寸一列都没对上（源有数据却全走估算）："
             "平台参数 " + "、".join(params)
             + "；源参数 " + "、".join(sorted(
-                {k for row in src_norm.values() for k in (row or {})})))
+                {k for row in src_norm.values() for k in (row or {})}))
+            + f"；根因 {source_unused_reason}")
 
     if need:
         est = await sizechart_measurements._estimate_measurements(title, size_ref, sizes, need, norm,
@@ -456,5 +467,7 @@ async def add_sizechart(session: BrowserSession, info_path: str,
             "categorySource": sel.get("source"),
             "params": params, "measureSource": gen, "estimated": need,
             "partUsed": part_used, "sourceUnused": source_unused,
+            "sourceUnusedReason": source_unused_reason,
+            "srcSizeKeys": sorted(src_norm)[:8], "pageSizes": sizes[:8],
             "data": norm, "formText": final.get("text"),
             "charts": final.get("charts", st.get("charts", 1))}

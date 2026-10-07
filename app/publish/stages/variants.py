@@ -127,15 +127,24 @@ async def _st_sizechart(ctx: dict, session: BrowserSession, emit) -> dict:
             note += f" | 源部件 {r.get('partUsed')}"
         if est:
             note += f" | 模型估算 {'、'.join(est)}"
-        # 【源数据一列都没用上】源有实测尺寸、平台参数却全走估算：尺码分类与商品维度
-        # 对不上（背带裤归上装→参数变领围），源真实尺码全被丢弃。这是要人工介入的异常，
-        # 不是普通「缺几列估算」，单独发一条 manual_check 而不是只混在 note 里。
+        # 【源数据一列都没用上】源有实测尺寸、平台参数却全走估算。分两类根因报，
+        # 复核要核对的东西完全不同（取证见 editor.add_sizechart 的 sourceUnusedReason）：
+        # 尺码键对不上时报「表头语义对不上」会让人去查错方向（2026-10-07 939043735707：
+        # 源键 7/9/11/13/15 商家码 vs 弹窗 90~140 身高码，衣长/臀围其实全对得上）。
         if r.get("sourceUnused"):
             note += " | 源数据未采用(待复核)"
-            await emit({"type": "manual_check", "stage": "sizechart",
-                        "message": "源商品有实测尺码数据，但平台尺码表参数一列都没对齐上"
-                                   "（源表头与可选参数语义对不上，或源数据与商品严重不符），"
-                                   "已全部改交模型估算，源真实尺码未采用，请人工核对尺码表"})
+            if r.get("sourceUnusedReason") == "size-keys":
+                await emit({"type": "manual_check", "stage": "sizechart",
+                            "message": f"源尺码表的尺码键（{'、'.join(r.get('srcSizeKeys') or [])}）"
+                                       f"与平台尺码行（{'、'.join(r.get('pageSizes') or [])}）"
+                                       "完全对不上，源实测值无法按行对应填入；"
+                                       "已按源身高参考为锚交模型估算（源数据未直接采用），"
+                                       "请人工核对尺码表各行的档位与数值"})
+            else:
+                await emit({"type": "manual_check", "stage": "sizechart",
+                            "message": "源商品有实测尺码数据，但平台尺码表参数一列都没对齐上"
+                                       "（源表头与可选参数语义对不上，或源数据与商品严重不符），"
+                                       "已全部改交模型估算，源真实尺码未采用，请人工核对尺码表"})
 
     # 【多重防线判定是否为套装】
     # 1. 大模型/预热判定：skuCat 为 2(同款多件) 或 3(混合套装)
