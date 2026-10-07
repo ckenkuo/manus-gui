@@ -4,7 +4,7 @@ import asyncio
 import os
 from app.logger import logger
 from app.publish import images
-from app.publish.browser import BrowserSession, J
+from app.publish.browser import BrowserSession, J, fill_js
 from app.publish.media import (
     menus as media_menus,
     skc_scripts as media_skc_scripts,
@@ -275,6 +275,66 @@ async def skc_image_support(session: BrowserSession) -> dict:
         return {"supported": None, **st}
     has_slot = bool(st.get("imgs") or st.get("pickBtns") or st.get("imageCells"))
     return {"supported": has_slot, **st}
+
+
+async def map_source_colors_to_page_rows(session: BrowserSession, rowid,
+                                         colors: list) -> dict:
+    """源色名 → 页面 SKC 行标签 的映射；拉不到/配不上的一律不映（调用方按原名找行）。
+
+    【为什么需要】色板类目认领时平台把自定义色名改映射成平台标准色
+    （2026-10-07 实测 717941628394 女童帽：源「596图片色」→ 页面行标签「白色」），
+    ⑦ 换图与尺寸兜底拿源色名找行必然报「找不到颜色行」。配对原料与交叉判据见
+    skc_scripts._JS_SKC_PAGE_COLOR_MAP 上方注释。
+
+    【配不上必须原样保留，不能报错】extCode 的形状（「色名-尺码」）是 1688 认领的
+    实测，单色产品还可能退化成纯尺码（色名只在 attrMap 里，走函数尾部「唯一未配对
+    源色 + 剩余 variation 颜色值收拢」的兜底）；别的认领来源（Temu/拼多多）未必
+    同形。配不上时退回原名找行，行为与引入本映射前完全一致——色板类目本来就找不着
+    （失败照常暴露），自定义色类目原名本来就找得着。
+    """
+    if not rowid or not colors:
+        return {}
+    d = await session.eval_json(
+        fill_js(media_skc_scripts._JS_SKC_PAGE_COLOR_MAP, ROWID=str(rowid)))
+    labels = set(d.get("labels") or [])
+    variants = d.get("vars") or []
+    if not labels or not variants:
+        return {}
+    out = {}
+    for c in (c for c in colors if c):
+        vals = set()
+        for v in variants:
+            ext = v.get("ext") or ""
+            # 「-」边界挡住前缀互含（「红」配不上「红色款-90cm」）；
+            # 色名本身含「-」（「白色-热卖款」）时 startswith 照样成立
+            if ext == c or ext.startswith(c + "-"):
+                vals |= {str(x) for x in (v.get("attrs") or {}).values()
+                         if str(x) in labels}
+        # 唯一命中才采信：一对多说明色名撞前缀，放行原名比挂错行安全
+        if len(vals) == 1:
+            out[c] = next(iter(vals))
+    # 【extCode 只有尺码维时的兜底配对】单色产品的 extCode 可能不带色名（2026-10-07
+    # 实测 1072478434320：ext 全是 '90'~'140'，颜色只在 attrMap 里，源「8095蝴蝶结喇叭裤」
+    # 被认领改成「蝴蝶结喇叭裤」），前缀匹配零命中。此时若只剩一个源色没配上，且未被
+    # 已配对色认领的 variations 的颜色值（∩ 行标签）收拢到唯一值，这个值就是该色被
+    # 改写后的行标签——单色单值，配对是被逼出来的，不需要色名相似度判断。
+    # 【两个以上源色没配上时绝不兜底】：配件色被⑦a 反选后行已不存在、extCode 也
+    # 查无此色，形状与本兜底完全相同，兜底会把不存在的行错配到别的颜色行上——
+    # 拿 B 的图换 A 的行，比「找不到颜色行」失败严重得多。
+    unmapped = [c for c in colors if c and c not in out]
+    if len(unmapped) == 1:
+        taken = set(out.values())
+        rest = set()
+        for v in variants:
+            ext = v.get("ext") or ""
+            if any(ext == m or ext.startswith(m + "-") for m in out):
+                continue                      # 已被已配对色认领的 variation 不算数
+            rest |= {str(x) for x in (v.get("attrs") or {}).values()
+                     if str(x) in labels}
+        rest -= taken                         # 行标签已被别的源色占用的不能重复配
+        if len(rest) == 1:
+            out[unmapped[0]] = next(iter(rest))
+    return {k: v for k, v in out.items() if k != v}
 
 
 async def skc_replace_row(session: BrowserSession, row_keyword: str, img_dir: str,

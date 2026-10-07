@@ -1271,9 +1271,9 @@ async def test_skc兜底重做破线行(tmp_path, monkeypatch):
     async def emit(ev):
         events.append(ev)
 
-    fixed = await service._skc_size_fallback(ctx, None, emit, ["粉红色", "咖啡色"],
-                                             ["粉红色"])
-    assert fixed == ["咖啡色"]
+    fx = await service._skc_size_fallback(ctx, None, emit, ["粉红色", "咖啡色"],
+                                          ["粉红色"])
+    assert fx == {"fixed": ["咖啡色"], "broken": []}
     # 整行替换：破线的和达标的都要重挂，只补破线那几张会让达标旧图被一并删掉
     assert calls["replaced"] == [("咖啡色", 2)]
     # 已换过图的行不许再动
@@ -1291,14 +1291,15 @@ async def test_skc兜底跳过已达标行(tmp_path, monkeypatch):
     async def emit(ev):
         events.append(ev)
 
-    fixed = await service._skc_size_fallback({"workdir": str(tmp_path)}, None, emit,
-                                             ["咖啡色"], [])
-    assert fixed == [] and calls["replaced"] == []
+    fx = await service._skc_size_fallback({"workdir": str(tmp_path)}, None, emit,
+                                          ["咖啡色"], [])
+    assert fx == {"fixed": [], "broken": []} and calls["replaced"] == []
 
 
 @pytest.mark.asyncio
 async def test_skc兜底替换失败不静默(tmp_path, monkeypatch):
-    """兜底本身失败要发人工确认：此时行里仍是破线原图，保存还是会被拦。"""
+    """兜底本身失败要发人工确认：此时行里仍是破线原图，保存还是会被拦。
+    确认破线没修好的行必须进 broken——阶段据此判 fail，不留「带病报 ok」的口子。"""
     states = {"咖啡色": {"count": 1, "urls": ["https://cbu01/1.jpg"],
                        "sizes": [[1000, 1000]],
                        "tooSmall": [{"idx": 0, "url": "https://cbu01/1.jpg",
@@ -1311,24 +1312,26 @@ async def test_skc兜底替换失败不静默(tmp_path, monkeypatch):
     async def emit(ev):
         events.append(ev)
 
-    fixed = await service._skc_size_fallback({"workdir": str(tmp_path)}, None, emit,
-                                             ["咖啡色"], [])
-    assert fixed == []
+    fx = await service._skc_size_fallback({"workdir": str(tmp_path)}, None, emit,
+                                          ["咖啡色"], [])
+    assert fx == {"fixed": [], "broken": ["咖啡色"]}
     assert any(e["type"] == "manual_check" and "尺寸兜底替换失败" in e["message"]
                for e in events)
 
 
 @pytest.mark.asyncio
 async def test_skc兜底读不到行状态只告警(tmp_path, monkeypatch):
+    """读不到状态不进 broken：配件色被⑦a 反选后行已不存在（正当缺席）与
+    色板映射漏网（行还在、标签对不上）无从区分，保持告警不拦（2026-10-07 定）。"""
     calls = _fake_skc_env(monkeypatch, tmp_path, {})     # 查表查不到 → err
     events = []
 
     async def emit(ev):
         events.append(ev)
 
-    fixed = await service._skc_size_fallback({"workdir": str(tmp_path)}, None, emit,
-                                             ["咖啡色"], [])
-    assert fixed == [] and calls["replaced"] == []
+    fx = await service._skc_size_fallback({"workdir": str(tmp_path)}, None, emit,
+                                          ["咖啡色"], [])
+    assert fx == {"fixed": [], "broken": []} and calls["replaced"] == []
     assert any("读不到状态" in e.get("message", "") for e in events)
 
 

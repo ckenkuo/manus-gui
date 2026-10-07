@@ -284,3 +284,33 @@ _JS_SKC_IMAGE_SUPPORT = r"""(() => {
     checkboxes: sec.querySelectorAll('label.d-checkbox').length,
   });
 })()"""
+
+
+# 源色名 → 页面行标签 的映射原料（一次性取回，配对在 Python 侧做）。
+# 【为什么源色名会找不到行】色板类目认领时平台把自定义色名改映射成平台标准色
+# （2026-10-07 实测 717941628394 女童帽：源「596图片色」→ 页面行标签「白色」），
+# ⑦ 与尺寸兜底拿源色名按精确匹配找行必然报「找不到颜色行」。
+# edit.json 的 variations 同时带两侧名字：extCode 是源规格串（「596图片色-90cm」）、
+# attrMap 的颜色维值是色板名，而色板名必然就是页面行标签之一——三者交叉精确配对，
+# 单色多色同一条路，不为单色单开直通分支。自定义色类目里 attrMap 值就是源色名
+# 原样，映射退化成恒等，不影响既有行为。
+# 【extCode 不是总有色名】2026-10-07 实测 1072478434320（单色 6 尺码）：extCode 全是
+# 纯尺码（'90'~'140'），颜色只出现在 attrMap——前缀配对零命中。这种形态由 Python 侧
+# map_source_colors_to_page_rows 的「唯一未配对源色 + 剩余 variation 颜色值收拢」
+# 兜底处理，JS 这里照常原样取回，不为它改结构。
+_JS_SKC_PAGE_COLOR_MAP = r"""(async () => {
+  const labels = Array.from(document.querySelectorAll('#skuAttrsInfo tr'))
+    .map(tr => ((tr.querySelector('td') || {}).textContent || '').trim())
+    .filter(t => t);
+  let vars = [];
+  try {
+    const e = await fetch('/api/popTemuProduct/edit.json?id=' + encodeURIComponent(__ROWID__),
+                          {credentials: 'include'});
+    if (e.ok) {
+      const p = (((await e.json()).data) || {}).product || {};
+      vars = (p.variations || []).map(v => ({ext: String(v.extCode || ''),
+                                             attrs: v.attrMap || {}}));
+    }
+  } catch (err) {}
+  return JSON.stringify({labels: labels, vars: vars});
+})()"""

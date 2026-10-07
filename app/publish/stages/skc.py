@@ -9,6 +9,7 @@ from app.publish.media.skc import (
     SKC_ROW_MIN_IMAGES,
     _skc_row_matches,
     _skc_row_state,
+    map_source_colors_to_page_rows,
     skc_image_support,
     skc_replace_row,
 )
@@ -37,8 +38,15 @@ async def _skc_size_fallback(ctx: dict, session: BrowserSession, emit,
 
     只在【纯增益】方向动手：读不到尺寸、行里图本来就达标、或下载/合规化失败，
     一律保持原样并报人工确认，绝不把行搞成空的。
+
+    返回 {"fixed": [...], "broken": [...]}：broken 是【确认留了破线原图】的行
+    （有低于下限的图、但一张没修成或整行替换失败）。读不到状态的行不算 broken
+    ——那可能是配件色被 ⑦a 反选后行已不存在（正当缺席），也可能是色板映射漏网
+    （行还在、标签对不上），两者无从区分，保持告警不拦（2026-10-07 定）。broken
+    则证据确凿，调用方必须据它判阶段失败：阶段报 ok 会让商品带病走到发布被平台
+    打回，且状态文件记着「已完成」、续跑跳过⑦ 永远修不好（1072478434320 实况）。
     """
-    fixed = []
+    fixed, broken = [], []
     for kw in colors:
         st = await _skc_row_state(session, kw)
         if st.get("err"):
@@ -80,6 +88,7 @@ async def _skc_size_fallback(ctx: dict, session: BrowserSession, emit,
                         "message": f"「{kw}」行 {len(small)} 张图低于 "
                                    f"{images.CLOTH_MIN_W}x{images.CLOTH_MIN_H}，"
                                    "但一张都没处理成功，仍是原图（保存会被拦）"})
+            broken.append(kw)
             continue
         r = await skc_replace_row(session, kw, prep)
         if r.get("status") == "ok":
@@ -89,7 +98,8 @@ async def _skc_size_fallback(ctx: dict, session: BrowserSession, emit,
         else:
             await emit({"type": "manual_check", "stage": "skc",
                         "message": f"「{kw}」行尺寸兜底替换失败：{str(r)[:120]}"})
-    return fixed
+            broken.append(kw)
+    return {"fixed": fixed, "broken": broken}
 
 
 def _pad_row_images(picked: list, info: dict, workdir: str) -> tuple:
@@ -205,6 +215,19 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
     plan = await vision.plan_skc(info, ctx["workdir"], min_clean=SKC_ROW_MIN_IMAGES)
     rows = plan.get("rows") or []
     colors = [c for c in (info.get("colors") or []) if c]
+    # 色板类目认领时源色名被平台改成色板标准色（源「596图片色」→ 页面行「白色」），
+    # 拿源名找行必报「找不到颜色行」。先译成页面行标签再进换图与尺寸兜底；
+    # 配不上的颜色保留原名（行为同引入映射前，真定位问题照常暴露）。
+    # 判据与取证见 media.skc.map_source_colors_to_page_rows。
+    cmap = await map_source_colors_to_page_rows(session, ctx.get("rowid"), colors)
+    if cmap:
+        logger.info(f"页面 SKC 行标签是平台色板名，源色名已映射：{cmap}")
+        await emit({"type": "log", "stage": "skc",
+                    "message": "页面颜色行用的是平台色板标准色，已按草稿映射："
+                               + "、".join(f"{s}→{p}" for s, p in cmap.items())})
+        for row in rows:
+            row["keyword"] = cmap.get(row["keyword"], row["keyword"])
+        colors = [cmap.get(c, c) for c in colors]
     if plan.get("dirtyUsed"):
         logger.warning(f"SKC 候选池合规图不足，被迫放回：{plan['dirtyUsed']}"
                        "（哪一行真用上了，见下面逐行的人工确认）")
@@ -215,9 +238,16 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
         # 一行都没换 ≠ 尺寸不用管：留在页面上的 1688 原始图往往破线，
         # 阶段⑫ save 会被静默拦下（见 _skc_size_fallback）
         fx = await _skc_size_fallback(ctx, session, emit, colors, [])
-        if fx:
+        if fx["fixed"]:
             return {"status": "ok",
-                    "note": f"未换图，但按尺寸兜底重做了 {len(fx)} 行：{'、'.join(fx)}"}
+                    "note": f"未换图，但按尺寸兜底重做了 {len(fx['fixed'])} 行："
+                            f"{'、'.join(fx['fixed'])}"}
+        if fx["broken"]:
+            # 与主路径同一取向：留了确认破线的原图就不能报 ok/skipped 放行
+            return {"status": "fail",
+                    "note": f"视觉未给出选图，{len(fx['broken'])} 行原始图破线且"
+                            f"尺寸兜底没修好（{'、'.join(fx['broken'])}），"
+                            "save/发布会被平台拦下"}
         return {"status": "skipped", "note": plan.get("reason") or "无可替换行"}
     # skipped_rows：续跑时页面上已经是本轮图片、无需重换的行。它必须与 ok_rows 一起
     # 传给尺寸兜底——跳过的行图是达标的，再被兜底重做一遍就白干了。
@@ -321,7 +351,8 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
     # 没换成图的行（视觉分不出归属、或换图失败）仍可能留着破线的原始图：
     # 内容判断失败不等于尺寸可以不管，这里只补像素与比例，画面一张不换。
     # 已跳过的行同样算「已完成」，不能再被兜底重做一遍。
-    fixed = await _skc_size_fallback(ctx, session, emit, colors, ok_rows + skipped_rows)
+    fx = await _skc_size_fallback(ctx, session, emit, colors, ok_rows + skipped_rows)
+    fixed, broken = fx["fixed"], fx["broken"]
 
     note = f"{len(ok_rows) + len(skipped_rows)}/{len(rows)} 行完成"
     if skipped_rows:
@@ -330,8 +361,16 @@ async def _st_skc(ctx: dict, session: BrowserSession, emit) -> dict:
         note += f"（失败：{'、'.join(fail_rows)}）"
     if fixed:
         note += f"；尺寸兜底重做 {len(fixed)} 行：{'、'.join(fixed)}"
+    if broken:
+        # 【确认留了破线原图的行必须让阶段 fail】报 ok 的代价是双重的：商品带病走到
+        # 阶段⑮ 被平台打回（只剩一句静默的「服装类图片尺寸不能小于1340px*1785px」，对
+        # 不上是哪行）；且状态文件记着⑦ 已完成，续跑直奔发布再撞一次、永远修不好
+        # （2026-10-07 1072478434320 实况：0/1 行完成仍 ok → save ok → publish 被拒，
+        # 普通续跑只重跑 publish）。fail-fast 后普通续跑自然重跑⑦。
+        note += f"；{len(broken)} 行换图与尺寸兜底都没修好：{'、'.join(broken)}（留破线原图）"
     if dirty_rows:
         # 进 note 是为了留在状态文件里：事后被 Temu 打回时能直接对上是哪几行
         note += f"；{len(dirty_rows)} 行含不合规图：{'、'.join(dirty_rows)}"
+    if broken or dirty_rows:
         return {"status": "fail", "note": note[:300]}
     return {"status": "ok", "note": note}
