@@ -312,9 +312,10 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
     （那是缓存键），每一条都是踩过坑换来的，理由见各分支注释。
 
     失败时返回 {"ok": False, "kind": ..., "why": ...}，kind ∈ fetch（源站取不到）/
-    edit（出图链路报错）/ qc（质检发数用尽仍不过）。调用方按 kind 分流（见
-    description._replace_round）：qc 的这张图被判死、直接丢弃；另两类是「条件弄好再来
-    一次」，保留原图、重跑即可。2026-09-22 用户定案：最后一律丢弃，不再停下等人工换图。
+    edit（出图链路报错）/ qc（质检发数用尽仍不过）/ moderation（内容审核持续拒收）。
+    调用方按 kind 分流（见
+    description._replace_round）：qc 与 moderation 的这张图被判死、直接丢弃；另两类是
+    「条件弄好再来一次」，保留原图、重跑即可。2026-09-22 用户定案：最后一律丢弃，不再停下等人工换图。
 
     抽成独立函数【只为了能并发预热】：本函数不碰浏览器页面（输入是源 URL、输出是
     本地文件），故 N 张可以同时跑；而定位序号与替换必须逐张串行（见
@@ -482,6 +483,15 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
                                                out_path=en_path, desc_mode=True,
                                                timeout=images.EDIT_TIMEOUT)
             qc = await vision.check_cleaned(ed["output"])
+        except images.ModerationBlocked as e:
+            # 【审核持续拒收 = 这张图被判死，与 qc 同走丢弃】重跑多少次都是同一个拒绝
+            # （见 images.ModerationBlocked 的实测与 _busy_exhausted 的改判）。退回
+            # kind=edit「保留原图」会把一张带中文的 1688 外链留在描述区：desc_save
+            # 回读必报外链未转存+尺寸破线、整阶段 fail，下次重跑又白烧一发生图——
+            # 商品永久卡在 ⑬（2026-10-07 717941628394 的 upstream_text_reply 持续
+            # 政策文案就是这条路径，只是那单赶上过载误报、重跑恰好恢复了）。
+            return {"ok": False, "kind": "moderation",
+                    "why": f"英化被内容审核持续拒收：{e}"[:150]}
         except Exception as e:
             return {"ok": False, "kind": "edit", "why": f"英化失败：{e}"[:150]}
         if qc.get("clean"):
@@ -541,8 +551,9 @@ async def _prepare_desc_image(workdir: str, rep: dict, dl_sem=None) -> dict:
             logger.info(f"描述图英化质检未过（{attempt}/{tries}"
                         f"{'，' + flags if flags else ''}），重烧一发："
                         f"{last_issues[:60]}")
-    # kind 供调用方分流（见 _replace_round）：「qc」= 发数用尽仍不过，这张图被判死、该丢弃；
-    # 「fetch」/「edit」= 源站取不到 / 出图链路报错，图本身没被判死，重跑就该好，仍保留原图。
+    # kind 供调用方分流（见 _replace_round）：「qc」= 发数用尽仍不过、「moderation」= 审核
+    # 持续拒收，这张图被判死、该丢弃；「fetch」/「edit」= 源站取不到 / 出图链路报错，
+    # 图本身没被判死，重跑就该好，仍保留原图。
     return {"ok": False, "kind": "qc", "why": f"英化质检未过：{last_issues}"[:150],
             "residualChinese": cjk_left, "marketingClaim": claim_left,
             "bannedTerm": banned_left, "brandMark": brand_left,

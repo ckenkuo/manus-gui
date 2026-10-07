@@ -158,7 +158,8 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
     failed_urls: list = []
     # 【被判死、待扔掉的源 URL】与 failed_urls 刻意不同：那个每轮 clear（重试轮只关心本轮
     # 失败），这个要跨轮累积——重试轮是同一个 _replace_round 的第二次调用，clear 会把第一轮
-    # 收集到的丢弃项洗掉。判据是 _prepare_desc_image 的 kind=="qc"（发数用尽仍不过）：这类图
+    # 收集到的丢弃项洗掉。判据是 _prepare_desc_image 的 kind ∈ {"qc", "moderation"}（质检发数
+    # 用尽仍不过 / 内容审核持续拒收）：这两类图
     # 重跑还是同一个结果，留在描述区只是一张带中文/夸大词的外链原图，还会让收尾 desc_save
     # 判整阶段 fail（2026-09-22 用户定案：最后一律丢弃，不再保留原图等人工换图）。
     discard_urls: set = set()
@@ -208,8 +209,9 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
                 got = await stages_description_images._prepare_desc_image(ctx["workdir"], rep)
             if not got.get("ok"):
                 why = got.get('why') or '未知原因'
-                if got.get("kind") == "qc":
-                    # 【发数用尽仍不过 → 丢弃该图】2026-09-22 用户定案（原先保留 1688 外链
+                if got.get("kind") in ("qc", "moderation"):
+                    # 【发数用尽仍不过 / 审核持续拒收 → 丢弃该图】2026-09-22 用户定案（原先
+                    # 保留 1688 外链
                     # 原图，收尾 desc_save 因它同时命中 foreignHosts 与 tooSmall 判整阶段
                     # fail，一张图拖停整单）。这里只收集、不当场删：此刻删会让后面每一张的
                     # pos 前移，而它们都已按当前 pos 定位过一次了；统一到替换轮走完再删
@@ -266,7 +268,7 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
                 logger.warning(f"重试前关闭编辑器失败，仍尝试重试：{closed.get('reason')}")
             await _replace_round(retry)
 
-    # ---- 质检判死的图：从描述区删掉 ------------------------------------------
+    # ---- 被判死的图（质检未过/审核拒收）：从描述区删掉 --------------------------
     # 【为什么放在替换轮（含重试轮）之后】此刻描述编辑器还开着（ensure_desc_closed 在更
     # 后面），而前面每一张都已按当时的 pos 定位替换过——提前删会让它们整体前移。
     # 删除本身是安全的：desc_delete 内部重读 state、重建 idx 映射并按倒序删（见
@@ -291,12 +293,12 @@ async def _st_desc(ctx: dict, session: BrowserSession, emit) -> dict:
                 dd = await desc_delete(session, positions)
                 if dd.get("status") == "ok":
                     discarded = len(dd.get("deleted") or [])
-                    logger.info(f"描述图丢弃 {discarded} 张：英化质检多次未过，不保留原图")
+                    logger.info(f"描述图丢弃 {discarded} 张：英化质检多次未过或审核持续拒收，不保留原图")
                 else:
                     logger.warning(f"丢弃描述图失败（这几张保留原样）：{str(dd)[:150]}")
                     await emit({"type": "manual_check", "stage": "desc",
-                                "message": f"{len(positions)} 张质检未过的描述图未能丢弃"
-                                           f"（保留原图）：{str(dd)[:120]}"})
+                                "message": f"{len(positions)} 张被判死的描述图（质检未过/审核拒收）"
+                                           f"未能丢弃（保留原图）：{str(dd)[:120]}"})
         except Exception as e:
             logger.warning(f"丢弃描述图异常（这几张保留原样）：{e}")
 

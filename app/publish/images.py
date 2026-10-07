@@ -872,20 +872,60 @@ class ModerationBlocked(RuntimeError):
 
     【为什么不重试】同上，判据与 _BAD_CHANNEL_CODE 那段的取向一致：确定性失败原样
     抛出，白等几分钟还把真因埋成一串重试噪音（见 [[publish-vision-400-no-retry]]）。
+
+    【入口有两条】一是 _save_result 按审核码（_MODERATION_CODES）直接判；二是
+    _busy_exhausted 在瞬时重试耗尽、最后一发仍是政策文案时改判永久（多账号池全拒
+    = 触发点在图本身，与那条实测同性质）。
     """
 
 
 # 内容审核拒绝的错误签名（2026-09-18 实测，见 ModerationBlocked 的取证）。
-# 判 code 而不是判文案：message 里带 request id、会变也会被截断。
+# 判 code 为主、文案只做一种纠偏：审核码装限流文案时真因是过载（见
+# _RATE_LIMIT_MARKS 注释），不能让永久通道误杀。
 _MODERATION_CODES = frozenset({"moderation_blocked", "content_policy_violation"})
+
+# 文案纠偏签名：网关两层错误 JSON 里 code 与真实成因可能张冠李戴，两个方向都实测到过——
+# 【限流文案装进了审核码】2026-10-05 过载潮（1074427410266 main-04.jpg）：
+#   content_policy_violation 码的 message 写的是「频率限制…稍后重试」，真因是过载。
+#   按 code 判永久会把一张好图标成 unusable 永久排除（见 [[publish-image-moderation-blocked]]）。
+# 【政策文案装进了瞬时码】upstream_text_reply 码的 message 是「可能违反了我们的内容
+#   政策…请重试」。过载期它多是误报（网关是多账号池，重发换账号就过，2026-10-07 实测
+#   恢复后同图首发即成功），照常走瞬时重试；但预算耗尽时最后一发仍是政策文案，说明
+#   池内多个账号全拒、触发点在图片内容本身——与 ModerationBlocked 的实测（同图连发
+#   4 次全拒）同性质，改按永久失败处置（见 _busy_exhausted）。
+_RATE_LIMIT_MARKS = ("频率限制", "速率限制", "请求过于频繁", "稍后重试",
+                     "rate limit", "rate_limit", "too many requests")
+_POLICY_REFUSAL_MARKS = ("内容政策", "内容审核", "内容规范",
+                         "content policy", "content_policy", "policy violation")
+
+
+def _err_blob(resp_json: dict) -> str:
+    """拼错误响应两层（顶层与 error 对象）的 type/message/status/stage，小写化供文案匹配。"""
+    if not isinstance(resp_json, dict):
+        return ""
+    err = resp_json.get("error")
+    err = err if isinstance(err, dict) else {}
+    return " ".join(str(err.get(k) or resp_json.get(k) or "")
+                    for k in ("type", "message", "status", "stage")).lower()
+
+
+def _has_mark(blob: str, marks) -> bool:
+    return any(str(m).lower() in blob for m in marks)
 
 
 def _is_moderation_blocked(resp_json: dict) -> bool:
-    """判响应是否为「内容审核拒收这张图」——这是永久性失败，不能重试也不该判换图。"""
+    """判响应是否为「内容审核拒收这张图」——这是永久性失败，不能重试也不该判换图。
+
+    【审核码装限流文案时让路】真因是过载不是违规（见 _RATE_LIMIT_MARKS 注释的取证），
+    判永久会把好图标成 unusable 永久排除。文案命中限流签名时返回 False，让给
+    _is_upstream_busy 走瞬时重试（那边有对称的入口）。
+    """
     err = (resp_json or {}).get("error")
     if not isinstance(err, dict):
         return False
-    return str(err.get("code") or "") in _MODERATION_CODES
+    if str(err.get("code") or "") not in _MODERATION_CODES:
+        return False
+    return not _has_mark(_err_blob(resp_json), _RATE_LIMIT_MARKS)
 
 
 def _curl_json(args: list, timeout: int = 280) -> dict:
@@ -1085,9 +1125,20 @@ def _is_bad_channel(resp_json: dict) -> bool:
 # 响应结构、与真因无关的话，而且【不经过任何重试】直接判这张图失败。实测这两个码重发
 # 即成功（单发时段首发失败率约 50%，30 并发压测时段全 200，判为上游忙时排队），不认
 # 它们等于让一半的首发失败炸单。
-_TRANSIENT_TASK_CODES = frozenset({"477", "434"})
+#
+# 2026-10-05~07 渠道商过载潮再补三个签名（同样是 HTTP 200 + 错误 JSON，两家通道同形）：
+#   upstream_text_reply             —— 上游回了段文本而不是图：限流（「触发了速率限制」）
+#                                     或内容政策误报（「可能违反了内容政策…请重试」）。
+#                                     网关后面是多上游账号池，重发即换账号，两类重发都能过
+#                                     （10-07 实测恢复后同图首发即成功）。预算耗尽仍是政策
+#                                     文案的，由 _busy_exhausted 改判 ModerationBlocked。
+#   image_account_selection_timeout —— 网关挑不到可用上游账号（「当前系统过载」）。
+#   No available compatible accounts —— 同上，但响应只有 message 没有 code，走 MARKS 认。
+_TRANSIENT_TASK_CODES = frozenset({"477", "434", "upstream_text_reply",
+                                   "image_account_selection_timeout"})
 # 码之外的兜底签名：网关把错误码换字段或改成字符串时，这两个文案仍认得出。
-_TRANSIENT_TASK_MARKS = ("image_task_failed_or_requires_review", "生图超时")
+_TRANSIENT_TASK_MARKS = ("image_task_failed_or_requires_review", "生图超时",
+                         "No available compatible accounts")
 
 
 def _is_upstream_busy(resp_json: dict) -> bool:
@@ -1096,16 +1147,22 @@ def _is_upstream_busy(resp_json: dict) -> bool:
     【为什么两层都查】这家的错误 JSON 有两种形状：坏 key 是顶层
     `{"code": "INVALID_API_KEY", ...}`，参数错是 `{"error": {"message", "type"}}`，
     477/434 落在哪一层没有稳定保证，故两层的 code 都取、文案拼一起判。
+
+    【审核码装限流文案也归这里】与 _is_moderation_blocked 的让路对称：code 是
+    审核码但文案是「频率限制…稍后重试」时，真因是过载（取证见 _RATE_LIMIT_MARKS），
+    走瞬时重试而不是永久排除。
     """
     if not isinstance(resp_json, dict):
         return False
     err = resp_json.get("error")
     err = err if isinstance(err, dict) else {}
-    if {str(resp_json.get("code") or ""), str(err.get("code") or "")} & _TRANSIENT_TASK_CODES:
+    codes = {str(resp_json.get("code") or ""), str(err.get("code") or "")}
+    if codes & _TRANSIENT_TASK_CODES:
         return True
-    blob = " ".join(str(err.get(k) or resp_json.get(k) or "")
-                    for k in ("type", "message", "status", "stage"))
-    return any(mark in blob for mark in _TRANSIENT_TASK_MARKS)
+    blob = _err_blob(resp_json)
+    if codes & _MODERATION_CODES and _has_mark(blob, _RATE_LIMIT_MARKS):
+        return True
+    return _has_mark(blob, _TRANSIENT_TASK_MARKS)
 
 
 def _err_brief(resp_json: dict) -> str:
@@ -1113,6 +1170,24 @@ def _err_brief(resp_json: dict) -> str:
     err = resp_json.get("error")
     err = err if isinstance(err, dict) else resp_json
     return f"{err.get('code') or ''} {err.get('message') or err.get('type') or ''}".strip()[:160]
+
+
+def _busy_exhausted(resp_json: dict, attempt: int, tries: int, what: str):
+    """瞬时重试预算耗尽的抛异常出口：按最后一发的文案分永久/瞬时（edit/文生图共用）。
+
+    政策文案（_POLICY_REFUSAL_MARKS）：多账号池轮流拒了 tries 次仍是同一句内容政策，
+    触发点在图片内容本身，抛 ModerationBlocked 让调用方按「放弃这张图」处置——
+    若抛 TransientNetError，上层会保留原图等重跑，重跑只是再烧一轮同样的拒绝
+    （⑬ 还会因留下的 1688 外链/破线图被 desc_save 判整阶段 fail，商品永久卡住）。
+    限流文案或认不出的：仍是过载，抛 TransientNetError。两类文案同时命中时按瞬时
+    处理——误判永久的代价是把好图永久排除，比白跑一轮重得多。
+    """
+    blob = _err_blob(resp_json)
+    if not _has_mark(blob, _RATE_LIMIT_MARKS) and _has_mark(blob, _POLICY_REFUSAL_MARKS):
+        raise ModerationBlocked(f"{what}持续被内容政策拒收（{attempt}/{tries}）："
+                                f"{_err_brief(resp_json)}")
+    raise TransientNetError(f"{what}上游任务失败（{attempt}/{tries}）："
+                            f"{_err_brief(resp_json)}")
 
 
 def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TIMEOUT,
@@ -1130,6 +1205,8 @@ def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TI
 
     抖动重试到最后一次仍失败时把异常抛出去（而不是返回坏响应），交由上层
     best-effort 兜住——⑤b 清理与⑬ 备料都会把单张失败降级成「保留原图」。
+    耗尽时抛哪种异常按最后一发的文案分：政策文案抛 ModerationBlocked（永久），
+    其余抛 TransientNetError（瞬时），判据与取舍见 _busy_exhausted。
 
     【内容审核拒绝走原样返回、不在这里重试】它是永久性失败（见 ModerationBlocked
     的实测：同图连发 4 次全被拒），重试只是把 4 次拒绝叠成一串日志。响应原样返回给
@@ -1151,12 +1228,12 @@ def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TI
             continue
         if _is_upstream_busy(resp):
             # 上游忙时排队（477/434）：与链路抖动同源（重发能过、与时间有关），故同样
-            # 退避后重试。预算耗尽时抛 TransientNetError 而不是把坏响应交出去——交给
-            # _save_result 只会报「响应中没有图片」，上层按阶段 fail 处置，而这里的
-            # 正确处置与抖动一致：这张图没做出来，best-effort 兜住、继续跑别的图。
+            # 退避后重试。预算耗尽时抛异常而不是把坏响应交出去——交给 _save_result
+            # 只会报「响应中没有图片」，上层按阶段 fail 处置。耗尽时抛哪种异常按最后
+            # 一发的文案分（政策文案 = 永久，见 _busy_exhausted）；瞬时类的正确处置与
+            # 抖动一致：这张图没做出来，best-effort 兜住、继续跑别的图。
             if attempt >= tries:
-                raise TransientNetError(
-                    f"出图服务上游任务失败（{attempt}/{tries}）：{_err_brief(resp)}")
+                _busy_exhausted(resp, attempt, tries, "出图服务")
             logger.warning(
                 f"gpt-image-2 上游任务瞬时失败（{attempt}/{tries}），"
                 f"{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试："
@@ -1255,8 +1332,8 @@ def generate_image(prompt: str, out_path: str, size: str = "1024x1024",
         if not _is_upstream_busy(resp):
             break
         if attempt >= EDIT_BAD_CHANNEL_RETRY:
-            raise TransientNetError(
-                f"文生图上游任务失败（{attempt}/{EDIT_BAD_CHANNEL_RETRY}）：{_err_brief(resp)}")
+            # 耗尽时按最后一发的文案分永久/瞬时（理由见 _busy_exhausted）
+            _busy_exhausted(resp, attempt, EDIT_BAD_CHANNEL_RETRY, "文生图")
         logger.warning(f"文生图上游任务瞬时失败（{attempt}/{EDIT_BAD_CHANNEL_RETRY}），"
                        f"{EDIT_TRANSIENT_BACKOFF * attempt}s 后重试：{_err_brief(resp)}")
         time.sleep(EDIT_TRANSIENT_BACKOFF * attempt)

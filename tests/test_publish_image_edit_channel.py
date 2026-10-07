@@ -307,8 +307,11 @@ def test_审核拒绝不重试(monkeypatch, 假图, tmp_path):
     assert len(calls) == 1, f"审核拒绝不该重试，实际发了 {len(calls)} 次"
 
 
-def test_审核拒绝判据只认code不认文案():
-    """message 里带 request id、会变也会被截断，判据必须是 code。"""
+def test_审核拒绝判据认code但限流文案要纠偏():
+    """message 里带 request id、会变也会被截断，判据以 code 为主；
+    唯一的例外是审核码装限流文案——真因是过载（2026-10-05 过载潮实测
+    1074427410266 main-04.jpg 因此被误判审核拒收、标 unusable 永久排除），
+    必须让给瞬时重试而不是判永久。"""
     assert images._is_moderation_blocked(MODERATION_RESP)
     assert not images._is_moderation_blocked(BAD_CHANNEL_RESP)
     assert not images._is_moderation_blocked(FIDELITY_RESP)
@@ -316,9 +319,57 @@ def test_审核拒绝判据只认code不认文案():
     # 别把「文案里出现 safety」的其它错也当审核拒绝
     assert not images._is_moderation_blocked(
         {"error": {"code": "server_error", "message": "safety system unavailable"}})
+    # 审核码 + 限流文案：不算审核拒收，且要被瞬时重试认下（两边对称）
+    rate_limited = {"error": {"code": "content_policy_violation",
+                              "message": "请求触发频率限制，请稍后重试",
+                              "type": "invalid_request_error"}}
+    assert not images._is_moderation_blocked(rate_limited)
+    assert images._is_upstream_busy(rate_limited)
+    # 审核码 + 真正的政策文案：仍是永久拒收，不归瞬时重试
+    assert not images._is_upstream_busy(MODERATION_RESP)
 
 
 def test_审核拒绝与坏渠道是两类不能互认():
     """两者处置相反：坏渠道要换渠道重发，审核拒绝要放弃这张图。"""
     assert not images._is_bad_channel(MODERATION_RESP)
     assert not images._is_moderation_blocked(BAD_CHANNEL_RESP)
+
+
+# 瞬时码装政策文案（upstream_text_reply + 「可能违反了我们的内容政策」）：
+# 过载期是误报，重发换账号能过（2026-10-07 实测），故照常进瞬时重试；但预算耗尽
+# 仍是政策文案时说明池内多账号全拒、触发点在图本身，改判 ModerationBlocked（永久），
+# 否则上层保留原图等重跑，只是再烧一轮同样的拒绝（⑬ 还会被 desc_save 判整阶段 fail）。
+UPSTREAM_POLICY_RESP = {
+    "error": {"code": "upstream_text_reply",
+              "message": "非常抱歉，该提示可能违反了我们的内容政策。"
+                         "如果你认为此判断有误，请重试或修改提示语。",
+              "type": "invalid_request_error"}
+}
+
+
+def test_瞬时码装政策文案先按瞬时重试():
+    """单发命中不判死：过载误报重发换账号就过，与限流同走一条瞬时通道。"""
+    assert images._is_upstream_busy(UPSTREAM_POLICY_RESP)
+    assert not images._is_moderation_blocked(UPSTREAM_POLICY_RESP)
+
+
+def test_重试耗尽仍是政策文案改判永久(monkeypatch, 假图, tmp_path):
+    """多账号池全拒 = 触发点在图本身，与 ModerationBlocked 实测同性质。"""
+    calls = []
+    _stub(monkeypatch, [UPSTREAM_POLICY_RESP], calls)
+    monkeypatch.setattr(images.time, "sleep", lambda s: None)  # 跳过退避，别真睡 18s
+    with pytest.raises(images.ModerationBlocked):
+        images.edit_image(假图, out_path=str(tmp_path / "o.png"), do_compress=False)
+    assert len(calls) == images.EDIT_BAD_CHANNEL_RETRY
+
+
+def test_重试耗尽是限流文案仍判瞬时():
+    """文案说是限流就还是过载：保留原图等重跑，不该把图永久排除。"""
+    resp = {"error": {"code": "upstream_text_reply", "message": "触发了速率限制，请稍后重试"}}
+    with pytest.raises(images.TransientNetError):
+        images._busy_exhausted(resp, 4, 4, "出图服务")
+    # 两类文案同时命中时按瞬时（误判永久的代价远高于白跑一轮）
+    mixed = {"error": {"code": "upstream_text_reply",
+                       "message": "可能违反内容政策；当前频率限制，请稍后重试"}}
+    with pytest.raises(images.TransientNetError):
+        images._busy_exhausted(mixed, 4, 4, "出图服务")
