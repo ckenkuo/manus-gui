@@ -497,3 +497,25 @@ snapshot = true            # 关掉＝只写主表那行文本
 screenshot = true          # 失败页 PNG 开关
 screenshot_max_kb = 2048   # 单张 PNG 上限，超了不传（只记字节数）
 snapshot_max_kb = 256      # 现场 JSON 上限，超了按 history→state→page 顺序降级
+
+# ---- 活动历史（app/activity/history.py，2026-09-30 新增）-----------------------
+# 活动报名管线 live 批次的真实平台动作持久化：报名结论（活动名/申报价/enrollId/
+# 成败）、加速器每次开/关（时间/档位/逐货号加速价/冷却/限流）。搞活动是持续时间
+# 维度的行为——活动按期数轮换、加速器有 24h 锁定期、同一商品会反复报名，落库后
+# 下次能查「这商品报过哪些活动、哪些成了、加速器何时开关过」，页面上也会给
+# 「上次结论」徽标与 24h 锁定期预警。多台 PC 共享同一张表（与 pipeline_errors 同库）。
+# best-effort：连接参数不齐或读写失败只告警、绝不中断扫描/报名主流程。
+# 【没有开关，默认就记】：连接参数（host/port/user/password/database/instance）
+# 缺省【逐项复用】上面 [error_report] 段的，一般整段都不用写——连不上库就静默
+# 降级为「没有历史」。本段只在这一处需要时才有用：想换一组账号或表名。
+# 注意账号权限要 SELECT + INSERT（历史要读回来做页面徽标）——若 [error_report]
+# 按上文建议配的是只写账号，历史查询会降级为空，需放开 SELECT 或在本段单配账号。
+[activity_history]
+# host = ""            # 缺省复用 [error_report]
+# port = 3306
+# user = ""
+# password = ""
+# database = ""
+# instance = ""
+# 表名由代码自动 CREATE TABLE IF NOT EXISTS；只允许字母数字下划线
+table = "activity_history"

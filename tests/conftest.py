@@ -18,6 +18,11 @@ cache_stats() 报缓存现状，各阶段跑通还会往里写类目路径与属
 场景会走同一个 _alert_hook，而它写的是公网 MySQL —— 跑一轮 -k publish 就往真实错误
 表里混进十几行假记录，跟真故障分不开。开发机通常 enabled=true（见 config.toml），
 所以这条不是可选项。
+
+活动历史（app/activity/history.py）同理且更要紧：它的写挂在 run_activity_batch 的
+事件切面上、读挂在 scan_activity_matrix / run_activity_batch 主路径（summarize 注入）
+上——不掐的话跑一轮 -k activity，写会往真实历史表混假行、读会真连公网 MySQL
+（慢且依赖网络），还会把「无历史」的测试前提变成未知。
 """
 import os
 
@@ -85,3 +90,28 @@ def _block_error_report(monkeypatch):
 
     monkeypatch.setattr(error_report, "_write", _blocked)
     monkeypatch.setattr(error_report, "_write_snapshot", _blocked)
+
+
+@pytest.fixture(autouse=True)
+def _block_activity_history(monkeypatch):
+    """禁止单测把活动历史真写进 MySQL、或让 summarize 真连公网库。
+
+    掐在最低层的 _write / _query_rows（而不是让 load_config 返回「连不上」）：这样
+    load_config 的逐项回退、切面的事件→记录映射、summarize 的归并逻辑都真实执行，
+    写错了照样能被测出来；同时连 pymysql 都不会被 import，离线跑也不会出网超时。
+    _query_rows 返回空 = 「无历史」，正是大多数用例的前提。
+
+    活动历史没有开关（开发机 [error_report] 配着生产库，load_config 必然可用），
+    不掐这两处的话单测就会真写生产库。
+
+    需要断言「记了什么」的用例自己 monkeypatch 覆盖掉这个夹具即可。
+    """
+    from app.activity import history
+
+    def _blocked_write(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(history, "_write", _blocked_write)
+    monkeypatch.setattr(history, "_query_rows", lambda *a, **k: [])
+    # summarize 里与 _query_rows 同路径的 DB 时钟查询也掐掉（返回 None = 不判 24h）。
+    monkeypatch.setattr(history, "_db_now", lambda *a, **k: None)
