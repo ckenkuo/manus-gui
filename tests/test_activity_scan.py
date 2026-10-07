@@ -26,9 +26,10 @@ def _snapshot(*rows):
     }
 
 
-def _row(spu, label, daily, sale, issues=None, row_number=7):
+def _row(spu, label, daily, sale, issues=None, row_number=7, margin=20.0):
     return {"row_number": row_number, "spu": spu, "sku": label, "daily": daily, "sale": sale,
-            "purchase": "12", "values": {}, "issues": issues or [], "selectable": not issues}
+            "margin": margin, "purchase": "12", "values": {}, "issues": issues or [],
+            "selectable": not issues}
 
 
 @pytest.fixture

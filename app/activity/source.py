@@ -10,7 +10,7 @@ from app.tool.wps_excel_tool import WpsExcelTool
 
 MAX_ROWS = 20000
 READ_BATCH = 500
-REQUIRED_FIELDS = {"spu": "SPU", "daily": "日常价", "sale": "销售价（底价）"}
+REQUIRED_FIELDS = {"spu": "SPU", "daily": "日常价", "sale": "销售价（底价）", "margin": "毛利"}
 
 
 def validate_document(document: str) -> str:
@@ -33,6 +33,50 @@ def price_value(value):
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) and number > 0 else None
+
+
+def margin_value(value):
+    """毛利率单元格 → 数值（百分号写法摘掉 % 取百分数本身，如 "15.88%" → 15.88）。
+
+    只在同一 SPU 内比大小（挑出毛利率最低的货号当门槛，见 service.plan_spu_activities），
+    不做跨表归一，故 15.88 与 0.1588 两种写法不需要换算成同一量纲。读不到返回 None，
+    由调用方 fail-closed（门槛货号定不了就整组不可选，绝不猜）。
+    """
+    text = str(value or "").strip().rstrip("%").strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def discount_value(value):
+    """折扣列单元格 → 折扣率小数（"85%" → 0.85；"0.85" → 0.85）。
+
+    只认两种不带歧义的写法：带 % 的百分数、或 ≤1 的裸小数。裸写 "85" 判不出是百分数
+    还是笔误（折扣率 >1 无意义），返回 None 由调用方 fail-closed。与毛利率不同：折扣列
+    只用于定加速器档位与加速价（2026-09-29 用户规则，见 service 阶段三），读不到不连坐、
+    不影响选中——届时不动流量、活动照常报名。
+    """
+    text = str(value or "").strip().replace(",", "")
+    if not text:
+        return None
+    percent = text.endswith("%")
+    if percent:
+        text = text[:-1].strip()
+    try:
+        number = float(text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    if percent:
+        number = number / 100
+    elif number > 1:
+        return None
+    return number if number <= 1 else None
 
 
 def read_document(document: str, sheet: str = "") -> dict:
@@ -86,6 +130,8 @@ def read_document(document: str, sheet: str = "") -> dict:
             spu = values.get(fields.get("spu"), "")
             daily = price_value(values.get(fields.get("daily")))
             sale = price_value(values.get(fields.get("sale")))
+            margin = margin_value(values.get(fields.get("margin")))
+            discount = discount_value(values.get(fields.get("discount")))
             issues = []
             if missing:
                 issues.append("缺少必需列")
@@ -95,10 +141,15 @@ def read_document(document: str, sheet: str = "") -> dict:
                 issues.append("日常价无有效计算结果")
             if sale is None:
                 issues.append("销售底价无有效计算结果")
+            if margin is None:
+                # 毛利率是门槛判定的输入（2026-09-29 起按毛利率最低货号定 SPU 门槛），
+                # 读不到与读不到底价同级别：该行无效、整组连坐。
+                issues.append("毛利率无有效计算结果")
             records.append({
                 "row_number": row_number, "spu": spu,
                 "sku": values.get(fields.get("sku"), ""),
-                "daily": daily, "sale": sale,
+                "daily": daily, "sale": sale, "margin": margin,
+                "discount": discount,
                 "purchase": values.get(fields.get("purchase"), ""),
                 "values": values, "issues": issues, "selectable": not issues,
             })
@@ -147,6 +198,8 @@ def costs_from_snapshot(snapshot: dict, spus, strict: bool = True) -> dict:
     仅当该 SPU 全部货号行都有效（selectable）才收录——提报页勾选是 SPU 级，无法只报
     部分货号，任一货号价格无效都不给价，避免按残缺价格申报。label 取货号列，无货号列
     兜底「行N」（执行层加速器按货号文本匹配时会因此中止不开，属预期 fail-closed）。
+    margin 是该货号的毛利率（2026-09-29 起门槛判定按毛利率最低货号，见 service）；
+    discount 是折扣列的折扣率小数（仅用于定加速器档位，读不到为 None、不连坐）。
 
     strict=False 时缺价 SPU 只是不出现在结果里、不抛错：识别扫描用——一个商品缺价不该让
     整张矩阵扫不出来（矩阵里那几格标成「成本表无有效价格」即可）。批次路径保持 strict=True：
@@ -161,6 +214,8 @@ def costs_from_snapshot(snapshot: dict, spus, strict: bool = True) -> dict:
                 "label": record.get("sku") or f"行{record['row_number']}",
                 "daily": record["daily"],
                 "sale": record["sale"],
+                "margin": record.get("margin"),
+                "discount": record.get("discount"),
                 "purchase": record["purchase"],
                 "row_number": record["row_number"],
             })

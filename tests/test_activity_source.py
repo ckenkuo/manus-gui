@@ -54,11 +54,14 @@ def cloud(monkeypatch):
     sheet = FakeSheet(
         rows={
             1: cells(A="商品成本核算"),
-            6: cells(B="货号", C="SPU ID", E="销售价格", F="日常价", G="采购价"),
+            6: cells(B="货号", C="SPU ID", E="销售价格", F="日常价", G="采购价", H="毛利", I="折扣"),
             # 一个 SPU 两个货号（不同价，合法多货号）；行8 的 C 由合并展开补上
-            7: cells(B="SKU-A", C="123456789012345678", E="40.00", F="60.00", G="12.50"),
-            8: cells(B="SKU-B", E="50", F="80", G="13.00"),
-            507: cells(B="SKU-C", C="999", E="50", F="80", G="15"),
+            # 毛利列：SKU-A 25.5% < SKU-B 30% → SKU-A 是门槛货号（2026-09-29 起门槛按它定）
+            # 折扣列：只用于定加速器档位（同日用户规则），读不到不连坐
+            7: cells(B="SKU-A", C="123456789012345678", E="40.00", F="60.00", G="12.50", H="25.5%",
+                     I="70%"),
+            8: cells(B="SKU-B", E="50", F="80", G="13.00", H="30%", I="70%"),
+            507: cells(B="SKU-C", C="999", E="50", F="80", G="15", H="18%", I="85%"),
         },
         merged={"C": {7: ("123456789012345678", 8)}},
     )
@@ -71,10 +74,14 @@ def test_read_document_uses_calculated_values_and_reads_all_windows(cloud):
     snapshot = source.read_document(DOCUMENT, "成本表")
     assert snapshot["header_row"] == 6
     assert snapshot["fields"]["sale"] == "E"
+    assert snapshot["fields"]["margin"] == "H"
+    assert snapshot["fields"]["discount"] == "I"
     assert snapshot["total"] == 3
     assert snapshot["selectable"] == 2
     assert snapshot["rows"][0]["spu"] == "123456789012345678"
     assert snapshot["rows"][0]["sale"] == 40
+    assert snapshot["rows"][0]["margin"] == 25.5  # "25.5%" → 百分数本身
+    assert snapshot["rows"][0]["discount"] == 0.7  # "70%" → 折扣率小数
     assert snapshot["rows"][0]["values"]["E"] == "40.00"
     assert (7, 506) in cloud.calls and (507, 507) in cloud.calls
     # 行8 的 SPU 由合并展开补出；表头探测（首个调用）不展开、数据批才带白名单
@@ -94,7 +101,43 @@ def test_same_spu_multiple_valid_skus_are_selectable(cloud):
     assert [(item["label"], item["daily"], item["sale"]) for item in items] == [
         ("SKU-A", 60.0, 40.0), ("SKU-B", 80.0, 50.0),
     ]
+    assert [item["margin"] for item in items] == [25.5, 30.0]
+    assert [item["discount"] for item in items] == [0.7, 0.7]
     assert [item["row_number"] for item in items] == [7, 8]
+
+
+def test_missing_margin_makes_whole_spu_unselectable(cloud):
+    """毛利率是门槛判定的输入（按毛利率最低货号定 SPU 门槛）：读不到与缺价同级别，
+    该行无效、整组连坐——门槛货号定不了就绝不猜。"""
+    cloud.rows[8]["H"]["text"] = "坏"
+    snapshot = source.read_document(DOCUMENT, "成本表")
+    rows = snapshot["rows"][:2]
+    assert all(not row["selectable"] for row in rows)
+    assert "毛利率无有效计算结果" in rows[1]["issues"]
+    assert "同一 SPU 第 8 行" in rows[0]["issues"][-1]
+    with pytest.raises(ValueError, match="价格无效"):
+        source.read_costs(DOCUMENT, "成本表", ["123456789012345678"])
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("85%", 0.85), ("70%", 0.7), ("0.8", 0.8),      # 百分数与裸小数都认
+    ("85", None), ("", None), ("七折", None),        # 裸整数/空/中文判不出量纲 → None
+    ("120%", None), ("0%", None),                    # 折扣率越界（>1 或 ≤0）无意义 → None
+])
+def test_discount_value_only_accepts_unambiguous_writeups(text, expected):
+    """折扣列解析 fail-closed：歧义写法返回 None，由执行层决定不动流量（绝不猜档位）。"""
+    assert source.discount_value(text) == expected
+
+
+def test_missing_discount_does_not_block_selection(cloud):
+    """折扣列只用于定加速器档位，读不到【不连坐】：行照样可选、活动照常规划，
+    只是执行遍不动它的流量（见 service 阶段一/三的 discount_missing 闸）。"""
+    cloud.rows[8]["I"]["text"] = "坏"
+    snapshot = source.read_document(DOCUMENT, "成本表")
+    rows = snapshot["rows"][:2]
+    assert all(row["selectable"] for row in rows)          # 不像缺毛利那样连坐
+    assert rows[1]["discount"] is None and rows[0]["discount"] == 0.7
+    assert not any("折扣" in issue for row in rows for issue in row["issues"])
 
 
 def test_one_invalid_row_makes_whole_spu_unselectable(cloud):
@@ -194,12 +237,13 @@ def test_planning_reads_fresh_cloud_prices_without_stock_gate(monkeypatch, cloud
     monkeypatch.setattr(service.pipeline, "read_stock", read_stock)
     events = []
     result = asyncio.run(service.run_activity_batch(
-        "999", DOCUMENT, "成本表", flux_page=object(), activity_page=object(), goods_page=object(),
+        "999", DOCUMENT, "成本表", dry_run=True,  # 只验规划，不跑执行遍
+        flux_page=object(), activity_page=object(), goods_page=object(),
         stock_map=stock_map, on_progress=events.append,
     ))
     assert result["done"] == 1
     assert result["results"][0]["skus"] == [
-        {"label": "SKU-C", "daily": 80, "sale": 65, "purchase": "15"}]
+        {"label": "SKU-C", "daily": 80, "sale": 65, "purchase": "15", "discount": 0.85}]
     assert result["results"][0]["submit_price"] == 72  # 单货号兼容字段
     read_stock.assert_not_called()
     plan = next(event for event in events if event["type"] == "product_plan")
@@ -208,11 +252,17 @@ def test_planning_reads_fresh_cloud_prices_without_stock_gate(monkeypatch, cloud
     assert plan["stock_ok"] is None
 
 
-@pytest.mark.parametrize("rate,expect_selected", [(0.9, True), (0.6, False)])
-def test_planning_multi_spu_skus_all_must_pass_floor(monkeypatch, cloud, rate, expect_selected):
-    """多货号 SPU 的规划：活动入选 = 全部货号申报价都达各自底价（提报是 SPU 级，不能只报
-    部分货号）。SKU-A 60/40、SKU-B 80/50：0.9 折全过 → sku_prices 两条；0.6 折 SKU-A 36<40
-    穿底 → 整活动淘汰，skip_nomatch 的 note 须点明是哪个货号穿底。"""
+@pytest.mark.parametrize("rate,sale_b,expect_selected", [
+    (0.9, "50", True),    # 门槛货号 SKU-A（毛利 25.5% 最低）可打 40/60≈6.7折，9折达标
+    (0.6, "50", False),   # 6折：SKU-A 60×0.6=36 < 底价 40 → 整活动淘汰
+    (0.9, "75", True),    # 非门槛货号 SKU-B 破底（72<75）不再一票否决（SPU 级门槛）
+])
+def test_planning_gate_follows_lowest_margin_sku(monkeypatch, cloud, rate, sale_b, expect_selected):
+    """多货号 SPU 的规划：活动入选 = 活动折扣率 ≥ 毛利率最低货号的「底价÷日常价」
+    （2026-09-29 用户改定的 SPU 级门槛；旧规则「全部货号达底价」已废——它在
+    2879383652×限时秒杀 上被 8 厘截断误差误杀，且与 SPU 级报名维度不匹配）。
+    fixture 里 SKU-A 毛利 25.5% < SKU-B 30%，门槛货号是 SKU-A（40/60 ≈ 6.7折）。"""
+    cloud.rows[8]["E"]["text"] = sale_b
     monkeypatch.setattr(service.pipeline, "dismiss_all_page_popups", AsyncMock())
     monkeypatch.setattr(service.pipeline, "read_accel_state", AsyncMock(return_value="off"))
     monkeypatch.setattr(service.pipeline, "read_activities", AsyncMock(return_value=[
@@ -221,7 +271,7 @@ def test_planning_multi_spu_skus_all_must_pass_floor(monkeypatch, cloud, rate, e
     monkeypatch.setattr(service, "reset_pipeline_llms", lambda: None)
     events = []
     result = asyncio.run(service.run_activity_batch(
-        "123456789012345678", DOCUMENT, "成本表",
+        "123456789012345678", DOCUMENT, "成本表", dry_run=True,  # 只验规划，不跑执行遍
         flux_page=object(), activity_page=object(), goods_page=object(),
         on_progress=events.append,
     ))
@@ -238,7 +288,7 @@ def test_planning_multi_spu_skus_all_must_pass_floor(monkeypatch, cloud, rate, e
         assert [s["label"] for s in plan["skus"]] == ["SKU-A", "SKU-B"]
     else:
         assert row["status"] == "skip_nomatch"
-        assert "货号SKU-A" in row["note"] and "36.0" in row["note"] and "底价40" in row["note"]
+        assert "货号SKU-A" in row["note"] and "6折" in row["note"]
 
 
 def _planning_events(monkeypatch, cloud, spus, activities, selection=None):
@@ -308,7 +358,9 @@ def test_cloud_preview_endpoint_and_failures(webapp, cloud, monkeypatch):
         assert "登录已过期" in response.json()["error"]
 
 
-def test_batch_requires_cloud_and_preserves_dry_run_default(webapp, monkeypatch):
+def test_batch_requires_cloud_and_defaults_to_execute(webapp, monkeypatch):
+    """不传 dry_run 时必须是正式执行（2026-09-30 用户改定：页面「正式执行」开关初始打开）。
+    live 不给则沿用 live=not dry_run，故默认档位是全程。"""
     received = []
 
     async def run(spus, document, sheet, **kwargs):
@@ -322,7 +374,7 @@ def test_batch_requires_cloud_and_preserves_dry_run_default(webapp, monkeypatch)
         response = client.post("/activity/batch", json={"cloud_url": DOCUMENT, "sheet": "成本表", "spus": "999"})
         assert response.status_code == 200
         client.get(f"/activity/batch/{response.json()['job_id']}/events")
-    assert received == [("999", DOCUMENT, "成本表", True, False)]
+    assert received == [("999", DOCUMENT, "成本表", False, True)]
 
 
 def _job_url(job_id: str) -> str:
@@ -399,7 +451,7 @@ def test_scan_and_execution_are_mutually_exclusive_but_dry_run_is_not(webapp, mo
             "cloud_url": DOCUMENT, "sheet": "成本表", "spus": "999", "dry_run": False})
         assert blocked.status_code == 409 and "提报页" in blocked.json()["error"]
         assert client.post("/activity/batch", json={
-            "cloud_url": DOCUMENT, "sheet": "成本表", "spus": "999"}).status_code == 200  # dry-run 放行
+            "cloud_url": DOCUMENT, "sheet": "成本表", "spus": "999", "dry_run": True}).status_code == 200  # dry-run 放行
 
         assert client.post(f"/activity/batch/{job_id}/pause", json={"paused": True}).json()["paused"] is True
         assert client.post(f"/activity/batch/{job_id}/pause", json={"paused": False}).json()["paused"] is False

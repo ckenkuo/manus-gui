@@ -94,3 +94,32 @@ def assess_registration(baseline: dict, current: dict, spu: str, activity: str, 
             return {**outcome, "status": "historical", "note": "仅查到未更新的历史报名记录，未确认本次报名"}
     return {**outcome, "ok": True, "status": "success",
             "note": f"报名记录确认本次{'更新' if same else '新增'}成功（enrollId={latest.get('enroll_id')}）"}
+
+
+def active_registration(current: dict, spu: str, activity: str) -> dict:
+    """该 SPU 在该活动下【此刻在平台上是否挂着生效报名】——与「本批是否提交过」无关。
+
+    与 assess_registration 的关键差别就是不看 attempted：后者回答「本批报成功了吗」，
+    本函数回答「这个商品现在在平台上报着名吗」。两者都要，因为它们是两个问题。
+
+    为什么需要它（2026-09-30 用户改定）：初始关闭的商品本批零提交时，阶段三原本一律不开
+    流量；但零提交的成因是「详情页按 SPU 查询可报名商品行数 0」，而这个判据区分不出
+    「真不符合该活动资格」和「早就报过了」——靠报名记录页才能区分。已报过的商品加速器
+    必须开：加速器关着时前端售价按日常价，「活动价 ≤ 加速价×0.9」不成立，报上的活动会
+    失效（2026-09-28 用户口径），白报。
+
+    查询不完整 / 无记录 / 已退出 / 状态未标定一律返回 {}：fail-closed，宁可不开流量，
+    也不拿不确定的记录去点开启。
+    """
+    if not query_complete(current, spu):
+        return {}
+    records = [record for record in current.get("records", [])
+               if str(record.get("spu")) == spu and record.get("activity") == activity]
+    latest, error = _latest(records)
+    if error or not latest:
+        return {}
+    if latest.get("exited") or latest.get("enroll_status") == 6:
+        return {}
+    if latest.get("enroll_status") not in {1, 3, 4} or not latest.get("success"):
+        return {}
+    return latest

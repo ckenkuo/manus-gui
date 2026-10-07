@@ -4,7 +4,8 @@
 纯本地算价筛选」，不需要 function-calling/LangGraph。浏览器操作使用 Playwright over CDP。
 判定完全确定性，不再用 LLM 选活动（judge_activity 保留但主流程未接入）。
 
-申报价(日常价×活动折扣率)达到 WPS 文档销售底价的活动全部入选。
+申报价(日常价×活动折扣率)的入围判定按 SPU 级门槛：活动折扣率 ≥ 毛利率最低货号的
+「底价÷日常价」（见 service.plan_spu_activities）。
 商品实时采购，库存不参与初筛。详情页仍由平台判定报名资格。
 
 最高优先级安全约束（真实商家账号、操作不可逆）：
@@ -41,6 +42,22 @@ ACTIVITY_LOG_PATH = "/activity/marketing-activity/log"
 GOODS_LIST_PATH = "/goods/list"
 # 库存查询接口关键字（库存不在 DOM，在此接口响应里，见 read_stock）。
 _STOCK_API_KEY = "skc/pageQuery"
+
+# 登录态失效标志：Temu SPA 会把所有页签陆续 302 到 /auth/authentication（或安全验证页
+# bgn_verification）。2026-09-30 实测：批次执行中登录被踢，各等待循环认不出登录页，在
+# 登录页上空等超时甚至卡死，批次表现为「点了提交后直接跳转了然后没下文」。
+_LOGIN_REDIRECT_KEYS = ("/auth/authentication", "bgn_verification")
+
+
+def kicked_to_login(url) -> bool:
+    """URL 是否已被平台踢回登录/安全验证页（登录态失效）。
+
+    等待循环每轮先查它：一旦被踢，后续任何等待都是空等，必须立刻带明确原因退出，
+    让批次 fail-fast 而不是挂到超时。尤其 enroll_activity 的结果行等待——登录页上
+    查不到行会被误判成「详情页 0 行 = 无资格」（info 语义不重试），那是错上加错。
+    """
+    url = str(url or "")
+    return any(key in url for key in _LOGIN_REDIRECT_KEYS)
 
 # ---- 已探测确认的活动主题名（用于从行文本里认出是哪个活动）--------------------
 _KNOWN_ACTIVITIES = ["清仓甩卖", "限时秒杀", "官方大促", "额外降价超级万人团"]
@@ -627,23 +644,143 @@ _MARK_ACTIVITY_LOG_NEXT_JS = r"""
     element => element.removeAttribute('data-kiro-log-next')
   );
   const pagination = document.querySelector('ul[data-testid="beast-core-pagination"]');
-  if (!pagination) return {found: false, disabled: false};
+  if (!pagination) return {found: false, disabled: false, page: null};
   const candidates = [...pagination.querySelectorAll('li,button,[role="button"]')];
+  // 当前页码（beast 分页的激活项）：「翻页后组件是否回稳」的主判据——翻到末页后下一页
+  // 按钮合法禁用，只有页码能证明上一次翻页已经渲染完。读不到（结构变化）时回 null，
+  // 调用方退回「下一页按钮可用」判据。
+  const active = candidates.find(element =>
+    /active/i.test(String(element.className || ''))
+    || ['true', 'page'].includes(String(element.getAttribute('aria-current') || '').toLowerCase())
+  );
+  const activeText = active ? (active.textContent || '').trim() : '';
+  const page = /^\d+$/.test(activeText) ? parseInt(activeText, 10) : null;
   const next = candidates.find(element => {
     const cls = String(element.className || '');
     const label = `${element.getAttribute('aria-label') || ''} ${element.title || ''}`;
+    // 排除 jumpNext 跳页块快进钮：它的 class（PGT_jumpNext）也含 "next" 且 DOM 顺序在
+    // 真「下一页」（PGT_next）前面，不误排会点到快进钮——2026-10-03 实机实锤：从第 1 页
+    // 点一下直接跳第 6 页，中间 2-5 页数据整段漏拉。
+    if (/jump/i.test(cls)) return false;
     return /next/i.test(cls) || /下一页|next/i.test(label)
       || Boolean(element.querySelector(
         'svg[data-icon="right"],svg[data-icon="right-circle"],[class*="rightArrow"]'
       ));
   });
-  if (!next) return {found: false, disabled: false};
+  if (!next) return {found: false, disabled: false, page};
   const disabled = next.matches('[disabled],[aria-disabled="true"]')
     || /disabled/i.test(String(next.className || ''));
   if (!disabled) next.setAttribute('data-kiro-log-next', '1');
-  return {found: true, disabled};
+  return {found: true, disabled, page};
 }
 """
+
+
+# 空安全点击：beast 组件重绘会丢 data-kiro-log-next 标记，querySelector 拿到 null 直接
+# .click() 会抛 JS 异常；返回 false 让调用方重新标记后再点。
+_CLICK_ACTIVITY_LOG_NEXT_JS = r"""
+() => {
+  const next = document.querySelector('[data-kiro-log-next="1"]');
+  if (!next) return false;
+  next.click();
+  return true;
+}
+"""
+
+
+async def _maximize_activity_log_page_size(page):
+    """把记录页「每页条数」切到最大档，返回切换触发的新首屏 result（没切换回 None）。
+
+    2026-10-03 探针实测：记录页 sizeChanger 档位 10/20/30/40，切到 40 后 78 条记录只剩
+    2 页——页数不超页码窗口时跳页块快进钮（jumpNext）不渲染，翻页恒为逐页 +1；且翻页
+    请求从 8 次降到 2 次，enroll/list 限流暴露面小 4 倍。best-effort：没有切换器（记录
+    太少不渲染）、已是最大档或切换失败都回 None，调用方按原 pageSize 继续。
+    """
+    current = await page.evaluate(r"""() => {
+      const header = document.querySelector(
+        'ul[data-testid="beast-core-pagination"] [class*="PGT_sizeChanger"] [data-testid="beast-core-select-header"]'
+      ) || document.querySelector(
+        'ul[data-testid="beast-core-pagination"] [class*="PGT_sizeChanger"] [class*="ST_head"]'
+      );
+      if (!header) return -1;
+      const match = (header.textContent || '').match(/\d+/);
+      header.click();  // 点开下拉
+      return match ? parseInt(match[0], 10) : 0;
+    }""")
+    if current < 0:
+        return None
+    # 等下拉选项渲染，取最大数字档
+    target = 0
+    for _ in range(10):
+        target = await page.evaluate(r"""() => {
+          const opts = [...document.querySelectorAll(
+            '[data-testid="beast-core-select-option"],[class*="cIL_item"],[role="option"]'
+          )].filter(o => /^\s*\d+\s*$/.test(o.textContent || ''));
+          if (!opts.length) return 0;
+          return Math.max(...opts.map(o => parseInt(o.textContent, 10)));
+        }""")
+        if target:
+            break
+        await asyncio.sleep(0.5)
+    if not target or target <= current:
+        return None  # 已是最大档（或读不到选项）：点了也不发请求，不必等响应
+    async with page.expect_response(
+        lambda response: "/marketing/enroll/list" in response.url, timeout=15000
+    ) as response_info:
+        await page.evaluate(r"""(size) => {
+          const opt = [...document.querySelectorAll(
+            '[data-testid="beast-core-select-option"],[class*="cIL_item"],[role="option"]'
+          )].find(o => parseInt((o.textContent || '').trim(), 10) === size);
+          if (opt) opt.click();
+        }""", target)
+    response = await response_info.value
+    payload = await response.json()
+    result = payload.get("result")
+    return result if isinstance(result, dict) else None
+
+
+async def _wait_activity_log_next_ready(page, timeout_s=10):
+    """轮询等「下一页」按钮从加载态恢复（found 且未禁用），返回最后一次采样状态。
+
+    beast 分页组件拿到响应后要处理/重绘，期间下一页按钮处于 disabled 加载态（2026-10-03
+    批次实锤：上一页响应刚 return、下一次循环入口几毫秒内一次性采样必命中加载态，
+    total=78 只拉到 4/8 页就被误判「按钮已禁用」中断全量拉取，19 个实际成功的报名全被
+    误判 not_verified）。加载态是暂时的：每秒重采一次、最多约 10s，仍不可用才是真故障。
+    """
+    state = {}
+    for _ in range(max(1, int(timeout_s))):
+        state = await page.evaluate(_MARK_ACTIVITY_LOG_NEXT_JS)
+        if state.get("found") and not state.get("disabled"):
+            return state
+        await asyncio.sleep(1.0)
+    if not state.get("found"):
+        raise RuntimeError("报名记录页未找到下一页按钮（等分页组件渲染约 10s 超时）")
+    raise RuntimeError("报名记录下一页按钮持续禁用约 10s 未恢复")
+
+
+async def _wait_activity_log_page_settled(page, before_page, timeout_s=10):
+    """翻页响应到手后等分页组件回稳，返回稳定后读到的当前页码（读不到回 None）。
+
+    主判据是「页码变成与翻页前不同的值」而不是「等于目标页码」——beast 分页在页数
+    超过页码窗口时「下一页」是跳页块（2026-10-03 实机插桩：第 1 页点一次直接到第 6 页，
+    1→6→7→8），目标页码可能根本不存在。翻到末页时下一页按钮合法禁用，故按钮可用只是
+    页码读不出时的旁证。best-effort：等不到稳定态按超时返回最后读到的页码，不为「等稳」
+    本身报错——下一次入口还有 _wait_activity_log_next_ready 兜底。
+    """
+    last_page = None
+    for _ in range(max(1, int(timeout_s))):
+        try:
+            state = await page.evaluate(_MARK_ACTIVITY_LOG_NEXT_JS)
+        except Exception:
+            return last_page  # 页面跳转/上下文销毁：等不到稳定态，交下一次入口重采兜底
+        if state.get("page") is not None:
+            last_page = state["page"]
+            if last_page != before_page:
+                return last_page
+        elif state.get("found") and not state.get("disabled"):
+            return None  # 页码读不出但按钮可用：按已回稳处理，页码缺失交调用方估算
+        await asyncio.sleep(1.0)
+    return last_page
 
 
 async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
@@ -668,21 +805,25 @@ async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
     page_size = reported_size or len(first_items) or 10
     expected_pages = max(1, (total + page_size - 1) // page_size)
     items = list(first_items)
-    pages_read = 1
+    current_page = 1
     error = None
 
-    for page_number in range(2, expected_pages + 1):
+    # 终止按【实际到达页码 / 已拉条数】而非翻页点击次数：beast 分页页数超过页码窗口时
+    # 「下一页」是跳页块（2026-10-03 实测 1→6→7→8，4 次点击就拉完 8 页），点击次数与到达
+    # 页码不一致，到末页后按钮合法禁用、再翻必报错——按次数翻页会把「数据已拉全」误判成
+    # 「查询不完整」。数据拉全（items==total）或到达末页即正常完成。
+    while current_page < expected_pages and len(items) < total:
         try:
-            result = await fetch_next(page_number)
+            result, actual_page = await fetch_next(current_page)
             page_list = result.get("list")
             if not isinstance(page_list, (list, type(None))) or int(result.get("total", -1)) != total:
                 raise ValueError("报名记录分页响应不完整或 total 发生变化，请重新查询")
         except Exception as exc:
             error = str(exc)[:120]
             break
-        page_items = page_list or []
-        pages_read += 1
-        items.extend(page_items)
+        items.extend(page_list or [])
+        # 页码读不出时按 +1 保守估算（跳块场景会低估，但 len(items)==total 判据兜住完整性）。
+        current_page = actual_page if isinstance(actual_page, int) else current_page + 1
 
     identities = [str(item["enrollId"]) for item in items if item.get("enrollId") not in (None, "")]
     unique_records = len(identities) == len(items) and len(set(identities)) == len(items)
@@ -694,14 +835,50 @@ async def _collect_activity_log_pages(first_result: dict, fetch_next) -> dict:
         "total": total,
         "page_size": page_size,
         "expected_pages": expected_pages,
-        "pages_read": pages_read,
-        "complete": error is None and pages_read == expected_pages and len(items) == total and unique_records,
+        # 实际到达页码（跳页块下不等于翻页点击次数）；完整性权威判据是 len(items)==total
+        "pages_read": current_page,
+        "complete": error is None and len(items) == total and unique_records,
         "error": error,
     }
 
 
+def _group_log_items_by_spu(items, targets, collected) -> tuple:
+    """把全量报名记录按 SPU（接口 productId）分组，产出 (records, queries)。
+
+    全量不完整（有页没拉到）时所有 SPU 一律 complete=False——缺失页里可能正有该 SPU
+    的记录，按残缺列表说「无记录」是假阴性（fail-closed）。查询完整但确实没记录时
+    total=0 且 complete=True（2026-09-25 起「无记录」与「查询不完整」必须分开）。
+    """
+    complete = bool(collected.get("complete"))
+    by_spu = {spu: [] for spu in targets}
+    for item in items:
+        pid = str(item.get("productId") or "")
+        if pid in by_spu:
+            by_spu[pid].append(item)
+    records = []
+    queries = []
+    for spu in targets:
+        matched = by_spu[spu]
+        queries.append({
+            "spu": spu, "returned": len(matched), "total": len(matched),
+            "page_size": collected.get("page_size"),
+            "expected_pages": 1, "pages_read": 1,
+            "complete": complete,
+            "error": None if complete else collected.get("error"),
+        })
+        records.extend(_parse_activity_log_item(item) for item in matched)
+    return records, queries
+
+
 async def read_activity_log_records(context, spus, region=None) -> dict:
-    """只读打开报名记录页，逐 SPU 查询并返回平台报名记录接口结果。
+    """只读打开报名记录页，拉【全量】报名记录分页，本地按 SPU（接口 productId）分组返回。
+
+    【为什么不逐 SPU 搜索】2026-09-30 实测：记录页「SPU ID」搜索框整体失效——搜 SPU、
+    goodsId、商品名一律返回 total=0（有历史记录的老商品同样搜不到），清空条件才返回
+    全量。而批次提交明明已被平台收录（结果页 successCount=1、全量列表里能翻到），按 SPU
+    搜却全 0，对账把成功提交全误判成「未收录」。记录行自带 productId（即 SPU），故改为
+    拉全量分页本地分组，不再依赖平台搜索；店铺记录量级（年几十条）下翻页成本可接受，
+    且平台哪天修好搜索本实现依然正确。
 
     region：调用方已确认的作业区域（app/temu_region.Region）。报名记录页开在该区域的
     域名下——区域切换换域名，写死全球域会读到另一个区域的报名记录。未传则就地从 context
@@ -715,93 +892,82 @@ async def read_activity_log_records(context, spus, region=None) -> dict:
     page = await context.new_page()
     records = []
     queries = []
-    complete = True
     try:
-        await page.goto(url_in_region(ACTIVITY_LOG_PATH, region),
-                        wait_until="domcontentloaded", timeout=30000)
+        # 开页即自动请求列表第一页（无需点查询），先挂 expect_response 再导航。
+        async with page.expect_response(
+            lambda response: "/marketing/enroll/list" in response.url,
+            timeout=30000,
+        ) as response_info:
+            await page.goto(url_in_region(ACTIVITY_LOG_PATH, region),
+                            wait_until="domcontentloaded", timeout=30000)
         await page.bring_to_front()
         await dismiss_all_page_popups(page)
-        for _ in range(30):
-            await asyncio.sleep(0.5)
-            try:
-                body = await page.evaluate("() => document.body.innerText || ''")
-            except Exception:
-                continue
-            if "报名记录" in body and "SPU ID" in body:
-                break
         # 【曾在这里硬点顶栏「全球」，已移除】那排标签是区域切换器，点它会【跨域跳转】
         # （全球 agentseller.temu.com ↔ 美国 agentseller-us.temu.com，2026-08-07 实测），
         # 等于把操作者选定的区域悄悄换掉、读到别的区域的报名记录。区域现由上面的 goto
         # 用已确认区域的域名钉住，页面自己会把数据限定在该区域，不需要也不该再点标签。
+        response = await response_info.value
+        payload = await response.json()
+        first_result = payload.get("result") or {}
 
-        query_button = page.get_by_role("button", name="查询", exact=True).last
-        for spu in targets:
-            marked = False
-            for _ in range(12):
-                if await page.evaluate(_MARK_ACTIVITY_LOG_SPU_JS):
-                    marked = True
-                    break
-                await asyncio.sleep(0.5)
-            if not marked:
-                complete = False
-                queries.append({"spu": spu, "error": "报名记录页重绘后仍未找到可编辑 SPU 查询框"})
-                logger.warning(f"[活动记录] SPU={spu} 未找到可编辑查询框，跳过本次查询")
-                continue
-            field = page.locator('[data-kiro-log-spu="1"]')
-            await field.fill(spu)
-            entered_spu = (await field.input_value()).strip()
-            if entered_spu != spu:
-                complete = False
-                queries.append({
-                    "spu": spu,
-                    "error": f"SPU 查询框输入校验失败（实际={entered_spu or '空'}）",
-                })
-                continue
-            logger.info(f"[活动记录] 已在报名记录页输入 SPU={spu}，准备点击查询")
-            # 让受控输入框完成状态同步，也让操作者能在前台页肉眼确认本次查询条件。
-            await asyncio.sleep(0.8)
-            try:
+        # 每页条数切到最大档（40）：页数从 8 降到 2，翻页请求少了、限流暴露面小；且页数
+        # 不超页码窗口时跳页块快进钮（jumpNext）不渲染，翻页恒逐页。切换触发的新首屏
+        # 响应替换原 first_result。best-effort：切换失败按原 pageSize 继续。
+        try:
+            switched_result = await _maximize_activity_log_page_size(page)
+            if switched_result:
+                first_result = switched_result
+        except Exception as exc:
+            logger.warning(f"记录页切换每页条数失败（按原分页继续）：{str(exc)[:120]}")
+
+        async def fetch_next(before_page):
+            # 入口先等分页组件从「上一页响应处理中」的加载态回稳，而不是一次性采样看到
+            # disabled/not found 就报错——加载态是暂时的（2026-10-03 批次竞态根因）。
+            await _wait_activity_log_next_ready(page)
+            # 平台对 enroll/list 有限流（2026-09-30 实测：快速连点翻页会返回
+            # {"success": false, "errorMsg": "请求太频繁了"}，result=null），点击前先等 2s；
+            # 仍撞上就把那次响应丢弃、再等 3s 重点（限流响应里页面没翻成，按钮还在当前页）。
+            await asyncio.sleep(2.0)
+            next_payload = None
+            ever_clicked = False
+            for _ in range(3):
+                # 每次点击前重新标记：组件重绘会丢 data-kiro-log-next 标记（此时 querySelector
+                # 拿到 null），且在 disabled 按钮上 JS click 不发请求、只会等满 expect_response
+                # 的 15s 超时，把「没点上」误导成「接口慢」。点击间隙又进加载态就再等回稳。
+                state = await page.evaluate(_MARK_ACTIVITY_LOG_NEXT_JS)
+                if not state.get("found") or state.get("disabled"):
+                    await _wait_activity_log_next_ready(page)
                 async with page.expect_response(
-                    lambda response: "/marketing/enroll/list" in response.url,
+                    lambda next_response: "/marketing/enroll/list" in next_response.url,
                     timeout=15000,
-                ) as response_info:
-                    await query_button.click(timeout=5000)
-                response = await response_info.value
-                payload = await response.json()
-                first_result = payload.get("result") or {}
+                ) as next_response_info:
+                    clicked = await page.evaluate(_CLICK_ACTIVITY_LOG_NEXT_JS)
+                if not clicked:
+                    continue  # 点击瞬间标记丢了（组件刚重绘），下一轮重标再点
+                ever_clicked = True
+                next_response = await next_response_info.value
+                next_payload = await next_response.json()
+                if isinstance(next_payload.get("result"), dict):
+                    # 拿到响应≠页面渲染完：等组件回稳再 return，保证下一次循环入口采到
+                    # 的是稳定 DOM（否则下次入口采样又撞加载态）。跳页块场景下实际到达
+                    # 页码不等于 before_page+1，须带回真实页码给上层循环。
+                    actual_page = await _wait_activity_log_page_settled(page, before_page)
+                    return next_payload["result"], actual_page
+                await asyncio.sleep(3.0)
+            if not ever_clicked:
+                raise RuntimeError("报名记录下一页按钮标记反复丢失，翻页点击未发出")
+            raise RuntimeError(f"报名记录翻页连续被限流：{str(next_payload)[:80]}")
 
-                async def fetch_next(_page_number):
-                    state = await page.evaluate(_MARK_ACTIVITY_LOG_NEXT_JS)
-                    if not state.get("found"):
-                        raise RuntimeError("报名记录页未找到下一页按钮")
-                    if state.get("disabled"):
-                        raise RuntimeError("报名记录下一页按钮已禁用")
-                    async with page.expect_response(
-                        lambda next_response: "/marketing/enroll/list" in next_response.url,
-                        timeout=15000,
-                    ) as next_response_info:
-                        await page.locator('[data-kiro-log-next="1"]').click(timeout=5000)
-                    next_response = await next_response_info.value
-                    next_payload = await next_response.json()
-                    return next_payload.get("result") or {}
-
-                collected = await _collect_activity_log_pages(first_result, fetch_next)
-                items = collected.pop("items")
-                if any(str(item.get("productId")) != spu for item in items):
-                    raise ValueError("报名记录接口返回了其他 SPU，查询结果未与当前输入匹配")
-                query = {"spu": spu, "returned": len(items), **collected}
-                queries.append(query)
-                logger.info(
-                    f"[活动记录] SPU={spu} 查询完成：total={query['total']}，"
-                    f"已读取={query['returned']}，页数={query['pages_read']}/{query['expected_pages']}"
-                )
-                if not query["complete"]:
-                    complete = False
-                records.extend(_parse_activity_log_item(item) for item in items)
-            except Exception as exc:
-                complete = False
-                queries.append({"spu": spu, "error": str(exc)[:120]})
-        note = "报名记录查询完成" if complete else "报名记录查询不完整"
+        collected = await _collect_activity_log_pages(first_result, fetch_next)
+        items = collected.pop("items")
+        records, queries = _group_log_items_by_spu(items, targets, collected)
+        complete = bool(collected["complete"])
+        matched_desc = ", ".join(f"{q['spu']}={q['total']}" for q in queries) or "无目标"
+        logger.info(
+            f"[活动记录] 全量拉取 total={collected['total']}，"
+            f"页数={collected['pages_read']}/{collected['expected_pages']}，本地匹配：{matched_desc}"
+        )
+        note = "报名记录查询完成（全量拉取本地匹配）" if complete else "报名记录查询不完整"
         return {"records": records, "complete": complete, "queries": queries, "note": note}
     finally:
         try:
@@ -1017,6 +1183,22 @@ def compute_submit_price(daily_price, discount_rate, sale) -> dict:
     }
 
 
+def rate_reaches_floor(daily_price, discount_rate, sale) -> bool:
+    """活动折扣率是否达到该货号底价（精确判定，不截断到分）。
+
+    与 compute_submit_price 的 ROUND_DOWN 分工：截断只用于【填价】（申报价超过平台参考价
+    必被拒）；门槛判定用精确乘积——188.88×0.85=160.548，若拿截断后的 160.54 比底价
+    160.548 会差 8 厘误判破底（2026-09-29 2879383652×限时秒杀 就是这样被误淘汰的：
+    底价本身就是按 85 折填的，SPU 明明能报）。任一值缺失返回 False（fail-closed）。
+    """
+    dp = _to_number(daily_price)
+    dr = _to_number(discount_rate)
+    fl = _to_number(sale)
+    if dp is None or dr is None or fl is None:
+        return False
+    return Decimal(str(dp)) * Decimal(str(dr)) >= Decimal(str(fl))
+
+
 def ceil_cent(value) -> Optional[float]:
     """向上取整到分（None/非法值原样返回）。
 
@@ -1029,6 +1211,33 @@ def ceil_cent(value) -> Optional[float]:
     if v is None:
         return None
     return float(Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_CEILING))
+
+
+# ---- 流量加速器档位（用户规则 2026-09-29）--------------------------------------
+# 档位按成本表「折扣」列定：9折/8折 → 高级流量加权；85折 → 普通流量加权；75折及更低 →
+# 超级流量加权（自定义价 = 最低折扣价÷0.9）。未点名的折扣率按区间就近归档（用户同日复核）：
+# >0.85 归高级、0.75~0.85 归高级（8折在其中）、≤0.75 归超级——即只有 85折 是普通档。
+ACCEL_TIER_NAMES = {"normal": "普通", "advanced": "高级", "super": "超级"}
+# 档位卡在抽屉里从左到右固定为 普通→高级→超级（2026-07-20 起卡片名画进背景图，DOM
+# 认不出文字时按这个位置序选）。
+ACCEL_TIER_POS = {"normal": 0, "advanced": 1, "super": 2}
+
+
+def accel_tier_for_discount(discount) -> Optional[str]:
+    """成本表折扣列值 → 加速档位（"normal"|"advanced"|"super"）；非法值返回 None。"""
+    d = _to_number(discount)
+    if d is None or d <= 0 or d > 1:
+        return None
+    if d <= 0.75:
+        return "super"
+    if abs(d - 0.85) < 1e-9:
+        return "normal"
+    return "advanced"
+
+
+# 限流品加速器列的标志词（2026-09-29 用户定）：行内是这些文案 = 平台限流，此时停止
+# 流量加速动作、只做活动报名。正常品的加速器列是「该商品已获得开启流量加速器机会」+「立即开启」。
+ACCEL_THROTTLE_WORDS = ("流量待关注", "报名流量加速器", "调价提效")
 
 
 def norm_sku_label(value) -> str:
@@ -1133,8 +1342,8 @@ def accel_price_groups(accel_prices) -> dict:
     对话框按平台的日常价档列行（实测 2026-09-25：SPU 8791757215 表里两个货号都写 163.23，
     平台却是 163.23 / 188.88 两档，对话框就给 2 行——用表里的价分组只有 1 档，档数对不上必中止）。
     同档平台只让填一个价，故取该档【最高传入价】：绝不会低于档内任一货号的底价，也不会
-    低于任一货号「保活动所需加速价」（=申报价÷0.9，见 service 层 accel_prices 构造）——
-    价由调用方按货号算好传入（底价+1 与活动价÷0.9 取高），这里只管同档取最高。
+    低于任一货号「保活动所需加速价」（=最低折扣价÷0.9，见 service 层 accel_prices 构造）——
+    价由调用方按货号算好传入（底价+1 与最低折扣价÷0.9 取高），这里只管同档取最高。
     floor 额外保留「档内最高底价+1」：传入价超对话框上限时退填这个旧逻辑价（用户 2026-09-28
     定「接收活动失效」），见 _set_accel_prices。
     """
@@ -1255,9 +1464,9 @@ def rows_text_desc(rows, limit: int = 220) -> str:
 # 安全约束：真实商家账号、操作不可逆。阶段3 才实现，实现时每步须先 verify_state 确认幂等、
 # 失败即停不硬闯。阶段1/dry-run 分支绝不调用以下任一函数。
 # 在流量页某 SPU 行内标记指定文案的操作 a（查看效果/立即开启），供点击。
-# 开启加速器的入口文案随商品状态变（实测 2026-09-24）：待开启的是「立即开启」，
-# 待关注的是「报名流量加速器」。按顺序试，命中即用。
-ACCEL_ENTRY_WORDS = ("立即开启", "报名流量加速器")
+# 开启加速器只认「立即开启」一个入口（用户 2026-09-29 定）：限流品的加速器列是
+# 「商品流量待关注 / 您可加速提效」+「报名流量加速器 / 调价提效」，这种品按规则停止
+# 流量加速动作、只做活动报名——绝不能拿「报名流量加速器」当开启入口点进去。
 _MARK_ROW_ACTION_JS = r"""
 (args) => {
   const [spu, word] = args;
@@ -1324,7 +1533,7 @@ _ROW_TEXT_JS = r"""
   for (const el of document.querySelectorAll('*')) {
     const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('').trim();
     if (!own || own.length > 30) continue;
-    if (!/加速|开启|关注/.test(own)) continue;
+    if (!/加速|开启|关注|提效/.test(own)) continue;
     const b = el.getBoundingClientRect();
     if (b.width === 0 || b.height === 0) continue;
     if (Math.abs((b.top + b.bottom) / 2 - cy) > 40) continue;
@@ -1551,6 +1760,31 @@ async def _verify_accel_off_in_list(page, spu, tries=120) -> dict:
             "polls": tries, "reload_warning": reload_warning}
 
 
+async def _restore_flux_page_after_panel(page, tries=30) -> None:
+    """close_accel 打开「查看效果」面板后的页面恢复：reload 回流量页列表并等搜索框就绪。
+
+    面板（含遮罩）不关会挡住下一个 SPU 查询的「查询」按钮——Locator.click 5s 超时，
+    状态判 unknown（2026-10-02 批次：1619974426 关闭走 success 早退没关面板，后续连续
+    6 个 SPU 连环 unknown 的实测根因，复现确认死法是查询按钮被遮挡）。reload 是最确定
+    的恢复方式（顺带清掉 toast/确认弹窗/筛选残留），verify 路径本就 reload；等搜索框可
+    标记再返回，避免把「面板遮挡」换成「页面未就绪」。best-effort：失败只告警，不改变
+    close_accel 已确定的结果。
+    """
+    try:
+        await page.reload(wait_until="domcontentloaded", timeout=60000)
+    except Exception as exc:
+        logger.warning(f"关闭流量面板后 reload 失败（忽略）：{str(exc)[:120]}")
+        return
+    for _ in range(tries):
+        try:
+            if await page.evaluate(_MARK_FLUX_SPU_SEARCH_JS):
+                return
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+    logger.warning("关闭流量面板后等待搜索框就绪超时（忽略）")
+
+
 async def close_accel(page, spu, allow=False) -> dict:
     """关闭某 SPU 的流量加速：点行内「查看效果」→ 面板「近期流量加速效果」tab →「停止流量加速」
     →确认弹窗。allow=False（默认）只走到确认弹窗前不点最终确认（半程、可逆）。
@@ -1606,6 +1840,7 @@ async def close_accel(page, spu, allow=False) -> dict:
     }""")
     if not has_stop:
         result["note"] = "面板内未找到「停止流量加速」"
+        await _restore_flux_page_after_panel(page)
         return result
 
     if not allow:
@@ -1631,6 +1866,7 @@ async def close_accel(page, spu, allow=False) -> dict:
                 pass
     if not confirmed:
         result["note"] = "关闭确认弹窗内未点到「停止」按钮"
+        await _restore_flux_page_after_panel(page)
         return result
     result["clicked_stop"] = True
 
@@ -1641,18 +1877,22 @@ async def close_accel(page, spu, allow=False) -> dict:
     if not completion.get("settled"):
         result["request_timeout"] = True
         result["note"] = f"关闭请求仍在处理中或未确认结束：{completion.get('message', '')}"
+        await _restore_flux_page_after_panel(page)
         return result
     if completion.get("status") == "cooldown":
         result["cooldown"] = True
         result["note"] = f"未关闭：{completion.get('message', '命中24小时冷却提示')}"
+        await _restore_flux_page_after_panel(page)
         return result
     if completion.get("status") == "failure":
         result["note"] = f"关闭失败：{completion.get('message', '平台返回失败提示')}"
+        await _restore_flux_page_after_panel(page)
         return result
     if completion.get("status") == "success":
         result["closed"] = True
         result["success_message"] = completion.get("message", "")
         result["note"] = f"已停止流量加速（成功提示：{completion.get('message', '')}）"
+        await _restore_flux_page_after_panel(page)
         return result
 
     # ★ 24h 冷却检测（最可靠的判定信号）：加速器开启不满 24h 手动关闭时，平台会弹 toast
@@ -1662,6 +1902,7 @@ async def close_accel(page, spu, allow=False) -> dict:
         result["closed"] = False
         result["cooldown"] = True
         result["note"] = f"未关闭：{cooldown}"
+        await _restore_flux_page_after_panel(page)
         return result
 
     off_verification = await _verify_accel_off_in_list(page, spu)
@@ -1861,6 +2102,9 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
         modal_loading = False
         for _ in range(20):
             await asyncio.sleep(0.5)
+            if kicked_to_login(getattr(activity_page, "url", "")):
+                logger.error("[活动] 登录态失效：活动页已被踢回登录页，中止开提报页")
+                return None
             direct_pages = [
                 page for page in ctx.pages
                 if "detail-new" in (page.url or "") and all(page is not old for old in before)
@@ -1892,6 +2136,9 @@ async def open_enroll_page(activity_page, activity_name, timeout_s=25):
         # ⑤ 轮询 diff 认新 tab（本次尝试的短超时）
         for _ in range(int(per_try_s * 2)):
             await asyncio.sleep(0.5)
+            if kicked_to_login(getattr(activity_page, "url", "")):
+                logger.error("[活动] 登录态失效：活动页已被踢回登录页，中止开提报页")
+                return None
             news = [
                 p for p in ctx.pages
                 if "detail-new" in (p.url or "") and all(p is not old for old in before)
@@ -2012,13 +2259,20 @@ async def _set_sessions_all(page) -> dict:
         return {"ok": False, "note": f"弹窗全选失败（{qx}）"}
     await asyncio.sleep(1.0)
 
-    # 校验有场次被勾中，再点「确认」
+    # 校验有场次被勾中，再点「确认」。注意排除「全选」框自身——它也是 CBX_squareInputWrapper，
+    # 不剥掉会把 1 个真实场次报成「已全选 2 个场次」（2026-09-29 排查破冰提交失败时被这
+    # 句文案误导过一轮：弹窗实际只有「秘鲁」1 个场次 + 全选框）。
     checked_n = await page.evaluate(r"""() => {
       const dlgs = [...document.querySelectorAll('[class*=MDL_outerWrapper]')]
         .filter(e => e.getBoundingClientRect().width > 0 && (e.innerText || '').includes('设置场次'));
       if (!dlgs.length) return -1;
       const d = dlgs[dlgs.length - 1];
-      return [...d.querySelectorAll('[class*=CBX_squareInputWrapper] input')].filter(i => i.checked).length;
+      return [...d.querySelectorAll('[class*=CBX_squareInputWrapper] input')].filter(i => {
+        if (!i.checked) return false;
+        const label = i.closest('label') || i.parentElement;
+        const t = ((label && label.textContent) || '').replace(/\s+/g, '');
+        return t !== '全选';
+      }).length;
     }""")
     if not isinstance(checked_n, int) or checked_n < 1:
         return {"ok": False, "note": f"全选后无场次勾中（checked={checked_n}）"}
@@ -2099,6 +2353,39 @@ _MARK_ENROLL_SKU_ROWS_JS = r"""
 """
 
 
+# 提报页「场次共用活动库存」输入框标记（2026-09-29 补）：秒杀/破冰类活动库存必填——空着提交
+# 平台拦下报「采集失败」、记录页无记录（2879383652 全程实跑 3 个活动实锤）；大促进阶类没有
+# 此栏、平台兜底，故找不到「参考库存」锚不算失败。
+# 为什么用「参考库存」文本当锚而不是 SPU 行：平台大表左右分栏渲染，库存列与商品信息列不在
+# 同一 DOM 子树（TR 里可能根本不含库存格）；而搜索后页面只剩目标商品，全文档认锚即可。
+_MARK_STOCK_INPUT_JS = r"""
+() => {
+  const anchors = [];
+  for (const el of document.querySelectorAll('*')) {
+    const own = [...el.childNodes].filter(n => n.nodeType === 3)
+      .map(n => n.textContent).join('').replace(/\s+/g, '');
+    if (/^参考库存[：:]\d+$/.test(own)) anchors.push(el);
+  }
+  if (!anchors.length) return {found: false, reason: 'no-ref-stock'};
+  const refStock = Number(anchors[0].textContent.match(/(\d+)/)[1]);
+  // 从锚向上找含可填输入框的容器（库存值与输入框同栏）
+  let node = anchors[0];
+  for (let i = 0; i < 8 && node; i++, node = node.parentElement) {
+    const input = [...node.querySelectorAll('input[type=text],input:not([type])')]
+      .find(x => !x.disabled && x.offsetWidth > 0);
+    if (input) {
+      const current = (input.value || '').trim();
+      // 已有值（平台默认/上轮填过）：不覆盖不拦，如实带回去
+      if (current) return {found: false, reason: 'already-filled', refStock, current};
+      input.setAttribute('data-enroll-stock', '1');
+      return {found: true, refStock};
+    }
+  }
+  return {found: false, reason: 'no-input-near-ref', refStock};
+}
+"""
+
+
 async def probe_detail_eligibility(page, spu, on_step=None) -> dict:
     """提报页只读资格探测：定位 SPU 搜索框 → 填 SPU → 点「查询」→ 等结果行数。
 
@@ -2123,6 +2410,11 @@ async def probe_detail_eligibility(page, spu, on_step=None) -> dict:
     #    渲染，须轮询等其出现再搜（否则立即 evaluate 得 no-label）。
     loc = "no-label"
     for _ in range(20):  # 最多等 ~10s
+        if kicked_to_login(getattr(page, "url", "")):
+            out["failed_step"] = "input_spu"
+            out["note"] = "登录态失效：提报页已被踢回登录页"
+            await report("input_spu", False, out["note"])
+            return out
         loc = await page.evaluate(_SEARCH_SPU_JS, str(spu))
         if loc == "ok":
             break
@@ -2155,6 +2447,11 @@ async def probe_detail_eligibility(page, spu, on_step=None) -> dict:
     row = page.locator("tr").filter(has_text=f"SPU ID: {spu}")
     n = 0
     for _ in range(20):
+        if kicked_to_login(getattr(page, "url", "")):
+            out["failed_step"] = "query"
+            out["note"] = "登录态失效：提报页已被踢回登录页"
+            await report("query", False, out["note"])
+            return out
         n = await row.count()
         if n == 1:
             break
@@ -2201,6 +2498,7 @@ async def enroll_activity(
        场次不设 → 提交无效（这是之前全失败的根因之一）。
     4. 匹配：枚举本 SPU 的 SKU 价格行（_MARK_ENROLL_SKU_ROWS_JS）并与 sku_prices 匹配。
     5. 填价：逐行参考价校验（申报价≤参考价，全过才填）→ 逐行填申报价。
+    5.5 填库存：秒杀/破冰类必填「场次共用活动库存」，按参考库存填；大促进阶类无此栏跳过。
     6. 提交：底部「提交」，仅 allow_submit=True（授权后）才点。
 
     安全：默认 allow_submit=False → 只走到填价、绝不提交（未提交不生效、可逆）。返回
@@ -2210,7 +2508,7 @@ async def enroll_activity(
     result = {"located": False, "queried": False, "detail_eligible": None,
               "checked": False, "sessions_set": False,
               "filled": False, "submitted": False, "over_ref": False,
-              "ref_price": None, "failed_step": None, "note": ""}
+              "ref_price": None, "stock_filled": None, "failed_step": None, "note": ""}
 
     async def report(step, ok, note=""):
         if on_step is not None:
@@ -2378,14 +2676,55 @@ async def enroll_activity(
         prices_desc += f"（提报页 {len(rows)} 个价格行）"
     await report("fill_price", True, f"已填写 {prices_desc}")
 
+    # 5.5 填「场次共用活动库存」（2026-09-29 实测补）：秒杀/破冰类活动此栏必填——空着提交
+    #    平台拦下报「采集失败」、报名记录页无记录（2879383652 全程实跑 3 个活动实锤）。
+    #    库存值按平台给的参考库存填（用户定案）；大促进阶类没有此栏（平台兜底），找不到
+    #    「参考库存」锚不算失败；页面上已有值时不覆盖（上轮填过/平台默认）。
+    stock = await page.evaluate(_MARK_STOCK_INPUT_JS)
+    if stock.get("found"):
+        stock_value = str(stock["refStock"])
+        inp = page.locator('[data-enroll-stock="1"]').first
+        try:
+            await inp.click()
+            await inp.fill(stock_value)
+            # 与填价同判据：React 受控输入可能吞掉写入，必须回读校验
+            back = (await inp.input_value() or "").strip()
+            if back != stock_value:
+                result["failed_step"] = "fill_stock"
+                result["note"] = f"填写活动库存未生效：写入 {stock_value} 但读回 {back!r}"
+                await report("fill_stock", False, result["note"])
+                return result
+        except Exception as exc:
+            result["failed_step"] = "fill_stock"
+            result["note"] = f"填写活动库存失败：{exc}"
+            await report("fill_stock", False, result["note"])
+            return result
+        result["stock_filled"] = True
+        await report("fill_stock", True, f"已按参考库存填写活动库存 {stock_value}")
+    elif stock.get("reason") == "already-filled":
+        result["stock_filled"] = True
+        await report("fill_stock", True, f"活动库存已有值 {stock.get('current')}，不覆盖")
+    elif stock.get("reason") == "no-ref-stock":
+        # 大促进阶类无「场次共用活动库存」栏，平台兜底，不算失败
+        await report("fill_stock", True, "本活动无「场次共用活动库存」栏（平台兜底），跳过")
+    else:
+        # 有参考库存栏但找不到可填输入框：秒杀/破冰类空库存提交必败，fail-closed 不提交
+        result["failed_step"] = "fill_stock"
+        result["note"] = (f"找到「参考库存：{stock.get('refStock')}」但附近没有可填的"
+                          f"活动库存输入框，保守不提交")
+        await report("fill_stock", False, result["note"])
+        return result
+
     if not allow_submit:
         result["note"] = (
-            f"已勾选+全选场次+填申报价 {prices_desc}，等待当前活动统一点击提交"
+            f"已勾选+全选场次+填申报价 {prices_desc}，待提交"
         )
         return result
 
-    # 单条即时提交（授权后）。批量报名请改用 allow_submit=False 逐个填 + submit_enroll_page 一次提交。
-    sub = await submit_enroll_page(page, allow=True)
+    # 单条即时提交（授权后）。多 SPU 批量报名同样走「逐 SPU 填完立即提交」（调用方逐个
+    # 调本函数+提交，每 SPU 一张干净提报页）——2026-10-03 起废弃「活动末统一提交」：
+    # 提报页每次搜索都重渲结果表格，上一 SPU 的勾选随旧行卸载，统一提交必然丢单。
+    sub = await submit_enroll_page(page, allow=True, expected_spus=[str(spu)])
     result["submitted"] = sub.get("submitted", False)
     result["note"] = f"已提交申报价 {prices_desc}" if result["submitted"] else sub.get("note", "")
     return result
@@ -2393,6 +2732,10 @@ async def enroll_activity(
 
 _SUBMIT_FEEDBACK_JS = r"""
 (canConfirm) => {
+  // 词表里的「我已阅读并同意」是分层申报（破冰/阶梯价类）活动的前置协议弹窗按钮——
+  // 2026-09-29 实锤：该类活动点提交后前端先弹《商品活动申报价分层申报功能说明》协议
+  // （加载 PDF），不同意就根本不发报名请求；页面无 toast、无行内报错，此前三次「点了
+  // 没反应」全是它。弹窗文本不含「提交/报名」，只能靠 actionWords 命中按钮来识别。
   const norm = value => (value || '').replace(/\s+/g, '').trim();
   const visible = element => {
     const rect = element.getBoundingClientRect();
@@ -2407,9 +2750,13 @@ _SUBMIT_FEEDBACK_JS = r"""
   const dialogs = [...document.querySelectorAll(
     '[role=dialog],[aria-modal=true],[class*=MDL_outerWrapper],[class*=Modal],[class*=modal],'
       + '[class*=Dialog],[class*=dialog]'
-  )].filter(visible);
+  )].filter(visible)
+    // 店小秘插件注入的弹窗（class 全带 dxm- 前缀）与报名无关——它的「采集失败：」常驻
+    // 文案 2026-09-29 曾把破冰提交失败的排查带偏三轮，反馈识别一律排除。
+    .filter(element => !element.closest('[class*="dxm-"]'));
   const messages = [...document.querySelectorAll(messageSelectors), ...dialogs]
     .filter(visible)
+    .filter(element => !element.closest('[class*="dxm-"]'))
     .map(element => (element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim())
     .filter(text => text && text.length <= 300);
   const failureWords = ['活动太火爆', '稍后再试', '提交失败', '报名失败', '操作失败',
@@ -2420,8 +2767,27 @@ _SUBMIT_FEEDBACK_JS = r"""
   const success = messages.find(text => successWords.some(word => norm(text).includes(norm(word))));
   if (success) return {status: 'success', message: success.slice(0, 160)};
 
+  // 联报推荐弹窗（2026-10-02 官方大促实锤）：点「提交」后平台弹「推荐将当前活动所选商品
+  // 同时报入以下活动」（联报限时包邮活动推广）。弹窗文本不含「确认/确定」、按钮文案
+  // 「仅提交当前活动」也不匹配下方 actionWords 的 endsWith 规则——识别不到时提交请求
+  // 根本发不出去，表现为「点了提交零请求、无任何提示」的静默失败。用户拍板的正确动作
+  // 只有「仅提交当前活动」：联报 toggle 保持关闭、绝不碰「一键报名活动 (N)」——所以
+  // 按钮文案必须【精确等值】匹配，endsWith/包含一旦放宽就可能误点一键报名。
+  for (const dialog of dialogs) {
+    const dialogText = norm(dialog.innerText);
+    if (!dialogText.includes('联报') || !dialogText.includes('仅提交当前活动')) continue;
+    const buttons = [...dialog.querySelectorAll('button,[role=button]')].filter(visible);
+    const only = buttons.find(button => norm(button.textContent) === '仅提交当前活动');
+    if (!only || only.disabled || String(only.className || '').includes('disabled')) {
+      return {status: 'confirmation_blocked', message: (dialog.innerText || '').slice(0, 160)};
+    }
+    if (!canConfirm) return {status: 'pending', message: '联报推荐弹窗等待处理'};
+    only.click();
+    return {status: 'confirmation_clicked', message: '联报推荐弹窗：仅提交当前活动'};
+  }
+
   const actionWords = ['确认提交', '确定提交', '继续提交', '仍要提交', '确认报名', '确定报名',
-    '继续报名', '确认', '确定', '提交'];
+    '继续报名', '确认', '确定', '提交', '我已阅读并同意'];
   for (const dialog of dialogs.reverse()) {
     const text = norm(dialog.innerText);
     const buttons = [...dialog.querySelectorAll('button,[role=button]')].filter(visible);
@@ -2444,10 +2810,26 @@ _SUBMIT_FEEDBACK_JS = r"""
 """
 
 
-async def _wait_submit_result_page(page, tries=12) -> dict:
-    """等待提交后的 detail-new-result 页面，读取 successCount/“已提交N个商品”。"""
+# 提交后等页面跳到结果页的上限（× 0.25s）。URL 一变即返回，实测跳转在 1s 内完成；给 3s
+# 兜住慢响应，等不到就按原回执返回，不为失败/不跳转的情形额外拖时间。
+SUBMIT_RESULT_WAIT_TRIES = 12
+
+
+async def _wait_submit_result_page(page, tries=12, expected_count=None) -> dict:
+    """等待提交后的 detail-new-result 页面，读取 successCount/“已提交N个商品”。
+
+    expected_count：本次提交【应该】提交的商品数（提报页已填价勾选的商品数）。给了它才做
+    数量对账——「>0 即成功」会把部分丢失吞掉（2026-10-03 实测：8791757215 填价成功却被
+    后一个 SPU 的搜索重渲冲掉勾选，结果页「已提交 1 个商品」实际是别人，旧判据照判成功）。
+    count < expected 时 success 仍为 True（确实有商品提交成功）但 verified=False，note
+    点名差额，交报名记录页逐 SPU 对账兜底。
+    """
     for attempt in range(tries):
         url = str(getattr(page, "url", "") or "")
+        if kicked_to_login(url):
+            # 被踢回登录页就不可能再跳结果页了，立即退出，别白等满整个窗口。
+            return {"detected": False, "success": False, "success_count": None,
+                    "url": url, "note": "登录态失效：页面被踢回登录页"}
         if "detail-new-result" in url:
             url_match = re.search(r"[?&]successCount=(\d+)", url)
             url_count = int(url_match.group(1)) if url_match else None
@@ -2461,11 +2843,18 @@ async def _wait_submit_result_page(page, tries=12) -> dict:
             success_count = body_count if body_count is not None else url_count
             if success_count is not None:
                 success = success_count > 0
+                verified = success
+                note = (f"结果页确认已提交 {success_count} 个商品"
+                        if success else "结果页显示提交成功商品数为 0")
+                if success and expected_count is not None and success_count < expected_count:
+                    verified = False
+                    note = (f"结果页显示已提交 {success_count} 个商品，低于本次填价的 "
+                            f"{expected_count} 个——差 {expected_count - success_count} 个商品的"
+                            f"勾选/填价在提交前丢失，须到报名记录页逐个核验")
                 return {
-                    "detected": True, "success": success, "success_count": success_count,
-                    "url": url,
-                    "note": (f"结果页确认已提交 {success_count} 个商品"
-                             if success else "结果页显示提交成功商品数为 0"),
+                    "detected": True, "success": success, "verified": verified,
+                    "success_count": success_count,
+                    "url": url, "note": note,
                 }
         if attempt + 1 < tries:
             await asyncio.sleep(0.25)
@@ -2473,9 +2862,13 @@ async def _wait_submit_result_page(page, tries=12) -> dict:
 
 
 def _submit_result_payload(result_page: dict, confirmed: bool) -> dict:
+    # verified 不再等于 success（2026-10-03 起）：success 只表示「有商品提交成功」，
+    # verified 还要求结果页数量不少于本次填价数（_wait_submit_result_page 已比对；
+    # 没做比对的旧路径不带 verified 键，维持原口径）。
+    success = bool(result_page.get("success"))
     return {
-        "submitted": bool(result_page.get("success")),
-        "verified": bool(result_page.get("success")),
+        "submitted": success,
+        "verified": success and bool(result_page.get("verified", True)),
         "clicked_submit": True,
         "confirmed": confirmed,
         "result_page": True,
@@ -2484,84 +2877,233 @@ def _submit_result_payload(result_page: dict, confirmed: bool) -> dict:
     }
 
 
-async def submit_enroll_page(page, allow=False, feedback_tries=20) -> dict:
-    """点提报页底部「提交」，一次提交本页已勾选+填价的所有 SPU（活动维度批量报名用）。
+# 提交前的勾选盘点（2026-10-03 起）：提报页每做一次 SPU 搜索就重渲结果表格，之前勾选的
+# 商品随旧行卸载丢失（多 SPU 静默漏报的根因），故点提交前必须核对当前勾选是不是本次要报
+# 的商品。beast 左右分表，勾选框与商品文字列不在同一 DOM 行，按视觉 y 对齐把勾中的勾选框
+# 归到「SPU ID: n」文本行（同 _CHECK_ROW_JS 的套路）；同时带出搜索框现值与未勾的协议框，
+# 供「提交按钮持续禁用」时的现场归因。
+_CHECKED_ENROLL_STATE_JS = r"""
+() => {
+  const visible = element => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const wrappers = [...document.querySelectorAll('[class*=CBX_squareInputWrapper]')].filter(visible);
+  const isChecked = w => {
+    const input = w.querySelector('input');
+    return Boolean(input && input.checked) || /checked/i.test(String(w.className || ''));
+  };
+  const checked = wrappers.filter(isChecked);
+  const spuRows = [];
+  for (const el of document.querySelectorAll('td,div,span')) {
+    const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('');
+    const m = own.match(/SPU\s*ID[：:\s]*([0-9]+)/);
+    if (m) spuRows.push({spu: m[1], y: el.getBoundingClientRect().y});
+  }
+  const spus = new Set();
+  let unattributed = 0;
+  for (const w of checked) {
+    const y = w.getBoundingClientRect().y;
+    let best = null;
+    for (const row of spuRows) {
+      const d = Math.abs(row.y - y);
+      if (d < 30 && (best === null || d < best.d)) best = {spu: row.spu, d};
+    }
+    if (best) spus.add(best.spu); else unattributed += 1;
+  }
+  const searchValues = [...document.querySelectorAll('input')]
+    .map(i => (i.value || '').trim()).filter(v => /^\d{6,}$/.test(v));
+  const uncheckedAgreements = wrappers.filter(w => {
+    if (isChecked(w)) return false;
+    const label = ((w.closest('label') || w.parentElement || w).textContent || '');
+    return /同意|协议|须知|承诺/.test(label);
+  }).length;
+  return {checked: checked.length, spus: [...spus], unattributed,
+          search_values: searchValues.slice(0, 3), unchecked_agreements: uncheckedAgreements};
+}
+"""
 
-    allow=False（默认）只定位提交按钮、不点击（半程、可逆）。allow=True 才真提交（不可逆，
-    授权后）。提交后短轮询等待可能延迟出现的二次确认弹窗，只在弹窗内部点击；同时捕获
-    成功/失败提示。返回 {submitted, verified, note}，其中 submitted 仅表示提交动作已被页面接受，
-    verified=True 才表示本函数捕获到明确成功提示。
+
+async def _submit_disabled_scene(page) -> str:
+    """「提交」按钮持续禁用时的页面现场摘要（best-effort，读不到的部分自动省略）。
+
+    旧文案「本页无已填 SPU？」只是猜测；多 SPU 场景的真凶是「上一 SPU 的勾选被搜索重渲
+    冲掉」，必须把当前勾选数/勾选归属 SPU/搜索框现值/未勾协议框/行内报错摆出来。
+    """
+    parts = []
+    try:
+        inv = await page.evaluate(_CHECKED_ENROLL_STATE_JS)
+    except Exception:
+        inv = None
+    if isinstance(inv, dict):
+        desc = f"当前勾选 {inv.get('checked', 0)} 行"
+        spus = inv.get("spus") or []
+        if spus:
+            desc += f"（勾选归属 SPU：{'、'.join(map(str, spus))}）"
+        if inv.get("unattributed"):
+            desc += f"，{inv['unattributed']} 个勾选框未能归属到商品行"
+        parts.append(desc)
+        if inv.get("search_values"):
+            parts.append(f"搜索框现值：{'、'.join(map(str, inv['search_values']))}")
+        if inv.get("unchecked_agreements"):
+            parts.append(f"有 {inv['unchecked_agreements']} 个协议/须知勾选框未勾")
+    try:
+        scene = await page.evaluate(_SUBMIT_SCENE_JS)
+    except Exception:
+        scene = ""
+    if scene:
+        parts.append(f"行内提示：{scene}")
+    return "；".join(parts) or "页面现场读取失败"
+
+
+async def _submit_enroll_page_once(page, allow=False, feedback_tries=20, expected_spus=None) -> dict:
+    """点一次「提交」并按页面反馈判定结果。
+
+    expected_spus：本次提交【应该】提交的 SPU 列表（提报页已填价勾选的商品）。给定时点
+    提交前先核对页面勾选：勾选数=0 或能确认期望 SPU 的勾选已丢失 → 不照点、报错点名
+    （提报页搜索重渲会清掉之前的勾选，照点等于把残缺提交发出去；提交不可逆）。
+
+    不含提交后的结果页收尾等待——那一步在 submit_enroll_page 里统一做（本函数的所有返回
+    路径都可能带着「跳转还没走完」的页面出去）。
     """
     btn = page.get_by_role("button", name="提交").first
     if not await btn.count():
         return {"submitted": False, "note": "未找到「提交」按钮"}
     if not allow:
         return {"submitted": False, "note": "半程：已定位「提交」按钮，未点击（allow=False）"}
+    # 提交前勾选核对（2026-10-03 起）：勾选丢失是静默的（页面无提示），不核对就会把
+    # 「只剩最后一个 SPU」的残缺提交发出去。
+    if expected_spus:
+        try:
+            inv = await page.evaluate(_CHECKED_ENROLL_STATE_JS)
+        except Exception:
+            inv = None  # 读不到页面不擅自阻断：后面的 disabled 判定与点击异常自带护栏
+        if isinstance(inv, dict):
+            checked_spus = {str(s) for s in (inv.get("spus") or [])}
+            missing = [str(s) for s in expected_spus if str(s) not in checked_spus]
+            if not inv.get("checked"):
+                return {
+                    "submitted": False, "clicked_submit": False,
+                    "note": (f"提交前勾选核对失败：页面当前勾选数=0，本次要报的 "
+                             f"{'、'.join(map(str, expected_spus))} 的勾选已丢失"
+                             f"（提报页搜索重渲会清掉勾选），不照点提交"),
+                }
+            # 勾选框与 SPU 文字行对不齐时（unattributed>0）退化为「有勾选」判据——
+            # 归不了属就无法证明丢失，不拦；只有全部可归因且确实缺期望 SPU 才拦。
+            if missing and not inv.get("unattributed"):
+                return {
+                    "submitted": False, "clicked_submit": False,
+                    "note": (f"提交前勾选核对失败：页面勾选的是 "
+                             f"{'、'.join(sorted(checked_spus)) or '未识别'}，缺 "
+                             f"{'、'.join(missing)} 的勾选（疑似被后续搜索重渲冲掉），不照点提交"),
+                }
     # 「提交」按钮 disabled 时（本页无已勾选/已填 SPU）不可点——旧代码硬点会等满 30s 超时
     # 抛异常，冒泡中断整个执行遍（含阶段三重开流量）。故先判 disabled，禁用即优雅返回。
+    # 2026-10-03 加固：命中后有界等待约 8s 排除「页面重渲中」的瞬时禁用；仍禁用则抓页面
+    # 现场（勾选数/勾选归属/搜索框现值/未勾协议框/行内报错）写进 note，不再只写猜测。
     try:
-        if await btn.is_disabled():
-            return {"submitted": False, "note": "「提交」按钮禁用（本页无已填 SPU？），跳过"}
+        disabled = await btn.is_disabled()
+        for _ in range(16):
+            if not disabled:
+                break
+            await asyncio.sleep(0.5)
+            disabled = await btn.is_disabled()
+        if disabled:
+            scene = await _submit_disabled_scene(page)
+            return {
+                "submitted": False, "clicked_submit": False, "scene": scene,
+                "note": f"「提交」按钮持续禁用（等约 8s 未恢复），跳过：{scene}",
+            }
     except Exception:
         pass
-    try:
-        await btn.click(timeout=8000)
-    except Exception as e:
-        return {"submitted": False, "note": f"点「提交」失败：{str(e)[:80]}"}
+    # 点提交 + 反馈轮询最多两轮：分层申报（破冰/阶梯价类）首次提交会先弹《功能说明》
+    # 协议，点「我已阅读并同意」只是接受协议、平台【不会自动续提交】（2026-09-30 实测：
+    # confirmed=True 但零报名请求，再点一次才发出 /marketing/enroll/semi/submit 并收录）。
+    # 故 confirmed 后轮询仍无结论时，等弹窗散尽重新定位按钮再点一次。
     confirmed = False
-    blocked_polls = 0
     last_message = ""
-    for _ in range(feedback_tries):
-        await asyncio.sleep(0.5)
-        if "detail-new-result" in str(getattr(page, "url", "") or ""):
-            result_page = await _wait_submit_result_page(page, tries=4)
-            if result_page.get("detected"):
-                return _submit_result_payload(result_page, confirmed)
+    expected_count = len(expected_spus) if expected_spus else None
+    for submit_attempt in range(2):
+        if submit_attempt > 0:
+            await asyncio.sleep(1.0)
+            btn = page.get_by_role("button", name="提交").first
+            if not await btn.count():
+                break
         try:
-            raw_feedback = await page.evaluate(_SUBMIT_FEEDBACK_JS, not confirmed)
-        except Exception as exc:
-            message = str(exc)
-            if "Execution context was destroyed" in message or "navigat" in message.lower():
-                result_page = await _wait_submit_result_page(page)
-                if result_page.get("detected"):
-                    return _submit_result_payload(result_page, confirmed)
+            await btn.click(timeout=8000)
+        except Exception as e:
+            if submit_attempt > 0:
                 return {
                     "submitted": True, "verified": False, "clicked_submit": True,
-                    "confirmed": confirmed, "navigated": True,
-                    "note": "点击提交后页面发生跳转，待报名记录页最终核验",
+                    "confirmed": confirmed,
+                    "note": f"已确认弹窗但重点「提交」失败：{str(e)[:60]}，待报名记录页最终核验",
                 }
-            return {
-                "submitted": True, "verified": False, "clicked_submit": True,
-                "confirmed": confirmed, "feedback_error": message[:120],
-                "note": f"点击提交后读取结果异常，待报名记录页最终核验：{message[:80]}",
-            }
-        feedback = raw_feedback if isinstance(raw_feedback, dict) else {}
-        status = feedback.get("status", "pending")
-        last_message = feedback.get("message") or last_message
-        if status == "confirmation_clicked":
-            confirmed = True
-            blocked_polls = 0
-            continue
-        if status == "success":
-            return {
-                "submitted": True, "verified": True, "clicked_submit": True,
-                "confirmed": confirmed, "note": last_message or "报名成功",
-            }
-        if status == "failure":
-            return {
-                "submitted": False, "verified": False, "clicked_submit": True,
-                "confirmed": confirmed, "note": last_message or "提交失败",
-            }
-        if status == "confirmation_blocked":
-            blocked_polls += 1
-            if blocked_polls >= 4:
+            return {"submitted": False, "note": f"点「提交」失败：{str(e)[:80]}"}
+        blocked_polls = 0
+        for _ in range(feedback_tries):
+            await asyncio.sleep(0.5)
+            if kicked_to_login(getattr(page, "url", "")):
+                # 点已点下但登录态被踢：提交请求是否被平台收录不确定，口径与 navigated
+                # 分支一致（submitted=True / verified=False），附明确原因，别再空等。
+                return {
+                    "submitted": True, "verified": False, "clicked_submit": True,
+                    "confirmed": confirmed, "login_lost": True,
+                    "note": "提交后页面被踢回登录页：登录态已失效，本次提交结果须到报名记录页核验",
+                }
+            if "detail-new-result" in str(getattr(page, "url", "") or ""):
+                result_page = await _wait_submit_result_page(page, tries=4,
+                                                             expected_count=expected_count)
+                if result_page.get("detected"):
+                    return _submit_result_payload(result_page, confirmed)
+            try:
+                raw_feedback = await page.evaluate(_SUBMIT_FEEDBACK_JS, not confirmed)
+            except Exception as exc:
+                message = str(exc)
+                if "Execution context was destroyed" in message or "navigat" in message.lower():
+                    result_page = await _wait_submit_result_page(page, expected_count=expected_count)
+                    if result_page.get("detected"):
+                        return _submit_result_payload(result_page, confirmed)
+                    return {
+                        "submitted": True, "verified": False, "clicked_submit": True,
+                        "confirmed": confirmed, "navigated": True,
+                        "note": "点击提交后页面发生跳转，待报名记录页最终核验",
+                    }
+                return {
+                    "submitted": True, "verified": False, "clicked_submit": True,
+                    "confirmed": confirmed, "feedback_error": message[:120],
+                    "note": f"点击提交后读取结果异常，待报名记录页最终核验：{message[:80]}",
+                }
+            feedback = raw_feedback if isinstance(raw_feedback, dict) else {}
+            status = feedback.get("status", "pending")
+            last_message = feedback.get("message") or last_message
+            if status == "confirmation_clicked":
+                confirmed = True
+                blocked_polls = 0
+                continue
+            if status == "success":
+                return {
+                    "submitted": True, "verified": True, "clicked_submit": True,
+                    "confirmed": confirmed, "note": last_message or "报名成功",
+                }
+            if status == "failure":
                 return {
                     "submitted": False, "verified": False, "clicked_submit": True,
-                    "confirmed": False,
-                    "note": f"出现二次确认弹窗但无法点击确认：{last_message or '未识别确认按钮'}",
+                    "confirmed": confirmed, "note": last_message or "提交失败",
                 }
-        else:
-            blocked_polls = 0
+            if status == "confirmation_blocked":
+                blocked_polls += 1
+                if blocked_polls >= 4:
+                    return {
+                        "submitted": False, "verified": False, "clicked_submit": True,
+                        "confirmed": False,
+                        "note": f"出现二次确认弹窗但无法点击确认：{last_message or '未识别确认按钮'}",
+                    }
+            else:
+                blocked_polls = 0
+        # 本轮轮询无结论：点过二次确认（协议类弹窗）就再点一轮提交——平台不自动续提交；
+        # 没点过确认说明弹窗/提示压根没出现，重点无意义，落尾部抓现场。
+        if not confirmed:
+            break
     # 点了提交却既没弹二次确认、也没抓到成功/失败提示（实测 2026-09-25：平台侧最终 0 条记录）。
     # 这时页面往往有行内报错（资格/站点/库存/价格），但不在 toast 里 → 抓一次现场写进 note，
     # 否则只剩「已点击提交」这句没法定位原因。
@@ -2579,13 +3121,49 @@ async def submit_enroll_page(page, allow=False, feedback_tries=20) -> dict:
     }
 
 
+async def submit_enroll_page(page, allow=False, feedback_tries=20, expected_spus=None) -> dict:
+    """点提报页底部「提交」，提交本页已勾选+填价的商品（逐 SPU 报名时 expected_spus=[该SPU]）。
+
+    allow=False（默认）只定位提交按钮、不点击（半程、可逆）。allow=True 才真提交（不可逆，
+    授权后）。提交后短轮询等待可能延迟出现的二次确认弹窗，只在弹窗内部点击；同时捕获
+    成功/失败提示。返回 {submitted, verified, note}，其中 submitted 仅表示提交动作已被页面接受，
+    verified=True 才表示本函数捕获到明确成功提示。
+
+    expected_spus（2026-10-03 起）：本次应提交的 SPU 列表。给定时两道额外闸门生效——
+    ① 点提交前核对页面勾选（提报页搜索重渲会清掉之前的勾选，不一致就不照点）；
+    ② 结果页 successCount 与应提交数对账（少了判 verified=False 并点名差额），替换旧的
+    「successCount>0 即成功」（它会把多 SPU 场景的部分丢失吞掉）。
+
+    返回前多一道收尾：等页面跳到 detail-new-result 结果页（「已提交 N 个商品」）。用户
+    2026-09-30 要求——提交报名后不能直接关页签，必须等跳转到结果页，再开新页签报下一个
+    活动。SPA 的提交是异步收尾的：成功提示先到、跳转后到，拿到提示就返回会让调用方立刻关
+    页签、把这次跳转打断。等到了就用结果页当回执（successCount 比 toast 硬——0 就是平台
+    当刻没收录），等不到（明确失败/压根不跳转）原样返回，不额外拖时间。
+    """
+    expected_count = len(expected_spus) if expected_spus else None
+    result = await _submit_enroll_page_once(page, allow=allow, feedback_tries=feedback_tries,
+                                            expected_spus=expected_spus)
+    # submitted=False 的这些情形没有跳转可等：未找到按钮/按钮禁用/半程没点/明确失败提示/
+    # 确认弹窗点不动。result_page=True 则已经是结果页回执。
+    if result.get("result_page") or not result.get("submitted"):
+        return result
+    detected = await _wait_submit_result_page(page, tries=SUBMIT_RESULT_WAIT_TRIES,
+                                              expected_count=expected_count)
+    if not detected.get("detected"):
+        return result
+    return _submit_result_payload(detected, bool(result.get("confirmed")))
+
+
 # 提交后没回执时抓页面现场：URL + 含「报错关键词」的短句（行内校验/资格提示多半长这样）。
+# 店小秘弹窗（dxm-* class）整棵子树跳过：它的「采集失败：」常驻文案会被关键词命中，
+# 与报名成败无关（2026-09-29 实测被它误导，把协议弹窗根因盖了三轮）。
 _SUBMIT_SCENE_JS = r"""
 () => {
   const norm = s => (s || '').replace(/\s+/g, ' ').trim();
   const keys = /失败|错误|异常|不可|不能|已结束|已过期|库存不足|不符合|无资格|不支持|超出|请选择|请填写|请设置/;
   const hits = [];
   for (const el of document.querySelectorAll('*')) {
+    if (el.closest('[class*="dxm-"]')) continue;
     const own = [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join('');
     const t = norm(own);
     if (!t || t.length > 60 || !keys.test(t)) continue;
@@ -2599,12 +3177,18 @@ _SUBMIT_SCENE_JS = r"""
 """
 
 
-# 在开启弹窗里选「超级流量加权」档卡片（用户规则 2026-07-17：加速统一选超级档）。
-_SELECT_SUPER_TIER_JS = r"""
-() => {
+# 在开启弹窗里选指定档卡片（普通/高级/超级；2026-09-29 起档位按成本表「折扣」列定，
+# 不再是写死超级档）。参数 args=[word, pos]：word=档名文字（"普通"/"高级"/"超级"），
+# pos=卡片从左到右的位置序号（0/1/2，对应 ACCEL_TIER_POS），用于文字认不出时的位置兜底。
+# 注意必须是单参数解构：Playwright page.evaluate 只把第二个实参整体传给第一个形参，
+# 写成 (word, pos) => 双形参会让 pos=undefined、位置兜底取到 cards[NaN] 直接抛错
+# （2026-09-29 半程实测踩到，单测桩签名宽松没拦住）。
+_SELECT_TIER_JS = r"""
+(args) => {
+  const [word, pos] = args;
   for (const el of document.querySelectorAll('*')) {
     const t = (el.innerText || '').replace(/\s+/g, '');
-    if (t.includes('超级') && t.includes('流量加权') && t.length < 40) {
+    if (t.includes(word) && t.includes('流量加权') && t.length < 40) {
       let n = el;
       for (let i = 0; i < 4 && n; i++) {
         if (n.offsetWidth > 80) { n.click(); return true; }
@@ -2616,7 +3200,7 @@ _SELECT_SUPER_TIER_JS = r"""
   }
   // 2026-07-20 页面把「普通/高级/超级」画进卡片背景图，DOM innerText 只剩
   // 「让价/对应申报价格」，上面的文字匹配会必然失败。三张可选档位按普通→高级→超级
-  // 从左到右排列；只收集同时含两列价格、可见且 cursor:pointer 的独立卡片，取最右侧。
+  // 从左到右排列；只收集同时含两列价格、可见且 cursor:pointer 的独立卡片，按 x 排序取第 pos 张。
   const cards = [];
   const seen = new Set();
   for (const el of document.querySelectorAll('*')) {
@@ -2643,7 +3227,7 @@ _SELECT_SUPER_TIER_JS = r"""
   }
   if (cards.length >= 3) {
     cards.sort((a, b) => a.x - b.x);
-    cards[cards.length - 1].node.click();
+    cards[Math.min(pos, cards.length - 1)].node.click();
     return true;
   }
   return false;
@@ -2651,10 +3235,11 @@ _SELECT_SUPER_TIER_JS = r"""
 """
 
 
-async def _select_super_tier(page, tries=20) -> bool:
-    """轮询等待档位卡异步渲染后选择超级档，避免抽屉已开但卡片尚未挂载的偶发空读。"""
+async def _select_tier(page, tier: str, tries=20) -> bool:
+    """轮询等待档位卡异步渲染后选指定档（normal/advanced/super），避免抽屉已开但卡片尚未挂载的偶发空读。"""
+    args = [ACCEL_TIER_NAMES[tier], ACCEL_TIER_POS[tier]]
     for _ in range(tries):
-        if await page.evaluate(_SELECT_SUPER_TIER_JS):
+        if await page.evaluate(_SELECT_TIER_JS, args):
             return True
         await asyncio.sleep(0.5)
     return False
@@ -2704,7 +3289,7 @@ async def _set_accel_prices(page, accel_prices) -> dict:
     """在「调整申报价」对话框逐行填加速价（传入价须 ≤ 每行参考价，超上限的档退填底价+1）。
 
     accel_prices: [{label, daily, sale, price}]（逐货号传入，price 由调用方算好=底价+1 与
-    活动价÷0.9 取高；内部按日常价档合并，见 accel_price_groups）。对话框按日常价档列行，
+    最低折扣价÷0.9 取高；内部按日常价档合并，见 accel_price_groups）。对话框按日常价档列行，
     行身份键是「参考申报价格+让价」= 日常价；行数不等于档数 → count_mismatch；某行对不上档
     → match_failed；两种情况调用方都中止不开（给错价比不开严重得多）。
 
@@ -2767,27 +3352,39 @@ async def _set_accel_prices(page, accel_prices) -> dict:
             "degraded_detail": degraded}
 
 
-async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
-    """单次尝试（重新）开启某 SPU 的流量加速。accel_prices 给定时走完整路径：立即开启→选超级流量加权
-    →继续让价「去获取」→「调整申报价」对话框【逐货号】填加速价(=各自底价+1)→确认→
-    (授权后)立即加速。accel_prices=None 时退回旧简单路径（只点开启确认）。
+async def _open_accel_once(page, spu, allow=False, accel_prices=None, tier="super") -> dict:
+    """单次尝试（重新）开启某 SPU 的流量加速。
 
-    accel_prices: [{label, daily, sale, price}]。多货号时对话框行必须先按货号 label 归属到
-    成本表货号（match_accel_rows，一行货号可对应多行）；行数少于货号数、或有行归属不到任何
-    货号 → 中止不开（fail-closed：同日常价的货号底价可以不同，瞎填就是把高底价货号按低价卖，
-    不可逆）。
+    首要前提——限流校验（用户 2026-09-29 定）：正常品的加速器列是「该商品已获得开启流量
+    加速器机会」+「立即开启」；限流品显示「商品流量待关注 / 您可加速提效」，入口只剩
+    「报名流量加速器 / 调价提效」。限流品按规则停止流量加速动作、只做活动报名（返回
+    throttled=True）。所以入口只认「立即开启」，找不到时按行文本判限流，绝不点
+    「报名流量加速器」。
 
-    allow=False（默认）只走到最终「立即加速」前不点（半程、可逆）。返回 {state, opened, note,
-    price_set}。若该 SPU 已加速（on）→ opened=True(no-op)。
+    tier（档位）由调用方按成本表「折扣」列定（accel_tier_for_discount，用户 2026-09-29）：
+    - "normal"/"advanced"（85折→普通、其余高位折扣→高级）：平台给默认申报价、卡片上
+      没有自定义价入口（实测 2026-09-29 只有超级档有「去获取」），选卡后直接收尾，
+      accel_prices 用不上。
+    - "super"（75折及以下）：完整路径——立即开启→选超级流量加权→「去获取」→「调整申报价」
+      对话框【逐货号】填加速价(=各自底价+1 与最低折扣价÷0.9 取高)→确认→(授权后)立即加速。
+      accel_prices: [{label, daily, sale, price}]；=None 退回旧简单路径（只点开启确认，
+      兼容老调用/半程探测）。
+
+    accel_prices 多货号时对话框行必须先按货号 label 归属到成本表货号（match_accel_rows，
+    一行货号可对应多行）；行数少于货号数、或有行归属不到任何货号 → 中止不开（fail-closed：
+    同日常价的货号底价可以不同，瞎填就是把高底价货号按低价卖，不可逆）。
+
+    allow=False（默认）只走到最终「立即加速」前不点（半程、可逆）。返回 {state, opened,
+    note, price_set, tier}。若该 SPU 已加速（on）→ opened=True(no-op)。
 
     用户规则 2026-07-17：加速器一开，前端显示价以加速价为准，故加速价须设为 Excel 底价+1；
-    档位固定选超级；加速价不得高于该品「参考申报价格」（超参考价则该行填不进、须告警）。
+    加速价不得高于该品「参考申报价格」（超参考价则该行填不进、须告警）。
     真开启不可逆（实测锁 24h 才能手动停），故 allow=False 时不点「立即加速」。
     """
     await dismiss_all_page_popups(page)
     result = {
         "state": "unknown", "precheck_state": "unknown",
-        "opened": False, "note": "", "price_set": None,
+        "opened": False, "note": "", "price_set": None, "tier": tier,
     }
     state = await read_accel_state(page, spu, search=True)
     result["state"] = state
@@ -2800,32 +3397,47 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
         result["note"] = f"加速态={state}，保守不操作"
         return result
 
-    # 入口文案随商品状态变（实测 2026-09-24）：待开启的商品是「立即开启」，待关注的是
-    # 「报名流量加速器」（同一行的加速器列还写「商品流量待关注 / 您可加速提效」）。按顺序试，
-    # 命中哪个就用哪个——只认「立即开启」会让待关注的商品永远开不了流量。
-    marked = None
-    entry_word = ""
-    for word in ACCEL_ENTRY_WORDS:
-        marked = await page.evaluate(_MARK_ROW_ACTION_JS, [str(spu), word])
-        if marked:
-            entry_word = word
-            break
+    # 限流校验：先找「立即开启」；找不到再看行文本是不是限流现场。
+    # 带上加速器列的现场文本：平台限流和页面结构变了是两回事，只报「未定位到」操作者分不出来。
+    marked = await page.evaluate(_MARK_ROW_ACTION_JS, [str(spu), "立即开启"])
     if not marked:
-        # 带上加速器列的现场文本：平台没给这个入口和页面结构变了是两回事，只报「未定位到」
-        # 操作者分不出来。
         row_text = await page.evaluate(_ROW_TEXT_JS, str(spu))
-        result["note"] = ("未定位到该行的加速器入口"
+        if any(w in row_text for w in ACCEL_THROTTLE_WORDS):
+            result["throttled"] = True
+            result["note"] = (f"商品限流（加速器列：{row_text}），按规则停止流量加速动作、"
+                              f"只做活动报名")
+            return result
+        result["note"] = ("未定位到该行的加速器入口「立即开启」"
                           + (f"（加速器列：{row_text}）" if row_text else "（也没读到该 SPU 的行）"))
         return result
-    result["entry_word"] = entry_word
+    result["entry_word"] = "立即开启"
+
+    # 普通/高级档：平台默认申报价、无自定义价入口（实测 2026-09-29 只有超级档卡片有
+    # 「去获取」），选卡后直接收尾。半程也走完选卡——档位选择器是否在真实页面生效，
+    # 正是半程要验证的东西。
+    if tier in ("normal", "advanced"):
+        tier_name = ACCEL_TIER_NAMES[tier]
+        if not await _click_marked(page):
+            result["note"] = "「立即开启」点击失败"
+            return result
+        await asyncio.sleep(2.5)
+        if not await _select_tier(page, tier):
+            result["note"] = f"未找到「{tier_name}流量加权」档卡片"
+            return result
+        await asyncio.sleep(1.2)
+        if not allow:
+            result["note"] = (f"半程：已选{tier_name}流量加权档（平台默认申报价，无自定义价入口），"
+                              f"未点「立即加速」（allow=False）")
+            return result
+        return await _finalize_accel_open(page, spu, result, f"{tier_name}档平台默认申报价")
 
     # 旧路径：未给 accel_prices → 只点开启确认（兼容老调用/半程探测）。
     if accel_prices is None:
         if not allow:
-            result["note"] = f"半程：已定位「{entry_word}」，未点击（allow=False）"
+            result["note"] = "半程：已定位「立即开启」，未点击（allow=False）"
             return result
         if not await _click_marked(page):
-            result["note"] = f"「{entry_word}」点击失败"
+            result["note"] = "「立即开启」点击失败"
             return result
         await asyncio.sleep(2)
         for word in ("确定", "确认", "立即开启", "开启"):
@@ -2848,7 +3460,7 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
         result["note"] = "「立即开启」点击失败"
         return result
     await asyncio.sleep(2.5)
-    if not await _select_super_tier(page):
+    if not await _select_tier(page, "super"):
         result["note"] = "未找到「超级流量加权」档卡片"
         return result
     await asyncio.sleep(1.2)
@@ -2914,7 +3526,23 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
         result["note"] = (f"半程：已选超级档、填加速价 {price_desc}（{price['rows_filled']} 个 SKC）"
                           f"并确认，未点「立即加速」（allow=False）")
         return result
+    return await _finalize_accel_open(
+        page, spu, result, f"{price_desc}（{price['rows_filled']} 个 SKC）")
 
+
+async def _finalize_accel_open(page, spu, result, price_desc) -> dict:
+    """授权（allow=True）后点「立即加速」并按「平台受理 + 回查状态」收尾，三档共用。
+
+    price_desc 仅用于写 note：普通/高级档=「平台默认申报价」，超级档=实际填的加速价。
+
+    最终判据：平台受理（成功提示）+ 回查状态。【实测 2026-09-25 的时序】
+      18:29 点「立即加速」→ 成功提示「流量加速成功…」；18:30~18:50 回查该 SPU 仍是
+      「开启流量加速器 / 立即开启」（状态 off）；19:0x 再看已是「流量加速中」（状态 on，
+      「查看效果」入口也出现了）——**平台生效有延迟（约半小时）**。
+    所以：状态读不到「加速中」不能立刻判未开（那会触发外层整轮重试、反复点「立即加速」），
+    但要如实把「平台已受理、状态尚未生效」写进 note，让人知道这一格还没落地。
+    只有「平台没给成功提示 + 回查也非加速中」才是真的没开成。
+    """
     feedback = await _click_open_with_busy_retries(page)
     result["final_clicks"] = feedback["clicks"]
     result["submit_feedback"] = feedback
@@ -2922,13 +3550,6 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
     if not result["clicked_open"]:
         result["note"] = "未点到最终「立即加速」按钮"
         return result
-    # 最终判据：平台受理（成功提示）+ 回查状态。【实测 2026-09-25 的时序】
-    #   18:29 点「立即加速」→ 成功提示「流量加速成功…」；18:30~18:50 回查该 SPU 仍是
-    #   「开启流量加速器 / 立即开启」（状态 off）；19:0x 再看已是「流量加速中」（状态 on，
-    #   「查看效果」入口也出现了）——**平台生效有延迟（约半小时）**。
-    # 所以：状态读不到「加速中」不能立刻判未开（那会触发外层整轮重试、反复点「立即加速」），
-    # 但要如实把「平台已受理、状态尚未生效」写进 note，让人知道这一格还没落地。
-    # 只有「平台没给成功提示 + 回查也非加速中」才是真的没开成。
     state_after = "unknown"
     for attempt in range(3):
         state_after = await read_accel_state(page, spu, search=True)
@@ -2941,8 +3562,8 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
     if state_after == "on":
         result["opened"] = True
         tail = f"成功提示：{feedback['message']}" if feedback.get("message") else "回查确认"
-        result["note"] = (f"已开启加速、加速价设为 {price_desc}（{price['rows_filled']} 个 SKC，"
-                          f"回查流量页确认状态=加速中；{tail}）")
+        result["note"] = (f"已开启加速、加速价设为 {price_desc}"
+                          f"（回查流量页确认状态=加速中；{tail}）")
     elif accepted:
         result["opened"] = True
         result["note"] = (f"已点「立即加速」并收到平台成功提示（{feedback['message']}），"
@@ -2958,13 +3579,14 @@ async def _open_accel_once(page, spu, allow=False, accel_prices=None) -> dict:
     return result
 
 
-async def open_accel(page, spu, allow=False, accel_prices=None, tries=3) -> dict:
+async def open_accel(page, spu, allow=False, accel_prices=None, tier="super", tries=3) -> dict:
     """开启流量加速，外层「开启→回查状态确认」重试，最多 tries 次（用户要求 2026-07-24）。
 
     单次执行（`_open_accel_once`）内部已有两级判定：点「立即加速」后先等成功 toast，toast 抓不到
     （unknown）时回查一次流量页状态兜底。本外层再包一层：一轮结束仍未确认开启成功（opened=False）
-    时，等状态回显后【重来一轮】，直到成功或用尽 tries 次。例外：match_failed（价格行数/货号
-    匹配不上）是确定性失败——页面结构与成本表对不上，重试只是反复开关对话框，直接返回。
+    时，等状态回显后【重来一轮】，直到成功或用尽 tries 次。例外两类确定性失败直接返回：
+    match_failed（价格行数/货号匹配不上）与 throttled（商品限流）——前者页面结构与成本表对不上，
+    后者是平台状态，重试都只是反复开关页面。
 
     安全前提（关键）：每轮 `_open_accel_once` 开头都 `read_accel_state(search=True)` 按 SPU 回查
     状态，读到 on 即 no-op 直接判成功——所以「上一轮其实已开成、只是没抓到 toast」时，下一轮
@@ -2975,10 +3597,10 @@ async def open_accel(page, spu, allow=False, accel_prices=None, tries=3) -> dict
     半程（allow=False）不真开、opened 恒为 False，整轮重试无意义且徒增页面查询，故只跑一次。
     """
     if not allow:
-        return await _open_accel_once(page, spu, allow=allow, accel_prices=accel_prices)
+        return await _open_accel_once(page, spu, allow=allow, accel_prices=accel_prices, tier=tier)
     last = None
     for attempt in range(1, tries + 1):
-        result = await _open_accel_once(page, spu, allow=allow, accel_prices=accel_prices)
+        result = await _open_accel_once(page, spu, allow=allow, accel_prices=accel_prices, tier=tier)
         result["open_attempts"] = attempt
         if result.get("opened"):
             if attempt > 1:
@@ -2986,7 +3608,7 @@ async def open_accel(page, spu, allow=False, accel_prices=None, tries=3) -> dict
                 result["note"] = f"第 {attempt} 次尝试确认开启成功；{result.get('note', '')}"
             return result
         last = result
-        if result.get("match_failed"):
+        if result.get("match_failed") or result.get("throttled"):
             return last
         if attempt < tries:
             logger.warning(

@@ -133,8 +133,9 @@ async def collect_page(request: Request):
 async def activity_page(request: Request):
     """活动管理页：SPU 清单 + dry-run/正式执行开关 + SSE 实时进度（独立页）。
 
-    最高优先级安全：涉及真实商家账号的不可逆操作，前端「正式执行」默认关闭，
-    默认只跑 dry-run（只读+算计划+出报名清单，不点任何变更按钮），对标采集页 base_only。
+    本页默认【正式执行】（开关初始打开、档位初始「全程」）：涉及真实商家账号的不可逆操作，
+    故保留红色告警 + 开始前二次确认。要只看计划就把「正式执行」开关关掉（dry-run 只读+
+    算计划+出报名清单，不点任何变更按钮），对标采集页 base_only。
     """
     return templates.TemplateResponse("activity.html", {"request": request})
 
@@ -617,8 +618,9 @@ async def collect_batch_events(job_id: str):
 
 # ==== 活动管理（关加速器→报活动→重开加速器）：确定性批处理，独立于通用 agent ========
 # 对标上面的采集接口：ActivityJob 照抄 CollectJob（内部队列 + on_progress 塞事件 + SSE 逐条
-# yield）。与采集不同的是【安全语义】：涉及真实商家账号的不可逆操作，dry_run 默认 True，
-# 只有前端显式开「正式执行」才 False。工作簿/Sheet 枚举复用采集 service，不重复造。
+# yield）。与采集不同的是【安全语义】：涉及真实商家账号的不可逆操作，dry_run 曾长期默认 True；
+# 2026-09-30 起默认 False（前端「正式执行」开关初始打开，dry_run 不传即正式执行），关掉开关
+# 才退回只读规划。工作簿/Sheet 枚举复用采集 service，不重复造。
 
 from app.activity import service as activity_service
 
@@ -635,7 +637,7 @@ class ActivityJob:
     MAX_KEPT_JOBS = 10  # 跑完的作业最多留几个：留着的才能回放，但也不能无限涨内存
 
     def __init__(
-        self, job_id: str, excel: str = "", sheet: str = "", dry_run: bool = True,
+        self, job_id: str, excel: str = "", sheet: str = "", dry_run: bool = False,
         kind: str = "batch",
     ):
         self.id = job_id
@@ -712,7 +714,7 @@ async def activity_batch(
     sheet: str = Body("", embed=True),
     spus: str = Body("", embed=True),
     min_margin: Optional[float] = Body(None, embed=True),
-    dry_run: bool = Body(True, embed=True),
+    dry_run: bool = Body(False, embed=True),
     cloud_url: str = Body("", embed=True),
     region_label: str = Body("", embed=True),
     live: Optional[bool] = Body(None, embed=True),
@@ -721,7 +723,7 @@ async def activity_batch(
     """启动一批活动管理作业，返回 job_id；进度经 /activity/batch/{job_id}/events (SSE) 消费。
 
     cloud_url 为在线成本表分享链接，sheet 为工作表名；excel 兼容旧客户端传链接。
-    dry_run 默认 True；开始前重新读取所选 SPU 的云端价格。
+    dry_run 默认 False（正式执行）；开始前重新读取所选 SPU 的云端价格。
     live 显式给定时用它分半程/全程：live=False 只开提报页填价（不提交、不真开关流量），
     live=True 真提交；不给则沿用旧口径 live=not dry_run（dry-run 恒不执行）。
     selection 是识别矩阵勾选的 [[spu, 活动名], ...]：只报这些格子，没勾的 SPU 连流量都不动。
@@ -823,20 +825,63 @@ async def activity_matrix_get(cloud_url: str = "", sheet: str = "", day: str = "
     """回读当天识别矩阵（不连 CDP、不读成本表）：刷新页面后矩阵与资格仍在。
 
     fresh=False 表示文件里的文档/工作表与本次请求的不是同一份，前端应提示重新识别。
+    cells 逐格注 activity_history 的上次报名结论（best-effort，查不到为 None），
+    刷新页面后历史徽标不丢。
     """
+    from app.activity import history as activity_history
     from app.activity import matrix as matrix_store
 
     data = matrix_store.load(day)
+    cells = matrix_store.flatten_cells(data)
+    history_map = await activity_history.summarize(
+        sorted({str(cell.get("spu")) for cell in cells if cell.get("spu")}))
+    for cell in cells:
+        cell["history"] = ((history_map.get(str(cell.get("spu"))) or {})
+                           .get("activities") or {}).get(cell.get("activity"))
     return {
         "day": data["day"], "generated_at": data.get("generated_at", ""),
         "document": data.get("document", ""), "sheet": data.get("sheet", ""),
         "region": data.get("region", ""), "activities": data.get("activities", []),
-        "cells": matrix_store.flatten_cells(data), "counts": data.get("counts", {}),
+        "cells": cells, "counts": data.get("counts", {}),
         "path": matrix_store.matrix_path(data["day"]),
         "fresh": bool(data.get("activities"))
         and (not cloud_url or data.get("document") == cloud_url)
         and (not sheet or data.get("sheet") == sheet),
     }
+
+
+@app.get("/activity/history")
+async def activity_history_get(spu: str = "", spus: str = "", activity: str = "",
+                               kind: str = "", limit: int = 200):
+    """查活动历史（activity_history 表）：SPU 时间线 / 按活动 / 按类型过滤。
+
+    spus 是 CSV（与 spu 二选一，spu 优先）；kind ∈ enroll|accel_close|accel_open。
+    返回 {"enabled", "rows", "error"?}：enabled=false 表示历史库连接参数没配上
+    （[activity_history] 与 [error_report] 都没有）；error 存在表示查询暂不可用
+    （前端如实提示，不装成「从没搞过活动」）。
+    """
+    from app.activity import history as activity_history
+
+    spu_list = [s.strip() for s in (spus or "").split(",") if s.strip()]
+    return await activity_history.query(
+        spu=spu.strip(), spus=spu_list, activity=activity.strip(),
+        kind=kind.strip(), limit=limit,
+    )
+
+
+@app.get("/activity/history_summary")
+async def activity_history_summary_get(spus: str = ""):
+    """批量取活动历史摘要（按 SPU 归并）：WPS 商品库列表的「活动·流量」列专用。
+
+    spus 是 CSV。与 /activity/history（原始时间线）的分工：那里给逐条记录查询，
+    这里给「每 SPU 一行摘要」（每活动最新结论 + 最近一次开/关流量），归并口径
+    与运行时注入同一份，列表看到的和管线决策依据一致。error 存在表示查询暂
+    不可用，前端如实提示，不装成「这些商品没搞过活动」。
+    """
+    from app.activity import history as activity_history
+
+    spu_list = [s.strip() for s in (spus or "").split(",") if s.strip()]
+    return await activity_history.summarize_for_display(spu_list)
 
 
 @app.post("/activity/batch/{job_id}/pause")

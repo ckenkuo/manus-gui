@@ -14,7 +14,7 @@ from app.activity.control import ActivityControl
 
 @pytest.fixture(autouse=True)
 def fast_log_retries(monkeypatch):
-    monkeypatch.setattr(service, "LOG_VERIFY_RETRY_DELAY", 0)
+    monkeypatch.setattr(service, "LOG_VERIFY_RETRY_DELAYS", (0, 0, 0))
 
 
 class FakePage:
@@ -106,20 +106,32 @@ def test_activity_page_has_recognition_matrix_and_pause_controls():
     assert "半程（填价不提交）" in html and "全程（正式提交）" in html
 
 
-def test_activity_log_search_waits_for_repaint_and_uses_editable_field():
-    """报名记录页首屏加载后可能重绘；搜索 marker 必须按可编辑 placeholder 重试。
+def test_activity_log_full_fetch_groups_locally_and_fail_closed():
+    """报名记录页平台搜索已失效（2026-09-30 实测搜 SPU/goodsId/商品名全 0）：
+    改为拉全量分页、本地按 productId 分组；全量不完整时所有 SPU 均 fail-closed。"""
+    source = __import__("inspect").getsource(pipeline.read_activity_log_records)
+    # 新路线：开页等列表接口首响应 + 翻页拉全量，不再操作 SPU 搜索框
+    assert '"/marketing/enroll/list" in response.url' in source
+    assert "_MARK_ACTIVITY_LOG_SPU_JS" not in source
 
-    （原先这里会先点顶栏「全球」再查询，那是区域切换器、点了会跨域跳转，已移除；
-    重绘等待仍要保留——页面首屏本身就有重绘。）
-    """
-    script = pipeline._MARK_ACTIVITY_LOG_SPU_JS
+    item_a = {"productId": 111, "activityThematicName": "活动A", "enrollStatus": 4}
+    item_b = {"productId": 222, "activityThematicName": "活动B", "enrollStatus": 6}
+    item_other = {"productId": 999, "activityThematicName": "活动C", "enrollStatus": 4}
 
-    assert "多个|空格|逗号" in script
-    assert "重绘成" in script
-    assert "labelRect" in script
-    assert "for _ in range(12)" in __import__("inspect").getsource(
-        pipeline.read_activity_log_records
-    )
+    collected_ok = {"complete": True, "page_size": 10, "error": None}
+    records, queries = pipeline._group_log_items_by_spu(
+        [item_a, item_b, item_other], ["111", "222", "333"], collected_ok)
+    assert {q["spu"]: q["total"] for q in queries} == {"111": 1, "222": 1, "333": 0}
+    # 查询完整但确实没记录（333）：total=0 且 complete=True——与「查询不完整」分开
+    assert all(q["complete"] for q in queries)
+    assert [(r["spu"], r["activity"]) for r in records] == [("111", "活动A"), ("222", "活动B")]
+
+    # 全量不完整：所有 SPU 一并 fail-closed，哪怕本地已匹配到记录
+    collected_bad = {"complete": False, "page_size": 10, "error": "翻页失败"}
+    _, queries_bad = pipeline._group_log_items_by_spu(
+        [item_a], ["111", "333"], collected_bad)
+    assert [q["complete"] for q in queries_bad] == [False, False]
+    assert queries_bad[0]["error"] == "翻页失败"
 
 
 def test_site_notification_panel_closer_is_scoped_to_all_messages():
@@ -297,15 +309,22 @@ def test_connect_pages_ignores_existing_tabs_and_opens_owned_tabs(monkeypatch):
     assert len(context.pages) == 4
 
 
-def _plan(spu, activities, accel_will_close, sale=46.5, accel_state=None):
+def _plan(spu, activities, accel_will_close, sale=46.5, accel_state=None, discount=0.7,
+          daily=None):
     """构造一条规划遍结果（status=done）。activities: [(名, 申报价)]。sale=销售底价（重开
-    加速器时加速价=sale+1）。单货号：label 固定「默认」，执行层只认 skus/sku_prices 列表。"""
+    加速器时加速价至少 sale+1）。单货号：label 固定「默认」，执行层只认 skus/sku_prices 列表。
+    discount=成本表折扣列（定加速档位）：默认 0.7 → 超级档，加速价=max(sale+1,
+    底价折扣价÷0.9 向上取整)；sale=46.5 时 46.5×0.7=32.55→÷0.9=36.17 < 47.5，断言
+    仍落在 sale+1 上。discount=None 表示折扣列读不到（discount_missing）。
+    daily=日常价，缺省与 sale 同值（要验证「最低折扣价÷0.9 抬过底价+1」时才传更大的）。"""
     if accel_state is None:
         accel_state = "on" if accel_will_close else "off"
-    sku = {"label": "默认", "daily": sale, "sale": sale}
+    sku = {"label": "默认", "daily": daily if daily is not None else sale,
+           "sale": sale, "discount": discount}
     return {
         "spu": spu, "status": "done", "accel_will_close": accel_will_close,
         "accel_state": accel_state,
+        "discount_missing": discount is None,
         "skus": [{**sku, "purchase": ""}],
         "enrolled_activities": [
             {"activity": n, "sku_prices": [{**sku, "submit_price": p}]}
@@ -367,9 +386,10 @@ def _run(results, live, monkeypatch, runtime_states=None, control=None, as_task=
             return dict(close_result)
         return {"state": "on", "closed": allow, "note": "半程" if not allow else "已停止"}
 
-    async def fake_open(page, spu, allow=False, accel_prices=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open"].append((spu, allow))
         calls.setdefault("open_price", []).append((spu, accel_prices))
+        calls.setdefault("open_tier", []).append((spu, tier))
         if open_result is not None:
             return dict(open_result)
         return {"state": "off", "opened": allow, "note": ""}
@@ -384,8 +404,9 @@ def _run(results, live, monkeypatch, runtime_states=None, control=None, as_task=
         calls["fill"].append((page.tag, spu, act, sku_prices, allow_submit))
         return {"filled": True, "submitted": False, "note": ""}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         calls["submit"].append((page.tag, allow))
+        calls.setdefault("submit_expected", []).append((page.tag, allow, expected_spus))
         return {"submitted": allow, "note": "已提交" if allow else "半程"}
 
     async def fake_read_log(_context, _spus):
@@ -429,21 +450,24 @@ def _run(results, live, monkeypatch, runtime_states=None, control=None, as_task=
 
 
 def test_groups_by_activity_across_spus(monkeypatch):
-    """两个 SPU 都报同一活动 A，另有活动 B：A 应只开一次提报页、填两次、提交一次。"""
+    """两个 SPU 都报同一活动 A，另有活动 B：逐 SPU 开页、填完立即单独提交（2026-10-03 起
+    废弃活动末统一提交——提报页每次搜索都重渲结果表格，上一 SPU 的勾选随旧行卸载）。"""
     results = [
         _plan("111", [("活动A", 10.0), ("活动B", 20.0)], accel_will_close=False),
         _plan("222", [("活动A", 11.0)], accel_will_close=False),
     ]
     summary, events, calls = _run(results, live=True, monkeypatch=monkeypatch)
-    # A、B 各开一次提报页
-    assert calls["open_page"] == ["活动A", "活动B"]
+    # 逐 SPU 一张干净提报页：活动A 开两次（111、222 各一），活动B 开一次
+    assert calls["open_page"] == ["活动A", "活动A", "活动B"]
     # 活动A 填两次（111、222），活动B 填一次（111）
     a_fills = [c for c in calls["fill"] if c[2] == "活动A"]
     b_fills = [c for c in calls["fill"] if c[2] == "活动B"]
     assert {c[1] for c in a_fills} == {"111", "222"}
     assert {c[1] for c in b_fills} == {"111"}
-    # 每活动提交一次
-    assert len(calls["submit"]) == 2
+    # 每 SPU 填完立即单独提交：共 3 次提交，不再按活动统一提交
+    assert len(calls["submit"]) == 3
+    # 每次提交都带 expected_spus（提交前勾选核对 + 结果页数量对账）
+    assert all(c[2] for c in calls["submit_expected"])
 
 
 def test_live_reads_activity_log_baseline_before_enrollment(monkeypatch):
@@ -468,7 +492,7 @@ def test_each_enroll_page_closed_after_activity(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "off", "closed": True, "note": ""}
 
-    async def fake_open(page, spu, allow=False, accel_prices=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None, tier="super"):
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
@@ -482,7 +506,7 @@ def test_each_enroll_page_closed_after_activity(monkeypatch):
         assert page.closed is False
         return {"filled": True, "submitted": False, "note": ""}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         assert page.closed is False  # 提交时页仍开着
         return {"submitted": allow, "note": ""}
 
@@ -766,7 +790,7 @@ def test_over_ref_recorded_as_failed(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "off", "closed": True, "note": "no-op"}
 
-    async def fake_open(page, spu, allow=False, accel_prices=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None, tier="super"):
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
@@ -779,7 +803,7 @@ def test_over_ref_recorded_as_failed(monkeypatch):
                 "ref_price": 47.31,
                 "note": f"申报价 {sku_prices[0]['submit_price']} 高于提报页参考价 47.31（疑 Excel 日常价与前端实际售价不一致）"}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         return {"submitted": False, "note": "无已填 SPU"}
 
     monkeypatch.setattr(service.pipeline, "close_accel", fake_close)
@@ -817,7 +841,7 @@ def test_empty_fill_skips_submit(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "off", "closed": True, "note": "no-op"}
 
-    async def fake_open(page, spu, allow=False, accel_prices=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None, tier="super"):
         return {"state": "off", "opened": allow, "note": ""}
 
     async def fake_open_page(activity_page, name, timeout_s=25):
@@ -827,7 +851,7 @@ def test_empty_fill_skips_submit(monkeypatch):
                           discount_rate=None):
         return {"filled": False, "submitted": False, "note": "搜索后定位行数=0（非唯一），保守跳过"}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         submit_called.append(allow)
         return {"submitted": allow, "note": ""}
 
@@ -868,11 +892,11 @@ def test_first_activity_rpa_failure_continues_scanning_without_open(monkeypatch)
         return {"filled": False, "submitted": False, "failed_step": "query",
                 "note": "查询结果为 0 行"}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         calls["submit"].append(allow)
         return {"submitted": allow, "note": ""}
 
-    async def fake_open_accel(page, spu, allow=False, accel_prices=None):
+    async def fake_open_accel(page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -913,13 +937,13 @@ def test_unverified_submit_uses_log_and_continues(monkeypatch):
                           discount_rate=None):
         return {"filled": True, "detail_eligible": True, "note": "已填价"}
 
-    async def fake_submit(_page, allow=False):
+    async def fake_submit(_page, allow=False, expected_spus=None):
         return {
             "submitted": True, "verified": False,
             "note": "已点击提交并确认，未捕获明确结果提示",
         }
 
-    async def fake_open_accel(_page, spu, allow=False, accel_prices=None):
+    async def fake_open_accel(_page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -962,10 +986,10 @@ def test_success_feedback_without_log_record_fails_after_full_scan(monkeypatch):
                           discount_rate=None):
         return {"filled": True, "detail_eligible": True, "note": "已填价"}
 
-    async def fake_submit(_page, allow=False):
+    async def fake_submit(_page, allow=False, expected_spus=None):
         return {"submitted": True, "verified": True, "note": "报名成功"}
 
-    async def fake_open_accel(_page, spu, allow=False, accel_prices=None):
+    async def fake_open_accel(_page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -1010,11 +1034,11 @@ def test_detail_ineligible_skips_activity_and_continues(monkeypatch):
                     "note": "详情页查询结果为 0"}
         return {"filled": True, "submitted": False, "detail_eligible": True, "note": ""}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         calls["submit"].append((page.tag, allow))
         return {"submitted": allow, "note": "已点击提交"}
 
-    async def fake_open_accel(page, spu, allow=False, accel_prices=None):
+    async def fake_open_accel(page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open_accel"].append(spu)
         return {"opened": allow, "note": ""}
 
@@ -1053,7 +1077,7 @@ def test_enroll_exception_still_reopens(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "on", "closed": allow, "note": "已停止"}
 
-    async def fake_open(page, spu, allow=False, accel_prices=None):
+    async def fake_open(page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open"].append((spu, allow, accel_prices))
         return {"state": "off", "opened": allow, "note": ""}
 
@@ -1242,23 +1266,25 @@ def test_close_request_captures_cooldown_toast():
     assert "24小时" in result["message"]
 
 
-def test_super_tier_selector_supports_image_label_cards():
-    """档位名画进背景图时，仍按三张价格卡从左到右选择最右侧超级档。"""
-    selector = pipeline._SELECT_SUPER_TIER_JS
+def test_tier_selector_supports_image_label_cards():
+    """档位名画进背景图时，按三张价格卡从左到右的位置序（普通/高级/超级 = 0/1/2）选档。"""
+    selector = pipeline._SELECT_TIER_JS
     assert "对应申报价格" in selector
     assert "getComputedStyle(node).cursor === 'pointer'" in selector
     assert "cards.length >= 3" in selector
-    assert "cards[cards.length - 1].node.click()" in selector
+    assert "cards[Math.min(pos, cards.length - 1)].node.click()" in selector
 
 
-def test_select_super_tier_waits_for_async_cards(monkeypatch):
+def test_select_tier_waits_for_async_cards(monkeypatch):
     """抽屉先打开、档位卡后挂载时，轮询到第三次再成功。"""
     class FakeTierPage:
         def __init__(self):
             self.calls = 0
+            self.args_seen = []
 
-        async def evaluate(self, _script):
+        async def evaluate(self, _script, args=None):
             self.calls += 1
+            self.args_seen.append(args)
             return self.calls == 3
 
     async def no_wait(_seconds):
@@ -1266,10 +1292,11 @@ def test_select_super_tier_waits_for_async_cards(monkeypatch):
 
     page = FakeTierPage()
     monkeypatch.setattr(pipeline.asyncio, "sleep", no_wait)
-    selected = asyncio.run(pipeline._select_super_tier(page, tries=4))
+    selected = asyncio.run(pipeline._select_tier(page, "super", tries=4))
 
     assert selected is True
     assert page.calls == 3
+    assert page.args_seen[0] == ["超级", 2]  # (档名文字, 位置序号)
 
 
 def test_open_accel_retries_same_final_button(monkeypatch):
@@ -1322,7 +1349,7 @@ def _patch_open_accel_full_path(monkeypatch, feedback, read_states):
     async def fake_click_marked(_page):
         return True
 
-    async def fake_select_super(_page, tries=6):
+    async def fake_select_tier(_page, _tier, tries=6):
         return True
 
     async def fake_set_prices(_page, _accel_prices):
@@ -1342,7 +1369,7 @@ def _patch_open_accel_full_path(monkeypatch, feedback, read_states):
 
     monkeypatch.setattr(pipeline, "dismiss_all_page_popups", fake_dismiss)
     monkeypatch.setattr(pipeline, "read_accel_state", fake_read)
-    monkeypatch.setattr(pipeline, "_select_super_tier", fake_select_super)
+    monkeypatch.setattr(pipeline, "_select_tier", fake_select_tier)
     monkeypatch.setattr(pipeline, "_set_accel_prices", fake_set_prices)
     monkeypatch.setattr(pipeline, "_click_marked", fake_click_marked)
     monkeypatch.setattr(pipeline, "_click_first_button", fake_click_first)
@@ -1365,7 +1392,7 @@ def test_open_accel_retries_whole_flow_until_confirmed(monkeypatch):
     ])
     calls = []
 
-    async def fake_once(_page, spu, allow=False, accel_prices=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None, tier="super"):
         calls.append((spu, allow, accel_prices))
         return dict(next(outcomes))
 
@@ -1392,7 +1419,7 @@ def test_open_accel_retry_is_idempotent_when_already_on(monkeypatch):
     """
     calls = []
 
-    async def fake_once(_page, spu, allow=False, accel_prices=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None, tier="super"):
         calls.append(spu)
         return {"opened": True, "precheck_state": "on", "note": "本就在加速中，无需开启（no-op）"}
 
@@ -1407,7 +1434,7 @@ def test_open_accel_retry_is_idempotent_when_already_on(monkeypatch):
 
 def test_open_accel_reports_failure_after_exhausting_retries(monkeypatch):
     """三轮都未确认成功时，如实报失败并在 note 标注已重试次数。"""
-    async def fake_once(_page, spu, allow=False, accel_prices=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None, tier="super"):
         return {"opened": False, "note": "未捕获成功提示且回查流量页状态非加速中"}
 
     async def no_wait(_seconds):
@@ -1429,7 +1456,7 @@ def test_open_accel_half_run_does_not_retry(monkeypatch):
     """半程 allow=False：不真开、opened 恒 False，整轮重试无意义，只跑一次。"""
     calls = []
 
-    async def fake_once(_page, spu, allow=False, accel_prices=None):
+    async def fake_once(_page, spu, allow=False, accel_prices=None, tier="super"):
         calls.append((spu, allow))
         return {"opened": False, "note": "半程：未点「立即加速」（allow=False）"}
 
@@ -1558,6 +1585,82 @@ def test_open_accel_success_toast_with_unreadable_state_falls_back_to_toast(monk
     assert "平台生效有延迟" in result["note"]
 
 
+# ---- 加速器三档与限流（用户规则 2026-09-29）--------------------------------------
+
+@pytest.mark.parametrize("discount,tier", [
+    (0.7, "super"), (0.75, "super"), (0.6, "super"),      # 75折及以下 → 超级档
+    (0.85, "normal"),                                      # 85折 → 普通档
+    (0.8, "advanced"), (0.9, "advanced"), (0.95, "advanced"),  # 其余按区间就近 → 高级档
+    (None, None), (0, None), (1.5, None), ("", None),      # 读不到/越界 → None（fail-closed）
+])
+def test_accel_tier_for_discount(discount, tier):
+    assert pipeline.accel_tier_for_discount(discount) == tier
+
+
+def test_open_accel_does_not_retry_throttled(monkeypatch):
+    """限流是平台状态（确定性），外层整轮重试无意义——与 match_failed 一样直接返回。"""
+    calls = []
+
+    async def fake_once(_page, spu, allow=False, accel_prices=None, tier="super"):
+        calls.append(spu)
+        return {"opened": False, "throttled": True, "note": "商品限流，只做活动报名"}
+
+    monkeypatch.setattr(pipeline, "_open_accel_once", fake_once)
+    result = asyncio.run(
+        pipeline.open_accel(FakePage("flux"), "2879383652", allow=True,
+                            accel_prices=_accel_prices(47.5), tier="super", tries=3)
+    )
+    assert result["throttled"] is True
+    assert len(calls) == 1
+
+
+def test_discount_missing_keeps_traffic_untouched(monkeypatch):
+    """折扣列读不到 → 定不了档位与加速价：阶段一不关（关了开不回来是最严重的不可逆后果），
+    阶段三不开；活动照常报名。逐品结果不算失败，note 如实写「流量保持现状」。"""
+    results = [_plan("111", [("活动A", 10.0)], accel_will_close=True, discount=None)]
+    summary, events, calls = _run(results, live=True, monkeypatch=monkeypatch)
+
+    assert calls["close"] == []          # 没关
+    assert calls["open"] == []           # 也没开
+    assert calls["fill"]                 # 活动照常报名
+    close_ev = next(e for e in events if e["type"] == "exec_close")
+    assert close_ev["ok"] is False and "折扣列读不到" in close_ev["note"]
+    product = next(e for e in events if e["type"] == "exec_product_done")
+    assert product["status"] == "done"   # 活动报上了就算成，不算失败
+    assert product["accel_ok"] is True
+    assert "折扣列读不到" in product["note"]
+
+
+def test_super_tier_price_is_max_of_floor_plus_1_and_lowest_price_over_0_9(monkeypatch):
+    """超级档自定义价 = max(底价+1, 最低折扣价÷0.9 向上取整)：最低折扣价 = 日常价×折扣列
+    折扣率、向下取整到分。日常价100×0.7=70 → 70÷0.9=77.77…→77.78 > 底价+1=61，按 77.78 填。"""
+    results = [_plan("111", [("活动A", 70.0)], accel_will_close=True,
+                     daily=100.0, sale=60.0, discount=0.7)]
+    summary, _events, calls = _run(results, live=True, monkeypatch=monkeypatch)
+
+    assert calls["open_tier"] == [("111", "super")]
+    assert [(c[0], [p["price"] for p in c[1]]) for c in calls["open_price"]] == [("111", [77.78])]
+    assert "111" in summary["reopened"]
+
+
+def test_normal_tier_opens_without_custom_price(monkeypatch):
+    """85折 → 普通档：平台默认申报价、无自定义价入口，accel_prices=None 传给开启层。"""
+    results = [_plan("111", [("活动A", 10.0)], accel_will_close=True, discount=0.85)]
+    _summary, _events, calls = _run(results, live=True, monkeypatch=monkeypatch)
+
+    assert calls["open_tier"] == [("111", "normal")]
+    assert calls["open_price"] == [("111", None)]
+
+
+def test_advanced_tier_for_unnamed_discount(monkeypatch):
+    """未点名的折扣率按区间就近归档：9折/8折（及 >85 折的）都归高级档。"""
+    for discount in (0.9, 0.8, 0.95):
+        results = [_plan("111", [("活动A", 10.0)], accel_will_close=True, discount=discount)]
+        _summary, _events, calls = _run(results, live=True, monkeypatch=monkeypatch)
+        assert calls["open_tier"] == [("111", "advanced")]
+        assert calls["open_price"] == [("111", None)]
+
+
 def test_popup_closer_clicks_merchant_helper_button():
     """阶段入口只点击商家助手的关闭按钮，不依赖具体随机弹窗结构。"""
     class FakePopupPage:
@@ -1582,7 +1685,7 @@ def test_cooldown_close_does_not_block_enroll(monkeypatch):
     async def fake_close(page, spu, allow=False):
         return {"state": "on", "closed": False, "cooldown": True, "note": "未关闭：24小时冷却"}
 
-    async def fake_open(page, spu, allow=False):
+    async def fake_open(page, spu, allow=False, accel_prices=None, tier="super"):
         calls["open"].append(spu)
         return {"state": "on", "opened": True, "note": "no-op"}
 
@@ -1594,7 +1697,7 @@ def test_cooldown_close_does_not_block_enroll(monkeypatch):
         calls["fill"].append(spu)
         return {"filled": True, "submitted": False, "note": ""}
 
-    async def fake_submit(page, allow=False):
+    async def fake_submit(page, allow=False, expected_spus=None):
         calls["submit"].append(allow)
         return {"submitted": allow, "note": ""}
 
@@ -1653,7 +1756,9 @@ def test_selection_excludes_unchecked_cells_and_their_traffic(monkeypatch):
 
 def test_skip_cell_during_execution_records_without_submitting(monkeypatch):
     """执行中逐格跳过：该格不填价、本活动没有可提交商品 → 不提交；
-    且跳过不算失败（对账豁免、最终状态是 skip 不是 fail），否则会出假失败。"""
+    且跳过不算失败（对账豁免），否则会出假失败。本 SPU 初始 off、本批零提交，但记录页
+    显示活动A 已有生效报名 → 2026-09-30 起照常补开流量，故最终状态是 done（旧口径是
+    skip 且完全不碰流量）。跳过本身仍不是失败：它只是「本批不报这个活动」。"""
     results = [_plan("111", [("活动A", 10.0)], accel_will_close=False)]
     control = ActivityControl()
     control.request_skip("111", "活动A")
@@ -1671,7 +1776,10 @@ def test_skip_cell_during_execution_records_without_submitting(monkeypatch):
     assert summary["skipped_cells"] == [["111", "活动A"]]
     assert summary["failed"] == []           # 跳过不是失败
     assert summary["errors"] == []           # 也不进「报名记录未确认」
-    assert summary["product_results"][0]["status"] == "skip"
+    # 已有生效报名 → 补开流量；这条即使整批零提交也照样走
+    assert summary["opened_by_existing"] == {"111": ["活动A"]}
+    assert calls["open"] == [("111", True)]
+    assert summary["product_results"][0]["status"] == "done"
 
 
 def test_skip_is_refused_after_cell_filled(monkeypatch):
@@ -1861,9 +1969,10 @@ def test_open_accel_prechecks_by_spu_and_noops_when_already_on(monkeypatch):
     assert "无需开启" in result["note"]
 
 
-def test_open_accel_falls_back_to_enroll_entry_word(monkeypatch):
-    """加速器入口文案随商品状态变（真机实测 2026-09-24）：待开启是「立即开启」，
-    待关注是「报名流量加速器」。只认前者会让待关注的商品永远开不了流量。"""
+def test_throttled_product_is_not_opened_via_enroll_entry(monkeypatch):
+    """限流品的加速器列是「商品流量待关注 / 您可加速提效」+「报名流量加速器 / 调价提效」
+    （真机实测 2026-09-24）。用户 2026-09-29 定：这种品停止流量加速动作、只做活动报名——
+    「报名流量加速器」绝不能当开启入口点，入口只试「立即开启」。"""
     tried = []
 
     async def fake_dismiss(_page):
@@ -1876,7 +1985,9 @@ def test_open_accel_falls_back_to_enroll_entry_word(monkeypatch):
         async def evaluate(self, script, arg=None):
             if script is pipeline._MARK_ROW_ACTION_JS:
                 tried.append(arg[1])
-                return ("同高命中：报名流量加速器" if arg[1] == "报名流量加速器" else None)
+                return None  # 行内没有「立即开启」
+            if script is pipeline._ROW_TEXT_JS:
+                return "商品流量待关注 / 您可加速提效 / 报名流量加速器"
             return None
 
     monkeypatch.setattr(pipeline, "dismiss_all_page_popups", fake_dismiss)
@@ -1884,14 +1995,15 @@ def test_open_accel_falls_back_to_enroll_entry_word(monkeypatch):
 
     result = asyncio.run(pipeline._open_accel_once(FakeFlux(), "111", allow=False))
 
-    assert tried == ["立即开启", "报名流量加速器"]  # 按顺序试，命中即用
-    assert result["entry_word"] == "报名流量加速器"
-    assert "半程：已定位「报名流量加速器」" in result["note"]  # 半程不点（用户 2026-09-24 定的口径）
+    assert tried == ["立即开启"]  # 只认正常入口，绝不试「报名流量加速器」
+    assert result["throttled"] is True
+    assert result["opened"] is False
+    assert "限流" in result["note"]
 
 
 def test_open_accel_without_entry_reports_accel_column_text(monkeypatch):
-    """两个入口文案都没有时，note 要带上加速器列的现场文本：平台没给入口（如「商品流量待关注」）
-    和页面结构变了是两回事，只报「未定位到」操作者分不出来。"""
+    """「立即开启」没有、行文本也不是限流现场时，note 要带上加速器列的现场文本：
+    平台没给入口和页面结构变了是两回事，只报「未定位到」操作者分不出来。"""
     async def fake_dismiss(_page):
         return False
 
@@ -1903,7 +2015,7 @@ def test_open_accel_without_entry_reports_accel_column_text(monkeypatch):
             if script is pipeline._MARK_ROW_ACTION_JS:
                 return None
             if script is pipeline._ROW_TEXT_JS:
-                return "商品流量待关注 / 您可加速提效"
+                return "流量加速机会已用完"
             return None
 
     monkeypatch.setattr(pipeline, "dismiss_all_page_popups", fake_dismiss)
@@ -1911,8 +2023,9 @@ def test_open_accel_without_entry_reports_accel_column_text(monkeypatch):
 
     result = asyncio.run(pipeline._open_accel_once(FakeFlux(), "111", allow=False))
     assert "未定位到该行的加速器入口" in result["note"]
-    assert "商品流量待关注" in result["note"]
-    assert result["opened"] is False and result.get("entry_word") is None
+    assert "流量加速机会已用完" in result["note"]
+    assert result["opened"] is False and not result.get("throttled")
+    assert result.get("entry_word") is None
 
 
 def test_activity_rule_button_supports_non_dialog_fullscreen_layer():
@@ -2117,13 +2230,15 @@ def test_activity_log_pagination_collects_total_fourteen():
     }
     requested_pages = []
 
-    async def fetch_next(page_number):
-        requested_pages.append(page_number)
-        return {"total": 14, "list": [{"enrollId": index} for index in range(11, 15)]}
+    async def fetch_next(before_page):
+        # 2026-10-03 起 fetch_next 收「翻页前页码」、返回 (result, 实际到达页码)：
+        # beast 分页超窗口时下一页是跳页块，点击次数不等于页码。
+        requested_pages.append(before_page)
+        return {"total": 14, "list": [{"enrollId": index} for index in range(11, 15)]}, 2
 
     result = asyncio.run(pipeline._collect_activity_log_pages(first, fetch_next))
 
-    assert requested_pages == [2]
+    assert requested_pages == [1]
     assert result["expected_pages"] == 2 and result["pages_read"] == 2
     assert len(result["items"]) == 14 and result["complete"] is True
 
@@ -2863,13 +2978,15 @@ def test_activity_log_pagination_collects_total_fourteen():
     }
     requested_pages = []
 
-    async def fetch_next(page_number):
-        requested_pages.append(page_number)
-        return {"total": 14, "list": [{"enrollId": index} for index in range(11, 15)]}
+    async def fetch_next(before_page):
+        # 2026-10-03 起 fetch_next 收「翻页前页码」、返回 (result, 实际到达页码)：
+        # beast 分页超窗口时下一页是跳页块，点击次数不等于页码。
+        requested_pages.append(before_page)
+        return {"total": 14, "list": [{"enrollId": index} for index in range(11, 15)]}, 2
 
     result = asyncio.run(pipeline._collect_activity_log_pages(first, fetch_next))
 
-    assert requested_pages == [2]
+    assert requested_pages == [1]
     assert result["expected_pages"] == 2 and result["pages_read"] == 2
     assert len(result["items"]) == 14 and result["complete"] is True
 

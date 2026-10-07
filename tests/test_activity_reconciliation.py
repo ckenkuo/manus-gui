@@ -105,7 +105,7 @@ def test_other_spu_query_failure_does_not_invalidate_complete_spu():
 def reconcile(monkeypatch, baseline, responses):
     reader = AsyncMock(side_effect=responses)
     monkeypatch.setattr(pipeline, "read_activity_log_records", reader)
-    monkeypatch.setattr(service, "LOG_VERIFY_RETRY_DELAY", 0)
+    monkeypatch.setattr(service, "LOG_VERIFY_RETRY_DELAYS", (0, 0, 0))
     plans = [{"spu": "111", "accel_state": "off", "enrolled_activities": [
         {"activity": "活动A", "submit_price": 10},
     ]}]
@@ -142,7 +142,8 @@ def test_exit_is_not_hidden_by_baseline_and_blocks_success_outcome(monkeypatch):
 
 def test_repeated_page_is_incomplete_even_when_raw_count_matches_total():
     first = {"total": 2, "pageSize": 1, "list": [{"enrollId": 1}]}
-    next_page = AsyncMock(return_value={"total": 2, "list": [{"enrollId": 1}]})
+    # fetch_next 返回 (result, 实际到达页码)：第二页重复返回同一条记录
+    next_page = AsyncMock(return_value=({"total": 2, "list": [{"enrollId": 1}]}, 2))
     result = asyncio.run(pipeline._collect_activity_log_pages(first, next_page))
     assert result["complete"] is False
     assert "重复" in result["error"]
@@ -150,7 +151,7 @@ def test_repeated_page_is_incomplete_even_when_raw_count_matches_total():
 
 def test_total_change_and_missing_response_cannot_look_like_complete_query():
     first = {"total": 2, "pageSize": 1, "list": [{"enrollId": 1}]}
-    next_page = AsyncMock(return_value={"total": 1, "list": [{"enrollId": 2}]})
+    next_page = AsyncMock(return_value=({"total": 1, "list": [{"enrollId": 2}]}, 2))
     assert not asyncio.run(pipeline._collect_activity_log_pages(first, next_page))["complete"]
     with pytest.raises(ValueError, match="list/total"):
         asyncio.run(pipeline._collect_activity_log_pages({}, next_page))

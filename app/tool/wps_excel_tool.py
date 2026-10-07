@@ -89,6 +89,10 @@ _FIELD_RULES = [
     ("purchase", lambda t: _title_hits(t, ("采购价格", "采购价", "购入价格", "进货价")), "first"),
     ("weight", lambda t: _title_hits(t, ("重量",)), "first"),
     ("ros", lambda t: _title_hits(t, ("ros",), allow_prefix=False), "first"),
+    # 毛利率：活动管线按「毛利率最低的货号」定 SPU 可打的最低折扣（2026-09-29 起，
+    # 见 app/activity/service.py plan_spu_activities）。核心词必须带「毛利率」：
+    # _UNIT_TAILS 不认「率」尾巴，只写「毛利」会漏掉「毛利率」这种写法。
+    ("margin", lambda t: _title_hits(t, ("毛利", "毛利率")), "first"),
     ("note", lambda t: t == "备注", "last"),
 ]
 

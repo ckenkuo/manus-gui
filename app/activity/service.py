@@ -6,31 +6,42 @@ UI / CLI 共用入口，进度经【结构化回调】抛出——对标 app/col
 和 UI（app.py 的 /activity 接口）都调这里。进度以结构化事件（dict）经 on_progress 抛出，
 UI 直接走 SSE 渲染。
 
-判定逻辑：一个 SPU 可有多个货号行（合并单元格成本表，各自一套日常价/销售底价）；
-【全部货号】的申报价（各日常价×活动折扣率）都达到各自销售底价的活动才入选——提报页
-勾选是 SPU 级、无法只报部分货号，任一货号穿底价即淘汰整个活动。一个 SPU 可报多个活动。
-商品实时采购，不读取库存、不按库存门槛初筛；平台详情资格检查仍保留。无需 LLM 选活动。
+判定逻辑：一个 SPU 可有多个货号行（合并单元格成本表，各自一套日常价/销售底价/毛利率）；
+报名是 SPU 级（提报页勾选无法只报部分货号），门槛也按 SPU 级定——取【毛利率最低】的
+货号，其 底价÷日常价 即该 SPU 能打的最低折扣，活动折扣率 ≥ 它才入选（精确比较不打折
+到分，2026-09-29 用户改定；旧规则「全部货号申报价都达底价」被截断误差误杀过，见
+plan_spu_activities）。一个 SPU 可报多个活动。商品实时采购，不读取库存、不按库存门槛
+初筛；平台详情资格检查仍保留。无需 LLM 选活动。
 
 最高优先级安全约束（真实商家账号、操作不可逆）：
-- 默认 dry-run 只生成计划；正式执行需要 dry_run=False 且 live=True。
-- 云端价格无效时中止；无全部货号达底价的活动时 skip_nomatch。
+- 默认【正式执行】：dry_run 默认 False，只有调用方显式要求才有 dry-run 只读计划
+  （2026-09-30 用户改定，此前默认 dry-run）。不可逆动作仍靠前端二次确认 + live 档位把关。
+- 云端价格无效时中止；无活动达到该 SPU 门槛（最低毛利货号可打折扣）时 skip_nomatch。
 - 报名成功由本次提交、完整前后快照和最新有效报名记录共同确认，历史成功不补作本次成功。
 
 事件契约（on_progress 收到的 dict，均含 "type"）：
+    # live=True 批次的关键事件（exec_close/exec_log_verify/exec_reopen/exec_done）由
+    # app/activity/history.py 的切面落 MySQL 的 activity_history 表（[activity_history]
+    # 配置，best-effort）；历史摘要经 history.summarize 注入 product_plan/product_done/
+    # scan_start 的 history 字段（无历史/未启用为 None）。
     {"type":"batch_start","total":int,"todo":int,"batch":int,"dry_run":bool}
     {"type":"product_start","index":int,"total":int,"spu":str,"name":str}
-    # product_plan：一个 SPU 会发多条（每个全部货号达底价的活动一条）；skus 是逐货号
-    # 明细（权威价格），daily_price/sale/submit_price/cost 是单货号兼容字段（多货号置 None）
+    # product_plan：一个 SPU 会发多条（每个折扣率达门槛的活动一条）；skus 是逐货号
+    # 明细（权威价格），daily_price/sale/submit_price/cost 是单货号兼容字段（多货号置 None）。
+    # history 是该 SPU×活动上次报名结论 {status,ok,submit_price,at}（无历史为 None）。
     {"type":"product_plan","spu":str,"activity":str,
                            "skus":[{"label":str,"daily":float,"sale":float,"submit_price":float}],
                            "sku_count":int,
                            "daily_price":float|None,"sale":float|None,
                            "cost":float|None,"submit_price":float|None,"within_floor":bool,
                            "stock":None,"min_stock":int|None,"stock_ok":None,"stock_policy":"on_demand",
-                           "selected":bool,"reason":str}
+                           "selected":bool,"reason":str,"history":dict|None}
+    # product_done：last_accel_open_at/accel_open_within_24h 是历史上次成功开启加速器的
+    # 时间（无历史为 None/False），供前端画「24h 内开启过，关闭可能撞锁定期」预警。
     {"type":"product_done","spu":str,"status":"done"|"skip_nofloor"|"skip_nomatch"|"fail",
                            "accel_closed":bool,"enrolled":bool,"submit_price":float|None,
-                           "enrolled_activities":list,"accel_reopened":bool,"verified":bool,"note":str}
+                           "enrolled_activities":list,"accel_reopened":bool,"verified":bool,
+                           "last_accel_open_at":str|None,"accel_open_within_24h":bool,"note":str}
     {"type":"batch_done","done":int,"skip":int,"fail":int,"dry_run":bool,"live":bool}
     {"type":"aborted","reason":str}
     {"type":"log","level":"info"|"warning"|"error","message":str}
@@ -41,7 +52,7 @@ UI 直接走 SSE 渲染。
     {"type":"exec_close","spu":str,"ok":bool,"live":bool,"note":str}       # 关流量
     {"type":"exec_rpa_step","activity":str,"spu":str|None,
                             "step":"open_activity"|"input_spu"|"query"|"select_product"|
-                                   "set_sessions"|"fill_price"|"submit",
+                                   "set_sessions"|"fill_price"|"fill_stock"|"submit",
                             "ok":bool,"note":str}
     {"type":"exec_activity_skip","activity":str,"spu":str,
                                 "reason":"detail_ineligible","note":str}
@@ -49,11 +60,15 @@ UI 直接走 SSE 渲染。
     #            已跳过未报名；ref_price 为读到的参考价上限。
     {"type":"exec_fill","activity":str,"spu":str,"ok":bool,"submit_price":float,
                         "over_ref":bool,"ref_price":float|None,"note":str}  # 提报页填价
+    # exec_enroll：活动级汇总（2026-10-03 起活动内逐 SPU 开页+填完立即单独提交——提报页
+    #            搜索会重渲结果表格丢勾选，统一提交必然丢单）；filled=填价成功的 SPU，
+    #            submitted/clicked_submit=是否所有/任一已填 SPU 提交成功，最终成败看 exec_log_verify。
     {"type":"exec_enroll","activity":str,"ok":bool,"submitted":bool,"verified":bool,
-                          "filled":list,"live":bool,"note":str}     # 单活动提交
+                          "filled":list,"live":bool,"note":str}     # 单活动逐 SPU 提交汇总
     {"type":"exec_log_verify","activity":str,"spu":str,"ok":bool,
                               "status":str,"note":str}               # 报名记录页最终对账
-    {"type":"exec_reopen","spu":str,"ok":bool,"live":bool,"note":str}      # 重开流量
+    {"type":"exec_reopen","spu":str,"ok":bool,"live":bool,
+                          "tier":"normal"|"advanced"|"super"|None,"throttled":bool,"note":str}  # 重开流量
     {"type":"exec_product_done","spu":str,"status":"done"|"skip"|"fail"|"preview",
                                "planned":int,"submitted":int,"ineligible":int,
                                "skipped":int,"accel_ok":bool,"note":str}
@@ -63,6 +78,7 @@ UI 直接走 SSE 渲染。
                         "failed":list,"skipped_cells":[[spu,activity]],"product_results":list}
     # 识别扫描（scan_activity_matrix，只读）：
     # scan_start 一次发全骨架（价格判定是本地算的、零成本），矩阵整体先出现，资格再逐格点亮。
+    # cells 元素另带 history 字段（该格上次报名结论 dict|None，只进事件不进矩阵落盘文件）。
     {"type":"scan_start","day":str,"spu_total":int,"activity_total":int,"cached":int,"path":str,
                         "activities":list,"cells":list,"counts":dict}
     {"type":"scan_activity_start","activity":str,"index":int,"total":int,"probe_count":int}
@@ -87,8 +103,8 @@ from typing import Optional
 
 from playwright.async_api import async_playwright
 
-from app.activity import pipeline, source
-from app.activity.reconciliation import assess_registration
+from app.activity import history, pipeline, source
+from app.activity.reconciliation import active_registration, assess_registration
 # 复用采集 service 已实测的 CDP 护栏 / 进度回调 / LLM token 清零，避免重复实现。
 from app.collect.service import CDP_URL, _emit, ensure_cdp_alive, reset_pipeline_llms
 from app.config import PROJECT_ROOT, get_config_section
@@ -98,7 +114,11 @@ from app.logger import logger
 # 单 SPU 超时护栏（秒）：阶段1 只有只读 + 1 次 LLM，给足余量即可。
 ACTIVITY_PRODUCT_TIMEOUT = 180
 LOG_VERIFY_TRIES = 3
-LOG_VERIFY_RETRY_DELAY = 2
+# 复查间隔递增退避（第 N 次复查前睡 LOG_VERIFY_RETRY_DELAYS[min(N-1, 末位)]）：
+# 批次末尾的对账常落在平台限流窗口里（响应慢→分页组件加载态长），固定 2s 会让三次复查
+# 全撞同一窗口（2026-10-03 批次「total=78 只拉到 4/8 页 → 19 个成功报名误判 not_verified」
+# 的教训）；递增拉开才有机会落到窗口外。
+LOG_VERIFY_RETRY_DELAYS = (5, 15, 30)
 # 全局默认毛利率红线（config.toml [activity] 缺失时兜底）。
 _FALLBACK_MIN_MARGIN = 0.15
 
@@ -233,6 +253,11 @@ async def _connect_pages(cdp_url: str, region_label: str = "", need_flux: bool =
         raise
 
 
+def _rate_text(rate) -> str:
+    """折扣率 → 折文案：0.85 → "8.5折"、0.9 → "9折"（去掉多余的 0）。"""
+    return f"{round(float(rate) * 10, 2):g}折"
+
+
 def plan_spu_activities(items: list, activities: list) -> dict:
     """纯本地：给定「已校验的逐货号价格」与「活动列表」，算出该 SPU 对每个活动的价格判定。
 
@@ -243,11 +268,34 @@ def plan_spu_activities(items: list, activities: list) -> dict:
 
     返回 {"selected": [...], "cells": {活动名: cell}, "rejected": [str]}：
     - selected：入选活动的执行计划（与旧 enrolled_activities 元素同形，下游零改动）；
-    - cells：全量格子，verdict 取 pass/under_floor/no_rate，note 与淘汰原因同文案；
+    - cells：全量格子，verdict 取 pass/under_floor/no_rate/no_cost，note 与淘汰原因同文案；
     - rejected：淘汰原因片段（保持旧格式，供 skip_nomatch 的 note 用）。
-    判定规则（用户 2026-07-16 定）：申报价 = 日常价 × 活动折扣率，全部货号都 ≥ 各自销售底价才入选；
-    提报是 SPU 级、无法只报部分货号，故任一货号穿底即淘汰整个活动。
+
+    判定规则（用户 2026-09-29 改定）：报名是 SPU 级（提报页勾选无法只报部分货号），门槛
+    也按 SPU 级定——取【毛利率最低】的货号当门槛货号，其 底价÷日常价 就是该 SPU 能打的
+    最低折扣；活动折扣率 ≥ 它即入选（精确比较、不打折到分，见 pipeline.rate_reaches_floor）。
+    其它货号不再逐一票决：它们毛利更厚、折扣空间更大，门槛货号扛得住它们必然扛得住。
+    （2026-07-16 旧规则「全部货号申报价都达底价」在 2879383652×限时秒杀 上被 8 厘截断
+    误差误杀——底价就是按 85 折填的 160.548，截断后 160.54 < 160.548；且逐货号票决与
+    SPU 级报名维度本就不匹配。）
     """
+    # 门槛货号 = 毛利率最低者（min 按行序取第一个，同毛利率时取表内靠前的行，确定可复现）。
+    # 毛利率读不到就没法定门槛货号：fail-closed 全部格子 no_cost，绝不猜（source 层正常
+    # 已把这类 SPU 整组拦下，这里是给直接调用方的最后防线）。
+    if any(not isinstance(it.get("margin"), (int, float)) for it in items):
+        cells = {
+            act["name"]: {
+                "activity": act["name"], "verdict": "no_cost",
+                "discount_rate": act.get("discount_rate"), "min_stock": act.get("min_stock"),
+                "skus": [], "sku_count": 0, "submit_price": None, "floor_price": None,
+                "within_floor": False,
+                "note": "毛利率读不到，无法判定门槛货号（请核对成本表毛利列）",
+            }
+            for act in activities
+        }
+        return {"selected": [], "cells": cells, "rejected": []}
+    binding = min(items, key=lambda it: it["margin"])
+
     selected = []
     rejected = []
     cells = {}
@@ -263,7 +311,7 @@ def plan_spu_activities(items: list, activities: list) -> dict:
                 "note": "活动无固定折扣率（万人团/详见提报列表），无法确定性算价",
             }
             continue
-        # 逐货号算价：任一货号穿底价即淘汰整个活动（提报是 SPU 级，不能只报部分货号）。
+        # 逐货号算申报价（填价要用，截断口径不变）；门槛判定只看门槛货号（精确口径）。
         calcs = [(it, pipeline.compute_submit_price(it["daily"], dr, it["sale"]))
                  for it in items]
         sku_prices = [{
@@ -279,10 +327,10 @@ def plan_spu_activities(items: list, activities: list) -> dict:
             "floor_price": sku_prices[0]["sale"] if single else None,
             "within_floor": False, "note": "",
         }
-        under = [(it, c) for it, c in calcs if not c.get("within_floor")]
-        if under:
-            it, c = under[0]
-            note = f"活动「{name}」货号{it['label']} 申报价{c.get('submit_price')}<底价{it['sale']}"
+        if not pipeline.rate_reaches_floor(binding["daily"], dr, binding["sale"]):
+            note = (f"活动「{name}」{_rate_text(dr)} 低于该 SPU 可打的最低折扣 "
+                    f"{_rate_text(binding['sale'] / binding['daily'])}"
+                    f"（毛利率最低的货号{binding['label']}：底价{binding['sale']}÷日常价{binding['daily']}）")
             rejected.append(note)
             cells[name] = {**cell, "verdict": "under_floor", "note": note}
             continue
@@ -308,18 +356,21 @@ async def _process_one_spu(
     stock_map: Optional[dict] = None,
     cost_map: Optional[dict] = None,
     selection=None,
+    history_map: Optional[dict] = None,
 ) -> dict:
     """单 SPU 确定性流程（重构版），返回结果 dict（供上层生成 product_done 事件）。
 
-    2026-07-16 用户重定义判定：不再 LLM 选一个活动、不再用毛利率红线，改为【确定性筛选】——
-    遍历活动页全部活动，把「全部货号的申报价(=各日常价×活动折扣率)都 ≥ 各自销售底价
-    (WPS 销售价格列)」的活动全部列入报名计划。一个 SPU 可有多个货号行（合并单元格成本表），
-    提报页勾选是 SPU 级、无法只报部分货号，故任一货号穿底价即淘汰整个活动。
-    商品实时采购，库存不参与初筛。每个入选活动发一条 product_plan（带逐货号明细 skus）。
-    规划阶段不执行报名或切换流量。
-    保守跳过：任一货号日常价或销售底价读不到 → skip_nofloor；无任何活动入选 → skip_nomatch。
+    判定规则（2026-09-29 用户改定，唯一实现在 plan_spu_activities）：遍历活动页全部活动，
+    活动折扣率 ≥ 毛利率最低货号的「底价÷日常价」（该 SPU 能打的最低折扣）才列入报名计划。
+    一个 SPU 可有多个货号行（合并单元格成本表），提报页勾选是 SPU 级，故门槛也按 SPU 级
+    定、不再逐货号票决。商品实时采购，库存不参与初筛。每个入选活动发一条 product_plan
+    （带逐货号明细 skus）。规划阶段不执行报名或切换流量。
+    保守跳过：任一货号日常价/销售底价/毛利率读不到 → skip_nofloor；无活动入选 → skip_nomatch。
+    history_map：activity_history 的本批摘要（spu→上次结论），只用于给事件挂徽标数据。
     """
     spu = entry["spu"]
+    spu_history = (history_map or {}).get(spu) or {}
+    activity_history_map = spu_history.get("activities") or {}
     # 多商品串行时，每个商品开始前都清一次随机公告遮罩；只在业务弹窗出现前调用。
     await pipeline.dismiss_all_page_popups(flux_page)
     await pipeline.dismiss_all_page_popups(activity_page)
@@ -337,17 +388,19 @@ async def _process_one_spu(
         result.update(status="skip_nofloor", note="WPS 文档未找到该 SPU 的有效价格")
         return result
     # 防御性重解析（=开头公式拒判）：source 层已校验过，这里是最后一道，任一货号无效即整组跳过。
+    # 毛利率同价：门槛判定按毛利率最低货号（plan_spu_activities），读不到就没法定门槛。
     items = []
     for item in items_raw:
         daily = pipeline._to_number(item.get("daily"))
         sale_raw = str(item.get("sale", "")).strip()
         sale = None if (not sale_raw or sale_raw.startswith("=")) else pipeline._to_number(sale_raw)
-        if daily is None or sale is None:
+        margin = pipeline._to_number(str(item.get("margin", "")).strip().rstrip("%"))
+        if daily is None or sale is None or margin is None:
             result.update(status="skip_nofloor",
                           note=f"货号{item.get('label')}（第{item.get('row_number')}行）"
-                               f"的日常价或销售底价读不到，整组跳过")
+                               f"的日常价、销售底价或毛利率读不到，整组跳过")
             return result
-        items.append({**item, "daily": daily, "sale": sale})
+        items.append({**item, "daily": daily, "sale": sale, "margin": margin})
     # 成本仅展示：多货号各不相同，n>1 不下发单值（避免把某货号成本当成整个 SPU 的）。
     cost = pipeline._to_number(str(items[0].get("purchase", "")).strip().lstrip("=")) \
         if len(items) == 1 else None
@@ -386,17 +439,23 @@ async def _process_one_spu(
             "stock_ok": None,
             "stock_policy": "on_demand",
             "selected": picked,
-            "reason": ("全部货号申报价达底价；实时采购，不按库存筛选" if picked
+            "reason": ("活动折扣率达到门槛（毛利率最低货号可打的最低折扣）；实时采购，不按库存筛选" if picked
                        else "未勾选（本次只报识别矩阵里勾选的格子）"),
+            # 上次该 SPU×活动的报名结论（activity_history 摘要）；无历史/查不到为 None。
+            "history": activity_history_map.get(sel["activity"]),
         })
 
     result["enrolled_activities"] = enrolled
     result["accel_state"] = accel_state  # 供执行遍区分初始 on/off/unknown
     result["accel_will_close"] = accel_will_close  # 初始 on 才需先关
-    # 逐货号价格（含底价）：执行遍阶段三重开加速器时按各自底价+1 逐行设加速价。
+    # 折扣列只用于定加速器档位与加速价（用户规则 2026-09-29），读不到不连坐报名——
+    # 但执行遍会因此不动它的流量（定不了档就绝不乱开关）。
+    result["discount_missing"] = not any(
+        isinstance(it.get("discount"), (int, float)) for it in items)
+    # 逐货号价格（含底价/折扣列）：执行遍阶段三重开加速器时按折扣列定档、逐行设加速价。
     result["skus"] = [{
         "label": it["label"], "daily": it["daily"], "sale": it["sale"],
-        "purchase": it.get("purchase"),
+        "purchase": it.get("purchase"), "discount": it.get("discount"),
     } for it in items]
     if enrolled:
         result["submit_price"] = enrolled[0]["submit_price"]  # 兼容旧单值字段（多货号为 None）
@@ -405,7 +464,7 @@ async def _process_one_spu(
     if not enrolled:
         detail = "；".join(rejected[:2]) if rejected else "无固定折扣活动"
         result.update(status="skip_nomatch",
-                      note=f"没有全部货号都达底价的活动（{detail}）")
+                      note=f"没有折扣率达到该 SPU 门槛的活动（{detail}）")
         return result
 
     # 7. 计划可行（status=done，携带计划）。真正的变更在【执行遍】(_run_execution_phases) 里按
@@ -414,11 +473,14 @@ async def _process_one_spu(
     #    note 只按【勾选到的】活动写：全量 planned 里没勾的不算「将报名」，否则页面会说
     #    「将报名 4 个活动」而执行遍只跑 1 个（真机半程实测踩到）。
     parts = []
-    if picked_names and accel_will_close:
+    if picked_names and result["discount_missing"]:
+        # 定不了档就绝不乱动流量（执行遍阶段一/三有同一道闸），规划 note 必须同口径。
+        parts.append("成本表折扣列读不到，不动流量（只报活动）")
+    elif picked_names and accel_will_close:
         parts.append("将关加速器")
     if picked_names:
         parts.append(f"将报名 {len(picked_names)} 个活动：" + "、".join(picked_names))
-        if accel_state in {"on", "off"}:
+        if accel_state in {"on", "off"} and not result["discount_missing"]:
             parts.append("将开启加速器")
     else:
         parts.append("本次未勾选该商品的任何活动（不会报名，也不动它的流量）")
@@ -482,6 +544,10 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
         "submitted_attempts": {}, "scan_failures": [], "log_verification": {},
         "log_baseline": {}, "accel_checks": {},
         "reopened": [], "errors": [], "failed": [], "skipped_cells": [],
+        # 本批零提交、靠报名记录页的「已有生效报名」补开流量的 SPU（值=命中的活动名），
+        # 以及查过记录页但确实没有生效报名的 SPU——两者都要，前者决定开不开，后者写清
+        # 「为什么还是不开」。
+        "opened_by_existing": {}, "no_existing_registration": [],
     }
     if not plans:
         return summary
@@ -531,6 +597,18 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
                 })
                 continue
 
+            # 折扣列读不到 → 定不了加速档位与加速价，阶段三重开不了 → 阶段一也不关：
+            # 关掉再开不回来是本品最严重的不可逆后果。流量保持现状，活动照常报名。
+            if plan.get("discount_missing"):
+                note = "成本表折扣列读不到，无法确定加速档位与价格；不关流量（活动照常报名）"
+                plan["accel_will_close"] = False
+                summary["accel_checks"][spu] = {"state": current_state, "ok": False, "note": note}
+                await _emit(on_progress, {
+                    "type": "exec_close", "spu": spu, "ok": False, "live": live,
+                    "state": current_state, "already_off": False, "cooldown": False, "note": note,
+                })
+                continue
+
             await _emit(on_progress, {
                 "type": "exec_accel_step", "phase": "close", "step": "acting",
                 "spu": spu, "state": current_state,
@@ -566,7 +644,7 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
     if live:
         await _capture_activity_log_baseline(plans, activity_page, on_progress, summary)
 
-    # ---- 阶段二：按活动分组报名（每活动开一次提报页、逐 SPU 填价、一次提交）----
+    # ---- 阶段二：按活动分组报名（活动内逐 SPU 开页、填完立即单独提交）----
     # 【设计决策·用户确认 2026-07-17】关流量撞 24h 冷却（summary["cooldown"] 里的 SPU，关不掉）
     # 时，其报名【照常继续】——不因关流量失败而跳过。冷却只如实记录在 exec_close/summary，
     # 不拦截报名。故此处对全部 plans 分组，不排除 cooldown/关闭失败的 SPU。
@@ -607,9 +685,13 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
     # ---- 阶段三：开启流量 ----
     # 初始 on：仅关闭成功后重开；关闭失败/冷却时仍为 on，不重复操作。
     # 初始 off：业务允许先报名再开启，因此报名遍结束后也开启。
-    # 初始 unknown：保守不操作。加速价逐货号 = max(底价+1, 活动申报价÷0.9 向上取整)——
-    # 平台要求活动价 ≤ 加速价×0.9（活动是引流价，加速价没高出约 11% 活动就失效，用户规则
-    # 2026-09-28）；抬不进对话框上限的档由 pipeline 退填底价+1 并注明活动将失效（接收失效）。
+    # 初始 unknown：保守不操作。
+    # 档位与加速价按成本表「折扣」列定（用户规则 2026-09-29）：85折→普通档、9/8折→高级档
+    # （这两档用平台默认申报价，无自定义价入口）、75折及以下→超级档（自定义价=逐货号
+    # max(底价+1, 最低折扣价÷0.9 向上取整)，与平台「活动价 ≤ 加速价×0.9」同向；抬不进对话框
+    # 上限的档由 pipeline 退填底价+1 并注明活动将失效）。开之前先校验限流（pipeline 内做）：
+    # 限流品停止流量加速动作、只做活动。折扣列读不到的品不动流量（阶段一已把关不关，
+    # 这里拦的是初始 off 的新开启）。
     skus_by_spu = {r["spu"]: r.get("skus") for r in plans}
     plan_by_spu = {r["spu"]: r for r in plans}
     initially_off = [r["spu"] for r in plans if r.get("accel_state") == "off"]
@@ -625,7 +707,15 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
                 "note": "收尾阶段不可暂停：已关闭的流量必须恢复，已自动继续",
             })
     if live:
-        # 初始 off 属于新增开启动作：只有该 SPU 的全部计划活动都完成提交后才允许开启。
+        # 初始 off 属于新增开启动作，两档理由各自成立即开：
+        #  (a) 本批真实提交了活动（该 SPU 的全部计划活动都已解析：提交/详情不符/跳过）；
+        #  (b) 本批零提交，但报名记录页显示该 SPU 在这些活动下【已有生效报名】。
+        # (b) 是 2026-09-30 用户改定。零提交的成因是「详情页按 SPU 查询可报名商品行数 0」，
+        # 该判据区分不出「真不符合这个活动」和「早就报过了」——后者在平台上报名仍然生效，
+        # 加速器关着时「活动价 ≤ 加速价×0.9」不成立、报上的活动会失效，必须照开。
+        # 记录快照复用阶段二对账的结果，不额外查一次报名记录页；快照不完整时
+        # active_registration 一律返回 {}（fail-closed：查不准就不开）。
+        log_snapshot = summary.get("log_verification") or {}
         successful_off = []
         for plan in plans:
             spu = plan["spu"]
@@ -644,9 +734,26 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
                 or (spu, item["activity"]) in skips
                 for item in planned_items
             )
-            # 至少真实提交一个活动；全都详情不符合时不新增开启流量。
-            if all_resolved and submitted_count > 0:
+            # 计划里还有没结论的格子：别开。半途开流量会把「这次到底报没报上」搅成一团。
+            if not all_resolved:
+                continue
+            if submitted_count > 0:
                 successful_off.append(spu)
+                continue
+            existing = [item["activity"] for item in planned_items
+                        if active_registration(log_snapshot, spu, item["activity"])]
+            if not existing:
+                # 详情页无可报名商品行、记录页也没有生效报名 → 确认是「本来就报不了」，
+                # 维持不开（省得为一个什么活动都没参加的商品白抬价）。
+                summary["no_existing_registration"].append(spu)
+                continue
+            successful_off.append(spu)
+            summary["opened_by_existing"][spu] = existing
+            await _emit(on_progress, {
+                "type": "log", "level": "info",
+                "message": f"[开流量] SPU={spu} 本批未新增报名，但报名记录页显示已有生效报名"
+                           f"（{'、'.join(existing)}），照常开启流量加速器",
+            })
         # 初始 on 且已被本管线关闭的商品，无论报名是否失败都必须恢复开启。
         to_open = list(dict.fromkeys(summary["closed"] + successful_off))
     else:
@@ -656,42 +763,60 @@ async def _run_execution_phases(results, flux_page, activity_page, live, on_prog
     for spu in to_open:
         try:
             plat = (summary.get("platform_daily") or {}).get(spu) or {}
-            plan = plan_by_spu.get(spu) or {}
-            # 平台规则（2026-09-28）：活动价 ≤ 加速价×0.9 活动才有效，故须按「本次对账确认
-            # 报上的活动里该货号的最高申报价 ÷0.9」抬加速价。只认对账报上的（planned 里
-            # 选了但被平台拒/跳过的活动没有生效价，拿它抬价会把加速价抬得虚高）。
-            need_by_label: dict = {}
-            for item in plan.get("enrolled_activities") or []:
-                if spu not in (summary["enrolled_activities"].get(item["activity"]) or []):
-                    continue
-                for sk in item.get("sku_prices") or []:
-                    sub = sk.get("submit_price")
-                    if sub is None or sk.get("label") is None:
+            skus = skus_by_spu.get(spu) or []
+            # 一个 SPU 多行货号的折扣列理应一致；不一致时取最小值（折扣打得最深的那个）
+            # 定档——档位跟错只会让价算保守，跟浅了才会破底价。
+            discounts = [s["discount"] for s in skus
+                         if isinstance(s.get("discount"), (int, float))]
+            if not discounts:
+                note = "成本表折扣列读不到，无法确定加速档位与价格；未开启流量加速器"
+                summary.setdefault("reopen_notes", {})[spu] = note
+                await _emit(on_progress, {
+                    "type": "exec_reopen", "spu": spu, "ok": False, "live": live,
+                    "tier": None, "note": note,
+                })
+                continue
+            tier = pipeline.accel_tier_for_discount(min(discounts))
+            accel_prices = None
+            if tier == "super":
+                # 超级档自定义价（用户 2026-09-29：「自定义价格就填写最低折扣价格/0.9得出的
+                # 金额」）：最低折扣价 = 日常价×折扣列折扣率，向下取整到分（与平台参考价同口径，
+                # 见 compute_submit_price）；再与底价+1 取高。
+                accel_prices = []
+                for s in skus:
+                    if s.get("sale") is None:
                         continue
-                    need_by_label[sk["label"]] = max(
-                        need_by_label.get(sk["label"], 0.0), float(sub))
-            accel_prices = [{
-                "label": s.get("label"), "daily": s.get("daily"), "sale": s.get("sale"),
-                # 平台侧该货号的真实日常价（本次提报页读到的）：加速器对话框按平台价格档列行，
-                # 用它才能把行配到货号；读不到时退回表里的价（旧行为）。
-                "platform_daily": plat.get(s.get("label")),
-                "price": max(
-                    round(float(s["sale"]) + 1, 2),
-                    pipeline.ceil_cent(need_by_label.get(s.get("label"), 0.0) / 0.9) or 0.0),
-            } for s in (skus_by_spu.get(spu) or []) if s.get("sale") is not None] or None
+                    submit = pipeline.compute_submit_price(
+                        s.get("daily"), s.get("discount"), s.get("sale")).get("submit_price")
+                    need = pipeline.ceil_cent(submit / 0.9) if submit else 0.0
+                    accel_prices.append({
+                        "label": s.get("label"), "daily": s.get("daily"), "sale": s.get("sale"),
+                        # 平台侧该货号的真实日常价（本次提报页读到的）：加速器对话框按平台价格档
+                        # 列行，用它才能把行配到货号；读不到时退回表里的价（旧行为）。
+                        "platform_daily": plat.get(s.get("label")),
+                        "price": max(round(float(s["sale"]) + 1, 2), need or 0.0),
+                    })
+                accel_prices = accel_prices or None
             await _emit(on_progress, {
                 "type": "exec_accel_step", "phase": "open", "step": "checking",
                 "spu": spu, "state": None, "note": "正在按 SPU 查询开启前状态",
             })
-            res = await pipeline.open_accel(flux_page, spu, allow=live, accel_prices=accel_prices)
+            res = await pipeline.open_accel(flux_page, spu, allow=live,
+                                            accel_prices=accel_prices, tier=tier)
             ok = res.get("opened", False)
             if ok:
                 summary["reopened"].append(spu)
-            # 存下开启失败的现场原因：逐品结果里要如实说「为什么没开起来」（档上限低于底价 /
-            # 平台没给入口 / 回查仍非加速中），而不是笼统一句「流量未完成」。
+            if res.get("throttled"):
+                # 限流品（用户 2026-09-29）：停止流量加速动作、只做活动。不进 reopened
+                # （流量确实没开），但逐品结果要按「按规则不动流量」而不是失败合成。
+                summary.setdefault("throttled", []).append(spu)
+            # 存下开启失败的现场原因：逐品结果里要如实说「为什么没开起来」（限流 / 档上限低于
+            # 底价 / 平台没给入口 / 回查仍非加速中），而不是笼统一句「流量未完成」。
             summary.setdefault("reopen_notes", {})[spu] = res.get("note", "")
             await _emit(on_progress, {
                 "type": "exec_reopen", "spu": spu, "ok": ok, "live": live,
+                "tier": tier,
+                "throttled": bool(res.get("throttled")),
                 "accel_prices": accel_prices,
                 # 单货号兼容字段（模板展示用）；多货号看 accel_prices 明细。
                 "accel_price": (accel_prices[0]["price"]
@@ -738,6 +863,8 @@ def _execution_product_results(plans, summary, live, skips=None) -> list[dict]:
     reopened = set(summary.get("reopened") or [])
     closed = set(summary.get("closed") or [])
     cooldown = set(summary.get("cooldown") or [])
+    by_existing = summary.get("opened_by_existing") or {}
+    no_existing = set(summary.get("no_existing_registration") or [])
     outcomes = []
     for plan in plans:
         spu = plan["spu"]
@@ -755,7 +882,13 @@ def _execution_product_results(plans, summary, live, skips=None) -> list[dict]:
             continue
 
         state = plan.get("accel_state")
-        if state == "off":
+        throttled = spu in set(summary.get("throttled") or [])
+        discount_missing = bool(plan.get("discount_missing"))
+        if throttled or discount_missing:
+            # 限流品/折扣列读不到的品按规则「只做活动、不动流量」（用户 2026-09-29）：
+            # 流量维度不算成败——它不是没开成，是根本没动。
+            accel_ok = True
+        elif state == "off":
             accel_ok = spu in reopened
         elif state == "on" and spu in cooldown:
             accel_ok = True  # 冷却拦截后仍保持原有 ON
@@ -770,12 +903,42 @@ def _execution_product_results(plans, summary, live, skips=None) -> list[dict]:
         activities_ok = all_resolved and bool(submitted_names)
         status = "skip" if all_ineligible else ("done" if activities_ok and accel_ok else "fail")
         reasons = []
+        if spu in by_existing:
+            # 本批零提交、靠报名记录页的已有生效报名补开流量（用户 2026-09-30）：本批没新增
+            # 报名不是失败，但流量这一件事是实打实做了——开成了记 done，没开成记 fail。
+            # 不能落到下面的 all_ineligible 分支记 skip：那会把补开失败吞掉。
+            status = "done" if accel_ok else "fail"
+            if throttled or discount_missing:
+                # 2026-09-30 实跑踩到：限流品 accel_ok=True（流量不算成败）但文案写成
+                # 「已按规则开启」——其实根本没动流量，会误导操作者以为开上了。
+                accel_note = ("流量侧按规则不动作（商品限流，只做活动报名）" if throttled
+                              else "流量侧按规则不动作（成本表折扣列读不到，只做活动报名）")
+            else:
+                accel_note = f"已按规则{'开启' if accel_ok else '尝试开启'}流量加速器"
+            reasons.append(
+                f"本批未新增报名，但报名记录页显示已有生效报名"
+                f"（{'、'.join(by_existing[spu])}），{accel_note}"
+            )
+            if not accel_ok:
+                why = (summary.get("reopen_notes") or {}).get(spu) or "未捕获开启失败原因"
+                reasons.append(f"但加速器未能开启：{why}")
+            outcomes.append({
+                "spu": spu, "status": status, "planned": len(planned_names),
+                "submitted": 0, "ineligible": len(ineligible_names),
+                "skipped": len(skipped_names),
+                "accel_ok": accel_ok, "note": "；".join(reasons),
+            })
+            continue
         if all_ineligible:
             parts = []
             if ineligible_names:
                 parts.append(f"{len(ineligible_names)} 个初筛活动在详情页无可报名商品")
             if skipped_names:
                 parts.append(f"{len(skipped_names)} 个活动按操作者指令跳过")
+            if spu in no_existing:
+                # 查过报名记录页、确实没有生效报名 → 说明这些活动是「本来就报不了」，
+                # 维持不开流量。说清楚，免得操作者以为是漏开。
+                parts.append("报名记录页也未查到生效报名，不新增开启流量")
             reasons.append("、".join(parts))
         elif not activities_ok:
             reasons.append(
@@ -784,7 +947,7 @@ def _execution_product_results(plans, summary, live, skips=None) -> list[dict]:
             )
             check = (summary.get("accel_checks") or {}).get(spu) or {}
             if (check.get("state") == "on" and not check.get("closed")
-                    and summary.get("failed")):
+                    and summary.get("failed") and not discount_missing):
                 # 加速器关不掉时前端售价按加速价，活动申报上限被压低 → 报名必被平台拒。
                 # 真机 2026-09-25：24h 锁定期内关闭被拒，随后提报页参考价变成加速价×折扣
                 # （89.04 = 98.94×0.9），按表里日常价算的申报价 146.9 必然超高。
@@ -816,6 +979,12 @@ def _execution_product_results(plans, summary, live, skips=None) -> list[dict]:
                     reasons.append("未发起加速器开启（本次报名未确认成功）")
             else:
                 reasons.append(f"流量状态未确认（初始={state}），未操作")
+        if throttled:
+            # 限流是「按规则不动流量」而非失败，但 note 里必须点名——否则操作者看到 done
+            # 会以为流量也开好了。
+            reasons.append("商品限流，按规则只做活动报名、不动流量加速器")
+        if discount_missing:
+            reasons.append("成本表折扣列读不到，定不了加速档位；流量保持现状、只做活动报名")
         outcomes.append({
             "spu": spu, "status": status, "planned": len(planned_names),
             "submitted": len(submitted_names), "ineligible": len(ineligible_names),
@@ -899,7 +1068,7 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary, sk
             "type": "log", "level": "info",
             "message": f"报名记录仍有未确认项，等待后第 {attempt + 2} 次复查（最多 {LOG_VERIFY_TRIES} 次）",
         })
-        await asyncio.sleep(LOG_VERIFY_RETRY_DELAY)
+        await asyncio.sleep(LOG_VERIFY_RETRY_DELAYS[min(attempt, len(LOG_VERIFY_RETRY_DELAYS) - 1)])
     summary["log_verification"] = {
         **_log_snapshot(result),
         "baseline_queries": baseline.get("queries") or [],
@@ -996,44 +1165,35 @@ async def _reconcile_activity_log(plans, activity_page, on_progress, summary, sk
 
 
 async def _enroll_by_activity(by_activity, activity_page, live, on_progress, summary, control=None) -> None:
-    """逐活动串行扫描；单活动失败只记录，最终统一由报名记录页对账。
+    """逐活动串行；活动内【每 SPU 填完立即单独提交】，单活动失败只记录，最终统一由报名记录页对账。
+
+    【为什么废弃「逐 SPU 填价、活动末统一提交」】2026-10-03 实测实锤：提报页（detail-new）
+    每做一次 SPU 搜索就重渲结果表格，上一个 SPU 的勾选与填价随旧行卸载全部丢失——页面
+    没有跨搜索保留的已选商品池。统一提交是 2026-07-17 单 SPU 时代的设计，多 SPU 时只要
+    后面 SPU 详情查询为 0，前面 SPU 的勾选就被清掉，统一提交要么按钮禁用、要么只提交
+    最后一个 SPU（8791757215 的限时秒杀填价被 3822224199 的搜索冲掉，结果页「已提交 1 个
+    商品」实际是后者，旧「successCount>0 即成功」判据把部分丢失吞掉）。现改为：
+      - 每 SPU 一张干净提报页，填完立即提交（live）；提交过的页面一律关掉（结果页/不确定
+        现场都不复用），下一 SPU 重新 open_enroll_page——残留勾选有重复提交风险；
+      - 半程（live=False）同理逐 SPU 一页：填好的页签逐 SPU 留给操作者人工核对提交；
+      - 详情查询 0 行（无资格）/逐格跳过的 SPU 没有填价现场，页面直接复用给下一 SPU。
 
     control 给定时：活动之间可暂停（安全边界），内层可逐格跳过（见 app/activity/control.py）。
     """
     for act_name, items in by_activity.items():
-        # 暂停只挂在活动之间：上一个活动的提报页已在 finally 里关掉，此处挂起不会留下
-        # 半开的 detail-new tab（残留 tab 会让下一个活动 open_enroll_page 认错页）。
+        # 暂停只挂在活动之间：全程模式下每 SPU 提交后提报页都已在循环里关掉（或还没开），
+        # 此处挂起不会留下操作到一半的 detail-new tab；半程保留的页签是填好价的完整现场。
         await _pause_gate(control, on_progress, "enroll", note=f"活动「{act_name}」开始前暂停")
-        page = await pipeline.open_enroll_page(activity_page, act_name)
-        if page is None:
-            note = "打开提报页失败，已记录并继续扫描下一活动"
-            summary["activity_results"][act_name] = {
-                "filled": [], "submitted": False, "note": note,
-            }
-            for item in items:
-                summary["scan_failures"].append({
-                    "activity": act_name, "spu": item["spu"],
-                    "step": "open_activity", "note": note,
-                })
-            await _emit(on_progress, {"type": "exec_rpa_step", "activity": act_name,
-                                      "spu": None, "step": "open_activity", "ok": False,
-                                      "note": note})
-            await _emit(on_progress, {"type": "exec_enroll", "activity": act_name, "ok": False,
-                                      "submitted": False, "note": note})
-            continue
-        await _emit(on_progress, {"type": "exec_rpa_step", "activity": act_name,
-                                  "spu": None, "step": "open_activity", "ok": True,
-                                  "note": "活动详情页已打开并核对活动名"})
-        # 该活动全程包在 try/finally：无论报名成功/失败/异常，处理完都【立刻关掉这个提报页
-        # (detail-new) tab】再开下一个。实测教训（2026-07-20）：报完不关 → 提报页一个个堆着，
-        # 下个活动 open_enroll_page 靠 diff 认新 tab 时被多个残留 tab 干扰，出现首个开不出、
-        # 末个搜 0 行等时序失败。始终只留一个提报页，diff 才可靠。
         halt = None
+        filled = []          # 填价成功的 SPU（=本活动要提交的）
+        attempted = []       # 提交动作已被页面接受的 SPU（live；半程恒空）
+        page_verified = []   # 提交当场拿到明确成功回执（结果页/成功提示）的 SPU
+        submit_notes = []
+        ineligible = []
+        skipped = []
+        page = None          # 当前提报页；只在「上面没有未提交的填价现场」时才复用
         try:
-            filled = []
-            ineligible = []
-            skipped = []
-            for it in items:
+            for index, it in enumerate(items):
                 # 执行中逐格跳过：操作者在「报名计划」表上点了跳过。跳过只影响本格，
                 # 该 SPU 的流量等 SPU 级动作不受影响（阶段三照常重开）。
                 if control is not None and control.is_skipped(it["spu"], act_name):
@@ -1043,6 +1203,30 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                         "where": "queued", "note": "已按操作者指令跳过该商品在该活动的报名",
                     })
                     continue
+                # 上一 SPU 填过价/提过交的页面已在各自分支留下或关掉（page 置 None）——
+                # 搜索会重渲结果表格，上一 SPU 的现场保不住也不该保；page 非 None 说明
+                # 上面只有跳过/详情不符的探测现场、或 over_ref 拦截留下的勾选（未填价未
+                # 提交，下一 SPU 搜索重渲时随旧行一并卸载），均可安全复用。
+                if page is None:
+                    page = await pipeline.open_enroll_page(activity_page, act_name)
+                    if page is None:
+                        note = "打开提报页失败，已记录并继续扫描下一活动"
+                        for later in items[index:]:
+                            if control is not None and control.is_skipped(later["spu"], act_name):
+                                continue
+                            summary["scan_failures"].append({
+                                "activity": act_name, "spu": later["spu"],
+                                "step": "open_activity", "note": note,
+                            })
+                        await _emit(on_progress, {"type": "exec_rpa_step", "activity": act_name,
+                                                  "spu": None, "step": "open_activity", "ok": False,
+                                                  "note": note})
+                        halt = {"activity": act_name, "spu": None,
+                                "step": "open_activity", "note": note}
+                        break
+                    await _emit(on_progress, {"type": "exec_rpa_step", "activity": act_name,
+                                              "spu": None, "step": "open_activity", "ok": True,
+                                              "note": "活动详情页已打开并核对活动名"})
                 try:
                     async def on_step(event, current=it):
                         await _emit(on_progress, {
@@ -1069,7 +1253,7 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                         # 算价，但配对得用平台自己的价档）。
                         summary.setdefault("platform_daily", {}).setdefault(
                             it["spu"], {}).update(r.get("platform_daily") or {})
-                        # 填价成功后锁定这一格：活动级一次提交已经会把它报上去，之后再跳过是假的。
+                        # 填价成功后锁定这一格：随后立即提交（或半程保留页签），之后再跳过是假的。
                         if control is not None:
                             control.lock_cell(it["spu"], act_name)
                     else:
@@ -1082,11 +1266,16 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                             "over_ref": bool(r.get("over_ref")),
                             "reason": r.get("note", "填价未成功"),
                         })
-                        halt = {
-                            "activity": act_name, "spu": it["spu"],
-                            "step": r.get("failed_step") or "fill_price",
-                            "note": r.get("note", "当前活动操作未完成"),
-                        }
+                        # over_ref 是本 SPU 自己的加速价压制（SPU 级价格问题），不连坐同活动
+                        # 其余 SPU——2026-10-03 批次 8791757215 被压制 halt 掉限时秒杀等 6 个
+                        # 活动，排后面的 3822224199 全部没轮到处理、零提交漏报。其余填价失败
+                        # （页面/活动级问题）仍 fail-fast：继续填多半同样失败。
+                        if not r.get("over_ref"):
+                            halt = {
+                                "activity": act_name, "spu": it["spu"],
+                                "step": r.get("failed_step") or "fill_price",
+                                "note": r.get("note", "当前活动操作未完成"),
+                            }
                     await _emit(on_progress, {"type": "exec_fill", "activity": act_name,
                                               "spu": it["spu"], "ok": r.get("filled", False),
                                               "over_ref": bool(r.get("over_ref")),
@@ -1097,6 +1286,61 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                                               "note": r.get("note", "")})
                     if halt:
                         break
+                    if r.get("filled") and live:
+                        # ---- 逐 SPU 立即提交（2026-10-03 起；不再攒到活动末统一提交）----
+                        # expected_spus 让提交层在点按钮前核对勾选还在、结果页数量对账。
+                        try:
+                            sub = await pipeline.submit_enroll_page(
+                                page, allow=True, expected_spus=[it["spu"]])
+                        except Exception as e:
+                            sub = {
+                                "submitted": False, "clicked_submit": False,
+                                "note": f"提交调用异常，待记录页对账：{str(e)[:80]}",
+                            }
+                        sub_note = sub.get("note", "")
+                        if sub_note:
+                            submit_notes.append(f"{it['spu']}：{sub_note}")
+                        sub_attempted = bool(sub.get("submitted") or sub.get("clicked_submit"))
+                        if sub_attempted:
+                            attempted.append(it["spu"])
+                            if sub.get("verified"):
+                                page_verified.append(it["spu"])
+                        await _emit(on_progress, {"type": "exec_rpa_step", "activity": act_name,
+                                                  "spu": it["spu"], "step": "submit",
+                                                  "ok": sub_attempted, "note": sub_note})
+                        # 提交过的页面一律关掉（结果页或不确定现场都不复用），下一 SPU 开新页。
+                        # submit_enroll_page 返回前已等页面跳到 detail-new-result 结果页
+                        # （2026-09-30 用户要求：提交后不能马上关页签，要等跳转完），此处只管关。
+                        try:
+                            await page.close()
+                        except Exception as e:
+                            logger.warning(f"关提报页 tab 失败（{act_name}/{it['spu']}）：{e}")
+                        page = None
+                        if not sub_attempted:
+                            # 提交没发出去 = 这一格没报上；fail-fast 不再处理本活动后续 SPU
+                            # （按钮持续禁用/弹窗点不动多半是活动级问题，继续只会同样失败）。
+                            summary["failed"].append({
+                                "spu": it["spu"], "activity": act_name,
+                                "submit_price": it.get("submit_price"),
+                                "sku_count": len(it.get("sku_prices") or []),
+                                "reason": f"提交未成功：{sub_note or '提交按钮未接受'}",
+                            })
+                            halt = {"activity": act_name, "spu": it["spu"], "step": "submit",
+                                    "note": sub_note or "提交未完成"}
+                            break
+                    elif r.get("filled"):
+                        # 半程：已填价的页签逐 SPU 留给操作者人工核对+手动点提交——半程的
+                        # 意义就是「管线填好、人来把关」，关了等于白填；一张页留不下两个
+                        # SPU 的填价现场（搜索会重渲表格），故逐 SPU 各留一张。
+                        try:
+                            probe = await pipeline.submit_enroll_page(page, allow=False)
+                            if probe.get("note"):
+                                submit_notes.append(f"{it['spu']}：{probe['note']}")
+                        except Exception as e:
+                            logger.warning(f"半程定位提交按钮失败（{act_name}/{it['spu']}）：{e}")
+                        logger.info(f"[活动] 半程模式保留提报页页签供人工核对提交："
+                                    f"{act_name}/{it['spu']}")
+                        page = None  # 页签保留不关；下一 SPU 开新页
                 except Exception as e:
                     summary["failed"].append({"spu": it["spu"], "activity": act_name,
                                               "submit_price": it.get("submit_price"),
@@ -1107,23 +1351,19 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                     halt = {"activity": act_name, "spu": it["spu"],
                             "step": "unknown", "note": f"异常：{e}"}
                     break
-            # 一次提交本活动页所有已填 SPU。无任何已填 SPU 时不提交（否则点 disabled 的「提交」
-            # 会等满超时抛异常）。submit 也包异常保护，单活动失败不扩散。
+            # 活动级汇总：filled/attempted 已逐 SPU 落定，这里只组装 summary 与事件，不再有
+            # 统一提交动作。submitted_attempts 记【实际提交出去】的 SPU——对账据此区分
+            # 「提交过待核验」与「根本没提交」，中断前已提交的部分不能丢（旧统一提交模型下
+            # 中断=全员未提交，没有部分提交可言）。
             summary["filled_activities"][act_name] = filled
+            summary["submitted_attempts"][act_name] = list(attempted)
+            # 最终 enrolled_activities 只由扫描结束后的报名记录页对账写入。
+            summary["enrolled_activities"].setdefault(act_name, [])
             actionable_count = len(items) - len(ineligible) - len(skipped)
-            if halt or len(filled) != actionable_count:
-                if halt is None:
-                    halt = {"activity": act_name, "spu": None, "step": "fill_price",
-                            "note": "当前活动有商品未完成填价"}
-                note = (halt or {}).get("note", "当前活动有商品未完成填价")
-                summary["enrolled_activities"][act_name] = []
-                summary["activity_results"][act_name] = {
-                    "filled": filled, "submitted": False, "note": note,
-                }
-                await _emit(on_progress, {"type": "exec_enroll", "activity": act_name, "ok": False,
-                                          "submitted": False, "filled": filled, "live": live,
-                                          "note": f"当前活动操作未完整完成，未提交；记录后继续：{note}"})
-            elif actionable_count == 0:
+            if halt is None and len(filled) != actionable_count:
+                halt = {"activity": act_name, "spu": None, "step": "fill_price",
+                        "note": "当前活动有商品未完成填价"}
+            if actionable_count == 0 and halt is None:
                 parts = []
                 if ineligible:
                     parts.append(f"{len(ineligible)} 个商品详情页无可报名商品")
@@ -1133,7 +1373,6 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                 # 没有任何「报了但没成」的商品：详情不可报是平台正常业务结果、跳过是操作者选择，
                 # 两种都不是失败，前端按 info 展示。
                 status = "skipped_by_user" if skipped and not ineligible else "detail_ineligible"
-                summary["enrolled_activities"][act_name] = []
                 summary["activity_results"][act_name] = {
                     "filled": [], "ineligible": ineligible, "skipped": skipped,
                     "submitted": False, "status": status, "note": note,
@@ -1144,46 +1383,51 @@ async def _enroll_by_activity(by_activity, activity_page, live, on_progress, sum
                                           "ineligible": ineligible, "skipped": skipped,
                                           "live": live, "note": note})
             else:
-                try:
-                    sub = await pipeline.submit_enroll_page(page, allow=live)
-                except Exception as e:
-                    sub = {
-                        "submitted": False, "clicked_submit": False,
-                        "note": f"提交调用异常，待记录页对账：{str(e)[:80]}",
-                    }
-                submitted = bool(sub.get("submitted"))
-                feedback_verified = bool(sub.get("verified", submitted))
-                clicked_submit = bool(sub.get("clicked_submit", submitted))
-                attempted = submitted or clicked_submit
-                note = sub.get("note", "")
-                summary["submitted_attempts"][act_name] = filled if attempted else []
-                # 最终 enrolled_activities 只由扫描结束后的报名记录页对账写入。
-                summary["enrolled_activities"].setdefault(act_name, [])
+                submitted = live and bool(filled) and len(attempted) == len(filled)
+                clicked_submit = bool(attempted)
+                feedback_verified = bool(attempted) and len(page_verified) == len(attempted)
+                if halt is not None:
+                    note = halt.get("note", "当前活动操作未完整完成")
+                elif not live and filled:
+                    note = (f"已填价 {len(filled)} 个商品，提报页页签已逐商品保留，"
+                            f"可人工核对后手动提交")
+                else:
+                    note = "；".join(submit_notes) or "等待报名记录页最终核验"
                 summary["activity_results"][act_name] = {
                     "filled": filled, "submitted": submitted,
                     "clicked_submit": clicked_submit, "feedback_verified": feedback_verified,
-                    "verified": False, "status": "pending_log" if attempted else "submit_failed",
-                    "note": note or "等待报名记录页最终核验",
+                    "verified": False, "status": "pending_log" if clicked_submit else "submit_failed",
+                    "note": note,
                 }
-                await _emit(on_progress, {"type": "exec_rpa_step", "activity": act_name,
-                                          "spu": None, "step": "submit",
-                                          "ok": attempted if live else True,
-                                          "note": note})
-                await _emit(on_progress, {"type": "exec_enroll", "activity": act_name,
-                                          "ok": attempted if live else bool(filled),
-                                          "submitted": submitted, "clicked_submit": clicked_submit,
-                                          "verified": False,
-                                          "feedback_verified": feedback_verified,
-                                          "filled": filled, "live": live, "note": note})
-                if live and not attempted:
-                    halt = {"activity": act_name, "spu": None, "step": "submit",
-                            "note": note or "提交未完成"}
+                if halt is not None:
+                    partial = f"已提交 {len(attempted)} 个（{'、'.join(attempted)}），" if attempted else ""
+                    await _emit(on_progress, {"type": "exec_enroll", "activity": act_name,
+                                              "ok": False,
+                                              "submitted": submitted,
+                                              "clicked_submit": clicked_submit,
+                                              "verified": False,
+                                              "feedback_verified": feedback_verified,
+                                              "filled": filled, "live": live,
+                                              "note": f"当前活动操作未完整完成，{partial}"
+                                                      f"记录后继续：{note}"})
+                else:
+                    await _emit(on_progress, {"type": "exec_enroll", "activity": act_name,
+                                              "ok": clicked_submit if live else bool(filled),
+                                              "submitted": submitted,
+                                              "clicked_submit": clicked_submit,
+                                              "verified": False,
+                                              "feedback_verified": feedback_verified,
+                                              "filled": filled, "live": live, "note": note})
         finally:
-            # 报完（成功/失败/异常）立刻关掉本提报页 tab，保证任意时刻只有一个 detail-new。
-            try:
-                await page.close()
-            except Exception as e:
-                logger.warning(f"关提报页 tab 失败（{act_name}）：{e}")
+            # 退出路径上关掉【没提交、也没保留给操作者】的当前页：live 下提交过的页在循环里
+            # 已关，半程填好的页签在循环里已留下（page 已置 None，不会走到这里）。
+            # 残留页不干扰后续开页：open_enroll_page 的 diff 按 Page 对象身份认新 tab
+            # （非 URL），残留 detail-new 都在 before 快照里（2026-09-30 多残留实测验证）。
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception as e:
+                    logger.warning(f"关提报页 tab 失败（{act_name}）：{e}")
         if halt:
             summary["scan_failures"].append({"activity": act_name, **halt})
             await _emit(on_progress, {"type": "log", "level": "warning",
@@ -1195,7 +1439,7 @@ async def run_activity_batch(
     excel: str,
     sheet: str,
     min_margin: Optional[float] = None,
-    dry_run: bool = True,
+    dry_run: bool = False,
     on_progress=None,
     flux_page=None,
     activity_page=None,
@@ -1214,10 +1458,11 @@ async def run_activity_batch(
       裸 SPU 字符串列表。
     - cloud_url：WPS 在线成本表分享链接；excel 参数兼容旧调用，但也只接受在线链接。
     - min_margin：保留兼容，价格筛选只使用文档日常价与销售底价。
-    - dry_run=True（默认）：只算计划、发 product_plan，绝不点任何变更按钮、不跑执行遍。
-    - dry_run=False：跑执行遍（活动维度：关流量→报名→重开流量）。其中 live 再分两档——
-      live=False（半程，默认）：开提报页/填价但【不提交、不真关/开】，全部可逆，用于端到端验证；
-      live=True（全程）：真提交/真关流量/真开流量，不可逆，须调用方显式授权。
+    - dry_run=False（默认，2026-09-30 起）：跑执行遍（活动维度：关流量→报名→重开流量）。
+      其中 live 再分两档——live=False（半程）：开提报页/填价但【不提交、不真关/开】，全部可逆，
+      用于端到端验证；live=True（全程）：真提交/真关流量/真开流量，不可逆，须调用方显式授权。
+    - dry_run=True：只算计划、发 product_plan，绝不点任何变更按钮、不跑执行遍；由调用方
+      （Web 页的「正式执行」开关关掉、CLI 的 --dry-run）显式要求，不再作为默认。
     - selection：识别矩阵勾选的 [[spu, 活动名], ...]；给定时只报这些格子（没勾的 SPU 连
       流量都不动）。None = 不限制，与改造前一致。
     - control：ActivityControl，给定时可在安全边界暂停/继续、执行中逐格跳过。
@@ -1226,6 +1471,9 @@ async def run_activity_batch(
     """
     # 失败事件切面：aborted / product_done fail 自动上报公网 MySQL（best-effort）。
     on_progress = attach(on_progress, "activity")
+    # 活动历史切面：live 批次的报名结论/加速器开关落 activity_history 表（best-effort，
+    # 未启用/写失败零感知）。包在 error_report 之后，两个切面互不感知。
+    on_progress = history.attach_history(on_progress, region=region_label)
     bm = _normalize_margin(min_margin)
     if bm is None:
         bm = global_min_margin()
@@ -1306,6 +1554,10 @@ async def run_activity_batch(
     done = skip = fail = 0
     results: list[dict] = []
     exec_summary = None  # 执行遍汇总（dry-run 保持 None）
+    # 历史摘要一次性批量取（单条 WHERE spu IN，不在循环里逐 SPU 往返）：规划事件带
+    # 「上次报名结论/加速器上次开启时间」徽标数据；dry-run 也查——计划表徽标正是
+    # dry-run 决策时用的。查不到降级 {}，主流程零感知。
+    history_map = await history.summarize([entry["spu"] for entry in entries])
     try:
         logger.info(
             f"=== 活动批次：SPU {total} 个，dry_run={dry_run}，本批毛利率默认={bm} "
@@ -1337,6 +1589,7 @@ async def run_activity_batch(
                         entry, flux_page, activity_page, dry_run,
                         on_progress, stock_map,
                         cost_map, selection=selection,
+                        history_map=history_map,
                     ),
                     timeout=ACTIVITY_PRODUCT_TIMEOUT,
                 )
@@ -1373,6 +1626,13 @@ async def run_activity_batch(
                 "enrolled_activities": res.get("enrolled_activities", []),
                 "accel_reopened": res.get("accel_reopened", False),
                 "verified": res.get("verified", False),
+                # 历史上次成功开启加速器的时间（activity_history 摘要）：前端据此给
+                # 「24h 内开启过，关闭可能撞锁定期」预警徽标（仅展示，不改流程）。
+                "last_accel_open_at": ((history_map.get(spu) or {})
+                                       .get("last_accel_open") or {}).get("at"),
+                "accel_open_within_24h": bool(((history_map.get(spu) or {})
+                                               .get("last_accel_open") or {})
+                                              .get("within_24h")),
                 "note": res.get("note", ""),
             })
 
@@ -1458,6 +1718,8 @@ async def scan_activity_matrix(
     """
     from app.activity import matrix as matrix_store
 
+    # 扫描只读、不产生平台事实，不挂 history 切面（它只认 exec_* 事件，挂上也是透传）；
+    # 但历史【摘要】照常在下方注入 scan_start 的格子，供矩阵画「上次结论」徽标。
     on_progress = attach(on_progress, "activity")
     day = day or matrix_store.today()
     if control is not None:
@@ -1473,6 +1735,9 @@ async def scan_activity_matrix(
         await _emit(on_progress, {"type": "aborted", "reason": "SPU 清单为空或无有效 SPU。"})
         return {"day": day, "cells": [], "counts": {}}
     spu_list = [e["spu"] for e in entries]
+    # 历史摘要一次性批量取（单条 WHERE spu IN）：注入 scan_start 的格子画「上次结论」
+    # 徽标；查不到降级 {}，扫描主流程零感知。
+    history_map = await history.summarize(spu_list)
 
     # 1. 读成本表（宽松模式：单个商品缺价只影响它自己那几格，不该让整张矩阵扫不出来）。
     try:
@@ -1535,6 +1800,11 @@ async def scan_activity_matrix(
         cached = prev.get("eligibility") or {}
         cells = matrix_store.flatten_cells({"price": price, "eligibility": cached})
         counts_now = matrix_store.counts({"price": price, "eligibility": cached})
+        # 逐格注上次报名结论（activity_history 摘要，只进事件不进矩阵落盘文件——
+        # 历史有自己的库，矩阵文件只存资格这个客观事实）；无历史/未启用为 None。
+        for cell in cells:
+            cell["history"] = ((history_map.get(str(cell.get("spu"))) or {})
+                               .get("activities") or {}).get(cell.get("activity"))
         await _emit(on_progress, {
             "type": "scan_start", "day": day, "spu_total": len(entries),
             "activity_total": len(activities), "cached": counts_now["eligible"] + counts_now["ineligible"],
@@ -1616,8 +1886,13 @@ async def scan_activity_matrix(
             "unknown": counts["unknown"], "cached": from_cache, "probed": probed,
             "activities": len(todo),
         })
+        # 返回值的 cells 同样注历史摘要（与 scan_start 下发的那批同口径）。
+        result_cells = matrix_store.flatten_cells(data)
+        for cell in result_cells:
+            cell["history"] = ((history_map.get(str(cell.get("spu"))) or {})
+                               .get("activities") or {}).get(cell.get("activity"))
         return {"day": day, "path": path, "activities": activities,
-                "cells": matrix_store.flatten_cells(data), "counts": counts,
+                "cells": result_cells, "counts": counts,
                 "scanned": probed, "from_cache": from_cache}
     finally:
         if not injected and browser is not None:

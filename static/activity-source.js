@@ -17,6 +17,12 @@ class ActivitySourcePicker {
     this.hiddenStorageKey = "activity-wps-hidden-v1";
     this.filters = [];
     this.filterMode = "all";
+    // 活动历史摘要（spu → {activities, last_accel_open, last_accel_close}）：
+    // 文档读完后异步补齐，拿不到不阻塞表格（与后端 best-effort 降级语义一致）。
+    this.history = {};
+    this.historyEnabled = true;
+    this.historyError = "";
+    this.expanded = new Set();
     this.element = (id) => document.getElementById(id);
   }
 
@@ -87,6 +93,14 @@ class ActivitySourcePicker {
       this.render();
     });
     this.element("sourceBody").addEventListener("click", (event) => {
+      const toggle = event.target.closest("button[data-history-toggle]");
+      if (toggle) {
+        const key = toggle.dataset.historyToggle;
+        if (this.expanded.has(key)) this.expanded.delete(key);
+        else this.expanded.add(key);
+        this.render();
+        return;
+      }
       const button = event.target.closest("button[data-hide-row]");
       if (!button || this.running || this.loading) return;
       const key = button.dataset.hideRow;
@@ -181,6 +195,10 @@ class ActivitySourcePicker {
     this.page = 0;
     this.sheet = "";
     this.hidden = new Set();
+    this.history = {};
+    this.historyEnabled = true;
+    this.historyError = "";
+    this.expanded.clear();
     this.element("sourceFilter").value = "";
     this.element("sourceWarning").classList.add("d-none");
     this.element("openSourceDoc").classList.add("d-none");
@@ -250,6 +268,8 @@ class ActivitySourcePicker {
       } catch (error) {
         this.element("sourceStatus").textContent += " · 浏览器未保存本次选择";
       }
+      // 历史摘要不 await：表格先可用，「活动·流量」列随后补齐（查不到只影响该列）。
+      this.loadHistory();
     } catch (error) {
       this.showError(error.message);
       this.element("sourceStatus").textContent = "读取失败，请检查链接、kdocs-cli 登录状态或文档访问权限后重试。";
@@ -257,6 +277,23 @@ class ActivitySourcePicker {
       this.loading = false;
       this.render();
     }
+  }
+
+  async loadHistory() {
+    const spus = [...new Set(this.rows.map((row) => String(row.spu || "").trim()).filter(Boolean))];
+    if (!spus.length) return;
+    try {
+      const response = await fetch("/activity/history_summary?spus=" + encodeURIComponent(spus.join(",")), { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || data.detail || "活动历史读取失败");
+      this.historyEnabled = data.enabled !== false;
+      this.history = data.map || {};
+      this.historyError = data.error || "";
+    } catch (error) {
+      this.history = {};
+      this.historyError = error.message || "活动历史读取失败";
+    }
+    this.render();
   }
 
   filtered() {
@@ -339,6 +376,54 @@ class ActivitySourcePicker {
     return `${this.document}\n${this.sheet}\n${row.row_number}\n${row.spu}`;
   }
 
+  historyCell(row) {
+    if (this.historyError) {
+      return `<span class="text-muted" title="${this.escape(this.historyError)}">历史不可用</span>`;
+    }
+    if (!this.historyEnabled) {
+      return '<span class="text-muted" title="历史库连接参数未配置（[activity_history]/[error_report]）">未配置</span>';
+    }
+    const summary = this.history[String(row.spu)];
+    if (!summary) return '<span class="text-muted">—</span>';
+    const activities = summary.activities || {};
+    const names = Object.keys(activities);
+    const open = summary.last_accel_open;
+    const close = summary.last_accel_close;
+    let accel = '<span class="text-muted">—</span>';
+    if (open && (!close || open.at > close.at)) {
+      accel = `<span class="badge text-bg-success" title="最近开启 ${this.escape(open.at)}">流量开${open.within_24h ? "·24h" : ""}</span>`;
+    } else if (close) {
+      accel = `<span class="badge text-bg-secondary" title="最近关闭 ${this.escape(close.at)}">流量关</span>`;
+    }
+    if (!names.length) return accel;
+    const activeCount = names.filter((name) => activities[name].ok).length;
+    const key = this.rowKey(row);
+    const toggle = this.expanded.has(key) ? "▲" : "▼";
+    return `${accel} <button type="button" class="btn btn-link btn-sm p-0 text-nowrap"
+      data-history-toggle="${this.escape(key)}"
+      title="生效 ${activeCount} / 有记录 ${names.length}，点击展开活动列表">${activeCount} 个活动 ${toggle}</button>`;
+  }
+
+  historyDetailRow(row, colSpan) {
+    const activities = (this.history[String(row.spu)] || {}).activities || {};
+    const items = Object.keys(activities).map((name) => {
+      const item = activities[name];
+      let badge;
+      if (item.ok) badge = '<span class="badge text-bg-success">已报名</span>';
+      else if (item.status === "exited") badge = '<span class="badge text-bg-secondary">已退出</span>';
+      else if (item.status === "skipped_by_user") badge = '<span class="badge text-bg-secondary">被跳过</span>';
+      else if (item.status === "fail") badge = '<span class="badge text-bg-danger">失败</span>';
+      else badge = `<span class="badge text-bg-light text-dark border">${this.escape(item.status || "未确认")}</span>`;
+      const price = item.submit_price != null && item.submit_price !== ""
+        ? ` · 申报价 ${this.escape(item.submit_price)}` : "";
+      const at = item.at ? ` · ${this.escape(String(item.at).slice(5, 16))}` : "";
+      return `<div class="py-1">${badge} ${this.escape(name)}${price}${at}</div>`;
+    }).join("");
+    return `<tr class="table-light"><td></td><td colspan="${colSpan}">
+      <div class="small text-muted mb-1">管线历史记录（仅含经本管线执行的批次；后台手动操作不在其中）</div>
+      ${items || '<span class="text-muted">无活动记录</span>'}</td></tr>`;
+  }
+
   loadHidden() {
     try {
       const stored = JSON.parse(localStorage.getItem(this.hiddenStorageKey) || "{}");
@@ -376,22 +461,25 @@ class ActivitySourcePicker {
     this.element("filterChips").innerHTML = this.filters.map((filter, index) =>
       `<span class="badge text-bg-light text-dark border">${this.escape(filter.label)} ${this.escape(filter.operator)} ${this.escape(filter.value)} <button type="button" class="btn-close ms-1" style="font-size:.55rem" data-filter-index="${index}" aria-label="移除筛选条件"></button></span>`).join("");
     this.element("sourceHead").innerHTML = this.columns.length
-      ? `<tr><th>选择</th><th>文档行号</th><th>数据状态</th>${this.columns.map(
+      ? `<tr><th>选择</th><th>文档行号</th><th>数据状态</th><th title="管线历史库记录：流量=最近一次开/关动作，活动=报名结论（仅含经本管线执行的批次）">活动·流量</th>${this.columns.map(
         (column) => `<th>${this.escape(column.title)}</th>`,
       ).join("")}<th>操作</th></tr>` : "";
     this.element("sourceBody").innerHTML = visible.length ? visible.map((row) => {
       const state = row.selectable ? '<span class="badge text-bg-success">可选择</span>'
         : `<span class="text-warning-emphasis" title="${this.escape(row.issues.join("；"))}">${this.escape(row.issues.join("；"))}</span>`;
       const hidden = this.hidden.has(this.rowKey(row));
-      return `<tr class="${hidden ? "table-secondary" : ""}"><td><input class="form-check-input" type="checkbox" data-spu="${this.escape(row.spu)}"
+      const main = `<tr class="${hidden ? "table-secondary" : ""}"><td><input class="form-check-input" type="checkbox" data-spu="${this.escape(row.spu)}"
         aria-label="选择第 ${row.row_number} 行商品 ${this.escape(row.spu)}"
         ${this.selected.has(row.spu) ? "checked" : ""} ${disabled || !row.selectable ? "disabled" : ""}></td>
-        <td>${row.row_number}</td><td>${state}</td>${this.columns.map((column) => {
+        <td>${row.row_number}</td><td>${state}</td><td class="text-nowrap">${this.historyCell(row)}</td>${this.columns.map((column) => {
           const original = row.values[column.key] || "";
           const value = this.escape(/DISPIMG\s*\(/i.test(original) ? "图片请在原文档查看" : original);
           return `<td title="${value}">${value || "—"}</td>`;
         }).join("")}<td><button type="button" class="btn btn-link btn-sm p-0" data-hide-row="${this.escape(this.rowKey(row))}" data-spu="${this.escape(row.spu)}">${hidden ? "取消隐藏" : "隐藏"}</button></td></tr>`;
-    }).join("") : `<tr><td colspan="${this.columns.length + 4}" class="text-center text-muted p-4">${
+      const detail = this.expanded.has(this.rowKey(row))
+        ? this.historyDetailRow(row, this.columns.length + 4) : "";
+      return main + detail;
+    }).join("") : `<tr><td colspan="${this.columns.length + 5}" class="text-center text-muted p-4">${
       this.loading ? "正在读取 WPS 文档…" : this.sheet ? "没有匹配的数据" : "选择文档与工作表后，数据将在这里显示"
     }</td></tr>`;
     this.element("sourcePageInfo").textContent = this.sheet

@@ -159,8 +159,8 @@
     </nav>
 
     <div class="container-fluid px-4 pb-5">
-      <!-- 安全告警：正式执行开启时才出现 -->
-      <div id="execAlert" class="alert alert-danger d-none" role="alert">
+      <!-- 安全告警：正式执行开启时才出现（当前默认开启，故初始可见） -->
+      <div id="execAlert" class="alert alert-danger" role="alert">
         <i class="bi bi-exclamation-octagon-fill"></i>
         <strong>正式执行已开启：</strong>将对真实商家账号执行不可逆操作（关加速器 /
         报名活动 / 重开加速器）。请确认无误后再开始。
@@ -291,21 +291,21 @@
           </div>
           <div class="d-flex flex-wrap gap-2 align-items-center">
             <div class="form-check form-switch ms-1">
-              <input class="form-check-input" type="checkbox" id="switchExecute" />
+              <input class="form-check-input" type="checkbox" id="switchExecute" checked />
               <label
                 class="form-check-label small text-danger fw-semibold"
                 for="switchExecute"
-                title="默认关闭=只跑 dry-run（只读+算计划，不点任何变更按钮）。开启才真正对商家账号执行不可逆操作"
-                >正式执行（默认 dry-run 只读）</label
+                title="默认开启=真正对商家账号执行不可逆操作（关加速器/报名/重开加速器）。关闭则只跑 dry-run（只读+算计划，不点任何变更按钮）"
+                >正式执行（默认开启）</label
               >
             </div>
-            <button id="btnStart" class="btn btn-primary btn-sm ms-auto">
+            <button id="btnStart" class="btn btn-danger btn-sm ms-auto">
               <span
                 id="startSpinner"
                 class="spinner-border spinner-border-sm d-none"
                 role="status"
               ></span>
-              <i class="bi bi-play-fill"></i> <span id="startLabel">开始（dry-run）</span>
+              <i class="bi bi-play-fill"></i> <span id="startLabel">开始（正式执行）</span>
             </button>
             <span id="statusText" class="text-muted small"></span>
           </div>
@@ -359,7 +359,7 @@
               title="半程=开提报页并填价，但不提交、不真关/开流量（可逆，适合首次验证）；全程=真提交/真关/真开（不可逆）"
             >
               <option value="half">半程（填价不提交）</option>
-              <option value="full">全程（正式提交）</option>
+              <option value="full" selected>全程（正式提交）</option>
             </select>
             <button id="btnExecSel" class="btn btn-primary btn-sm" disabled>
               <i class="bi bi-play-fill"></i> <span id="execSelLabel">执行选中</span>
@@ -490,6 +490,8 @@
       let dones = {};
       let activityStates = {};
       let accelStates = {};
+      // product_done 带的历史摘要：spu → {at, within_24h}，给流量加速流程表画 24h 预警。
+      let lastAccelOpen = {};
       let currentDryRun = true;
 
       function showToast(title, body, kind = "primary") {
@@ -550,7 +552,7 @@
           return '<span class="badge text-bg-success">done</span>';
         if (st === "fail")
           return '<span class="badge text-bg-danger">fail</span>';
-        // skip_nofloor（无活动达底价）/ skip_nomatch（无匹配活动）一律黄
+        // skip_nofloor（价格/毛利率读不到）/ skip_nomatch（无活动达门槛）一律黄
         return `<span class="badge text-bg-warning">${st}</span>`;
       }
 
@@ -626,8 +628,16 @@
         }
         body.innerHTML = order.map((spu) => {
           const state = ensureAccelState(spu);
+          // 历史摘要：24h 内成功开启过加速器 → 预警（仅展示；锁定期内仍会照常尝试
+          // 关闭与报名，失败如实报——2026-09-25 定案的流程语义不变）。
+          const hist = lastAccelOpen[String(spu)];
+          const warn = hist && hist.within_24h
+            ? `<div class="accel-flow-note text-warning" title="上次成功开启：${escapeHtml(
+                hist.at || ""
+              )}（平台有 24h 锁定期，期内关闭会被拒）"><i class="bi bi-exclamation-triangle"></i> 24h 内开启过，关闭可能撞锁定期（仍会照常尝试）</div>`
+            : "";
           return `<tr data-accel-spu="${escapeHtml(spu)}">
-            <td class="fw-semibold">${escapeHtml(spu)}</td>
+            <td class="fw-semibold">${escapeHtml(spu)}${warn}</td>
             <td>${accelFlowBadge(state.closePre)}</td>
             <td>${accelFlowBadge(state.closeAction)}</td>
             <td class="accel-flow-arrow"><i class="bi bi-arrow-right"></i></td>
@@ -710,13 +720,14 @@
             // SPU 列按商品合并；状态列必须每个活动一格，实时显示当前活动自身进度。
             const spuTd =
               i === 0
-                ? `<td class="small text-muted" rowspan="${span}">${spu}</td>`
+                ? `<td class="small text-muted" rowspan="${span}" role="button"
+                       title="查看该商品活动历史" onclick="openHistory('${escapeHtml(spu)}')">${spu}</td>`
                 : "";
             rows.push(`<tr data-spu="${spu}">
               ${spuTd}
               <td class="cell-ellipsis" title="${p.activity || ""}">${
               p.activity || '<span class="text-muted">–</span>'
-            }</td>
+            }<div class="small">${histBadge(p.history)}</div></td>
               <td class="small">${priceCell(p, "daily_price", "daily")}</td>
               <td class="small">${priceCell(p, "sale", "sale")}</td>
               <td class="small fw-semibold">${priceCell(p, "submit_price", "submit_price")}</td>
@@ -793,6 +804,14 @@
           // 正式执行时 product_done 只代表规划完成，不能提前标成最终 done。
           const isPlannedForExecution = !currentDryRun && data.status === "done";
           dones[data.spu] = isPlannedForExecution ? "planned" : data.status;
+          // 历史摘要：上次成功开启加速器的时间，流量加速流程表据此画 24h 锁定期预警。
+          if (data.last_accel_open_at) {
+            lastAccelOpen[String(data.spu)] = {
+              at: data.last_accel_open_at,
+              within_24h: Boolean(data.accel_open_within_24h),
+            };
+            renderAccelFlow();
+          }
           if (data.status === "done" && currentDryRun) {
             $("statDone").textContent = +$("statDone").textContent + 1;
           } else if (data.status === "fail") {
@@ -895,6 +914,7 @@
             select_product: "勾选列表",
             set_sessions: "填写场次",
             fill_price: "填写活动申报价",
+            fill_stock: "填写活动库存",
             submit: "提交",
           };
           const stepLabels = {
@@ -904,12 +924,13 @@
             select_product: "商品已勾选",
             set_sessions: "场次已填写",
             fill_price: "价格已填写",
+            fill_stock: "库存已填写",
             submit: "提交动作完成",
           };
           setActivityStatus(
             data.spu,
             data.activity,
-            data.ok ? (data.step === "fill_price" ? "filled" : "running") : "failed",
+            data.ok ? (["fill_price", "fill_stock"].includes(data.step) ? "filled" : "running") : "failed",
             data.ok ? stepLabels[data.step] || "执行中" : `${stepNames[data.step] || data.step}失败`,
             data.note || ""
           );
@@ -1028,11 +1049,16 @@
             : data.precheck_state === "off"
               ? { code: "off", label: "已关闭", note: "开启前按 SPU 查询：商品信息列无流量加速中" }
               : { code: "failed", label: "状态未知", note: data.note || "未能确认开启前状态" };
+          // 档位（2026-09-29 起按成本表折扣列定：85折=普通、9/8折=高级、75折及以下=超级）；
+          // 限流品按规则只做活动、不动流量，单独标「限流不开启」而不是「开启失败」。
+          const tierLabel = { normal: "普通档", advanced: "高级档", super: "超级档" }[data.tier] || "";
           state.openAction = data.already_on
             ? { code: "noop", label: "无需重复开启", note: data.note || "当前已经开启" }
-            : data.ok
-              ? { code: "success", label: "开启成功", note: data.note || "平台成功提示已确认" }
-              : { code: "failed", label: "开启失败", note: data.note || "未捕获平台成功提示" };
+            : data.throttled
+              ? { code: "noop", label: "限流不开启", note: data.note || "商品限流，只做活动报名" }
+              : data.ok
+                ? { code: "success", label: tierLabel ? `开启成功（${tierLabel}）` : "开启成功", note: data.note || "平台成功提示已确认" }
+                : { code: "failed", label: "开启失败", note: data.note || "未捕获平台成功提示" };
           renderAccelFlow();
           const precheckLabel = data.precheck_state === "on"
             ? "已开启"
@@ -1230,6 +1256,26 @@
         return Boolean(cell) && cell.verdict === "pass" && cell.eligible !== false;
       }
 
+      // 「上次结论」徽标：history 是 activity_history 摘要 {status, ok, submit_price, at}
+      // （product_plan / scan_start cells 注入；无历史为 null 不渲染）。
+      // at 形如 "2026-09-12 10:30:45"，只取月-日。
+      function histBadge(history) {
+        if (!history || !history.status) return "";
+        const day = escapeHtml(String(history.at || "").slice(5, 10));
+        const price =
+          history.submit_price != null ? ` ¥${fmtNum(history.submit_price)}` : "";
+        const map = {
+          success: { cls: "text-success", label: "上次成功", price: true },
+          not_verified: { cls: "text-warning", label: "上次未成", price: true },
+          detail_ineligible: { cls: "text-muted", label: "详情不可报", price: false },
+          skipped_by_user: { cls: "text-muted", label: "上次跳过", price: false },
+        };
+        const meta = map[history.status] || { cls: "text-muted", label: "上次未确认", price: false };
+        return `<span class="${meta.cls}" title="上次报名：${escapeHtml(history.status)} ${escapeHtml(
+          history.at || ""
+        )}">${meta.label}${meta.price ? price : ""}${day ? ` · ${day}` : ""}</span>`;
+      }
+
       function cellBadge(cell) {
         if (!cell) return '<span class="text-muted">–</span>';
         const note = escapeHtml(cell.note || "");
@@ -1238,7 +1284,7 @@
           return `<span class="badge text-bg-warning" title="${note}">探测失败</span>`;
         }
         if (cell.verdict === "under_floor") {
-          return `<span class="badge text-bg-light" title="${note}">价格不达底价</span>`;
+          return `<span class="badge text-bg-light" title="${note}">折扣不达门槛</span>`;
         }
         if (cell.verdict === "no_rate") {
           return `<span class="badge text-bg-light" title="${note}">无固定折扣</span>`;
@@ -1302,7 +1348,8 @@
             const tds = [
               `<td><div class="d-flex align-items-center gap-1">
                  <input type="checkbox" class="form-check-input m-0" data-matrix-row="${escapeHtml(spu)}" />
-                 <span class="small">${escapeHtml(spu)}</span></div></td>`,
+                 <span class="small text-nowrap" role="button" title="查看该商品活动历史"
+                       onclick="openHistory('${escapeHtml(spu)}')">${escapeHtml(spu)}</span></div></td>`,
             ];
             cols.forEach((name) => {
               const cell = cellAt(spu, name);
@@ -1313,6 +1360,7 @@
                           ${cellSelection.has(key) ? "checked" : ""} ${cellSelectable(cell) ? "" : "disabled"} />
                    <div class="small">${cellBadge(cell)}</div>
                    <div class="small text-muted">${cellPrice(cell)}</div>
+                   <div class="small">${histBadge(cell && cell.history)}</div>
                  </td>`
               );
             });
@@ -1626,6 +1674,113 @@
       loadCellSelection();
       renderMatrix();
       sourcePicker.init();
+
+      // ---- 活动历史弹层：点 SPU 看完整时间线（搞过哪些活动、成没成、加速器开关时间）----
+      const HIST_KIND_LABEL = {
+        enroll: "报名",
+        accel_close: "关加速器",
+        accel_open: "开加速器",
+      };
+      const HIST_STATUS_LABEL = {
+        success: ["text-bg-success", "报名成功"],
+        not_verified: ["text-bg-danger", "未确认"],
+        detail_ineligible: ["text-bg-secondary", "详情不可报"],
+        skipped_by_user: ["text-bg-secondary", "已跳过"],
+        closed: ["text-bg-success", "已关闭"],
+        already_off: ["text-bg-secondary", "本就关闭"],
+        cooldown: ["text-bg-warning", "锁定期拦截"],
+        unknown_state: ["text-bg-warning", "状态未识别"],
+        no_discount: ["text-bg-secondary", "缺折扣列未动"],
+        opened: ["text-bg-success", "已开启"],
+        already_on: ["text-bg-secondary", "本就开启"],
+        throttled: ["text-bg-warning", "限流未动"],
+        rejected: ["text-bg-danger", "未开成"],
+        error: ["text-bg-danger", "异常"],
+      };
+
+      function histRowNote(row) {
+        const d = row.detail || {};
+        const parts = [];
+        if (row.kind === "enroll") {
+          if (d.submit_price != null) parts.push(`申报价 ¥${fmtNum(d.submit_price)}`);
+          if (d.enroll_id) parts.push(`enrollId=${escapeHtml(d.enroll_id)}`);
+          if (d.over_ref) parts.push("超参考价");
+        } else {
+          if (d.tier) parts.push({ normal: "普通档", advanced: "高级档", super: "超级档" }[d.tier] || d.tier);
+          if (Array.isArray(d.accel_prices) && d.accel_prices.length) {
+            parts.push(
+              "加速价 " + d.accel_prices.map((p) => `${escapeHtml(p.label || "")}=¥${fmtNum(p.price)}`).join("，")
+            );
+          } else if (d.accel_price != null) {
+            parts.push(`加速价 ¥${fmtNum(d.accel_price)}`);
+          }
+        }
+        if (d.note) parts.push(escapeHtml(d.note));
+        return parts.join("；");
+      }
+
+      async function openHistory(spu) {
+        const modal = new bootstrap.Modal($("historyModal"));
+        $("historyModalTitle").textContent = `SPU ${spu} 的活动历史`;
+        const body = $("historyBody");
+        body.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">查询中…</td></tr>';
+        modal.show();
+        let resp;
+        try {
+          const r = await fetch(`/activity/history?spu=${encodeURIComponent(spu)}&limit=200`);
+          resp = await r.json();
+        } catch (e) {
+          body.innerHTML = `<tr><td colspan="5" class="text-center text-danger py-3">查询失败：${escapeHtml(e)}</td></tr>`;
+          return;
+        }
+        if (!resp.enabled) {
+          body.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">历史库未配置（[activity_history] 或 [error_report] 的连接参数缺失）</td></tr>';
+          return;
+        }
+        if (resp.error) {
+          body.innerHTML = `<tr><td colspan="5" class="text-center text-danger py-3">历史查询暂不可用：${escapeHtml(resp.error)}</td></tr>`;
+          return;
+        }
+        const rows = resp.rows || [];
+        if (!rows.length) {
+          body.innerHTML = '<tr><td colspan="5" class="text-center text-muted py-3">暂无记录（该商品还没有 live 批次的活动/加速器动作）</td></tr>';
+          return;
+        }
+        body.innerHTML = rows
+          .map((row) => {
+            const [cls, label] = HIST_STATUS_LABEL[row.status] || ["text-bg-light text-dark", row.status || "–"];
+            return `<tr>
+              <td class="small text-nowrap text-muted">${escapeHtml(String(row.created_at || "").slice(0, 16))}</td>
+              <td class="small text-nowrap">${HIST_KIND_LABEL[row.kind] || escapeHtml(row.kind)}</td>
+              <td class="small cell-ellipsis" title="${escapeHtml(row.activity || "")}">${escapeHtml(row.activity || "–")}</td>
+              <td><span class="badge ${cls}">${label}</span></td>
+              <td class="small">${histRowNote(row)}</td>
+            </tr>`;
+          })
+          .join("");
+      }
     </script>
+
+    <!-- SPU 活动历史弹层 -->
+    <div class="modal fade" id="historyModal" tabindex="-1" aria-hidden="true">
+      <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h5 class="modal-title" id="historyModalTitle">活动历史</h5>
+            <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+          </div>
+          <div class="modal-body">
+            <table class="table table-sm align-middle mb-0">
+              <thead>
+                <tr><th>时间</th><th>类型</th><th>活动</th><th>结果</th><th>说明</th></tr>
+              </thead>
+              <tbody id="historyBody">
+                <tr><td colspan="5" class="text-center text-muted py-3">点 SPU 查看</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
   </body>
 </html>
