@@ -191,29 +191,39 @@ def set_stage_choice(stage: str, choice: Optional[str]) -> None:
     _write_prefs(get_llm_choice(), stages)
 
 
-def _section_api_key(config_name: str) -> str:
-    """读统一配置源【原文】里该段的 api_key。
+def _section_api_keys(config_name: str) -> list:
+    """读统一配置源【原文】里该段的 key 池，返回可用的 key 列表（空 = 未配置）。
+
+    段里 api_keys 有非空条目时以它为准，否则回落单个 api_key；空串与 "<...>"
+    占位符都算没填。
 
     为什么不能看加载后的 config.llm：app/config.py 合并时会【剔除空 api_key 再合并】
     （空串会盖掉 [llm] 默认 key，见 _load_initial_config 注释），于是段里留
     api_key = "" 时，合并结果反而带着 [llm] 默认段的真 key——拿它判可用性会
     误判为「已配置」，切过去就拿别家的 key 打 Kimi 的端点（2026-08-21 实测踩中）。
-    统一源（load_raw_config）保证给的是未合并原文，且顺带修掉了原先相对路径
-    config/config.toml 依赖进程 CWD 的口径问题（2026-09-22 配置中心改造）。
+    api_keys 同理（空表被剔除后合并结果带默认段的池）。统一源（load_raw_config）
+    保证给的是未合并原文，且顺带修掉了原先相对路径 config/config.toml 依赖进程
+    CWD 的口径问题（2026-09-22 配置中心改造）。
     """
     try:
         from app.config import load_raw_config
 
-        raw = load_raw_config()
-        return str(raw.get("llm", {}).get(config_name, {}).get("api_key") or "").strip()
+        section = load_raw_config().get("llm", {}).get(config_name, {}) or {}
+        raw = section.get("api_keys")
+        keys = [str(k).strip() for k in raw
+                if str(k).strip()] if isinstance(raw, list) else []
+        if not keys:
+            single = str(section.get("api_key") or "").strip()
+            keys = [single] if single else []
+        return [k for k in keys if not k.startswith("<")]
     except Exception:
-        return ""
+        return []
 
 
 def _choice_available(config_name: str) -> bool:
-    """对应配置段是否可用：config.toml 里该段的 api_key 已填（空串/占位符都算没填）。"""
-    key = _section_api_key(config_name)
-    return bool(key) and not key.startswith("<")
+    """对应配置段是否可用：config.toml 里该段的 api_key 或 api_keys 已填
+    （空串/占位符都算没填）。"""
+    return bool(_section_api_keys(config_name))
 
 
 def _choice_multimodal(choice: str) -> bool:
@@ -258,6 +268,7 @@ def list_llm_choices() -> list:
             out.append({
                 "id": cid, "label": meta["label"], "model": "gemini.google.com",
                 "available": True, "active": cid == active, "multimodal": True,
+                "key_count": 0,  # 官网直连走浏览器页签，不用 API key
             })
             continue
         section = (config.llm or {}).get(meta["config_name"])
@@ -266,6 +277,9 @@ def list_llm_choices() -> list:
             "label": meta["label"],
             "model": getattr(section, "model", "") if section else "",
             "available": _choice_available(meta["config_name"]),
+            # 池大小（api_keys 非空时为池内 key 数，否则单 key 为 1，未配置为 0）。
+            # 排障时一眼看出「几个 key 生效了」；前端暂可不展示。
+            "key_count": len(_section_api_keys(meta["config_name"])),
             "active": cid == active,
             # 前端据此禁掉视觉阶段里的非多模态项（见 set_stage_choice 的同名闸）
             "multimodal": _choice_multimodal(cid),

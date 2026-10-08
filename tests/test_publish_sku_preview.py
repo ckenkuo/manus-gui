@@ -19,8 +19,10 @@ r"""阶段⑦b SKU 预览图（变种信息表第一列）——2026-08-30 玩�
 
 from publish_patching import patch_publish
 import json
+import os
 
 import pytest
+from PIL import Image, ImageDraw
 
 from app.publish import pipeline as P
 from app.publish import service as S
@@ -392,3 +394,165 @@ def test_复用素材图那套空间弹窗():
     """2026-08-30 探查确认预览图与 ⑥⑦ 的空间弹窗是同一个组件实例（标题、
     .img-item、.img-check 文本、计数器全一致），故 _pick_from_space 可直接复用。"""
     assert P.SPACE_MODAL_TITLE == "从图片空间选择"
+
+
+# ---- 6) 英化产物的判定口径：软类（只报乱码/错拼）要两问一致才继续重生 ---------
+# 判据本体在 vision.qc_hard（与 ⑤c 共用一份，取证见那边 docstring）。这里钉的是
+# _clean_downloaded_preview 的三支行为：软类先补问、硬红线不补问、两次一致的软类照旧重生。
+
+def _stub_clean_env(monkeypatch, verdicts):
+    """把出图与质检换成脚本化假实现，返回 (出图调用记录, 质检调用记录)。"""
+    from app.publish.stages import preview
+
+    edits, checks = [], []
+
+    async def fake_edit(path, **kwargs):
+        edits.append(path)
+        out = kwargs["out_path"]
+        Image.new("RGB", (800, 800), "white").save(out)
+        return {"output": out}
+
+    async def fake_check(path):
+        checks.append(path)
+        return verdicts.pop(0) if verdicts else {"clean": True, "issues": ""}
+
+    monkeypatch.setattr(preview.images, "edit_image_async", fake_edit)
+    monkeypatch.setattr(preview.vision, "check_cleaned", fake_check)
+    return edits, checks
+
+
+def _raw(tmp_path):
+    path = tmp_path / "row-raw.jpg"
+    Image.new("RGB", (800, 800), "white").save(path)
+    return str(path)
+
+
+@pytest.mark.asyncio
+async def test_软类首答坏复问好就采用这一版(monkeypatch, tmp_path):
+    """明确只报乱码/错拼时，首答的坏结论不可复现（取证见 vision.qc_hard）：补问一次
+    （零生图成本），复问说好就用这一版——不白烧一发生图，也不退回源图停整单。"""
+    from app.publish.stages import preview
+
+    edits, checks = _stub_clean_env(monkeypatch, [
+        {"clean": False, "garbled": True, "issues": "叠加文案拼写错误 Magnuetic"},
+        {"clean": True, "issues": ""},
+    ])
+    out = await preview._clean_downloaded_preview(_raw(tmp_path), str(tmp_path))
+    assert out and os.path.isfile(out)
+    assert len(edits) == 1, "复问判好就不该再烧一发生图"
+    assert len(checks) == 2
+
+
+@pytest.mark.asyncio
+async def test_硬红线首答坏不补问直接重生(monkeypatch, tmp_path):
+    """品牌标识/中文这类一次就当真：补问只是给同一次抖动第二次机会，红线不吃这一套。"""
+    from app.publish.stages import preview
+
+    edits, checks = _stub_clean_env(monkeypatch, [
+        {"clean": False, "brandMark": True, "issues": "盒上有他人品牌标识 382 TOYS"},
+        {"clean": True, "issues": ""},
+    ])
+    out = await preview._clean_downloaded_preview(_raw(tmp_path), str(tmp_path))
+    assert out and os.path.isfile(out)
+    assert len(edits) == 2, "硬红线首答坏要直接重生"
+    assert len(checks) == 2, "硬红线不补问（两问分别属于两次尝试）"
+
+
+@pytest.mark.asyncio
+async def test_软类两次一致照旧重生到预算耗尽(monkeypatch, tmp_path):
+    """两次都说坏 = 残留是真的：照原路重生，修不动才退回源图交人工
+    （与 ⑤c「两次一致才拦」同口径），并把末发产物的结论交给调用方如实报出。"""
+    from app.publish.stages import preview
+
+    verdicts = [{"clean": False, "garbled": True, "issues": "仍写作 Magnuetic"}] * 6
+    edits, checks = _stub_clean_env(monkeypatch, verdicts)
+    detail = {}
+    out = await preview._clean_downloaded_preview(_raw(tmp_path), str(tmp_path),
+                                                  detail=detail)
+    assert out == "", "两次一致的软类不许放行"
+    assert len(edits) == 3, "三发预算都要用掉"
+    assert len(checks) == 6
+    assert "Magnuetic" in detail["issues"]
+
+
+# ---- 7) 品牌标识定点抹除救援：生图抹不掉实物上的第三方商标时的确定性兜底 ---------
+# 2026-10-08 商品 1048494210610 实证：同一个包装盒的「382 TOYS」在 ⑦b 第 3 行、第 6 行
+# 两次都是「三发生图纹丝不动」，而同款别的行偶尔能抹掉——纯随机，属确定性能力缺口。
+# 救援链路 = 视觉按原文给整个标记图形的框 → 按周围底色整框填 → 复检必须通过。
+
+def test_抹除图形标记按整框填底色(tmp_path):
+    """refine=False 是给图形标记用的：白底方框要整块被底色吃掉，不能只抹里面的字。"""
+    from app.publish import text_erase
+
+    src = tmp_path / "mark.jpg"
+    picture = Image.new("RGB", (400, 300), (0, 100, 200))
+    draw = ImageDraw.Draw(picture)
+    draw.rectangle((250, 40, 350, 100), fill=(255, 255, 255))
+    draw.text((262, 62), "382 TOYS", fill=(0, 0, 0))
+    picture.save(src)
+    result = text_erase.erase_boxes(str(src), [(250, 40, 350, 100)],
+                                    out_path=str(tmp_path / "erased.jpg"), refine=False)
+    assert result["ok"] is True
+    with Image.open(tmp_path / "erased.jpg") as erased:
+        pixel = erased.getpixel((300, 70))
+    assert pixel[2] > 150 and pixel[0] < 60, "白框该被整块填成盒面底色"
+
+
+def test_框外沿不是近纯色就放弃抹除(tmp_path):
+    """蹭到商品主体/照片的框不抹：填出来是一块色疤，不如不抹（留白交重生或人工）。"""
+    from app.publish import text_erase
+
+    src = tmp_path / "busy.jpg"
+    picture = Image.new("RGB", (400, 300), (0, 100, 200))
+    draw = ImageDraw.Draw(picture)
+    for x in range(200, 400, 10):                      # 半幅打上高对比条纹，外沿必杂
+        draw.rectangle((x, 0, x + 4, 300), fill=(255, 255, 0))
+    picture.save(src)
+    result = text_erase.erase_boxes(str(src), [(250, 40, 350, 100)],
+                                    out_path=str(tmp_path / "out.jpg"), refine=False)
+    assert result["ok"] is False
+    assert "近纯色" in result["why"]
+
+
+@pytest.mark.asyncio
+async def test_品牌标识三发抹不掉时走定点抹除救援(monkeypatch, tmp_path):
+    """三发生图都抹不掉商标 → 不再烧第四发，改用确定性定点抹除；抹完复检通过就采用。"""
+    from app.publish.stages import preview
+
+    bad = {"clean": False, "brandMark": True, "brandMarkTexts": ["382 TOYS"],
+           "issues": "包装盒正面右上角有品牌标识 382 TOYS"}
+    edits, checks = _stub_clean_env(monkeypatch, [
+        dict(bad), dict(bad), dict(bad),
+        {"clean": True, "issues": ""}, {"clean": True, "issues": ""},
+    ])
+    seen = []
+
+    async def fake_erase(path, texts, out_path=None):
+        seen.append(list(texts))
+        return {"ok": True}
+
+    monkeypatch.setattr(preview.text_erase, "erase_marks", fake_erase)
+    out = await preview._clean_downloaded_preview(_raw(tmp_path), str(tmp_path))
+    assert out and os.path.isfile(out)
+    assert seen == [["382 TOYS"]], "要拿质检给出的商标原文去定位"
+    assert len(edits) == 3, "确定性兜底不该再烧第四发生图"
+
+
+@pytest.mark.asyncio
+async def test_定点抹除没做成仍退回源图交人工(monkeypatch, tmp_path):
+    """抹除没执行（底色不纯/定位失败）时照原样退回，不新增失败面。"""
+    from app.publish.stages import preview
+
+    bad = {"clean": False, "brandMark": True, "brandMarkTexts": ["382 TOYS"],
+           "issues": "包装盒上有品牌标识 382 TOYS"}
+    _stub_clean_env(monkeypatch, [dict(bad), dict(bad), dict(bad)])
+
+    async def fake_erase(path, texts, out_path=None):
+        return {"ok": False, "why": "文字行背景非近纯色，填除会留色疤"}
+
+    monkeypatch.setattr(preview.text_erase, "erase_marks", fake_erase)
+    detail = {}
+    out = await preview._clean_downloaded_preview(_raw(tmp_path), str(tmp_path),
+                                                  detail=detail)
+    assert out == ""
+    assert "382 TOYS" in detail["issues"], "退回时仍要如实报末发产物的残留"

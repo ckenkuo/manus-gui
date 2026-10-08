@@ -28,6 +28,12 @@ from typing import Optional
 # 仿真水果/仿真花瓣/仿真树枝/仿真花环…，搜「摆件」返回「摆件」，搜「装饰」返回
 # 装饰品/装饰画/装饰带…。即平台早就有这些词，是我们的词表把选择面锁死在服装里了。
 #
+# 【2026-10-08 补记两条更正】一、搜索不是本地过滤静态词表，走远程接口
+# /api/pddkjCategory/searchByPlatformAndValue.json；空搜索的默认列表每个 select 实例
+# 各不相同且随滚动增量加载，「搜不到」≠「词表里没这个词」。二、前端会把【本单元格
+# 兄弟子行已选中的配件值】从搜索结果里剔除（本行现值保留）——同一配件在一个 SKU 的
+# 清单里只能出现一行，所以 _normalize_sku_judge 必须把同名配件合并，见该函数内注释。
+#
 # 故按「服装 + 非服装」两段收词：非服装段收家居装饰/仿真花艺/通用附件这三类实测存在的
 # 词。仍然只收【搜索确认存在】的词，不臆造——词表的作用是让模型在真实可选项里挑，
 # 塞进不存在的词会让页面侧 option-not-found、白跑一轮重试。
@@ -240,6 +246,8 @@ def _normalize_sku_judge(judge: dict, info: dict) -> dict:
     SKU分类数量」，这是个算术约束，模型给 packing 时算错和是常事（列了 3 项但 qty
     仍写 2）。这里不造 fallback 分支，只做归一：
     - 配件名过 _canon_accessory 归到平台词表（模型爱给「外套」这类表外词）
+    - 同名配件合并成一行、件数求和（平台下拉会屏蔽同单元格兄弟行已选的配件值，
+      同一配件在一个 SKU 清单里只能选一行，重名行到页面侧必死，见下方实测注释）
     - packing 缺失或全空 → 按分类数量补一项（名字取源「套装类型」再归一）
     - 件数和与 qty 不等 → 以 packing 的实际和为准，反过来修正 qty（清单是实物构成，
       更接近事实；改 qty 只动一个数字，改 packing 要凭空猜拆分方式）
@@ -263,6 +271,20 @@ def _normalize_sku_judge(judge: dict, info: dict) -> dict:
         except ValueError:
             n = 1
         items.append({"name": name, "qty": max(1, n)})
+
+    # 【同名配件必须合并成一行】2026-10-08 商品 1067569173636 实测：4 件套门廊鹅服饰
+    # 被判成「装饰品x1」四行，而平台包装清单的配件下拉会把【本单元格兄弟子行已选中的
+    # 配件值】从搜索结果里剔除——i=0 选中装饰品后，i=1 再搜只剩「充气装饰品」被页面侧
+    # includes 兜底误选，i=2/i=3 直接暂无数据 option-not-found，整阶段 validation-error。
+    # 平台语义就是「同一配件在一个 SKU 的清单里只占一行」，重复数量走该行的件数字段；
+    # 合并后件数和不变量（和=qty）原样保持。放在 canon 之后做，别名归一到同词的也能并。
+    merged = {}
+    for it in items:
+        merged[it["name"]] = merged.get(it["name"], 0) + it["qty"]
+    if len(merged) < len(items):
+        logger.info(f"包装清单同名配件合并：{items} -> "
+                    f"{[{'name': k, 'qty': v} for k, v in merged.items()]}")
+        items = [{"name": k, "qty": v} for k, v in merged.items()]
 
     if not items:
         # 源「套装类型」多是「裙套装」这类词，归一后能落到「半身裙」。

@@ -313,8 +313,8 @@ temperature = 0.0
 api_version = ""
 
 # ---- 发布管线的备选模型（发布页下拉可切换）------------------------------------
-# 每段对应 app/publish/llm.py 的 LLM_CHOICES 一项；api_key 留空的段在下拉里显示为
-# 不可用（判据是本文件该段的 api_key 是否填了，见 _section_api_key 的注释）。
+# 每段对应 app/publish/llm.py 的 LLM_CHOICES 一项；api_key 与 api_keys 都留空的段
+# 在下拉里显示为不可用（判据是本文件该段的原文，见 _section_api_keys 的注释）。
 # 切模型不需要改代码，但【换端点前先验一发它收不收图】：各家对图片的接受方式不同。
 
 # Kimi Code（api.kimi.com/coding/v1）。
@@ -322,11 +322,27 @@ api_version = ""
 # 「invalid temperature: only 1 is allowed for this model」（2026-08-21 实测）。
 # 【只接受 base64 图片】远程 http 图片 URL 一律 400 unsupported image url
 # （2026-08-22 实测）；发布管线已统一在 image_ref 里下载转 base64，故可用。
+#
+# 【多 key 池：限额/故障自动转移】Kimi Code 按账号限额（5 小时/每周/月度配额），
+# 单 key 触顶整批发布就中断。有多个 Kimi 账号时把 key 都填进 api_keys，运行中
+# 某个 key 触限额/鉴权失败会立即切下一个 key 重发（403 usage limit / 401 鉴权·
+# 订阅档位 / 402 会员权益 / 500 账号封禁，错误码见 kimi.com/code/docs/kimi-code/
+# error-reference.html）；429 限流与 403 并发限制也会切（新 key 新速率额度），
+# 全池都撞才退避等待；全池不可用则立即报错，不走指数退避白等。
+# 注意三条纪律：
+#   1. api_keys 非空时优先于 api_key；【api_key 仍必须填池里第一个 key】——多台
+#      机器经配置中心共享本文件，未升级的旧代码只认 api_key；且 api_key 留空会被
+#      合并逻辑顶上 [llm] 默认段的别家 key。
+#   2. 当前用到哪个 key 是各机进程内状态，不跨机共享，A 机用 key2、B 机用 key1
+#      是正常现象，不是配置错。
+#   3. LLM 配置段是进程启动时加载的单例，改完 key 池要【重启生效】。
+# 下面 3 个 Kimi 段（k27/k256k/highspeed）同此规则；同账号池就填同一组 key。
 [llm.publish-kimi]
 api_type = "openai"
 model = "k3"
 base_url = "https://api.kimi.com/coding/v1"
-api_key = ""                                                   # 你的 Kimi Code API key
+api_key = ""                                                   # 你的 Kimi Code API key（池里第一个）
+# api_keys = ["sk-xxx-1", "sk-xxx-2"]                          # 多账号池，见上方说明
 max_tokens = 16000
 temperature = 1.0
 api_version = ""
@@ -336,6 +352,7 @@ api_type = "openai"
 model = "kimi-for-coding"
 base_url = "https://api.kimi.com/coding/v1"
 api_key = ""
+# api_keys = ["sk-xxx-1", "sk-xxx-2"]                          # 多账号池，规则同 [llm.publish-kimi]
 max_tokens = 16000
 temperature = 1.0  # 只能 1，同上
 api_version = ""
@@ -345,6 +362,7 @@ api_type = "openai"
 model = "k3-256k"
 base_url = "https://api.kimi.com/coding/v1"
 api_key = ""
+# api_keys = ["sk-xxx-1", "sk-xxx-2"]                          # 多账号池，规则同 [llm.publish-kimi]
 max_tokens = 16000
 temperature = 1.0  # 只能 1，同上
 api_version = ""
@@ -354,6 +372,7 @@ api_type = "openai"
 model = "kimi-for-coding-highspeed"
 base_url = "https://api.kimi.com/coding/v1"
 api_key = ""
+# api_keys = ["sk-xxx-1", "sk-xxx-2"]                          # 多账号池，规则同 [llm.publish-kimi]
 max_tokens = 16000
 temperature = 1.0  # 只能 1，同上
 api_version = ""

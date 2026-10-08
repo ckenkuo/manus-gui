@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+from app import llm as app_llm
 from app.logger import logger
 from app.publish import claims, images, preferences, state, vision
 from app.publish.browser import BrowserSession
@@ -19,6 +20,37 @@ from app.publish.stages import (
 # 原先写死 90，依据是「实测一张约 35s」的单发耗时；并发跑时服务端实际要 30~79s，
 # 90s 会在服务端【已出图并计费】之后才被本地掐断。超了仍走原图兜底，不拖住整批。
 CLEAN_TIMEOUT = images.EDIT_TIMEOUT
+
+# 质检调用报错的外层重试预算。check_cleaned 内置的退避（ask_with_images 的 6 次
+# tenacity）撞不过分钟级的对端黑洞：2026-10-08 实测 api.deepseek.com 的新 TCP 连接
+# 被黑洞约 5 分钟（并发突发触发的边缘限流特征），内置重试全部落在窗口内，
+# 1028864900016 有 6 张产物已落盘的图被判 qc_error 拖停整阶段。质检是只读调用
+# （约 2.7k token），重试零生图成本——与出图不同（那边重试一次就是一发付费生图，
+# 瞬时故障照旧交 kind=edit 分类，不在外层垫）。
+_QC_ERROR_TRIES = 3
+_QC_ERROR_INTERVAL = 30
+
+# ---- 质检调用的并发闸门 ------------------------------------------------------
+# 【为什么 QC 也要限流，且与出图闸门分开管】出图闸门约束的是打【出图中转】的 curl
+# 路数（30 路是对中转的实测安全值），质检打的是【LLM 端点】（当前 api.deepseek.com），
+# 两边是不同的对端、不同的限流阈值——2026-10-08 那场风暴正是约 30 路文本+视觉调用
+# 集中打向 deepseek 触发的，把出图的安全路数套到 LLM 端点上就是那个下场。
+# 【复用路径让这道闸门成为必需】落盘产物补 QC 不经过出图闸门（不烧生图），没有
+# 自己的上限时，续跑会上百个 _one 同时把 QC 打向 LLM 端点——恰好复现触发风暴的
+# 突发形态。取 10：远低于当天触发突发的量级，141 张全走复用也就两三分钟。
+# 按事件循环缓存的理由同 images._EDIT_GATES（多 loop 共存，测试每个用例一个 loop）。
+_QC_CONCURRENCY = 10
+_QC_GATES: dict = {}
+
+
+def _qc_gate():
+    """取当前事件循环的质检并发闸门（同 loop 内共用一个）。"""
+    loop = asyncio.get_running_loop()
+    gate = _QC_GATES.get(loop)
+    if gate is None:
+        gate = asyncio.Semaphore(_QC_CONCURRENCY)
+        _QC_GATES[loop] = gate
+    return gate
 
 
 def _save_info(info_path: str, info: dict) -> None:
@@ -93,6 +125,27 @@ def _fail_message(r: dict) -> str:
                 f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
     return (f"{r['file']} 多次英化质检均未通过（仍带中文/水印，不能发布）。"
             f"已丢弃该图、不再等人工换图，其余图照常发布，不用处理：{why}")
+
+
+async def _check_cleaned_with_retry(image_path: str, fname: str) -> dict:
+    """调一次 vision.check_cleaned；调用报错按 _QC_ERROR_TRIES 预算隔档重问，耗尽抛原异常。
+
+    【重试的只是「调用报错」，不是「判定不合格」】判定不合格是模型看着产物下的结论，
+    走 _one 原有的多烧几发逻辑（每烧一发都是付费生图）；调用报错说明产物压根没被
+    判过（对端限流/断连），重问零生图成本，值得多垫这一层。
+    判据复用 app.llm._worth_retry：白名单错配、400 这类确定性失败立即抛，不在外层
+    白等——与内置 tenacity 同一口径，那边日后新增确定性类型时这里自动跟随。
+    """
+    for attempt in range(1, _QC_ERROR_TRIES + 1):
+        try:
+            async with _qc_gate():
+                return await vision.check_cleaned(image_path)
+        except Exception as e:
+            if attempt >= _QC_ERROR_TRIES or not app_llm._worth_retry(e):
+                raise
+            logger.warning(f"{fname} 英化质检调用报错（{attempt}/{_QC_ERROR_TRIES}），"
+                           f"{_QC_ERROR_INTERVAL}s 后重问：{str(e)[:100]}")
+            await asyncio.sleep(_QC_ERROR_INTERVAL)
 
 
 async def _clean_main_images(ctx: dict, emit) -> dict:
@@ -194,7 +247,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
     conc = preferences.get_image_concurrency()
 
     async def _one(item: dict) -> dict:
-        """清一张：出图 → 质检 → 通过才算成功。
+        """清一张：盘上有未判过的产物先补质检直接用，否则出图 → 质检 → 通过才算成功。
 
         成功返回 {"file", "ok": True, "path"}；失败返回 {"file", "ok": False,
         "kind", "why"}，kind 标出栽在哪一环（edit 出图 / qc_error 质检环节报错 /
@@ -216,6 +269,35 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
         豁免（同 ⑬ 的 sizechart 分支）。
         """
         dst = os.path.join(outdir, os.path.splitext(item["file"])[0] + "-clean.png")
+        # 【续跑先给盘上已有产物补一次质检，别直接重烧一发】上一轮出图成功后、质检前
+        # 撞上对端故障的图（kind=qc_error），盘上留着从未被判过的产物——2026-10-08
+        # 实测 1028864900016：deepseek 连接超时风暴撞死 6 张图的质检，产物明明就在
+        # cleaned/ 里，续跑却要各重烧一发付费生图。这里先对它补 QC：过了直接用
+        # （与正常「出图 → 质检通过」的后续流程完全一致），不过再走正常出图。
+        # 与 ⑬ 的「复用落盘产物」同一取向，差别就在必须补这道 QC：⑬ 的缓存键意味着
+        # 「落盘即已通过」（质检未过的产物那边会删掉），而本阶段失败不删产物
+        # （dst 在下一发会被覆盖复用），存在≠合格。
+        # 【产物路径按 edit_image 的产物链推】_save_result 写到 dst，compress 把非 jpg
+        # 转 .jpg 并删旧文件，故终产物是 dst 换成 .jpg 后缀。
+        # 【质检判死（unusable）的旧产物不会走到这里】plan_clean 与上面补充循环都跳过
+        # unusable（见 vision.is_unusable），能被重新送进来的，盘上产物一定没被判过。
+        product = (dst if dst.lower().endswith((".jpg", ".jpeg"))
+                   else os.path.splitext(dst)[0] + ".jpg")
+        if os.path.isfile(product):
+            try:
+                qc0 = await _check_cleaned_with_retry(product, item["file"])
+            except Exception as e:
+                # 补质检撞上链路故障不算失败：照常出图，本次出图后的质检同样带重试；
+                # 若整轮都在故障中，会由下面出图后的那道 qc_error 如实上报。
+                logger.warning(f"{item['file']} 已有产物补质检报错"
+                               f"（忽略，照常重新出图）：{str(e)[:100]}")
+            else:
+                if qc0.get("clean"):
+                    logger.info(f"{item['file']} 复用上一轮已落盘的清理产物"
+                                f"（补质检通过），省掉一次生图")
+                    return {"file": item["file"], "ok": True, "path": product}
+                logger.info(f"{item['file']} 已有产物补质检未过，照常重新出图："
+                            f"{(qc0.get('issues') or '')[:60]}")
         last_why, cjk_left, claim_left = "", False, False
         banned_left, brand_left, material_left = False, False, False
         attempt, tries = 0, stages_description_images.DESC_QC_TRIES
@@ -252,7 +334,7 @@ async def _clean_main_images(ctx: dict, emit) -> dict:
                         "transient": isinstance(e, images.TransientNetError),
                         "why": str(e)[:120]}
             try:
-                qc = await vision.check_cleaned(ed["output"])
+                qc = await _check_cleaned_with_retry(ed["output"], item["file"])
             except Exception as e:
                 # 质检自己报错时产物合规与否没判过，同样不能报成「图带中文」
                 return {"file": item["file"], "ok": False, "kind": "qc_error",

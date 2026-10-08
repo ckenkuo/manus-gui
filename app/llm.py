@@ -23,6 +23,7 @@ from tenacity import (
 from app.bedrock import BedrockClient
 from app.config import LLMSettings, config
 from app.exceptions import (
+    AllApiKeysExhausted,
     EmptyContentTruncated,
     ModelNotMultimodalError,
     TokenLimitExceeded,
@@ -37,6 +38,73 @@ from app.schema import (
 )
 
 
+# ---- key 池：限额/故障自动转移 ------------------------------------------------
+# 【为什么池只给 Kimi 段启用】2026-10-08 用户定：多账号池是 Kimi Code 订阅制
+# （按账号 5 小时/每周/月度限额）催生的需求，别家渠道的故障转移语义未实测，
+# 不提前泛化。其余段在 config.toml 里配了 api_keys 也只打 warning 忽略。
+# 分类器本身通用——下面的标记全是 Kimi 特有文案，别家端点不会误命中。
+_KEY_POOL_CONFIG_NAMES = {
+    "publish-kimi",
+    "publish-kimi-k27",
+    "publish-kimi-k256k",
+    "publish-kimi-highspeed",
+}
+
+# 错误分类标记，来源：Kimi 官方错误码文档（2026-10-08，
+# kimi.com/code/docs/kimi-code/error-reference.html）。全部小写匹配。
+# 【限额是 403 不是 429】Kimi 的 5 小时/每周/月度配额触顶都返回 403 + usage limit；
+# 429 只表示速率/引擎过载（瞬时），两类处置相反，不能按状态码一概而论。
+_QUOTA_403_MARKERS = ("usage limit",)
+# 403 的并发限额是瞬时风控（等几秒就恢复），与配额两码事，按 ratelimit 处置。
+_CONCURRENT_403_MARKERS = ("concurrent request limit",)
+# 401 里 key 无效/订阅档位不足都是 key 级问题（换个账号可能就有该档位）；
+# 注意「Your model id does not exist」也是 401 但属配置错误——它不含下列任何
+# 标记，自然落 other 不轮转，无需单独排除。
+_QUOTA_401_MARKERS = (
+    "invalid or may have expired",
+    "invalid authentication",
+    "does not have access",
+    "plan supports only",
+)
+# 账号封禁类被平台包成 500，是 key 级确定性失败，与真正的服务端抖动（同 500）分开。
+_BANNED_5XX_MARKERS = ("未找到该账号", "已被禁用", "已被暂时禁用", "已被禁言")
+
+
+def _key_error_kind(exc: BaseException) -> str:
+    """把 API 异常分成三类，决定 key 池的处置方式。
+
+    返回：
+      "quota"     —— key 级确定性失败（限额/鉴权/权益/封禁）：立即换下一个 key；
+                     全池都这样才抛 AllApiKeysExhausted，不退避。
+      "ratelimit" —— 瞬时限速（429、403 并发限额）：也换 key（新 key 新速率额度），
+                     但全池都撞时抛原生异常交 tenacity 退避（等一等会恢复）。
+      "other"     —— 请求或端点问题（400/404/超时/连接/其他 5xx）：换 key 无用，
+                     原样抛出交 tenacity 既有逻辑。连接超时乘以池大小只会放大
+                     故障时长，绝不能轮转。
+    """
+    status = getattr(exc, "status_code", None)  # APIConnectionError 等没有 status_code
+    text = " ".join([
+        str(getattr(exc, "message", "") or ""),
+        str(getattr(exc, "body", "") or ""),
+        str(exc) or "",
+    ]).lower()
+    if status == 429:
+        return "ratelimit"
+    if status == 403:
+        if any(m in text for m in _CONCURRENT_403_MARKERS):
+            return "ratelimit"
+        if any(m in text for m in _QUOTA_403_MARKERS):
+            return "quota"
+        return "other"  # 未识别的 403 不轮转，维持现状
+    if status == 401 and any(m in text for m in _QUOTA_401_MARKERS):
+        return "quota"
+    if status == 402:  # 会员权益异常（unable to verify your membership benefits）
+        return "quota"
+    if status is not None and status >= 500 and any(m in text for m in _BANNED_5XX_MARKERS):
+        return "quota"
+    return "other"
+
+
 def _worth_retry_text(exc: BaseException) -> bool:
     """纯文本请求是否值得退避重试。
 
@@ -48,9 +116,12 @@ def _worth_retry_text(exc: BaseException) -> bool:
       - TokenLimitExceeded：输入本身超限，重发一样超。原先装饰器里注释写着
         "Don't retry TokenLimitExceeded"，但 retry_if_exception_type 的元组里带着
         Exception（等于什么都重试），这条豁免形同虚设——顺手做实。
+      - AllApiKeysExhausted：key 池全灭（见该类的注释），退避重发只是把同一批
+        拒绝信再收一遍。
     """
     return not isinstance(
-        exc, (BadRequestError, EmptyContentTruncated, TokenLimitExceeded))
+        exc, (BadRequestError, EmptyContentTruncated, TokenLimitExceeded,
+              AllApiKeysExhausted))
 
 
 def _worth_retry(exc: BaseException) -> bool:
@@ -71,9 +142,14 @@ def _worth_retry(exc: BaseException) -> bool:
     ModelNotMultimodalError 也是确定性失败（config 模型名与本地白名单没对齐，
     请求根本没发出去），2026-09-11 那次整批卡死就是它被当成普通 ValueError
     重试造成的——见 app/exceptions.py 该类的注释。
+
+    AllApiKeysExhausted 与 TokenLimitExceeded 同 _worth_retry_text 的理由：
+    前者是池全灭、退避白等；后者原先在这条谓词里漏排除了（带图路径今天会
+    白走 6 次退避），顺手补上。
     """
     return not isinstance(
-        exc, (BadRequestError, EmptyContentTruncated, ModelNotMultimodalError))
+        exc, (BadRequestError, EmptyContentTruncated, ModelNotMultimodalError,
+              TokenLimitExceeded, AllApiKeysExhausted))
 
 
 # 截断返空时就地重发用的额度倍数。1.5 是够用的经验值：deepseek 档配 32000，抬到
@@ -317,13 +393,34 @@ class LLM:
         if not hasattr(self, "client"):  # 仅在尚未初始化时初始化
             llm_config = llm_config or config.llm
             llm_config = llm_config.get(config_name, llm_config["default"])
+            self.config_name = config_name
             self.model = llm_config.model
             self.max_tokens = llm_config.max_tokens
             self.temperature = llm_config.temperature
             self.api_type = llm_config.api_type
-            self.api_key = llm_config.api_key
             self.api_version = llm_config.api_version
             self.base_url = llm_config.base_url
+
+            # key 池：段里配了 api_keys（非空、非占位）且该段启用了池才生效，
+            # 否则就是 [api_key] 单 key（池大小 1，_chat_create 自然不轮转）。
+            # 【过滤后为空也要退回单 key】api_keys = ["", "<占位>"] 且 api_key 也
+            # 空时，空池会在 pool[0] 直接 IndexError；退回 [api_key]（哪怕是空串）
+            # 与今天 api_key="" 时延迟到请求才报错的行为一致。
+            raw_keys = [
+                str(k).strip() for k in (getattr(llm_config, "api_keys", None) or [])
+                if str(k).strip() and not str(k).strip().startswith("<")
+            ]
+            if raw_keys and config_name not in _KEY_POOL_CONFIG_NAMES:
+                logger.warning(
+                    f"[{config_name}] 配了 api_keys，但 key 池目前仅 Kimi 渠道段启用"
+                    f"（{sorted(_KEY_POOL_CONFIG_NAMES)}），已忽略、仍用单 api_key"
+                )
+                raw_keys = []
+            self._key_pool = raw_keys or [llm_config.api_key]
+            # 粘性索引：某 key 限额死掉后，批次后续调用直接从当前好 key 开始，
+            # 不重复踩死 key。各进程各自维护，不跨机共享（配置中心只同步配置文本）。
+            self._key_index = 0
+            self.api_key = self._key_pool[0]  # 当前 key，轮转时同步更新
 
             # 添加 token 计数相关属性
             self.total_input_tokens = 0
@@ -352,7 +449,86 @@ class LLM:
             else:
                 self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
 
+            # client 按 key 索引缓存、惰性创建、进程内【绝不 close】：发布管线对同一
+            # 单例有真实并发（vision.py ⑤c/⑬ 分块 gather、sku_codes 信号量并发翻译），
+            # 轮转时 close 旧 client 会中止别的协程在该 client 上的在途请求。
+            # 池子就几个 client，无泄漏增长。
+            self._clients = {0: self.client}
+
             self.token_counter = TokenCounter(self.tokenizer)
+
+    def _switch_key(self, j: int, kind: str, err: BaseException) -> None:
+        """把当前 key 切到池里第 j 个（轮转由 _chat_create 驱动，别直接调）。
+
+        只翻索引、更新 self.api_key / self.client（按索引缓存惰性建），旧 client
+        不 close（见 __init__ 里 _clients 的注释）。日志只打 key 序号与错误摘要，
+        【绝不打 key 值】（项目铁律：密钥不回显）。
+        本方法无 await：与 _chat_create 里「self._key_index == i 才轮转」的判据
+        配合，保证单事件循环下判定+切换是原子的，并发协程不会重复轮转跳过一个
+        没试过的 key。
+        """
+        pool = self._key_pool
+        brief = str(err)[:200]
+        logger.warning(
+            f"[{self.config_name}] key #{self._key_index + 1}/{len(pool)} "
+            f"{'限额/鉴权类失败' if kind == 'quota' else '速率受限'}"
+            f"（{brief}），切到 key #{j + 1}"
+        )
+        self._key_index = j
+        self.api_key = pool[j]
+        if j not in self._clients:
+            self._clients[j] = AsyncOpenAI(
+                api_key=pool[j], base_url=self.base_url)
+        self.client = self._clients[j]
+
+    async def _chat_create(self, **params):
+        """带 key 轮转的一次 chat.completions.create 调用（ask/ask_with_images
+        的全部发请求点都走这里，包括流式分支）。
+
+        【为什么在 tenacity 之下轮转】ask/ask_with_images 的 tenacity 是 6 次
+        指数退避（单次最多 60s）。限额是确定性失败，若冒到外层再换 key，每个死
+        key 都白烧几分钟退避。挂在这一层，死 key 零等待切换；退避只留给真正的
+        瞬时故障（全池 429、超时、5xx）。
+
+        轮转语义（分类见 _key_error_kind）：
+          - quota（限额/鉴权/权益/封禁）：立即换下一个没试过的 key 重发；
+            本次调用试遍全池仍失败 → 抛 AllApiKeysExhausted（tenacity 谓词已排除，
+            不退避，文案直接告诉调用方「N 个 key 全灭」）。
+          - ratelimit（429 / 403 并发限额）：同样换 key（新 key 新速率额度）；
+            试遍全池 → 抛原生异常交 tenacity 退避（瞬时限速等一等会恢复）。
+          - other：原样抛出，不轮转（端点故障换 key 无用）。
+        池大小 1（未配 api_keys 的段）不轮转；quota 类失败从「6 次退避后抛原生错」
+        变为「立即抛 AllApiKeysExhausted」——确定性失败不再白等（2026-10-08 用户定）。
+        """
+        # 测试桩（tests/test_llm_empty_truncated.py 用 object.__new__ 不过 __init__）
+        # 没有池属性，getattr 取默认视为单 key：行为与引入池之前完全一致。
+        pool = getattr(self, "_key_pool", None) or [getattr(self, "api_key", "")]
+        tried = set()  # 本次调用已试过的池索引（判「全池耗尽」比计数准：并发下索引会动）
+        while True:
+            i = getattr(self, "_key_index", 0)
+            try:
+                return await self.client.chat.completions.create(**params)
+            except Exception as e:
+                kind = _key_error_kind(e)
+                tried.add(i)
+                if kind == "other":
+                    raise
+                if len(tried) >= len(pool):
+                    if kind == "quota":
+                        raise AllApiKeysExhausted(
+                            f"[{getattr(self, 'config_name', '?')}] key 池 "
+                            f"{len(pool)} 个全部限额/鉴权失败，请检查 Kimi 账号"
+                            f"配额或补充 key。最后错误：{str(e)[:200]}"
+                        ) from e
+                    raise  # ratelimit 全池都撞：交 tenacity 退避等待
+                # 只有我失败的 key 仍是当前 key 时才由我轮转；不等说明并发协程
+                # 已换好 key，直接用换好的重发（见 _switch_key 的原子性说明）。
+                if getattr(self, "_key_index", 0) == i:
+                    for off in range(1, len(pool) + 1):
+                        j = (i + off) % len(pool)
+                        if j not in tried:
+                            break
+                    self._switch_key(j, kind, e)
 
     @property
     def use_response_api(self) -> bool:
@@ -712,9 +888,7 @@ class LLM:
 
             if not stream:
                 # 非流式请求。截断返空时就地抬额度重发一次（见 _RETRY_TOKEN_SCALE）
-                response = await self.client.chat.completions.create(
-                    **params, stream=False
-                )
+                response = await self._chat_create(**params, stream=False)
                 if _is_truncated_empty(response):
                     bigger = int(self.max_tokens * _RETRY_TOKEN_SCALE)
                     logger.warning(
@@ -723,7 +897,7 @@ class LLM:
                     )
                     key = ("max_completion_tokens" if self.model in REASONING_MODELS
                            else "max_tokens")
-                    response = await self.client.chat.completions.create(
+                    response = await self._chat_create(
                         **{**params, key: bigger}, stream=False
                     )
                     if _is_truncated_empty(response):
@@ -745,7 +919,7 @@ class LLM:
                     )
                     key = ("max_completion_tokens" if self.model in REASONING_MODELS
                            else "max_tokens")
-                    response = await self.client.chat.completions.create(
+                    response = await self._chat_create(
                         **{**params, key: bigger}, stream=False
                     )
                     if not response.choices or not response.choices[0].message.content:
@@ -764,7 +938,7 @@ class LLM:
             # 流式请求，对于流式传输，在发出请求之前更新估计的 token 计数
             self.update_token_count(input_tokens)
 
-            response = await self.client.chat.completions.create(**params, stream=True)
+            response = await self._chat_create(**params, stream=True)
 
             collected_messages = []
             completion_text = ""
@@ -795,6 +969,10 @@ class LLM:
             # 不打 exception 堆栈：这不是代码出错，是额度/提示词配得不对，
             # 一行说清即可（掉到下面的 except Exception 会报成 "Unexpected error"）
             logger.error(f"正文被推理链挤空且抬额度无效：{e}")
+            raise
+        except AllApiKeysExhausted as e:
+            # 同 EmptyContentTruncated 的处置：池全灭不是代码意外，一行说清不堆栈
+            logger.error(f"key 池全部不可用：{e}")
             raise
         except ValueError:
             logger.exception(f"Validation error")
@@ -942,7 +1120,7 @@ class LLM:
                 # finish_reason=stop 走了退避重试。带图请求重发一次要重新上传整批
                 # base64（阶段⑬ 单次 11 张图），走满 6 次退避的代价比纯文本更高，
                 # 故能就地对症解决的先在这里解决。
-                response = await self.client.chat.completions.create(**params)
+                response = await self._chat_create(**params)
                 used_tokens = self.max_tokens
                 if _is_truncated_empty(response):
                     bigger = int(self.max_tokens * _RETRY_TOKEN_SCALE)
@@ -953,9 +1131,7 @@ class LLM:
                     )
                     key = ("max_completion_tokens" if self.model in REASONING_MODELS
                            else "max_tokens")
-                    response = await self.client.chat.completions.create(
-                        **{**params, key: bigger}
-                    )
+                    response = await self._chat_create(**{**params, key: bigger})
                     used_tokens = bigger
                     if _is_truncated_empty(response):
                         # 抬过一次仍空是确定性失败，抛专用类型让退避重试跳过它
@@ -977,9 +1153,7 @@ class LLM:
                     )
                     key = ("max_completion_tokens" if self.model in REASONING_MODELS
                            else "max_tokens")
-                    response = await self.client.chat.completions.create(
-                        **{**params, key: bigger}
-                    )
+                    response = await self._chat_create(**{**params, key: bigger})
                     used_tokens = bigger
                     if not response.choices or not response.choices[0].message.content:
                         raise ValueError(
@@ -1015,7 +1189,7 @@ class LLM:
 
             # 处理流式请求
             self.update_token_count(input_tokens)
-            response = await self.client.chat.completions.create(**params)
+            response = await self._chat_create(**params)
 
             collected_messages = []
             async for chunk in response:
@@ -1032,6 +1206,10 @@ class LLM:
             return full_response
 
         except TokenLimitExceeded:
+            raise
+        except AllApiKeysExhausted as e:
+            # 同 ask 的处置：池全灭一行说清，不落 except Exception 报成意外错误
+            logger.error(f"key 池全部不可用：{e}")
             raise
         except ValueError as ve:
             logger.error(f"Validation error in ask_with_images: {ve}")

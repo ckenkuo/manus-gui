@@ -178,6 +178,15 @@ _JS_FILL_STOCK_CAT = r"""(async () => {
 # 【配件名不能保证与词表字面相同】LLM 给的是「上衣/半身裙」这类通用词，词表里是
 # 「便服上衣/西装上衣/露腰上衣」。故先精确匹配、再退到 includes，两者都不中才报
 # option-not-found 交上层重试（判断层已按真实词表提示过，见 judge_packing_list）。
+#
+# 【2026-10-08 更正两条实测语义】一、搜索不是本地过滤静态词表，走远程接口
+# /api/pddkjCategory/searchByPlatformAndValue.json（上面 2026-08-27 那段「171 项
+# 静态词表」的说法作废；当时观察到的「滚动整段替换渲染项」实为增量加载）。二、
+# 前端会把【本单元格兄弟子行已选中的配件值】从搜索结果里剔除（本行现值保留）——
+# 同一配件在一个 SKU 的清单里只能选一行，重名行搜到后面必然暂无数据、报
+# option-not-found（商品 1067569173636 实测）。故本段假设 ITEMS 已无重名（由
+# accessories._normalize_sku_judge 合并保证）；includes 兜底挑到与请求不同的词时
+# 记入 fuzzy 交上层记 warning——那个词往往是兄弟行占用后仅剩的近义词，语义已偏。
 _JS_FILL_PACKING = r"""(async () => {
   const sleep = ms => new Promise(r => setTimeout(r, ms));
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
@@ -261,6 +270,7 @@ _JS_FILL_PACKING = r"""(async () => {
   const rows = all.slice(START, END);
   let processed = 0;
   const failed = [];
+  const fuzzy = [];
   for (const tr of rows) {
     const td = packTdOf(tr);
     if (!td) continue;
@@ -282,6 +292,10 @@ _JS_FILL_PACKING = r"""(async () => {
     for (let i = 0; i < ITEMS.length && i < ls.length; i++) {
       const r = await pickAccessory(ls[i].sel, ITEMS[i].name);
       if (!r.ok) failed.push({row: processed, i, ...r});
+      // includes 兜底选中的词与请求词不同（如「装饰品」被挑成「充气装饰品」）：
+      // 不算失败，但记 fuzzy 让 python 侧留 warning，事后能查到语义偏移
+      else if (r.got && r.got !== ITEMS[i].name && r.source !== 'already')
+        fuzzy.push({row: processed, i, want: ITEMS[i].name, got: r.got});
       const q = lineOf(td)[i].qtyInp;
       if (q && q.value !== String(ITEMS[i].qty)) setInp(q, ITEMS[i].qty);
     }
@@ -308,6 +322,6 @@ _JS_FILL_PACKING = r"""(async () => {
     const blank = got.some(x => !x.name || x.name === '请选择配件' || !x.qty);
     if (got.length !== ITEMS.length || blank || sum !== want) bad.push({got, sum, want});
   });
-  return JSON.stringify({processed, failed, bad, sample, want,
+  return JSON.stringify({processed, failed, fuzzy, bad, sample, want,
                          total, rowCount: all.length});
 })()"""

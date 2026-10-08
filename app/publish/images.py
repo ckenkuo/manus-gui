@@ -1134,11 +1134,22 @@ def _is_bad_channel(resp_json: dict) -> bool:
 #                                     文案的，由 _busy_exhausted 改判 ModerationBlocked。
 #   image_account_selection_timeout —— 网关挑不到可用上游账号（「当前系统过载」）。
 #   No available compatible accounts —— 同上，但响应只有 message 没有 code，走 MARKS 认。
+#
+# 2026-10-08 再补一个（同样是 HTTP 200 + 错误 JSON）：
+#   asset_storage_unavailable —— 网关侧的参考图存储暂时不可用。原文是
+#     {"error": {"code": "asset_storage_unavailable", "type": "server_error",
+#                "message": "参考图存储暂时不可用，请稍后重试"}}，【对端自己写明
+#     「请稍后重试」+ server_error】，重发即重新上传参考图。取证：1048494210610 的
+#     ⑤c 第 4 张英化首发撞上它，当时不在表里 → 不重试、直接判这张英化失败 →
+#     该张中文原图留在选用中、⑤c 整单 fail（一次对端抖动炸掉一单）。文案一并进
+#     MARKS：同家网关换字段/换码时不至于又漏认。
 _TRANSIENT_TASK_CODES = frozenset({"477", "434", "upstream_text_reply",
-                                   "image_account_selection_timeout"})
+                                   "image_account_selection_timeout",
+                                   "asset_storage_unavailable"})
 # 码之外的兜底签名：网关把错误码换字段或改成字符串时，这两个文案仍认得出。
 _TRANSIENT_TASK_MARKS = ("image_task_failed_or_requires_review", "生图超时",
-                         "No available compatible accounts")
+                         "No available compatible accounts",
+                         "参考图存储暂时不可用")
 
 
 def _is_upstream_busy(resp_json: dict) -> bool:

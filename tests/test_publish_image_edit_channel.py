@@ -373,3 +373,35 @@ def test_重试耗尽是限流文案仍判瞬时():
                        "message": "可能违反内容政策；当前频率限制，请稍后重试"}}
     with pytest.raises(images.TransientNetError):
         images._busy_exhausted(mixed, 4, 4, "出图服务")
+
+
+# 网关侧参考图存储暂时不可用（2026-10-08 商品 1048494210610 ⑤c 实测原样抄回）
+ASSET_STORAGE_RESP = {
+    "error": {"code": "asset_storage_unavailable",
+              "message": "参考图存储暂时不可用，请稍后重试",
+              "type": "server_error"}
+}
+
+
+def test_参考图存储不可用按瞬时重试(monkeypatch, 假图, tmp_path):
+    """对端自己写明 server_error +「请稍后重试」= 重发重新上传参考图就能过。
+
+    不进表的代价实测过：这张图的英化首发撞上它，不重试直接判该张失败，中文原图
+    留在选用中、⑤c 整单 fail——一次对端抖动炸掉一单。"""
+    assert images._is_upstream_busy(ASSET_STORAGE_RESP)
+    calls = []
+    _stub(monkeypatch, [ASSET_STORAGE_RESP, OK_RESP], calls)
+    monkeypatch.setattr(images, "_save_result", lambda r, o: o)
+    monkeypatch.setattr(images.time, "sleep", lambda *_: None, raising=False)
+    r = images.edit_image(假图, out_path=str(tmp_path / "o.png"), do_compress=False)
+    assert r["status"] == "ok"
+    assert len(calls) == 2
+
+
+def test_参考图存储不可用换码也认得出():
+    """同家网关换字段/换码时按文案认（与「No available compatible accounts」同一取向）。"""
+    assert images._is_upstream_busy(
+        {"error": {"message": "参考图存储暂时不可用"}})
+    # 别的 server_error 不许被这句带进来
+    assert not images._is_upstream_busy(
+        {"error": {"code": "server_error", "message": "internal error"}})

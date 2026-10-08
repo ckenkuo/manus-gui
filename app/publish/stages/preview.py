@@ -6,7 +6,8 @@ import os
 import shutil
 from typing import Optional
 from app.logger import logger
-from app.publish import claims, extract, images, variant_colors, vision, size_rules
+from app.publish import (claims, extract, images, size_rules, text_erase,
+                         variant_colors, vision)
 from app.publish.browser import BrowserSession
 from app.publish.media.preview import PREVIEW_MIN_SIDE, sku_preview_replace_row, sku_preview_state
 
@@ -93,12 +94,20 @@ class PreviewImageCleanError(RuntimeError):
     """
 
 
-async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> str:
+async def _clean_downloaded_preview(path: str, prep: str, issues: str = "",
+                                    detail: dict = None) -> str:
     """回源下载的预览图必须先英化并通过质检。
 
     issues 是调用方已经拿到的质检结论（语言关那边会先判一次脏），非空时并进首发提示词：
     与 ⑤c 的 _english_one 同源做法——把「这张图具体哪里不行」喂回去比原样重发命中率高，
     省一发白烧的生图。传空（bad 行的几何通道没有质检结论可用）就是原来的行为。
+
+    detail 是可选的出参字典：质检未过而放弃时写进 detail["issues"] =【末发产物】的结论。
+    【为什么必须由本函数给出】三次尝试的结论只在这里拿得到，调用方手上只有源图首检那句
+    ——2026-10-08 商品 1048494210610 实录：语言关把源图首检的「包装盒右上角品牌标识
+    382 TOYS」当成失败原因报出去，而末发产物其实【已经把 logo 抹掉了】，真正卡住的是
+    残留乱码「Magnuetic」，照那句话排查方向正好被带偏。同 PreviewImageCleanError 分
+    「出图链路异常 / 质检未过」是一件事：说法要落到真实环节上，别拿另一个环节的话充数。
     """
     if not path or "-raw" not in os.path.basename(path):
         return path
@@ -115,6 +124,8 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
     # 最后一步是出图异常就抛 PreviewImageCleanError，是质检未过就返回空串，
     # 调用方据此给不同环节的错误文案（见 PreviewImageCleanError docstring）。
     last_exc: Optional[Exception] = None
+    last_issues = ""
+    last_output = ""
     for _ in range(3):
         try:
             # 超时取出图链路统一值（原先写死 90，盖不住服务端并发时的 30~79s，
@@ -124,9 +135,28 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
                 path, prompt=prompt, out_path=output,
                 no_downscale=True, timeout=images.EDIT_TIMEOUT)
             last_exc = None
-            qc = await vision.check_cleaned(edited["output"])
+            last_output = edited["output"]
+            qc = await vision.check_cleaned(last_output)
             if qc.get("clean"):
-                return edited["output"]
+                return last_output
+            # 记下末发的结论：放弃时交给调用方如实报出（见本函数 docstring）
+            last_issues = qc.get("issues") or ""
+            # 【软类（明确只报乱码/错拼）：单发判坏不足以下结论，先补问一次】补问只花
+            # 一次质检调用（约 3s），换来的是省掉一整发生图与一次「判坏→重生」的拉锯：
+            # check_cleaned 在这一维不可复现（取证见 vision.qc_hard），首答的坏结论有
+            # 相当比例是误报。复问说好 = 两次结论不一致且都只报软类 → 按合格用这一版；
+            # 复问抓到硬红线则按硬红线的话术加码重生（绝不能因为首答只报软类就把中文
+            # 放过去）。两次都只报软类仍按原路重生——与 ⑤c「两次一致才拦」同口径，
+            # 这里只是先试一发去修，修不动才在预算耗尽时退回源图。
+            if not vision.qc_hard(qc):
+                again = await vision.check_cleaned(last_output)
+                if not vision.qc_failed(again):
+                    logger.info(f"预览图英化产物质检首问答坏、复问判好，按合格采用这一版："
+                                f"{last_issues[:60]}")
+                    return last_output
+                last_issues = again.get("issues") or last_issues
+                if vision.qc_hard(again):
+                    qc = again
             # 加码话术按上一发的实际问题分类（同 cleaning_rules._retry_hint 的取向）：
             # 对营销标语说「清除中文」是无效的，它压根没有中文。2026-09-25 起类别变多，
             # 按判罚最直接的取第一条命中的（夸大宣传与禁词是实罚项、品牌标识是侵权、
@@ -151,6 +181,26 @@ async def _clean_downloaded_preview(path: str, prep: str, issues: str = "") -> s
         raise PreviewImageCleanError(
             f"英化出图链路 3 次尝试未成功，最后一次栽在出图异常"
             f"（{type(last_exc).__name__}: {str(last_exc)[:120]}）") from last_exc
+    # 【定点抹除救援：品牌标识】三发都没过、且末发判的是品牌标识时，别再指望生图——
+    # 实物上印的第三方商标是它的确定性短板（2026-10-08 商品 1048494210610 实证：
+    # 同一个包装盒的「382 TOYS」在 ⑦b 第 3 行、第 6 行两次都是三发纹丝不动，而同款
+    # 别的行偶尔能抹掉，纯随机）。质检能给出商标原文，改用确定性链路：视觉模型按原文
+    # 给整个标记图形的框、按周围底色整框填掉，抹完【必须复检通过才认】。定位失败/
+    # 底色不纯/复检仍不过都原样退回源图交人工——与 ⑤c 的材质行救援同一取向，不新增失败面。
+    if last_output and qc.get("brandMark") and qc.get("brandMarkTexts"):
+        rescued = await text_erase.erase_marks(last_output, qc["brandMarkTexts"])
+        if rescued.get("ok"):
+            after = await vision.check_cleaned_twice(last_output)
+            if after.get("clean") is True:
+                logger.info("预览图英化产物定点抹除品牌标识后复检通过，采用这一版")
+                return last_output
+            last_issues = after.get("issues") or last_issues
+            logger.warning(f"预览图品牌标识定点抹除后复检仍未过："
+                           f"{after.get('issues') or '无结论'}")
+        else:
+            logger.warning(f"预览图品牌标识定点抹除未执行（{rescued.get('why')}）")
+    if detail is not None:
+        detail["issues"] = last_issues
     return ""
 
 
@@ -354,8 +404,9 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 unfixable.append(r)
                 continue
             if "-raw" in os.path.basename(src_path):
+                detail = {}
                 try:
-                    src_path = await _clean_downloaded_preview(src_path, prep)
+                    src_path = await _clean_downloaded_preview(src_path, prep, detail=detail)
                 except PreviewImageCleanError as e:
                     # 出图链路异常（API/结果下载/配置中心）≠ 质检未过，按环节分开报
                     # （PreviewImageCleanError docstring 的既定分类要求）
@@ -368,7 +419,9 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 if not src_path:
                     unfixable.append(r)
                     await emit({"type": "manual_check", "stage": "sku_preview",
-                                "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"})
+                                "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"
+                                           f"（末发产物仍有："
+                                           f"{detail.get('issues') or '未给出原因'}）"})
                     continue
             try:
                 sq = images.square_image(src_path, out_path=out)
@@ -473,9 +526,10 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 logger.info(f"预览图 {tag} 画面已干净（{r['w']}x{r['h']} 仅几何不合规），"
                             "只做 1:1 合规化、不动画面")
             else:
+                detail = {}
                 try:
                     cleaned = await _clean_downloaded_preview(
-                        raw, prep, issues=qc.get("issues") or "")
+                        raw, prep, issues=qc.get("issues") or "", detail=detail)
                 except PreviewImageCleanError as e:
                     # 出图链路异常按环节直报（理由同 fill 通道那处 try）
                     logger.warning(f"预览图 {tag} 回源图英化出图失败，保持原样：{e}")
@@ -487,7 +541,9 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                 if not cleaned:
                     fail_rows.append(tag)
                     await emit({"type": "manual_check", "stage": "sku_preview",
-                                "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"})
+                                "message": f"{tag} 回源预览图英化质检未通过，已阻止上传"
+                                           f"（末发产物仍有："
+                                           f"{detail.get('issues') or '未给出原因'}）"})
                     continue
                 raw = cleaned
             sq = images.square_image(raw, out_path=out)
@@ -592,8 +648,11 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                         "message": f"{tag} 预览图含中文/水印，但整组没有换图入口、无法自动"
                                    f"英化（{qc.get('issues') or ''}），需人工换图"})
             continue
+        detail = {}
         try:
-            cleaned = await _clean_downloaded_preview(raw, prep, issues=qc.get("issues") or "")
+            cleaned = await _clean_downloaded_preview(raw, prep,
+                                                      issues=qc.get("issues") or "",
+                                                      detail=detail)
         except PreviewImageCleanError as e:
             # 出图链路异常（API/结果下载/配置中心）≠ 质检未过，按环节分开报
             # （PreviewImageCleanError docstring 的既定分类要求；2026-09-28 实录：
@@ -606,12 +665,19 @@ async def _st_sku_preview(ctx: dict, session: BrowserSession, emit) -> dict:
                                    f"（{str(e)[:100]}），请人工换图"})
             continue
         if not cleaned:
-            logger.warning(f"预览图 {tag} 英化质检未通过（{qc.get('issues')}），原图照旧")
+            # 【报的是末发产物的结论，不是源图首检那句】两者混用会把排查方向带偏：
+            # 2026-10-08 商品 1048494210610 实录，源图首检说的是「包装盒右上角品牌
+            # 标识 382 TOYS」，而末发产物早把 logo 抹掉了、真正卡住的是残留乱码
+            # 「Magnuetic」。结论由 _clean_downloaded_preview 的出参给出（三次尝试
+            # 的结论只有它拿得到），语义错误与 PreviewImageCleanError 那类同源。
+            logger.warning(f"预览图 {tag} 英化质检未通过（末发产物仍有："
+                           f"{detail.get('issues') or '未给出原因'}），原图照旧")
             lang_failed.append(tag)
             fail_rows.append(tag)
             await emit({"type": "manual_check", "stage": "sku_preview",
                         "message": f"{tag} 预览图英化质检未通过、仍是源图"
-                                   f"（{qc.get('issues') or ''}），请人工换图"})
+                                   f"（末发产物仍有：{detail.get('issues') or '未给出原因'}），"
+                                   "请人工换图"})
             continue
         out = os.path.join(prep, f"lang{head['i']:02d}.jpg")
         try:

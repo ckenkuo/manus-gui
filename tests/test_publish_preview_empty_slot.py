@@ -168,7 +168,7 @@ async def test_合规但带中文的行逐行替换(monkeypatch, tmp_path):
 
     seen_issues = []
 
-    async def fake_clean(path, prep, issues=""):
+    async def fake_clean(path, prep, issues="", detail=None):
         # 英化产物另存一张真图，交给 square_image 读
         seen_issues.append(issues)
         out = path.replace("-raw", "-clean")
@@ -188,6 +188,37 @@ async def test_合规但带中文的行逐行替换(monkeypatch, tmp_path):
     # 已拿到的质检结论要喂进英化提示词（同 ⑤c 的带反馈修图，省一发白烧的生图）
     assert seen_issues and "萌龙弹射飞机" in seen_issues[0]
     assert res["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_英化质检未过时报的是末发产物的结论(monkeypatch, tmp_path):
+    """失败原因必须落在【末发产物】上，不能拿源图首检那句充数。
+
+    2026-10-08 商品 1048494210610 实录：源图首检说的是「包装盒右上角品牌标识
+    382 TOYS」，而末发产物早把 logo 抹掉了、真正卡住的是残留乱码「Magnuetic」——
+    照那句话去查方向正好被带偏（与 PreviewImageCleanError 分「出图链路异常 /
+    质检未过」是同一件事：说法要落到真实环节）。"""
+    rows = [{"i": 0, "color": "白色", "url": "http://x/1.jpg", "w": 1785, "h": 1785,
+             "empty": False, "bad": False, "hasTrigger": True}]
+    _stub_download(monkeypatch)
+
+    async def fake_check(path):
+        return {"status": "ok", "clean": False, "brandMark": True,
+                "issues": "图上有品牌标识：包装盒右上角可见「382 TOYS」及 ® 符号"}
+
+    async def fake_clean(path, prep, issues="", detail=None):
+        # 末发产物的真实残留：品牌标识已抹掉，卡住的是错拼
+        if detail is not None:
+            detail["issues"] = "乱码或拼写错误：叠加文案仍写作「Magnuetic」"
+        return ""
+
+    patch_publish(monkeypatch, "vision", "check_cleaned_twice", fake_check)
+    patch_publish(monkeypatch, "stages.preview", "_clean_downloaded_preview", fake_clean)
+    res, events = await _run(rows, monkeypatch, workdir=str(tmp_path))
+    assert res["status"] == "fail"
+    said = " ".join(e.get("message") or "" for e in events)
+    assert "Magnuetic" in said, "要报末发产物到底哪里不行"
+    assert "382 TOYS" not in said, "不能把源图首检那句当成失败原因"
 
 
 @pytest.mark.asyncio

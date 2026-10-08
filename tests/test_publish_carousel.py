@@ -24,6 +24,9 @@ def scene(tmp_path, monkeypatch):
             self.dirty = set()
             self.bad_final = set()
             self.flaky_final = set()
+            # 页面复检的脚本化结论（按源 URL 排队，逐次弹出）：用来钉「按类别分档」的
+            # 三支口径——结论里带 garbled 才算软类，带中文/水印那些算硬红线。
+            self.final_verdicts = {}
             self.unreachable = set()
             self.upload_fail = set()
             self.checks = []
@@ -69,6 +72,8 @@ def scene(tmp_path, monkeypatch):
             if final:
                 assert any(item["url"] == url and item["checked"] for item in self.items)
             self.checks.append((url, final))
+            if final and self.final_verdicts.get(self.sources[url]):
+                return self.final_verdicts[self.sources[url]].pop(0)
             generated = str(path) in self.generated_paths
             if generated and self.prepared_verdicts.get(url):
                 return self.prepared_verdicts[url].pop(0)
@@ -222,7 +227,12 @@ async def test_unreadable_images_require_manual_review(scene, information):
 
 
 @pytest.mark.asyncio
-async def test_generation_failure_for_information_image_blocks(scene, monkeypatch):
+async def test_generation_failure_for_information_image_only_warns(scene, monkeypatch):
+    """补勾的图生不出来只提示、不阻断（用户 2026-10-08 定）。
+
+    与 overflow 同一道理：图根本没上到页面，页面状态与「压根没打算补」完全一样——
+    选用图全部合格、数量合规，这就是一个可发布状态；判 fail 会把本可落库的商品停在
+    人工队列里。改判 ok 的前提是那条提示还在（用户要看得到这几张没补上）。"""
     for _ in range(3):
         scene.add()
     target = scene.add(selected=False, info=True)
@@ -230,7 +240,11 @@ async def test_generation_failure_for_information_image_blocks(scene, monkeypatc
     def broken(*args, **kwargs):
         raise RuntimeError("generation unavailable")
     monkeypatch.setattr(carousel.images, "edit_image", broken)
-    assert (await scene.run())["status"] == "fail"
+    result = await scene.run()
+    assert result["status"] == "ok"
+    assert "1 张信息图未能补勾" in result["note"]
+    assert any(event["type"] == "manual_check" and "未补勾" in event.get("message", "")
+               for event in scene.events)
 
 
 @pytest.mark.asyncio
@@ -376,31 +390,112 @@ def test_information_geometry_retains_edges(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_final_qc_flaky_pass_is_blocked(scene):
-    """判定抖动取严的一侧：首次判合格、复问判不合格 → 按不合格拦下。
+async def test_final_qc_flake_is_released(scene):
+    """判定抖动的处置：一票坏一票好 → 按合格放行（对称口径）。
 
-    2026-09-18 商品 1049857947880 取证：第 34 张那次判好被放行，复测却抓出
-    「Citizens后出现缺字乱码方块」（原图确实残留方块字 `Citizens囚`）。漏报的后果是
-    带中文的图发上真店（Temu 硬红线、后面没有第二道闸），比误报停摆重得多。"""
+    【方向变过，别再按旧口径"修"回去】2026-09-18 定的是取严（首检判好、复问判坏 →
+    拦下），理由是 `Citizens囚` 那种残留就是靠复问抓到的。2026-10-08 商品
+    1048494210610 一晚上四次卡 ⑤c 把这个代价兑满了：其中三次拦的是我用同一套质检
+    复问 2~3 次全干净的图（第 23 张 3/3、第 17 张 2/2、第 16 张 2/2），而同一套质检
+    对另一张整页中文的图（final-17）**一次都没报出中文**——单票判坏买到的红线安全感
+    没有那么足，用户据此拍板改成「放行两票好、拦下两票坏」。"""
     defaults = [scene.add() for _ in range(3)]
     scene.dirty.add(defaults[0])
-    scene.flaky_final.add(defaults[0])        # 首次判好、复问判坏 → 应拦下
+    scene.flaky_final.add(defaults[0])        # 首次判好、复问判坏 → 应放行
+    result = await scene.run()
+    assert result["status"] == "ok"
+    assert "未换成合规图" not in result["note"]
+    assert "按合格放行" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_final_qc_asks_twice_per_image(scene):
+    """反向钉住：固定问满两次（不是问一次就过，也不是问三次）。"""
+    defaults = [scene.add() for _ in range(3)]
+    scene.dirty.add(defaults[0])
+    result = await scene.run()
+    assert result["status"] == "ok"
+    assert "未换成合规图" not in result["note"]
+    # 两票一致才拦 → 每张待复检的图必须问满两次
+    finals = [url for url, final in scene.checks if final]
+    assert finals and len(finals) == len(set(finals)) * 2
+
+
+@pytest.mark.asyncio
+async def test_final_qc_bad_then_good_is_released(scene):
+    """先判坏、复问判好也放行：两次不一致就不当结论用。
+
+    2026-10-08 商品 1048494210610 取证：第 23 张首问答坏（报的是"品牌标识"，举证
+    却列着 Magnetic / 7.9 in / 60 levels 这些参数文案）、复问 3/3 全干净——纯误报。"""
+    defaults = [scene.add() for _ in range(3)]
+    scene.dirty.add(defaults[0])
+    scene.final_verdicts[defaults[0]] = [
+        {"clean": False, "brandMark": True, "issues": "品牌标识（实为参数文案）"},
+        {"clean": True, "issues": ""},
+    ]
+    result = await scene.run()
+    assert result["status"] == "ok"
+    assert "未换成合规图" not in result["note"]
+    assert "按合格放行" in result["note"]
+
+
+@pytest.mark.asyncio
+async def test_final_qc_blocks_when_both_verdicts_are_bad(scene):
+    """两票一致才拦：真残留（乱码确实在图上）不许发，硬类（品牌/中文）同样。"""
+    defaults = [scene.add() for _ in range(4)]
+    scene.dirty.update(defaults[:2])
+    scene.final_verdicts[defaults[0]] = [
+        {"clean": False, "garbled": True, "issues": "叠加文案拼写错误"},
+        {"clean": False, "garbled": True, "issues": "叠加文案拼写错误"},
+    ]
+    scene.final_verdicts[defaults[1]] = [
+        {"clean": False, "residualChinese": True, "issues": "残留中文"},
+        {"clean": False, "residualChinese": True, "issues": "残留中文"},
+    ]
     result = await scene.run()
     assert result["status"] == "fail"
     assert "未换成合规图" in result["note"]
 
 
 @pytest.mark.asyncio
-async def test_final_qc_needs_two_clean_verdicts(scene):
-    """反向钉住：两次都判合格才放行，且确实问满了两次（不是问一次就过）。"""
+async def test_final_qc_two_errors_block_and_report_unread(scene):
+    """两票都读不出结论照样拦（未知在这条红线上不能当安全，同 check_cleaned 取向），
+    但**报的必须是「读不出结论」而不是「未换成合规图」**：两者处置相反——前者是质检
+    环节没给结论（重跑/查链路），后者才要去看图换图。2026-10-08 那次复检两问都撞上
+    响应不完整却报成「请人工换图」，用户照着一批本来干净的图去查。
+
+    单独一票 error 不判死——见「一票坏一票好即放行」那两条。"""
     defaults = [scene.add() for _ in range(3)]
     scene.dirty.add(defaults[0])
+    scene.final_verdicts[defaults[0]] = [
+        {"clean": False, "status": "error", "issues": "响应不完整"},
+        {"clean": False, "status": "error", "issues": "响应不完整"},
+    ]
+    result = await scene.run()
+    assert result["status"] == "fail"
+    assert "读不出结论" in result["note"]
+    assert "未换成合规图" not in result["note"]
+    assert any("没读到结论" in (e.get("message") or "") for e in scene.events)
+
+
+@pytest.mark.asyncio
+async def test_hard_final_qc_single_verdict_no_longer_blocks(scene):
+    """硬类（这里用残留中文）单票也不再拦：对称口径对类别一视同仁。
+
+    【这是 2026-10-08 用户拍板的方向，别按"红线不能这么松"改回去】依据在
+    test_final_qc_flake_is_released 的 docstring：同一套质检对整页中文的图
+    （final-17）一次都没报出中文，单票判坏买到的安全感不足；而真缺陷要连过
+    备料段的双检（两票一致判好才放行）与收尾复检（两票一致判坏才拦）都漏掉才会发出去。"""
+    defaults = [scene.add() for _ in range(3)]
+    scene.dirty.add(defaults[0])
+    scene.final_verdicts[defaults[0]] = [
+        {"clean": False, "residualChinese": True, "issues": "残留中文"},
+        {"clean": True, "issues": ""},          # 复问判好 → 两次不一致 → 放行
+    ]
     result = await scene.run()
     assert result["status"] == "ok"
     assert "未换成合规图" not in result["note"]
-    # 任一次判坏都会拦下，故每张待复检的图必须问满两次
-    finals = [url for url, final in scene.checks if final]
-    assert finals and len(finals) == len(set(finals)) * 2
+    assert "按合格放行" in result["note"]
 
 
 @pytest.mark.asyncio

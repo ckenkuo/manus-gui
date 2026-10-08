@@ -1404,6 +1404,12 @@ async def check_cleaned(image_path: str) -> dict:
     的标识被判侵权、一条童裤因口袋上的方标被投诉），后者让平台判「含棉材质宣传但属性
     中材质描述不匹配」。这两类与「实物不算」的分界靠「装饰性」与「品牌/材质」区分，
     提示词两边都要写清楚，否则模型会退回「实物一律不报」的旧口径。
+    【2026-10-08 补：豁免条款必须点名中文】原写法「图案上的字母」留了一个字面漏洞：
+    中文刺绣文字不是「字母」，模型从严归类时把它排除出豁免，再按 residualChinese
+    定义里的「任何中文字符」上报——1045936299360 的「蕉个朋友」实物刺绣就这么被
+    误报成残留中文，已选轮播图被判脏、英化提示词（实物装饰可保留）与 QC 拉锯三连败、
+    过了双检的替换图页面复检又翻转，整单停摆。故现在定义句就把实物文字（含中文）
+    排除出叠加文字层，豁免段再点名重申一次，两头钉死。
     【新字段同样不进必答清单】materialText 与 brandMark 是 2026-09-25 新加的，理由与
     bannedTerm 一字不差（老响应漏答不该判 error 把整批图退回原图）。区别在兜底：
     材质说明有词表可复核（claims.material_hits，模型列了原文就按词表翻严），品牌标识
@@ -1421,9 +1427,14 @@ async def check_cleaned(image_path: str) -> dict:
     """
     prompt = """请对这张商品图片做英化质检（可能是原图，也可能已将中文文案改成英文）：
 
-前五项只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）；
-最后一项的实物标记要连【商品实物上的标签、吊牌、织标】一起看：
-- residualChinese：是否还残留任何中文字符或中文标点（『』「」、，。！？；：《》等）；
+前五项只看【叠加在图片上的文字层】（标题文案、说明文字、水印、店铺名这类后期加的字）。
+商品实物（商品本身）表面上的文字不属于叠加文字层：玩偶/衣物上的刺绣、印花、
+织标、吊牌，以及直接印在商品本体上的文字，都是实物的一部分——哪怕清清楚楚
+印着中文，也不算残留中文、不要报；实物上的文字只有品牌标识与材质成分说明
+两类要报（由最后两问单列），故实物标记要连【商品实物上的标签、吊牌、织标】
+一起看：
+- residualChinese：叠加文字层是否还残留任何中文字符或中文标点
+  （『』「」、，。！？；：《》等）；商品实物上的文字一律不算；
 - garbled：是否有拼音、乱码、断词、无意义字母串（正常英文单词不算）；
 - watermark：是否残留后期叠加的水印、店铺名、拍摄者账号、网址或联系方式。
   纯英文、数字或正常可读的网址同样算水印，不需要含中文或乱码。
@@ -1435,8 +1446,9 @@ async def check_cleaned(image_path: str) -> dict:
 - """ + claims.MARK_IMAGE_RULE + """
 
 【以下一律不算问题，不要报】：
-- 商品实物上的装饰性印花、刺绣、图案上的字母（不含品牌标识的）
-  —— 那是实物的一部分，选品时已人工确认过，不需要清理；
+- 商品实物上的装饰性印花、刺绣、图案及其上的文字或字母（含中文装饰文字，
+  品牌标识与材质成分说明除外）——那是实物本身的设计，选品时已人工确认过，
+  不需要清理，也不算残留中文；
 - 图片本身的构图、留白、配色。
 
 只输出 JSON：{"residualChinese": true/false, "garbled": true/false,
@@ -1525,6 +1537,45 @@ materialTexts / brandMarkTexts 同理：判 true 时列全可见的原文，没�
             material = True
             logger.info(f"图片质检 materialText 按 marketingClaim 举证原文翻为 true"
                         f"（模型把材质说明归到了宣称）：{claims.material_hits(hit)[:4]}")
+    # 【banned/material 的跨桶归正与举证复核翻 false】与上面「按 claim 举证翻严」
+    # 同一哲学：布尔是模型的自由裁量、会抖，举证原文+词表才是确定性判据。
+    # 2026-10-08 取证：玩偶本体印的 "Banana Duck" 被一鱼三吃——banned/material/
+    # brand 同报 true，重试反馈带着三个错误类别去烧生图（让它去抹不存在的禁词与
+    # 材质说明），拉锯必败。故先按对方词表把归错桶的捞回正确类别（禁词桶里的
+    # 材质词翻 material、材质桶里的禁词翻 banned），再对「判 true 但举证原文
+    # （含 issues）全不过本方词表」的翻 false——每一步都有词表依据，不是信
+    # 模型布尔。texts 为空不翻：模型没给出原文就没有复核依据，保持原判（同
+    # marketingClaim 复核的取向）；brandMark 没有词表（品牌名是开放集合），不在此列。
+    banned_evidence = ([t for t in banned_texts if isinstance(t, str)]
+                       if isinstance(banned_texts, list) else [])
+    material_evidence = ([t for t in material_texts if isinstance(t, str)]
+                         if isinstance(material_texts, list) else [])
+    if not material:
+        hit = next((t for t in banned_evidence if claims.material_hits(t)), "")
+        if hit:
+            material = True
+            logger.info(f"图片质检 materialText 按 bannedTerm 举证原文翻为 true"
+                        f"（模型把材质说明归到了禁词）：{claims.material_hits(hit)[:4]}")
+    if not banned:
+        hit = next((t for t in material_evidence if claims.has_banned_term(t)), "")
+        if hit:
+            banned = True
+            logger.info(f"图片质检 bannedTerm 按 materialText 举证原文翻为 true"
+                        f"（模型把禁词归到了材质）：{claims.banned_hits(hit)[:4]}")
+    if (banned and banned_evidence
+            and not any(claims.has_banned_term(t) for t in banned_evidence)
+            and not claims.has_banned_term(str(data.get("issues") or ""))):
+        non_blocking.append(data.get("issues") or "举证的禁词原文不在禁词判据内")
+        banned = False
+        logger.info(f"图片质检 bannedTerm 按原文复核翻为 false"
+                    f"（举证原文均不在禁词判据内）：{banned_evidence[:3]}")
+    if (material and material_evidence
+            and not any(claims.material_hits(t) for t in material_evidence)
+            and not claims.material_hits(str(data.get("issues") or ""))):
+        non_blocking.append(data.get("issues") or "举证的材质原文不在材质判据内")
+        material = False
+        logger.info(f"图片质检 materialText 按原文复核翻为 false"
+                    f"（举证原文均不在材质判据内）：{material_evidence[:3]}")
     if claim and claims.is_style_only_image_claim(data.get("issues"), claim_texts):
         non_blocking.append(data.get("issues") or "普通风格描述无需修改")
         claim = False
@@ -1643,6 +1694,61 @@ async def check_cleaned_twice(image_path: str) -> dict:
         return result
     except Exception as error:
         return {"status": "error", "clean": False, "issues": str(error)}
+
+
+# ---- 判坏的类别分档（⑦b 英化产物判定用）-------------------------------------------
+# 【硬红线】残留中文/水印/夸大宣称/平台禁词/品牌标识/材质说明：这几维是 Temu 的硬伤
+# （中文上真店最硬，后面没有第二道闸；销量与排名宣称是平台罚得最实的一类），且模型在
+# 这几维上判定是稳的，实测没抖过。
+# 【软类】只有 garbled（拼音/乱码/断词/错拼）一维，见 qc_hard 的取证。
+#
+# 【谁在用】qc_failed 两个使用点共用（⑦b 的英化产物判定 + ⑤c 收尾复检）；qc_hard 只有
+# ⑦b 在用——⑤c 收尾复检 2026-10-08 改成了对称口径（两票都判坏才拦，类别不参与判定，
+# 见 _confirm_page_qc 的 docstring），故那边不再分类。
+#
+# 【为什么放在这里而不是各阶段各写一份】口径必须一处定义：check_cleaned 的判定不可
+# 复现是它自身的性质，「哪几维要两次一致、哪几维一次就拦」是同一条口径的使用点。
+# 两处各写一份的话，一处收紧另一处没跟上就白收紧了——与 check_cleaned_twice 共用的
+# 理由一字不差。
+HARD_QC_FIELDS = ("residualChinese", "watermark", "marketingClaim",
+                  "bannedTerm", "brandMark", "materialText")
+
+
+def qc_failed(qc: dict) -> bool:
+    """这次质检算不算「没通过」：模型判坏，或压根没读到结论（status=error）。"""
+    return qc.get("clean") is not True or qc.get("status") == "error"
+
+
+def qc_unread(qc: dict) -> bool:
+    """这次「没通过」是不是【压根没读到结论】（响应不完整/老响应没回布尔）。
+
+    【为什么要单独问这一句】「模型判这张图脏」与「这次压根没读到结论」对用户的处置
+    完全不同：前者是图的问题（去看图、换图），后者是质检环节没给出结论（重跑或查链路）。
+    2026-10-08 前 ⑤c 收尾复检把两者一起报成「N 张未换成合规图」，用户照着去换一批
+    本来干净的图（那一晚第 17、23 张都是这种情况）。判据同 check_cleaned 的 error 口径。
+    """
+    return qc.get("status") == "error" or not isinstance(qc.get("clean"), bool)
+
+
+def qc_hard(qc: dict) -> bool:
+    """这份【判坏】的结论是硬红线类，还是明确只报了乱码/错拼（软类）。
+
+    【只在 qc_failed 为真的结论上问】判好的结论没有「哪一类」可言。
+    【为什么读不出结论、归不了类都按硬类】软类的前提是「明确只报了乱码」，不是
+    「没报别的」：status=error 是没读到结论，未知在这条红线上不能当安全（同
+    check_cleaned 的取向）；模型只说「不合格」却一个类目都没标（老响应/截断）
+    时我们同样没有依据把它算作软类。这样放宽面精确收在实测有噪声的那一维上。
+    【为什么软类要单独一档】2026-10-08 商品 1048494210610 取证：⑤c 收尾复检判坏的
+    三张里，第 16 张复问 2/2 干净（纯误报），另两张各是「一次判好、一次判坏」，而
+    三张的 residualChinese 全是 False——判坏全落在乱码/错拼这一维。噪声堆在软类、
+    硬类那一侧是稳的，让两类吃同一枚硬币，等于用中文红线的不对称代价
+    （见 check_cleaned_twice 的 docstring）替软问题买单，一次抖动就整单停摆。
+    """
+    if qc_unread(qc):
+        return True
+    if any(qc.get(field) for field in HARD_QC_FIELDS):
+        return True
+    return not qc.get("garbled")
 
 
 # ---- 重烧提示词：看着上一发的产物图实时生成 ----------------------------------------

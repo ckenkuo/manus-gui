@@ -6,7 +6,7 @@ import json
 import os
 import shutil
 from app.logger import logger
-from app.publish import extract, images, preferences, state, vision
+from app.publish import extract, images, preferences, state, text_erase, vision
 from app.publish.browser import BrowserSession
 from app.publish.media import space as media_space
 from app.publish.media.carousel import (
@@ -88,7 +88,12 @@ def _en_cache_path(workdir: str, url: str) -> str:
 
 async def _english_one(local_path: str, url: str, workdir: str,
                        sizechart: bool = False, initial_qc: dict = None) -> dict:
-    """缓存与新产物均先双检，带具体失败原因最多生图三次，再交页面复检。"""
+    """缓存与新产物均先双检，带具体失败原因最多生图三次，再交页面复检。
+
+    QC 唯一不满是材质文字时不走重生，改走 text_erase 定点抹除救援：生图模型
+    对规格表的选择性抹除是确定性失败（三组对照实验，见 text_erase 模块头），
+    重生多少次都是同一个错。
+    """
     out = _en_cache_path(workdir, url)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     last_qc = initial_qc or {}
@@ -106,6 +111,7 @@ async def _english_one(local_path: str, url: str, workdir: str,
     base = (images.SIZECHART_TRANSLATE_PROMPT if sizechart
             else images.DEFAULT_TRANSLATE_PROMPT)
     base += " 将完整内容排入1:1画布，保留客观商品介绍及尺码、数值和单位，不裁掉信息。"
+    erase_tried = False
     for attempt in range(EN_QC_TRIES):
         prompt = base
         if last_qc.get("issues"):
@@ -132,6 +138,24 @@ async def _english_one(local_path: str, url: str, workdir: str,
             return {"ok": False, "why": f"英化失败：{error}"[:150]}
         if last_qc.get("clean") is True:
             return {"ok": True, "path": prepared, "how": "edited"}
+        # 【材质行定点抹除救援】QC 唯一不满的是材质文字时，别再带反馈重生——
+        # 那对本类问题是确定性失败（模块 docstring 与 text_erase 模块头的取证），
+        # 改成按 QC 给出的原文（materialTexts）定点抹除，抹完复检过了照样放行。
+        # 只试一次：定位失败/背景非纯色抹不成、或抹完复检仍不过，都落回下面
+        # 原有的重试路径（下一发生图仍从原图重来，抹过的产物不进入下一轮）。
+        if not erase_tried and _material_only(last_qc):
+            erase_tried = True
+            rescued = await text_erase.erase_text_lines(
+                prepared, last_qc.get("materialTexts") or [])
+            if rescued.get("ok"):
+                last_qc = await vision.check_cleaned_twice(prepared)
+                if last_qc.get("clean") is True:
+                    return {"ok": True, "path": prepared, "how": "erased"}
+                logger.warning(f"轮播图材质行抹除后复检仍未过："
+                               f"{last_qc.get('issues') or '无结论'}")
+            else:
+                logger.warning(f"轮播图材质行定点抹除未执行（{rescued.get('why')}），"
+                               "回到带反馈重生")
         if os.path.exists(out):
             os.remove(out)
         logger.warning(f"轮播图上传前质检未通过（{attempt + 1}/{EN_QC_TRIES}）："
@@ -208,6 +232,61 @@ def _pick_adds(cands: list, pool: dict, verdicts: dict, picked: list,
         chosen.append((it, entry))
         refs.add(digest)
     return chosen
+
+
+def _material_only(qc: dict) -> bool:
+    """QC 的【唯一】阻断项是材质文字。只有这种情形才上定点抹除救援：
+    断词/残留中文/水印/宣称/品牌标是生图质量或另一类内容问题，定点抹除
+    治不了（也不该抹——挖掉的是商品信息），仍走带反馈重生。
+    """
+    if qc.get("status") == "error" or not qc.get("materialText"):
+        return False
+    return not any(qc.get(k) for k in (
+        "residualChinese", "garbled", "watermark", "marketingClaim",
+        "bannedTerm", "brandMark"))
+
+
+# ---- 页面复检：对称口径（放行两票好、拦下两票坏）-----------------------------
+# 判据本体（vision.qc_failed 等）与 ⑦b 的英化产物判定共用一份；本文件这里的口径
+# 是 2026-10-08 用户定的「两票一致才拦」，与备料段/⑦b 的取严口径不同，理由见下。
+
+
+async def _confirm_page_qc(path: str, qc: dict, tag: str) -> tuple:
+    """收尾复检的判定确认：固定问两次，**两票都判坏才拦，一票好即放行**。
+
+    返回 (据此放行/拦截的结论, 是否属于「两次不一致、按放行处理」)。
+
+    【为什么改成对称口径】备料段放行一份上传字节，要求 vision.check_cleaned_twice
+    连问两次都判好；收尾复检是对【同一份字节】的第二道判定，原先却只要一次判坏就拦
+    ——等于放行一侧要两票、拦下一侧只要一票。2026-10-08 商品 1048494210610 一晚上
+    四次卡在 ⑤c，其中三次拦的是我用同一套质检复问 2~3 次全干净的图（第 23 张 3/3、
+    第 17 张 2/2、第 16 张 2/2）；更关键的反证是：同一套质检对另一张整页中文的图
+    （final-17）**一次都没报出中文**（复问只报品牌/禁词）——单票判坏买到的红线安全感
+    并没有当初设想的那样足，而它的误报成本每次都是一整单停摆加一轮页面改动丢失。
+    故改成两票一致才拦：真缺陷要连过备料段双检与收尾复检两关都漏掉，才会发出去。
+    【error 票算坏票】status=error 是「没读到结论」，未知在这条红线上不能当安全
+    （同 check_cleaned 的取向）——「两票都读不出结论」照样拦；但它单独一票不足以判死
+    （另一票说好就放行，毕竟我们拿到过一次明确结论）。
+    【判好那一侧不再提前放行】本函数固定问满两次，2026-09-18 那种「首问答好就够」的
+    写法取消了——两次都问满才谈得上「两票一致」。
+    """
+    first_bad = vision.qc_failed(qc)
+    if first_bad:
+        logger.warning(f"轮播图{tag}复检首问未通过（{qc.get('issues') or '无结论'}），"
+                       "再问一次定夺")
+    again = await vision.check_cleaned(path)
+    second_bad = vision.qc_failed(again)
+    if first_bad and second_bad:
+        logger.warning(f"轮播图{tag}复检两问都判不合格"
+                       f"（{again.get('issues') or qc.get('issues') or '无结论'}），拦下")
+        return again, False
+    if first_bad != second_bad:
+        # 一票坏一票好：两次不一致就不当结论用，按合格放行并留痕（note 里会带上张数）
+        issues = qc.get("issues") if first_bad else again.get("issues")
+        logger.info(f"轮播图{tag}复检两次结论不一致（{issues or '无结论'}），"
+                    "按合格放行")
+        return (again if first_bad else qc), True
+    return qc, False
 
 
 def _kind_of(entry: dict, verdict: dict) -> str:
@@ -404,15 +483,19 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
                                "不影响已选图片的合规判定"})
 
     if failed_adds:
+        # 【提示但不硬失败】补勾失败与 overflow 是同一类「没能更好」：图没上到页面，
+        # 页面状态=压根没打算补，仍是一个可发布状态（理由见本阶段末尾 blocked 那段）。
         await emit({"type": "manual_check", "stage": "carousel",
                     "message": f"{len(failed_adds)} 张信息图处理失败、未补勾"
-                               f"（{'、'.join(failed_adds[:4])}），需人工补图"})
+                               f"（{'、'.join(failed_adds[:4])}），已跳过继续，"
+                               "不影响已选图片的合规判定；想补需人工加图"})
 
     if not ready:
-        # 【选用位满导致的 overflow 不阻断】选用图本身全部合格、数量也合规，页面这就是
-        # 一个可发布状态；能补的信息图补不进去只是「没能更好」，不是「不能发」。把它算进
-        # fail 等于让一单本可落库的商品停在人工队列里（这正是 1040482047185 那单的处境）。
-        status = "fail" if (failed_kept or failed_adds or unknown
+        # 【选用位满导致的 overflow 与补勾失败都不阻断】选用图本身全部合格、数量也合规，
+        # 页面这就是一个可发布状态；能补的信息图补不进去只是「没能更好」，不是「不能发」。
+        # 把它算进 fail 等于让一单本可落库的商品停在人工队列里（这正是 1040482047185
+        # 那单的处境）。
+        status = "fail" if (failed_kept or unknown
                             or not CAROUSEL_MIN_PICKED <= len(picked) <= CAROUSEL_MAX_PICKED) else "ok"
         note = f"轮播图已选 {len(picked)} 张"
         if unknown:
@@ -587,41 +670,46 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
         unknown.append("最终勾选结果与计划不一致")
         await emit({"type": "manual_check", "stage": "carousel",
                     "message": "轮播图最终勾选结果与计划不一致，暂停发布并交人工核对"})
+    mixed_released = 0
     for item in picked3:
         if item.get("url") in checked_urls:
             continue
         path = os.path.join(prep, f"final-{item['i']:02d}.jpg")
+        # 【编号是候选格位号】item["i"] 来自 carousel_state 的图格序号（与上面
+        # final-{i:02d}.jpg 同一套命名口径），不是「选用位第几张」——选用位是 1..10
+        # 的勾选顺序，格位号才是页面上那张图的位置，报给用户要能对上页面。
+        tag = f"第 {item['i'] + 1} 张"
+        released = False
         try:
             downloaded = await asyncio.to_thread(extract._download_image, item["url"], path)
             qc = await vision.check_cleaned(path) if downloaded else {}
-            # 【问两次，任一次判坏就算坏——只有两次都说好才放行】
-            # check_cleaned 对水印/单字符乱码的判定不可复现：2026-09-18 商品
-            # 1049857947880 取证，同一批 final 图、同一提示词，两次结论相反——
-            # 第 36 张那次判坏、复测回 clean（画面确实干净、全英文 2048²），
-            # 而第 34 张那次判好、复测却抓出「Citizens后出现缺字乱码方块」
-            # （原图确实残留一个方块字 `Citizens囚`，它就这么被放行到了选用中）。
-            #
-            # 【为什么取严的那一侧】抖动是双向的，一次判定既会误报也会漏报，而两种
-            # 错的代价不对称：误报的后果是整单停摆交人工（白拦一个本可落库的商品，
-            # 但图是好的、人工一看就放行）；漏报的后果是带中文/水印的图【发上真店】，
-            # 那是 Temu 的硬红线，且没有第二道闸会再拦它。宁可多拦几单，不可漏一张。
-            # 这与 ⑤b「带中文的图不能一路发上真店」、vision 模块头「拿不准一律交人工，
-            # 不硬猜——选错图会上真店」同一取向。
-            # 代价：每张选用图多一次质检调用（约 2 秒），且误报停摆会变多。
-            #
-            # status=error（响应不完整）同样算「没通过」：那是没读到结论，而未知在
-            # 这条红线上不能当安全。
-            if downloaded and qc.get("clean") is True and qc.get("status") != "error":
-                again = await vision.check_cleaned(path)
-                if again.get("clean") is not True or again.get("status") == "error":
-                    logger.warning(f"轮播图第 {item['i'] + 1} 张复检首次判合格、"
-                                   f"复问判不合格（{again.get('issues') or '无结论'}），"
-                                   "按不合格拦下（判定抖动，取严的一侧）")
-                    qc = again
+            # 【复问口径见 _confirm_page_qc】固定问两次、两票都判坏才拦（对称口径）。
+            # 这道判定对的是【备料段刚双检放行、原样上传的同一份字节】，单票判坏的
+            # 误报在 2026-10-08 那单上连兑三次（复问 2~3 次全干净），而同一套质检又
+            # 漏报过整页中文——取舍与取证都写在 _confirm_page_qc 的 docstring 里。
+            if downloaded:
+                qc, released = await _confirm_page_qc(path, qc, tag)
         except Exception as exc:
-            qc = {"issues": str(exc)}
-        if qc.get("clean") is not True or qc.get("status") == "error":
-            tag = f"第 {item['i'] + 1} 张"
+            qc, released = {"issues": str(exc)}, False
+        if released:
+            mixed_released += 1
+        if vision.qc_failed(qc):
+            # 【「没读到结论」与「模型判它脏」分开报】两者的处置完全不同：前者是质检
+            # 环节没给出结论（重跑 / 查链路），后者才是图的问题（去看图、换图）。
+            # 2026-10-08 那次复检两问都撞上响应不完整，却报成「1 张未换成合规图…请
+            # 人工换图」，用户照着一批本来就干净的图去查。这一支仍按 fail 拦（未知在
+            # 这条红线上不能当安全），只是把它并进 unknown、按「读不出结论」报。
+            if vision.qc_unread(qc):
+                # 这一支【不删 -en 缓存】（下面 failed_kept 那支才删）：没读到结论不等于
+                # 图有问题，重跑该直接复用那份已双检放行的产物，不该白烧一发生图。
+                unknown.append(tag)
+                await emit({"type": "manual_check", "stage": "carousel",
+                            "message": f"轮播图 {tag} 替换后英化复检两次都没读到结论"
+                                       f"（{qc.get('issues') or '响应不完整'}），"
+                                       "未通过处理，暂停发布并交人工核对"})
+                continue
+            # 【同一格位会被报两次】备料段英化失败的图仍留在选用里（不替换、原图不动），
+            # 收尾复检遍历已选图时它还在，于是同一张再报一次；汇总处按格位去重。
             failed_kept.append(tag)
             for source_url, destination_url in replacements.items():
                 if destination_url == item.get("url"):
@@ -639,10 +727,14 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
         await emit({"type": "manual_check", "stage": "carousel",
                     "message": f"处理完轮播图选用 {len(picked3)} 张，超过平台上限 "
                                f"{CAROUSEL_MAX_PICKED} 张，需人工取消多余勾选"})
-    if failed_kept:
+    # 【按格位去重再报】同一张不合规图会被备料段（英化失败、原图留在选用里）与收尾
+    # 复检段各报一次，不去重时「N 张未换成合规图」的 N 会虚高（2026-10-08 1045936299360
+    # 报的「第 3 张、第 3 张」就是同一张被报两次，看着像两张图失败）。
+    kept_tags = list(dict.fromkeys(failed_kept))
+    if kept_tags:
         await emit({"type": "manual_check", "stage": "carousel",
-                    "message": f"{len(failed_kept)} 张已选轮播图仍带中文/不合规"
-                               f"（{'、'.join(failed_kept[:6])}），发布可能被拒，"
+                    "message": f"{len(kept_tags)} 张已选轮播图仍带中文/不合规"
+                               f"（{'、'.join(kept_tags[:6])}），发布可能被拒，"
                                "请人工换图"})
 
     n_add = sum(1 for r, _ in added if r["add"] and r["tag"] in ok_tags)
@@ -650,16 +742,24 @@ async def _st_carousel(ctx: dict, session: BrowserSession, emit) -> dict:
             f"（现选用 {len(picked3)} 张，尺寸不合规 {len(bad3)} 张）")
     if unknown:
         note += f"；{len(unknown)} 张读不出结论"
-    if failed_kept:
-        note += f"；{len(failed_kept)} 张未换成合规图：{'、'.join(failed_kept[:4])}"
+    if mixed_released:
+        # 【文案对两次结论的先后不敏感】两支都会走到这里：先坏后好、先好后坏，
+        # 只说「两次不一致」就不会把顺序讲反。类别也不提：新口径下放行与类别无关。
+        note += f"；{mixed_released} 张复检两次结论不一致，按合格放行"
+    if kept_tags:
+        note += f"；{len(kept_tags)} 张未换成合规图：{'、'.join(kept_tags[:4])}"
     if failed_adds:
         note += f"；{len(failed_adds)} 张信息图未补勾"
     if overflow:
         note += f"；{len(overflow)} 张信息图因选用位已满未补勾"
     if failed_up:
         note += f"；{len(failed_up)} 张上传失败"
-    # overflow 不进 blocked，理由同上面 not ready 那支：页面状态本身是可发布的
-    blocked = (failed_kept or failed_adds or failed_up or unknown or bad3
+    # 【不阻断的两类：overflow 与 failed_adds】二者的共同点是「补勾没成」——overflow 是
+    # 选用位满没去补，failed_adds 是去补了但没补上，但【图都没上到页面】，页面状态与
+    # 「压根没打算补」完全一样：选用图全部合格、数量合规，这就是一个可发布状态。fail
+    # 等于让一单本可落库的商品停在人工队列里（理由同上面 not ready 那支的 overflow）。
+    # 补勾失败仍走上面那条 manual_check 提示，不再升级成硬失败（用户 2026-10-08 定）。
+    blocked = (failed_kept or failed_up or unknown or bad3
                or st3.get("supported") is not True
                or not CAROUSEL_MIN_PICKED <= len(picked3) <= CAROUSEL_MAX_PICKED)
     return {"status": "fail" if blocked else "ok", "note": note[:200]}

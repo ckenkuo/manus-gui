@@ -1,0 +1,313 @@
+# 全局 LLM 配置 —— 主模型使用 DashScope 的 qwen3.7-plus
+# 【2026-08-20 起 api_key 一律写在本文件里，不再走环境变量】两处维护容易只改一边、
+# 且环境变量优先级更高时会静默盖掉配置值，排查起来看不出来。本文件 gitignored。
+[llm]
+api_type = "openai"                                            # DashScope 兼容 OpenAI 接口
+model = "qwen3.7-plus"                                         # 主对话/推理模型
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1" # DashScope OpenAI 兼容端点
+api_key = "sk-ws-H.RXDMPED.up26.MEQCIDaHeU-v8wOAQS2z-RPUzd0lw36Uw7-ENbtfrflDzZiBAiAA-Ge16pli4v6mdCJxs1_Gr0YLXfm1cLrl66bD-blcAg"
+max_tokens = 8192
+temperature = 0.0
+api_version = ""
+# 不设 max_input_tokens：agent 兜底带页面截图（单张 base64 约 28k token），叠加
+# 历史后极易撞上限，check_token_limit 抛 TokenLimitExceeded 导致兜底整批退化。
+# 失控成本由 agent 的 max_steps 兜底，不再用 token 上限硬砍。
+# max_input_tokens = 60000
+
+# 视觉模型 —— 同样使用 qwen3.7-plus
+[llm.vision]
+api_type = "openai"
+model = "qwen3.7-plus"
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "sk-ws-H.RXDMPED.up26.MEQCIDaHeU-v8wOAQS2z-RPUzd0lw36Uw7-ENbtfrflDzZiBAiAA-Ge16pli4v6mdCJxs1_Gr0YLXfm1cLrl66bD-blcAg"
+max_tokens = 8192
+temperature = 0.0
+api_version = ""
+
+# 同款图片匹配模型（阶段二确定性管道用）—— 多模态，喂目标主图 + 候选缩略图挑同款。
+# 必须是 MULTIMODAL_MODELS 里的模型（app/llm.py），否则 ask_with_images 抛 ValueError。
+# 用法：LLM(config_name="samematch").ask_with_images([...], images=[url, ...])
+[llm.samematch]
+api_type = "openai"
+model = "qwen3-vl-plus"                                        # DashScope 多模态，已实测传图可返回商品描述
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "sk-ws-H.RXDMPED.up26.MEQCIDaHeU-v8wOAQS2z-RPUzd0lw36Uw7-ENbtfrflDzZiBAiAA-Ge16pli4v6mdCJxs1_Gr0YLXfm1cLrl66bD-blcAg"
+max_tokens = 2048
+temperature = 0.0
+api_version = ""
+
+# GUI 视觉坐标模型 —— 与 DOM 索引操作并列的交互方式，由 LLM 自主选择。
+# browser_use 工具的 action="gui_action" 会截图并交给该模型按像素坐标决策操作。
+[llm.gui]
+api_type = "openai"
+model = "qwen3.7-plus"                                         # DashScope 视觉模型，返回绝对像素坐标
+base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+api_key = "sk-ws-H.RXDMPED.up26.MEQCIDaHeU-v8wOAQS2z-RPUzd0lw36Uw7-ENbtfrflDzZiBAiAA-Ge16pli4v6mdCJxs1_Gr0YLXfm1cLrl66bD-blcAg"
+max_tokens = 2048                                              # 单个原子操作 JSON 足够，保守上限
+temperature = 0.0
+api_version = ""
+
+# 发布管线的文本判断模型（app/publish/）—— 类目选择、属性比对、标题生成、
+# 尺码表估算、SKU 货号翻译、包装清单判断这 6 个单发判断点都走它。
+# 已从 deepseek-v4-flash 迁移到 packycode 的 grok-4.6（更快、上下文窗口更大）。
+# 【max_tokens 必须给足】grok-4.6 同样是推理模型，先产 reasoning_content 再产
+# content。给小了推理就把额度占满、content 返回空字符串，且 finish_reason=length，
+# 表现为「调用成功但结果为空」——排查时极易误以为是提示词问题。
+# 原 deepseek 实测用量（属性审核这个最重的判断点：33 属性行 / 18 项带 options /
+# 289 个选项条目，prompt 3615 token）需要 max_tokens=16000 才不截断。
+# grok-4.6 上下文窗口 500k，保守沿用 16000；实测若够用可适当下调。
+[llm.publish]
+# 【2026-08-20 起必须是 openai-response】实测该网关的 grok-4.5/4.6 只支持
+# /v1/responses，打 /v1/chat/completions 返回 400 protocol_not_supported（纯文本
+# 和带图都一样）。这批模型此前是支持 chat 的，网关侧改过，故不能按模型名硬编码，
+# 靠这个 api_type 切协议（见 app/llm.py 的 use_response_api）。
+api_type = "openai-response"
+model = "grok-4.6"
+base_url = "https://cf.api.fan/v1"
+api_key = "sk-wL9vbY9njBAxiwF6IoU2906Ed1unpoRWIuu4KgOZLxMtfg7k"
+max_tokens = 16000
+temperature = 0.0
+api_version = ""
+
+# ---- 发布管线备选模型：Kimi Code（k3）------------------------------------------
+# 在发布页 UI 顶部「模型」下拉里切换，不用改本文件；这里只需把 api_key 填上
+# （Kimi Code 控制台创建，需会员；k3 需 Moderato 及以上档位：
+#   https://www.kimi.com/code/docs/en/ ）。
+# 【填/改 key 后要重启 app】配置是启动时加载的，不重启 UI 里该项一直是「未配 key」。
+# 注意三点：
+# 1) api_type 是 "openai"（chat/completions）——openai-response 是 grok 网关专用；
+# 2) k3 已登记进 app/llm.py 的 MULTIMODAL_MODELS（官方文档暗示 k3 支持图/视频输入），
+#    但 coding 端点吃不吃 base64 图未实测——视觉阶段报错就回 UI 切回 grok；
+# 3) 会员额度按请求数限流（约 300-1200 次/5 小时窗口），大批量发布前先算一下量。
+[llm.publish-kimi]
+api_type = "openai"
+model = "k3"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "sk-kimi-lFuOOf0pOla2QN08bHXHrmjH7kZUI1bCAQFlW6rebf0bqJd9PggrDI8yNZVmn8Ua"
+max_tokens = 16000
+# 【temperature 必须是 1】Kimi 这批模型只接受 temperature=1，给 0.0 直接 400
+# 「invalid temperature: only 1 is allowed for this model」（2026-08-21 实测）
+temperature = 1.0
+api_version = ""
+
+# K2.7 Code：k3 的快速/省额度替代（2026-08-21 探针实测：文本与 base64 图都通）。
+# 与 k3 是同一个 key。
+[llm.publish-kimi-k27]
+api_type = "openai"
+model = "kimi-for-coding"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "sk-kimi-lFuOOf0pOla2QN08bHXHrmjH7kZUI1bCAQFlW6rebf0bqJd9PggrDI8yNZVmn8Ua"
+max_tokens = 16000
+temperature = 1.0  # 只能 1，给 0.0 会 400（同上面 k3 段的实测注释）
+api_version = ""
+
+# k3 256K：256k 上下文内效果与 k3 相同、额度约省一半（2026-08-21 实测文本与图都通）。
+# 发布管线单次 prompt 最大也就几万 token，日常首选这档比 k3(1M) 划算。
+[llm.publish-kimi-k256k]
+api_type = "openai"
+model = "k3-256k"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "sk-kimi-lFuOOf0pOla2QN08bHXHrmjH7kZUI1bCAQFlW6rebf0bqJd9PggrDI8yNZVmn8Ua"
+max_tokens = 16000
+temperature = 1.0  # 只能 1，同上
+api_version = ""
+
+# K2.7 高速档：输出快 5-6 倍（2026-08-21 实测文本与图都通），适合大批量时抢速度。
+[llm.publish-kimi-highspeed]
+api_type = "openai"
+model = "kimi-for-coding-highspeed"
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "sk-kimi-lFuOOf0pOla2QN08bHXHrmjH7kZUI1bCAQFlW6rebf0bqJd9PggrDI8yNZVmn8Ua"
+max_tokens = 16000
+temperature = 1.0  # 只能 1，同上
+api_version = ""
+
+# DeepSeek 官方视觉模型。为什么单独一段而不是复用上面的 Kimi 段：base_url/协议/
+# temperature 约束各不相同，混在一段改一处就串味（见 publish-kimi 那几段的实测注释）。
+# 【2026-09-10 改名】官方模型 ID 已统一为 deepseek-flash（视觉文档 guides/vision 的
+# 示例同样用它）：旧名 deepseek-v4-flash-vision-exp 对应的模型已下线，旧名仍可调用但
+# 由最新 Flash 承接。实测本 ID 文本与 base64 图都通。
+# 【图片传法】官方文档（api-docs.deepseek.com/zh-cn/guides/vision）称 base64 与
+# 远程 http URL 都收（2026-08-22 实测两种都 200），但发布管线一律走 base64（app/publish/llm.py 的 image_ref 已统一
+# 下载转码）：远程 URL 让服务端自己出网取图，成不成看它的出网环境，不可控。
+# 【max_tokens 给到 32000】2026-08-22 属性审核实测：32 行属性 + 各行 options 的
+# 提示词下，该模型一次推理要 11165 completion token，16000 额度会偶发撞
+# finish_reason="length"——推理链吃满额度、content 返回空，被 LLM.ask 判为
+# ValueError 后靠 tenacity 重试才成功，白等 2 分 17 秒。端点侧上限探到 65536 可用
+# （2026-08-22 探针），故留一倍余量。按量计费只算实际产出的 token，调高额度本身不涨钱。
+[llm.publish-deepseek]
+api_type = "openai"
+model = "deepseek-flash"
+base_url = "https://api.deepseek.com"
+api_key = "sk-55493d22aeb14b12837732a14d19beb3"                                                   # 你的 DeepSeek API key，留空则发布页下拉里显示为不可用
+max_tokens = 32000
+temperature = 0.0
+api_version = ""
+
+# 浏览器配置 —— 接管你已登录的真实 Chrome，绕过携程等站点的反爬登录墙。
+# [前置步骤] 先用独立用户目录 + 远程调试端口启动 Chrome，并手动登录携程一次：
+#   Windows:
+#     & "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+#       --remote-debugging-port=9222 `
+#       --user-data-dir="C:\chrome-debug-ctrip"
+#   然后在该窗口里手动登录携程（cookie 会留在 C:\chrome-debug-ctrip）。
+# agent 通过 cdp_url 接管这个已登录实例：真实指纹(navigator.webdriver 干净) + 已有 cookie，
+# 不会再触发登录墙和假"无航班"提示。该实例需在 agent 运行期间保持开启。
+
+[browser]
+cdp_url = "http://localhost:9222"
+# 视口尺寸对齐到本机真实屏幕可用区（1920×953）。不设则用 browser_use 默认
+# 1280×1100，会比真实屏幕高出约 147px，导致 DOM 把视口外的元素也判为"可见"，
+# 与截图不一致、视觉模型点空。注意：cdp_url 接管已开的真实 Chrome 时，能否真正
+# 改变窗口取决于 browser_use 是否对 CDP 连接套用该 viewport。
+window_width = 1920
+window_height = 953
+
+# MCP（Model Context Protocol）配置
+[mcp]
+server_reference = "app.mcp.server"
+
+# 运行流程配置
+[runflow]
+use_data_analysis_agent = false
+
+# RAG 经验库 —— 把跑通的任务流程沉淀下来，新任务用「用户提示词」检索最相似的
+# 成功经验作为 few-shot 注入 prompt，让 agent 少绕圈、用更少步数完成。
+# 写入入口：任务成功后终端交互确认（[y/N]）；非交互运行（如 --prompt 脚本）跳过保存。
+# 想修改/删除某条经验：直接手编 experience/recipes.jsonl（人类可读、可 git diff）。
+[experience]
+enabled = true
+embedding_model = "text-embedding-v4" # DashScope 向量模型，建库与查询须一致
+top_k = 2                             # 注入的最相似经验条数
+min_score = 0.35                      # 相关性下限闸，防止给无关任务硬塞经验
+rrf_k = 60                            # RRF 倒数排名融合常数
+
+# 订单登记管线（真实值；本文件 gitignored。仓库里的 config.example.toml 已脱敏成占位符，
+# 故这里必须写全 [orders]，否则会退到 example 的占位映射、写错表）。
+[orders]
+workbook = "C:\\Users\\Administrator\\Desktop\\wintop订单登记表7.24.xlsx"
+list_url = "https://agentseller.temu.com/mmsos/orders.html?fulfillmentMode=0&queryType=2&sortType=1&timeZone=UTC%2B8&needBuySignService=0&sellerNoteLabelList=&packageAbnormalTypeList="
+dedupe_by = ["订单号", "尺码"]
+
+[[orders.sheet_map]]
+store = "Pawly"
+sites = ["哥伦比亚", "秘鲁"]
+sheet = "Pawly全球1"
+store_value = "Pawly全球"
+
+[[orders.sheet_map]]
+store = "WINTAK"
+sites = ["哥伦比亚", "秘鲁"]
+sheet = "WINTAK"
+store_value = "WINTAK"
+
+[[orders.sheet_map]]
+store = "WINTAK"
+sites = ["德国", "西班牙", "意大利", "法国", "波兰", "匈牙利"]
+sheet = "WINTAK欧区"
+store_value = "WINTAK"
+
+[[orders.sheet_map]]
+store = "VibeMakers"
+sites = ["美国"]
+sheet = "VibeMakers美国"
+store_value = "VibeMakers"
+
+[[orders.sheet_map]]
+store = "VibeMakers"
+sites = ["哥伦比亚", "秘鲁"]
+sheet = "VibeMakers全球"
+store_value = "VibeMakers"
+# ---- 店小秘 Temu 半托管发布管线（app/publish/）--------------------------------
+# 从 1688 链接到店小秘草稿保存的 12 阶段发布流程。浏览器操作走 [browser].cdp_url
+# 接管已登录的真实 Chrome，与采集/订单/活动三条管线同一个前提。
+[publish]
+# ---- 出图通道（图片 AI 编辑 + 文生图，app/publish/images.py）-------------------
+# 可选 zzlye（api.zzlye.xyz，默认）、shyfai（agent3.shyfai.cn，尺寸保真最好）或
+# packy（cf.api.fan，旧通道，走 Clash 代理、节点挂了整批全灭）。切换只改这一行，
+# 或直接在发布页的「出图通道」下拉里选（页面选择优先于这里）。
+# 成本优先：默认取 $0.03 的基础档（4k 档 $0.12 清晰度 23.6，要画质就把 image_model
+# 改成 gpt-image-2.5-flare-4k）。zzlye 按次固定计费，压尺寸不省钱故不封顶；Packy 按尺寸
+# 计费，代码里封到 ~1MP（实测同图 6.62 -> 2.19），缺口由本地 compress 等比放大补回。
+image_provider = "zzlye"
+# zzlye 出图密钥（image_provider = "zzlye" 时读这个）
+zzlye_api_key = "sk-sNiYOOYUHyS2W9PNlFvV5Fms7dTW8vzqTQWSdGZOVnOqsvVl"
+
+# shyfai 出图密钥（image_provider = "shyfai" 时读这个）。agent3.shyfai.cn 直连，
+# 2026-09-28 接入实测。
+# 【它比 zzlye 强在哪】尺寸保真：请求 2448x1792 原样返回 438 万像素，没有 zzlye 基础档
+# 那个 ~157 万像素预算——服装红线 1340x1785 原生满足，不必靠 compress 放大 1.66x 补，
+# 织标小字少糊一档。代价是响应只给 url 不给 b64（结果域名同域，_save_result 的 url
+# 分支直接可用），且上游忙时返 477/434 自定义码（代码里已纳入重试）。
+# 计费查不到（自建网关，无 pricing/usage 端点），单价要问供应商。
+shyfai_api_key = "sk-f4adbe67b389384b7f5ae7b04c40e88974cb603ef2eb1192f3c87eebe8b22202"
+
+# 图片 AI 编辑（去中文/去水印/描述图英化）用的 Packy gpt-image-2 密钥。
+# 【注意与 [llm.publish].api_key 是两个不同分组的 key，不能混用】2026-08-20 实测：
+# 这个 key 属生图分组（只有 gpt-image-2），[llm.publish] 那个属 grok 分组（只有
+# grok-4.5/4.6）。拿 grok 的 key 调 gpt-image-2 会得 503「分组下模型无可用渠道」。
+# 留空则纯本地几何合规化仍可用（fit34 / square / compress 不需要密钥），
+# 只有 AI 编辑会报错提示来配。
+packy_api_key = "sk-LqrmHlbIY9ttM9kMycZkbBhyh3hnaFLtoV6lkuSaJ3BetqCC"
+# 店小秘账号级常量：图片直传图床时回调要带的 fullCid。换账号必须改，否则图片传上去
+# 登记不到自己名下（表现为「上传成功但空间里找不到」）。
+# 【2026-08-20 已实测抓取】取法：在店小秘编辑页 fetch
+#   /api/album/selectImg.json?skuImgId=TemuMarketImg
+# 返回的 data.picListPage.list[].fullCid 即是。注意不要用 fileId 里的数字或 puid
+# （本账号 puid=2525332）去推断——那是另一个字段，与 fullCid 不同。
+full_cid = "5153348-"
+# 申报价（元）与库存的批量默认值，可在调用时覆盖
+declare_price = "168"
+stock = "100"
+# 仓库名（变种信息页勾选，只勾这一个）
+warehouse = "飞特COL仓库"
+
+# 站点 → 仓库名映射（stock.resolve_warehouse 按 --site 查这里，站点名去尾部「站」后匹配）。
+# 【为什么必须有这一段】编辑页仓库下拉的选项集合因站点而异，跑非哥伦比亚站时若沿用上面
+# 那个全局默认，下拉里根本找不到「飞特COL仓库」，阶段⑪ 直接报 no-option、整单不落库
+# （2026-09-10 实测：Pawly / 美国站 跑汽车吸尘器就卡在这里）。未配的站点仍退回全局默认。
+[publish.warehouse_by_site]
+# 键必须加引号：TOML 的裸键只允许 A-Za-z0-9_-，中文会报 Invalid statement。
+"美国" = "嘉运美东仓"
+
+# ---- 采集管线白底主体提取（app/collect/image_extract.py）------------------------
+# 把 Temu 营销拼图重绘成「纯白背景 + 单一商品」，只作为 1688 以图搜图的【查询图】
+# 提升 recall；判同款一律用原图（见该模块开头的红线说明）。
+# 与 [publish].packy_api_key 用的是同一个生图分组（gpt-image-2），故填同一个 key。
+[collect_image]
+# 主 key。留空则跳过白底提取、退回原图搜索，不阻断采集。
+# 2026-09-20 起与 [publish] 同一家（zzlye / gpt-image-2.5-flare，$0.03 按次固定），
+# 原先是 packyapi 的 gpt-image-2。
+api_key = "sk-sNiYOOYUHyS2W9PNlFvV5Fms7dTW8vzqTQWSdGZOVnOqsvVl"
+# 备用 key（主 key 余额耗尽 "没有可用token" 或调用失败时自动切过去）。
+# 【当前刻意留空，不是漏配】这个槽是当年 packyapi 的产物：那家主 key 便宜但会耗尽额度、
+# 备用 key 贵但稳，故做了双 key 兜底。换到 zzlye 后只用一个 key，留空即可——
+# _resolve_api_keys() 会自动只返回主 key 那一项，不会因空槽报错。
+# 要填就【必须与 base_url 同一家】：跨家填会在主 key 耗尽时切过去拿错分组、必然 503。
+api_key_expensive = ""
+# 以下选填，留空用代码里的默认值
+base_url = "https://api.zzlye.xyz/v1"
+model = "gpt-image-2.5-flare"
+size = "1024x1024"
+# medium 对搜索查询图够用；这是成本杠杆，别默认 high。
+# 【注意这家基础档有 ~157 万像素预算】请求 1024x1024 实得 1254x1254，size 基本只起
+# 定比例的作用。白底图只当搜索查询图，尺寸大小无所谓。
+quality = "medium"
+
+[publish.alert]
+enabled = true
+webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/5eef48dd-dca2-483c-a62a-6a486dde2bd5"
+
+# 管线错误集中上报到公网 MySQL（app/error_report.py，切面 + 注解式）。
+# 多台 PC 同时跑采集/订单/活动/发布四条管线时，把「主流程失败」（商品失败/批次
+# 中止/批次异常退出）结构化写进同一张表，方便按 pipeline/stage/item/machine 聚合排查。
+# best-effort：写库失败只告警、绝不中断主流程。
+[error_report]
+enabled = true
+host = "119.29.84.105"
+port = 3306
+user = "chenkuo"
+password = "13928551207Hzg."
+database = "manus-gui"
+table = "pipeline_errors"
+instance = ""

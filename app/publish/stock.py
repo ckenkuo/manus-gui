@@ -47,9 +47,9 @@ async def _fill_rows_batched(session: BrowserSession, js: str, what: str,
         if merged is None:
             merged = dict(r)
         else:
-            # processed 累加；bad/failed/sample 合并（sample 只留前几条，同 JS 侧口径）
+            # processed 累加；bad/failed/fuzzy/sample 合并（sample 只留前几条，同 JS 侧口径）
             merged["processed"] = (merged.get("processed") or 0) + (r.get("processed") or 0)
-            for k in ("bad", "failed"):
+            for k in ("bad", "failed", "fuzzy"):
                 if r.get(k):
                     merged[k] = (merged.get(k) or []) + r[k]
             if r.get("sample"):
@@ -181,6 +181,9 @@ async def set_stock(session: BrowserSession, info_path: str,
         return {"status": "error", "stage": "packing", **pk}
     if pk.get("failed"):
         logger.warning(f"包装清单有 {len(pk['failed'])} 处配件未选中：{pk['failed'][:3]}")
+    if pk.get("fuzzy"):
+        logger.warning(f"包装清单有 {len(pk['fuzzy'])} 处配件被包含匹配选成了别的词"
+                       f"（不判失败，但语义已偏移，建议人工复核）：{pk['fuzzy'][:3]}")
 
     ok = (res.get("processed", 0) > 0 and not res.get("bad")
           and pk.get("processed", 0) > 0 and not pk.get("bad") and not pk.get("failed"))

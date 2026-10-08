@@ -300,7 +300,7 @@ def _load_raw_from_db() -> dict:
 def load_raw_config() -> dict:
     """统一配置源：返回【未合并】的配置 raw dict（Config 单例与各管线散点共用）。
 
-    必须是未合并原文：app/publish/llm.py 的 _section_api_key 靠「段里显式留空
+    必须是未合并原文：app/publish/llm.py 的 _section_api_keys 靠「段里显式留空
     api_key = 未配置」判可用性，给合并后的 dict 会把 [llm] 默认 key 补进去造成
     误判。进程内 TTL 缓存（见 _CONFIG_CACHE_TTL），测试/push 后可用
     invalidate_config_cache() 强制重读。
@@ -340,6 +340,12 @@ class LLMSettings(BaseModel):
     model: str = Field(..., description="模型名称")
     base_url: str = Field(..., description="API 基础 URL")
     api_key: str = Field(..., description="API 密钥")
+    api_keys: Optional[List[str]] = Field(
+        None,
+        description="API 密钥池（限额/故障时自动转移到下一个 key）；"
+        "非空时优先于 api_key。目前仅 Kimi 渠道段启用（app/llm.py 的 "
+        "_KEY_POOL_CONFIG_NAMES），其余段配了也只打 warning 忽略",
+    )
     max_tokens: int = Field(4096, description="每次请求的最大 token 数")
     max_input_tokens: Optional[int] = Field(
         None,
@@ -594,6 +600,7 @@ class Config:
             "model": base_llm.get("model"),
             "base_url": base_llm.get("base_url"),
             "api_key": api_key,
+            "api_keys": base_llm.get("api_keys"),
             "max_tokens": base_llm.get("max_tokens", 4096),
             "max_input_tokens": base_llm.get("max_input_tokens"),
             "temperature": base_llm.get("temperature", 1.0),
@@ -674,10 +681,12 @@ class Config:
         # 【必须剔除空值再合并】某段写了 api_key = "" 时，字典合并会用空串盖掉 [llm]
         # 的值，那一段就没 key 可用了。原先这种情况靠环境变量回退兜住，去掉回退后
         # 必须显式处理，否则 [llm.xxx] 里留个空 api_key 就会让该段静默失效。
+        # api_keys 同理：段里写 api_keys = [] 会拿空表盖掉 [llm] 默认段的池，
+        # 故一并剔除（not v 对空串与空表都成立）。
         llm_configs = {}
         for name, override_config in llm_overrides.items():
             effective = {k: v for k, v in override_config.items()
-                         if not (k == "api_key" and not v)}
+                         if not (k in ("api_key", "api_keys") and not v)}
             llm_configs[name] = {**default_settings, **effective}
 
         config_dict = {

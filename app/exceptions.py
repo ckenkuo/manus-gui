@@ -35,3 +35,16 @@ class ModelNotMultimodalError(OpenManusError):
     吃掉，25 个商品排队等人工。单独成类后 retry 谓词直接放行（立即抛出），
     报错文案一眼可读。
     """
+
+
+class AllApiKeysExhausted(OpenManusError):
+    """key 池里所有 key 都限额/鉴权失败（或单 key 段唯一的 key 失败）时引发。
+
+    【为什么单独一类而不透传原生 403/401】两个理由：
+      1. 这是确定性失败——池里每个 key 都已实测失败，tenacity 退避重发只是把
+         同样一批拒绝信再收一遍，白等几分钟。单独成类才能让 ask/ask_with_images
+         的 retry 谓词把它排除在退避之外（同 EmptyContentTruncated 的取向）。
+      2. 原生气泡（如 PermissionDeniedError）只说「这一个 key 被拒」，读不出
+         「N 个 key 全灭、该去加 key 了」这个关键处置信息。
+    不继承 openai.APIError：它的 __init__ 要求 request/body 形参，构造别扭且无收益。
+    """
