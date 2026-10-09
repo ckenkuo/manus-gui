@@ -478,38 +478,91 @@ async def test_软类两次一致照旧重生到预算耗尽(monkeypatch, tmp_pa
 # ---- 7) 品牌标识定点抹除救援：生图抹不掉实物上的第三方商标时的确定性兜底 ---------
 # 2026-10-08 商品 1048494210610 实证：同一个包装盒的「382 TOYS」在 ⑦b 第 3 行、第 6 行
 # 两次都是「三发生图纹丝不动」，而同款别的行偶尔能抹掉——纯随机，属确定性能力缺口。
-# 救援链路 = 视觉按原文给整个标记图形的框 → 按周围底色整框填 → 复检必须通过。
+# 救援链路 = 视觉按原文给整个标记图形的框 → 逐像素重建背景、只填标记像素 → 复检必须通过。
+# 2026-10-09 换代取证（Klokflip 压在蓝色盒盖上，老实现的外沿近色占比 311/482）：
+# 「整框一个背景色 + 近纯色占比 ≥70%」在渐变/纹理底上必然放弃，换成「4 向射线背景模型
+# + 连通成分判定（从框外伸进来的结构不算标记）」。
 
-def test_抹除图形标记按整框填底色(tmp_path):
-    """refine=False 是给图形标记用的：白底方框要整块被底色吃掉，不能只抹里面的字。"""
+def _gradient_picture(w=400, h=300):
+    """造一张横向渐变的底图：老实现的近纯色闸门在这上面必挂。"""
+    picture = Image.new("RGB", (w, h))
+    draw = ImageDraw.Draw(picture)
+    for x in range(w):
+        tone = int(80 + 120 * x / w)
+        draw.line([(x, 0), (x, h)], fill=(0, tone, 255 - tone // 2))
+    return picture
+
+
+def test_图形标记压在渐变底上也抹得掉(tmp_path):
+    """图形标记走逐像素抹除：白框黑字要被抹回紧邻的底色，不能只抹里面的字。"""
     from app.publish import text_erase
 
     src = tmp_path / "mark.jpg"
-    picture = Image.new("RGB", (400, 300), (0, 100, 200))
+    picture = _gradient_picture()
     draw = ImageDraw.Draw(picture)
     draw.rectangle((250, 40, 350, 100), fill=(255, 255, 255))
     draw.text((262, 62), "382 TOYS", fill=(0, 0, 0))
     picture.save(src)
-    result = text_erase.erase_boxes(str(src), [(250, 40, 350, 100)],
-                                    out_path=str(tmp_path / "erased.jpg"), refine=False)
+    with Image.open(src) as im:
+        bg = im.getpixel((300, 20))                    # 标记正上方的渐变底色，用来比对
+    result = text_erase._erase_mark_boxes(str(src), [(250, 40, 350, 100)],
+                                          out_path=str(tmp_path / "erased.jpg"))
     assert result["ok"] is True
     with Image.open(tmp_path / "erased.jpg") as erased:
         pixel = erased.getpixel((300, 70))
-    assert pixel[2] > 150 and pixel[0] < 60, "白框该被整块填成盒面底色"
+    assert max(abs(pixel[i] - bg[i]) for i in range(3)) <= 40, "该填成紧邻的渐变底色"
 
 
-def test_框外沿不是近纯色就放弃抹除(tmp_path):
-    """蹭到商品主体/照片的框不抹：填出来是一块色疤，不如不抹（留白交重生或人工）。"""
+def test_框内穿过来的产品结构不跟着被抹(tmp_path):
+    """框里混进从框外伸进来的结构（提手孔那类贯通物）时，它必须原样留着。
+
+    这是「整框照填」时代踩过的坑（框里有实物时整块被抹平，商品直接消失），新实现靠
+    「触及检测区边界的连通成分不算标记」挡住——Klokflip 那张的提手孔就是这么保住的。
+    """
+    from app.publish import text_erase
+
+    picture = _gradient_picture()
+    draw = ImageDraw.Draw(picture)
+    draw.rectangle((60, 40, 160, 100), fill=(255, 255, 255))     # 标记
+    draw.rectangle((170, 0, 186, 300), fill=(20, 20, 20))        # 贯穿全图：从框外伸进来
+    src = tmp_path / "hole.jpg"
+    picture.save(src)
+    result = text_erase._erase_mark_boxes(str(src), [(60, 40, 160, 100)],
+                                          out_path=str(tmp_path / "erased.jpg"))
+    assert result["ok"] is True
+    with Image.open(tmp_path / "erased.jpg") as erased:
+        assert erased.getpixel((110, 70))[2] > 100, "标记该被抹掉"
+        hole = erased.getpixel((178, 70))
+    assert max(hole) < 60, "穿过检测区的结构不能被当成标记抹掉"
+
+
+def test_框内没有标记就放弃(tmp_path):
+    """框里找不到与背景不符的像素 → 如实放弃，不硬填一块色出去。"""
+    from app.publish import text_erase
+
+    src = tmp_path / "plain.jpg"
+    _gradient_picture().save(src)
+    result = text_erase._erase_mark_boxes(str(src), [(250, 140, 350, 200)],
+                                          out_path=str(tmp_path / "out.jpg"))
+    assert result["ok"] is False
+    assert "没有与背景不符" in result["why"]
+
+
+def test_文字行框外沿不是近纯色就放弃抹除(tmp_path):
+    """文字行那条路径照旧：蹭到商品主体/照片的框不抹（填出来是一块色疤，不如不抹）。"""
     from app.publish import text_erase
 
     src = tmp_path / "busy.jpg"
     picture = Image.new("RGB", (400, 300), (0, 100, 200))
     draw = ImageDraw.Draw(picture)
-    for x in range(200, 400, 10):                      # 半幅打上高对比条纹，外沿必杂
-        draw.rectangle((x, 0, x + 4, 300), fill=(255, 255, 0))
+    for x in range(0, 400, 8):                      # 全图铺高对比棋盘，精修后的外沿必杂
+        for y in range(0, 300, 8):
+            if (x // 8 + y // 8) % 2:
+                draw.rectangle((x, y, x + 7, y + 7), fill=(255, 255, 0))
+    draw.rectangle((190, 140, 210, 160), fill=(0, 0, 0))    # 一块墨，给精修当锚点
     picture.save(src)
-    result = text_erase.erase_boxes(str(src), [(250, 40, 350, 100)],
-                                    out_path=str(tmp_path / "out.jpg"), refine=False)
+    result = text_erase.erase_boxes(str(src), [(190, 140, 210, 160)],
+                                    out_path=str(tmp_path / "out.jpg"))
     assert result["ok"] is False
     assert "近纯色" in result["why"]
 

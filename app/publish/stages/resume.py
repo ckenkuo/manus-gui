@@ -1,6 +1,7 @@
 """店小秘发布共用能力：stages.resume。各来源流程由 workflows/ 独立定义。"""
 
 from app.logger import logger
+from app.publish import titles
 from app.publish.variant_colors import accessory_colors_from_rows
 
 
@@ -69,6 +70,12 @@ def _stale_form_stages(live: dict) -> list:
         return list(_FORM_ONLY_STAGES)
     stale = []
     if not live.get("titleFilled") or live.get("titleHasCjk"):
+        stale.append("titles")
+    # 【有值不等于成果还在】上面那行只判「空 / 含中文」，而那个框里的值并不只可能来自 ⑤：
+    # 认领会把源标题原样预填进去（2026-10-09 真站实测），旧产物也可能带材质。拉丁字母的
+    # 源标题、以及 2026-10-09 之前带材质生成的标题，都能让上面那行判「不用重跑」而原样
+    # 发出去。故补一道内容判据（判据本身在 titles._title_content_reject，不在这里复刻正则）。
+    elif titles._title_content_reject(live.get("titleText")):
         stale.append("titles")
     # ⑥⑦ 图片类：变种属性区一张图都没有说明素材图与 SKC 换图都丢了。
     # ⑤b clean_images 是它们的上游产物提供者，跟着一起重跑（它自己会判「已有干净图」跳过）。

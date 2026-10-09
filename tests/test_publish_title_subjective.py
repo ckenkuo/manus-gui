@@ -15,8 +15,11 @@ async def test_subjective_claim_rejected():
     }
     # 模拟 LLM 返回含主观营销词的标题
     import app.publish.llm as pub_llm
+    # 注意：用例里的标题一律不带材质与码数——2026-10-09 起这两类也是硬闸
+    # （titles._material_reject / _size_reject），带着它们会让「干净标题」反被另一道
+    # 闸拒掉，测出来的就不是主观营销用语这条了。
     violating = [
-        {"enTitle": "Must Have Kids Plaid Dress for Summer, Breathable Cotton"},
+        {"enTitle": "Must Have Kids Plaid Dress for Summer, Breathable Design"},
         {"enTitle": "Best Quality Girls Plaid Dress, Sleeveless, For Party"},
         {"enTitle": "Perfect Toddler Plaid Dress, Adjustable Straps, Daily Wear"},
         {"enTitle": "Top Rated Kids Dress, Plaid Pattern, Soft Fabric, Casual"},
@@ -30,10 +33,10 @@ async def test_subjective_claim_rejected():
             return {"candidates": violating[:3], "recommend": 0, "title": "儿童格子连衣裙"}
         return {
             "candidates": [
-                {"enTitle": "Kids Plaid Dress for Summer, Breathable Cotton, Casual Wear"}
+                {"enTitle": "Kids Plaid Dress for Summer, Breathable Design, Casual Wear"}
             ],
             "recommend": 0,
-            "title": "儿童夏季格子连衣裙透气棉质休闲款",
+            "title": "儿童夏季格子连衣裙透气休闲款",
         }
 
     monkeypatch = pytest.MonkeyPatch()
@@ -63,17 +66,17 @@ async def test_subjective_claim_chinese():
             _mock.called = True
             return {
                 "candidates": [
-                    {"enTitle": "Adjustable Pet Leash for Small Dogs, Durable Nylon"}
+                    {"enTitle": "Adjustable Pet Leash for Small Dogs, Reflective Design"}
                 ],
                 "recommend": 0,
                 "title": "养宠必备神器小型犬牵引绳最好用",  # 违规中文
             }
         return {
             "candidates": [
-                {"enTitle": "Adjustable Pet Leash for Small Dogs, Durable Nylon"}
+                {"enTitle": "Adjustable Pet Leash for Small Dogs, Reflective Design"}
             ],
             "recommend": 0,
-            "title": "小型犬可调节牵引绳耐用尼龙材质",
+            "title": "小型犬可调节牵引绳反光设计日常遛狗",
         }
 
     monkeypatch = pytest.MonkeyPatch()

@@ -7,7 +7,6 @@ from app.publish.attributes import (
     dropdowns as attributes_dropdowns,
     form as attributes_form,
     review as attributes_review,
-    server_options as attributes_server_options,
     validation as attributes_validation,
 )
 from app.publish.browser import BrowserSession
@@ -49,32 +48,64 @@ async def _scan_linkage_rows(session: BrowserSession, seen: set) -> list:
             and a.get("required") and a.get("visible") is not False]
 
 
-async def _read_linkage_options(session: BrowserSession, new_rows: list,
-                                rowid: str, cat_id: str = "") -> None:
-    """给联动行就地补上 options（原地改 new_rows），规矩与主轮 dump_attrs 一致。
+# 联动行读选项的尝试次数：_read_active_options 内部已对「下拉点不开」重试一次，这里再
+# 兜一层「读回来是空清单」——2026-10-09 探针实测连读多行时偶发读到空，而该行页面上明明
+# 有值可选（隔一会儿单独再读就有）。
+_LINKAGE_OPTIONS_TRIES = 2
 
-    联动新增的必填行仍是【同一类目】的属性，所以与主轮共用同一份服务端清单
-    （见 attributes/server_options）；数值行不读选项——它行内的 select 是只读单位。
+
+async def _read_linkage_options(session: BrowserSession, new_rows: list) -> None:
+    """给联动行就地补上 options（原地改 new_rows），【取自页面该行下拉的真实选项】。
+
+    【为什么联动轮不能沿用主轮的服务端清单】2026-10-09 商品 969290698843 /
+    1058272209244（家电 > 厨房小家电 > 其他，USB 充电封口机）真机取证：服务端接口按
+    类目返回的「工作电压」有 40 个档位（110V、220V、110V（含）-220V（含）…），而页面
+    该行下拉【只剩 2 项】（「36V（不含）-100V（不含）」「36V及以下」）；面板宽 240、
+    scrollHeight == clientHeight == 64、scrolledToEnd 为真，是「读全了」的硬判据，
+    不是没滚到底。平台按前置字段（电源方式=USB充电、电池属性=可充电电池）把这行的可选
+    值联动收窄了，服务端接口不知道这层前端过滤。
+    后果：LLM 拿着服务端全量清单选的市电档能过 _validate_attr_changes 的 options 闸
+    （那道闸的判据同样是服务端清单），却在点选时报 option-not-rendered，原值重试也点
+    不中，末尾复扫报「必填仍空：工作电压」，两单都在④ 失败。
+
+    联动行本来就少（实测 1~3 行）、本来就要为它开合下拉，读一次真实选项的代价可以接受；
+    主轮几十行仍走服务端清单——那条路省下的 3-5 分钟是实打实的，且服装类目没有这种
+    联动收窄。这也是 attributes/server_options 里「绝不回退去开下拉」的例外：那条取向
+    针对的是【主轮整批读选项】，与这里的单行补填不是一回事。
+
+    数值行不读选项——它行内的 select 是只读单位（同 dump_attrs 的同名分支）。
+    best-effort：读不到只标 optionsEmptyReason 交末尾复扫报人工，不抛、不假装有值。
     """
-    server_opts = await attributes_server_options.fetch_attr_options(
-        session, rowid, cat_id)
     for a in new_rows:
         a["options"] = []
         if a.get("kind") == "number":
             a["optionsEmptyReason"] = "number-row"
             continue
-        opts = server_opts.get(a["label"]) or []
+        opts, meta = [], {}
+        for _ in range(_LINKAGE_OPTIONS_TRIES):
+            opts, meta = await attributes_dropdowns._read_active_options(
+                session, a["label"], with_meta=True)
+            if opts:
+                break
+            await asyncio.sleep(0.5)
         if opts:
             a["options"] = opts
-            a["optionsFrom"] = "server"
+            a["optionsFrom"] = "dom"
+            if not meta.get("complete"):
+                # 清单非空但没滚到底/面板没铺开：可能被截断，如实留痕（静默截断是这一带
+                # 最难发现的一类错）。仍交 LLM 用——被截掉的值若正是该选的，写入会失败
+                # 并落进末尾复扫，不会静默错填。
+                logger.warning(f"联动行「{a['label']}」页面选项可能不完整"
+                               f"（{meta.get('reason') or '未滚到底'}），读到 "
+                               f"{len(opts)} 项")
         else:
-            a["optionsEmptyReason"] = "server-missing"
-            logger.warning(f"联动行「{a['label']}」在服务端清单里没有对应项，读不到选项")
+            a["optionsEmptyReason"] = "dom-unreadable"
+            logger.warning(f"联动行「{a['label']}」读不到页面下拉选项"
+                           f"（{meta.get('reason') or '读回为空'}），交末尾复扫认定")
 
 
 async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dict,
-                              main_comp: Optional[dict], rowid: str = "",
-                              cat_id: str = "", site: str = "") -> tuple:
+                              main_comp: Optional[dict], site: str = "") -> tuple:
     """补填一轮：读选项 → 问 LLM → 校验 → 写入，返回 (applied, compFailed)。
 
     与主轮共用 _validate_attr_changes 与 _apply_attr_changes：闸门（非必填留空、
@@ -83,7 +114,7 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
 
     【best-effort】读不到行、LLM 不给值、写入失败一律只记录不抛，交末尾复扫报人工。
     """
-    await _read_linkage_options(session, new_rows, rowid, cat_id)
+    await _read_linkage_options(session, new_rows)
     # 问 LLM：喂法与主轮完全一致（同一套提示词、同样带 kind/numHint），只是行少。
     # 【提示词不能换】规则 5（成分合计 100）、规则 8（数值行只给纯数字）对里衬成分和
     # 里料克重恰好都适用，换一套简版提示词等于把这两条闸的前提抽掉。
@@ -119,8 +150,7 @@ async def _fill_linkage_round(session: BrowserSession, new_rows: list, info: dic
 
 
 async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dict,
-                             main_comp: Optional[dict], rowid: str = "",
-                             cat_id: str = "", site: str = "") -> dict:
+                             main_comp: Optional[dict], site: str = "") -> dict:
     """补填「联动新增的必填行」，循环追到不再冒新行为止。
 
     为什么必须单独一轮而不能并进主轮：这些行是【改了别的行才出现的】——阶段④开头
@@ -152,15 +182,12 @@ async def _fill_linkage_rows(session: BrowserSession, pre_labels: set, info: dic
         all_new.extend(labels)
         logger.info(f"联动新增必填行 {len(labels)} 条（第 {rnd}/{_LINKAGE_MAX_ROUNDS} 轮），"
                     f"开始补填：{'、'.join(labels)}")
-        # 【cat_id 必须透传】漏传它，_read_linkage_options 会按「草稿已保存的类目」查
-        # 服务端属性清单，而阶段③ 是运行中改类目、还没保存的——查回来的是上一版类目的
-        # 选项。2026-09-12 商品 pdd-250293857545 实测：主轮按页面现值查类目 12989（20 个
-        # 属性），本轮却按草稿旧值查了 13624（30 个属性），联动行「插头规格」拿着旧清单
-        # 里的值去点，一律 option-not-rendered 写不上，末尾复扫报必填留空。这与
-        # server_options._JS_ATTR_OPTIONS 注释里 2026-09-11 记的是同一个坑，主轮当时
-        # 修好了、本轮漏了。
+        # 【这里不再需要 rowid/cat_id】2026-10-09 起本轮选项取自页面该行下拉（见
+        # _read_linkage_options），不是按类目查服务端清单，故「透传 cat_id 免得查成
+        # 草稿旧类目」那个坑（2026-09-12 商品 pdd-250293857545 的「插头规格」）在本轮
+        # 不再成立；主轮 dump_attrs 仍按服务端清单取，cat_id 照旧必须传。
         applied, comp_failed = await _fill_linkage_round(
-            session, new_rows, info, main_comp, rowid, cat_id, site)
+            session, new_rows, info, main_comp, site)
         all_applied.extend(applied)
         all_comp_failed.extend(comp_failed)
         if not any(a.get("result") == "ok" for a in applied):
@@ -296,10 +323,12 @@ async def check_attrs(session: BrowserSession, info_path: str,
     预填的属性值全都与商品相符就整个阶段短路——一个下拉都不点。不适用/判不正确则
     落回下面这条完整流程，一行逻辑都不跳。
 
-    选项来自服务端接口（见 attributes/server_options），rowid 是要传给它的草稿 id，
-    cat_id 是页面上当前生效的叶子类目 id（阶段③ 选定后经 ctx 传下来）——类目是运行中
-    改的、还没保存，接口只能按已保存的类目回答，不传就会查出上一版类目的属性清单。
+    【主轮】选项来自服务端接口（见 attributes/server_options），rowid 是要传给它的草稿
+    id，cat_id 是页面上当前生效的叶子类目 id（阶段③ 选定后经 ctx 传下来）——类目是运行
+    中改的、还没保存，接口只能按已保存的类目回答，不传就会查出上一版类目的属性清单。
     写入失败的行走 _retry_row 原值再试一次，不重读选项（选项当次现取、不存在过期）。
+    【联动补填轮例外】那几行的选项取自页面该行下拉——服务端清单是全量、页面会被前置
+    字段联动收窄，两者不一致正是「工作电压」写不进去的根因（见 _read_linkage_options）。
 
     site 是发布站点（中文站点名），喂给两条路径的 LLM 判据：插头规格、工作电压这类字段
     由目标市场的电气标准决定，源商品信息里推不出来——1688/国内源商品必然是中规两插
@@ -417,7 +446,7 @@ async def check_attrs(session: BrowserSession, info_path: str,
     # 会在联动显示后进入补填轮正常补上。
     fill = await _fill_linkage_rows(
         session, {a["label"] for a in attrs if a.get("visible") is not False},
-        info, main_comp, rowid, cat_id, site)
+        info, main_comp, site)
     result["linkageFilled"] = fill.get("applied") or []
     result["linkageNewRequired"] = fill.get("newRequired") or []
     if fill.get("compFailed"):

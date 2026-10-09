@@ -142,8 +142,11 @@ PROVIDERS = {
     # 【max_pixels 为什么不封顶】它的计费查不到（无 /api/pricing、无 billing/usage），
     # 但封顶在本项目只会白降画质——要么按次计费（压了不省）、要么按尺寸（省的那点
     # 换回放大糊字）。要省钱就切通道，别在这里偷偷压尺寸，这与 zzlye 那条同源。
-    # 【它只回 url 不给 b64_json】结果域名同域（v4-gateway-v*.shyfai.cn），不像 zzlye
-    # 的裸 IP 结果 CDN 有到不了的机器，_save_result 的 url 分支可直接用。
+    # 【它只回 url 不给 b64_json】结果落 v4-gateway-v*.fycsai.com（2026-10-09 实测，
+    # 2026-09-28 那会儿还是 v4-gateway-v*.shyfai.cn，服务商换过域名），不像 zzlye 的
+    # 裸 IP 结果 CDN 有到不了的机器，_save_result 的 url 分支可直接用；但新域名
+    # 【拒收 JPEG 资产】（请求 output_format=jpeg 时回的 URL 恒 400），故出图一律要
+    # png，详见 edit_image 里 output_format 的长注释。
     # 【必须配合下面的 _TRANSIENT_TASK_CODES】它的上游忙时返 477/434 这类自定义码，
     # 不纳入重试会有一半的首发失败直接炸单。
     "shyfai": {"base": "https://agent3.shyfai.cn/v1", "model": "gpt-image-2.5-flare",
@@ -1001,6 +1004,40 @@ def _json_post(url: str, payload: dict, timeout: int = 280) -> dict:
             os.unlink(tmp.name)
 
 
+# 下载结果图时的确定性失败码：4xx 里这些重试多少次都是同一个拒绝，立刻收手。
+# 【为什么不整个 4xx 都收手】429 是限流，隔几秒重发有意义，留给退避重试。
+# 与 _edits_post_with_retry「确定性失败一律原样抛出：重试多少次都是同样的错，
+# 白等还把真错误埋成一串重试噪音」同源。
+_DOWNLOAD_DETERMINISTIC_CODES = {"400", "401", "403", "404", "410"}
+
+
+def _download_err(r, code: str, out_path: str) -> str:
+    """拼下载失败的诊断串。
+
+    【为什么不能只用 r.stderr】网关把错误当正文回时（HTTP 4xx + JSON），curl 的
+    returncode 是 0、stderr 是空的，失败信息全在被 -o 写进 out_path 的那几百字节里。
+    2026-10-09 shyfai 换 CDN 那次，就是只看 stderr 导致日志里只剩「下载结果图失败：」
+    一个空冒号，258 次失败全靠人工 curl 复现才查出真因（HTTP 400 + 错误码正文）。
+    """
+    err = r.stderr.decode("utf-8", "replace").strip()[:200]
+    if err:
+        return err
+    parts = [f"curl rc={r.returncode}"]
+    if code:
+        parts.append(f"HTTP {code}")
+    try:
+        if os.path.exists(out_path):
+            n = os.path.getsize(out_path)
+            with open(out_path, "rb") as f:
+                snippet = f.read(300).decode("utf-8", "replace").strip()
+            parts.append(f"{n} 字节")
+            if snippet and not snippet.startswith("\x89PNG"):
+                parts.append(f"正文：{snippet[:200]}")
+    except OSError:
+        pass
+    return " ".join(parts)
+
+
 def _save_result(resp_json: dict, out_path: str) -> str:
     """从响应保存图片（b64_json 优先，其次 url 下载），返回保存路径。
 
@@ -1012,6 +1049,8 @@ def _save_result(resp_json: dict, out_path: str) -> str:
     url 分支保留给只回 url 的响应：下载走 curl（与请求同一 TLS 指纹策略）；
     结果 CDN 偶发连接失败（2026-08-18 实测），curl -s 会吞错误信息，故用 -sS
     且失败重试；超长签名 URL 用 -K 配置文件传，避免 WinError 206（命令行过长）。
+    失败信息一律经 _download_err 拼：stderr 为空时补响应码与错误正文，否则日志里
+    只剩一个空冒号（见那里的实测）。
     """
     import base64
 
@@ -1024,6 +1063,8 @@ def _save_result(resp_json: dict, out_path: str) -> str:
         url = data["url"]
         last_err = ""
         r = None
+        # -w 把最终响应码写 stdout：HTTP 4xx 的正文会被 -o 当成"文件"落盘，只看
+        # returncode 分不出「下到了图」和「下到一页错误 JSON」（两者 rc 都是 0）。
         for attempt in range(3):
             if len(url) > 1500:
                 cfg = tempfile.NamedTemporaryFile(
@@ -1033,21 +1074,27 @@ def _save_result(resp_json: dict, out_path: str) -> str:
                     cfg.write(f'url = "{url}"\n')
                     cfg.close()
                     r = subprocess.run(
-                        ["curl.exe", "-sS", "-L", "--max-time", "280",
-                         "-K", cfg.name, "-o", out_path],
+                        ["curl.exe", "-sS", "-L", "--max-time", "280", "-o", out_path,
+                         "-w", "%{http_code}", "-K", cfg.name],
                         capture_output=True, timeout=300)
                 finally:
                     if os.path.exists(cfg.name):
                         os.unlink(cfg.name)
             else:
                 r = subprocess.run(
-                    ["curl.exe", "-sS", "-L", "--max-time", "280", "-o", out_path, url],
+                    ["curl.exe", "-sS", "-L", "--max-time", "280", "-o", out_path,
+                     "-w", "%{http_code}", url],
                     capture_output=True, timeout=300)
-            if r.returncode == 0 and os.path.exists(out_path) \
+            code = r.stdout.decode("ascii", "replace").strip()
+            # 必须连响应码一起判：网关把错误正文写得比 1000 字节大时（如带详情的长
+            # JSON），只看体积会把它当成一张合法结果图收下，一路带病到出图下游。
+            if r.returncode == 0 and code == "200" and os.path.exists(out_path) \
                     and os.path.getsize(out_path) > 1000:
                 return out_path
-            last_err = r.stderr.decode("utf-8", "replace")[:200]
+            last_err = _download_err(r, "" if code == "000" else code, out_path)
             logger.warning(f"结果图下载失败（{attempt + 1}/3）：{last_err}")
+            if code in _DOWNLOAD_DETERMINISTIC_CODES:
+                break
             time.sleep(2 * (attempt + 1))
         # 【失败必须删掉部分下载的文件】curl 超时会留下不完整字节（2026-09-28 实测：
         # 14.9MB 的 PNG 中断后留下 10.1MB 前段，PIL 还能宽容读出尺寸），而 out_path
@@ -1202,7 +1249,8 @@ def _busy_exhausted(resp_json: dict, attempt: int, tries: int, what: str):
 
 
 def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TIMEOUT,
-                           tries: int = EDIT_BAD_CHANNEL_RETRY) -> dict:
+                           tries: int = EDIT_BAD_CHANNEL_RETRY,
+                           mask_path: Optional[str] = None) -> dict:
     """发 /images/edits，对【坏渠道】【链路抖动】【上游任务瞬时失败】三类失败重试。
 
     三类失败的判据与取舍分别见上方 _BAD_CHANNEL_CODE / _CURL_TRANSIENT_RC /
@@ -1226,8 +1274,11 @@ def _edits_post_with_retry(fields: dict, image_path: str, timeout: int = EDIT_TI
     last_resp = None
     for attempt in range(1, tries + 1):
         try:
+            files = {"image": image_path}
+            if mask_path:
+                files["mask"] = mask_path
             resp = _multipart_post(f"{_provider()['base']}/images/edits", fields,
-                                   {"image": image_path}, timeout=timeout)
+                                   files, timeout=timeout)
         except TransientNetError as e:
             if attempt >= tries:
                 raise
@@ -1266,7 +1317,8 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
                out_path: Optional[str] = None, size: Optional[str] = None,
                quality: str = "low", target: Optional[str] = None,
                do_compress: bool = True, no_downscale: bool = False,
-               timeout: int = EDIT_TIMEOUT, desc_mode: bool = False) -> dict:
+               timeout: int = EDIT_TIMEOUT, desc_mode: bool = False,
+               mask_path: Optional[str] = None) -> dict:
     """AI 编辑单张图（去中文/去水印/英化）。
 
     prompt 缺省用 DEFAULT_CLEAN_PROMPT，但【建议调用方按图定制】：先看图定位具体问题
@@ -1276,6 +1328,12 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
 
     no_downscale=True 让自动选档不小于原图（见 pick_size 注释），素材图用。
     timeout 可压短：批量清理时一张卡住不该拖住整批（阶段⑥前置清理给 90s）。
+
+    mask_path 是 OpenAI 口径的【局部重绘】掩膜（PNG，尺寸同图，【透明处】才是要重画的地方）：
+    给了它，模型只重画掩膜内的内容、其余原样保留——「把这块东西擦掉」这类活儿本就该这么干。
+    谁在用：`text_erase` 的品牌标识抹除确定性链路抹不掉时（标记与旁边结构同色相连、框太小
+    盖不住那几种）拿已经算好的掩膜兜底。三家网关收不收 mask 未逐一实测过（本机默认走的
+    那家实测能收，见 [[publish-brand-mark-targeted-erase]]）。
 
     desc_mode=True 走【描述长图】的尺寸口径（两边 >= 480、比例 0.5~2，见
     check_desc_size）：不按服装闸门挑出图尺寸、收尾 compress 也不放大到 1340x1785。
@@ -1293,16 +1351,24 @@ def edit_image(image_path: str, prompt: Optional[str] = None,
                                            gate_aware=not desc_mode),
         "quality": quality,
         "n": 1,
-        # 【为什么固定请求 jpeg】2026-09-28 shyfai 通道实测：其结果 CDN（v4-gateway-*.shyfai
-        # .cn）单连接仅 ~20KB/s 且【不支持 Range】（-r 请求回 200 全量，断点续传/多段并发
-        # 都无路），默认 PNG 一张 14MB 顶死 280s 超时，1067355258988 ⑬ 描述图 3 次重试全
-        # 败、整单未落库。jpeg 后同图 115KB 数秒下完（实测 1024x1024 仅 37KB）。下游链本
-        # 就全按 JPEG 走（compress q80、扩展名不可信按内容识别），无透明通道依赖，PNG 的
-        # 无损优势在照片级商品图上没有落点。三家兼容性实测：shyfai 认；zzlye 忽略参数
-        # 仍回 PNG（b64 优先路径不受影响）；Packy 未测（OpenAI 兼容网关通常忽略未知参数）。
-        "output_format": "jpeg",
+        # 【为什么现在要 png，而不是 2026-09-28 那样要 jpeg】当时要 jpeg 是为了绕开
+        # shyfai 结果 CDN（那会儿是 v4-gateway-*.shyfai.cn）单连接仅 ~20KB/s 且不支持
+        # Range 的龟速：默认 PNG 一张 14MB 顶死 280s 超时（1067355258988 ⑬ 描述图整单
+        # 未落库）。
+        # 2026-10-09 该 CDN 换域名到 v4-gateway-v*.fycsai.com 后，jpeg 请求反过来变得
+        # 【根本下不到图】：它回的 asset URL 恒 400 lossy_output_format_not_allowed
+        # （「不允许转为 JPEG、降低色深、丢弃透明度…请保留原图格式」，即新 CDN 拒收 JPEG
+        # 资产），而 curl 此时 rc=0、正文是 246 字节的 JSON 错误、stderr 全空，_save_result
+        # 原先只看 stderr，日志里只剩「下载结果图失败：」一个空冒号，⑤b/⑤c/⑥/⑦b 四阶段
+        # 出图集体报废（1048494210610 2026-10-09 实录 258 次，现场 curl 复现确认）。
+        # 实测 png：同一张图 HTTP 200、1.85MB、2.4s 下完（~770KB/s，是旧 CDN 的 38 倍），
+        # 「压体积换速度」的前提已不存在，且下游本就按内容识图、compress 收尾仍落 JPEG。
+        # 三家兼容性实测：shyfai 认；zzlye 忽略参数仍回 PNG（b64 优先路径不受影响）；
+        # Packy 未测（png 是 OpenAI 合法值，兼容网关应接受）。
+        "output_format": "png",
     }
-    resp = _edits_post_with_retry(fields, image_path, timeout=timeout)
+    resp = _edits_post_with_retry(fields, image_path, timeout=timeout,
+                                  mask_path=mask_path)
     saved = _save_result(resp, out_path)
     if target:
         tw, th = (int(x) for x in target.lower().split("x"))
@@ -1328,8 +1394,8 @@ def generate_image(prompt: str, out_path: str, size: str = "1024x1024",
     prov = _provider()
     payload = {"model": prov["model"], "prompt": prompt, "size": size,
                "quality": quality, "n": 1,
-               # 同 edit_image：结果图固定要 jpeg，理由见那里 output_format 的长注释
-               "output_format": "jpeg"}
+               # 同 edit_image：结果图固定要 png，理由见那里 output_format 的长注释
+               "output_format": "png"}
     for attempt in range(1, EDIT_BAD_CHANNEL_RETRY + 1):
         try:
             resp = _json_post(f"{prov['base']}/images/generations", payload)

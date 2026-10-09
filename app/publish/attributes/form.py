@@ -263,7 +263,9 @@ async def dump_attrs(session: BrowserSession, skip_options: bool = False,
     LLM 做修改建议，只能看现状。
 
     options 一律取自服务端（见 attributes/server_options）：一次请求拿全该类目所有属性的
-    可选值。要求的 rowid 是当前页打开的那个草稿，店铺 id 由它现取。
+    可选值。【联动补填轮的那几行例外】它的选项取自页面该行下拉，理由见
+    workflow._read_linkage_options——服务端清单是全量、页面会被前置字段联动收窄，
+    「工作电压」写不进去就是两者不一致造成的（2026-10-09）。要求的 rowid 是当前页打开的那个草稿，店铺 id 由它现取。
     cat_id 是【页面上当前生效】的叶子类目 id（阶段③ 选定后经 ctx 传下来）。必须由调用方
     给：类目是运行中改的、还没保存，服务端只能按已保存的类目回答，本次会话就是拿它查出
     了上一版类目的属性清单（20 个电子类属性），页面上要填的动态属性一个都没有。

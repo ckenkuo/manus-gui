@@ -175,8 +175,10 @@ async def test_defaults_and_all_information_images_pass_qc(scene):
     assert set(scene.edits) == {defaults[0], information[0]}
     assert {url for url, final in scene.checks if not final} == set(defaults + information)
     assert sum(item["checked"] for item in scene.items) == 9
-    # 5 张待复检的图，每张问满两次（任一次判坏就拦下，故两次都要问）
-    assert len([final for _, final in scene.checks if final]) == 10
+    # 【9 张全都要复检，每张问满两次】2026-10-09 起收尾复检不再跳过「备料段已放行、无需
+    # 重做」的格子（判的虽说是同一份字节，但那是两次独立判定，而漏判恰恰出现在这类格子上）；
+    # 任一次判坏就拦下，故每张都问满两次。
+    assert len([final for _, final in scene.checks if final]) == 18
 
 
 @pytest.mark.asyncio
@@ -194,7 +196,9 @@ async def test_cute_false_positive_never_blocks_carousel_or_requests_manual_edit
 
     assert result["status"] == "ok"
     assert sum(item["checked"] for item in scene.items) == 4
-    assert model.await_count == 10
+    # 【10 → 16：收尾复检改成「每张已选图都查」】原先只查重做过/补勾过的那 1 张（×2 问），
+    # 现在 4 张各 2 问（2026-10-09 定案，见 test_defaults_and_all_information_images_pass_qc）
+    assert model.await_count == 16
     assert not scene.edits
     assert not any(event["type"] == "manual_check" for event in scene.events)
 

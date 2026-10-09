@@ -547,6 +547,10 @@ _JS_LIVE_STATE = r"""(async () => {
     catDeleted: catDeleted,
     titleFilled: !!enTitle,
     titleHasCjk: titleHasCjk,
+    // ⑤ 续跑还要看【内容】而不仅是「有没有值」：认领会把源标题预填进这个框（2026-10-09
+    // 真站实测），旧产物也可能带材质。判据本身在 Python 侧（titles._title_content_reject），
+    // 这里只把原文透出去——正则只该有一份，不在 JS 里复刻。
+    titleText: enTitle,
     skuRowCount: skuRows.length,
     skuFilledRows: skuFilled,
     skuCodeCount: skuCodeInps.length,
